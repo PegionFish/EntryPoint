@@ -1,6 +1,9 @@
 # EntryPoint — AI 工具管控平台 设计文档
 
-> 状态：草案 v0.2 | 日期：2026-07-20
+> 状态：草案 v0.3 | 日期：2026-07-20
+>
+> v0.3 变更：模型缓存目录用户可指定、uv/Python 不内嵌（系统调用+引导安装）、
+> NPU 仅 Intel（可扩展）、Adapter 统一 REST 接口、genre 分类与多模型对比
 >
 > v0.2 变更：计算设备抽象（多后端）、模块化插件系统、虚拟环境自动管理、
 > 可移植性设计、模型按需下载、移除 ComfyUI/SD 相关讨论
@@ -27,7 +30,7 @@ EntryPoint 是一个 **Windows/Linux 原生桌面应用**，用于统一管控�
 | **可移植优先** | 所有路径相对于应用根目录；venv 不可移植时自动重建；无注册表/系统服务依赖 |
 | **模块即文件夹** | 一个模块 = 一个目录 + 一份 `module.toml`，放入 `modules/` 即被识别 |
 | **计算后端无关** | 核心不绑定任何 GPU 厂商，通过 ComputeBackend 抽象层适配 |
-| **模型与代码分离** | 模型文件统一存放在 `models/`，模块只声明下载源，不打包模型 |
+| **模型与代码分离** | 模型文件存放在用户可指定的缓存目录（默认 `models/`），模块只声明下载源，不打包模型 |
 | **渐进式复杂度** | 用户只需双击启动 → 选模块 → 下载模型 → 运行；高级用户可编辑 manifest/管线 |
 
 ### 1.2 初期范围
@@ -48,7 +51,7 @@ EntryPoint 是一个 **Windows/Linux 原生桌面应用**，用于统一管控�
 | 序列化 | **serde + toml / json** | 配置、模块清单、管线定义 |
 | 节点编辑器 | **egui_node_graph** 或自研 | DAG 可视化 |
 | 日志 | **tracing** | 结构化日志 |
-| Python 环境 | **uv** | 极速 venv 创建 + 依赖安装（替代 pip） |
+| Python 环境 | **uv**（系统安装） | 极速 venv 创建 + 依赖安装；不内嵌，调用系统 uv/python |
 | 模型下载 | **huggingface-hub** / **modelscope** (Python) | 标准模型下载，支持断点续传 |
 | 计算设备检测 | 多后端（见 §4.2） | nvidia-smi / rocm-smi / xpu-smi / OpenVINO |
 
@@ -62,13 +65,13 @@ EntryPoint 是一个 **Windows/Linux 原生桌面应用**，用于统一管控�
 EntryPoint/                        ← 应用根目录（可整体复制）
 ├── entrypoint.exe / entrypoint    ← 主程序二进制（Win/Linux 各一份）
 ├── config/
-│   ├── app.toml                   ← 全局设置
+│   ├── app.toml                   ← 全局设置（含模型缓存路径）
 │   └── pipelines/                 ← 用户保存的管线
 │       └── video_to_srt.toml
 ├── modules/                       ← 模块目录（放入即识别）
 │   ├── faster-whisper/
 │   │   ├── module.toml            ← 模块清单（核心）
-│   │   ├── adapter.py             ← 启动/适配脚本
+│   │   ├── adapter.py             ← 启动/适配脚本（统一 REST 接口）
 │   │   ├── requirements.txt       ← Python 依赖
 │   │   └── README.md              ← 模块说明
 │   ├── deep-filter/
@@ -80,18 +83,22 @@ EntryPoint/                        ← 应用根目录（可整体复制）
 │       ├── module.toml
 │       ├── adapter.py
 │       └── requirements.txt
-├── models/                        ← 模型文件统一存放（按需下载）
-│   ├── faster-whisper-large-v3/
-│   ├── qwen3-asr-1.7b/
-│   └── ...
 ├── runtime/                       ← 运行时环境（自动生成，不随发布）
-│   ├── python/                    ← uv 管理的 Python 安装（可选）
-│   └── venvs/                     ← 各模块的虚拟环境
+│   └── venvs/                     ← 各模块的虚拟环境（uv 创建）
 │       ├── faster-whisper/
 │       └── qwen3-asr/
 ├── workspace/                     ← 管线任务临时文件
 │   └── <task-id>/
 └── logs/                          ← 运行日志
+
+# 模型缓存目录（用户可自定义，默认在应用根目录下）
+<model_cache_dir>/                 ← 由 config/app.toml [models].cache_dir 指定
+├── faster-whisper-large-v3/
+│   ├── model.bin
+│   ├── config.json
+│   └── .ep_meta.json              ← 轻量元数据（来源、版本，可删除）
+├── qwen3-asr-1.7b/
+└── ...
 ```
 
 ### 3.2 可移植性规则
@@ -100,10 +107,10 @@ EntryPoint/                        ← 应用根目录（可整体复制）
 |---|---|
 | **零绝对路径** | 所有配置中的路径均相对于应用根目录，运行时解析为绝对路径 |
 | **venv 不复制** | `runtime/venvs/` 在 `.gitignore` 中；复制到新机器后首次启动自动重建 |
-| **模型不复制（可选）** | `models/` 可复制（大）或删除后重新下载；模块清单中记录下载源 |
-| **平台自适应** | 启动时检测 OS/arch，选择对应的二进制和 Python 解释器 |
+| **模型目录可分离** | 模型缓存路径由用户在 `app.toml` 中指定（默认 `models/`）；用户可自行备份、迁移、共享模型目录 |
+| **平台自适应** | 启动时检测 OS/arch，选择对应的二进制 |
 | **无系统依赖** | 不写注册表、不装系统服务、不要求管理员权限 |
-| **Python 来源** | 优先使用 `runtime/python/` 内嵌 Python；回退到系统 `python3`；最终由 uv 自动安装 |
+| **Python/uv 系统提供** | 不内嵌 Python 或 uv；调用系统 PATH 中的 `python3`/`uv`；缺失时引导用户安装 |
 
 ### 3.3 跨平台迁移流程
 
@@ -133,6 +140,7 @@ name = "Faster-Whisper ASR"
 version = "1.1.0"
 description = "基于 CTranslate2 的高速语音识别，支持词级时间戳"
 category = "asr"                    # asr | tts | denoise | ocr | image | translate | video | custom
+genre = "whisper"                   # 同类模型分组标签，用于多模型对比（如 "whisper" / "qwen-asr"）
 authors = ["EntryPoint Community"]
 license = "MIT"
 
@@ -277,9 +285,10 @@ struct ComputeDevice {
 enum ComputeBackend {
     Cuda,        // NVIDIA
     Rocm,        // AMD
-    OpenVINO,    // Intel CPU/GPU/NPU
+    OpenVINO,    // Intel CPU/GPU/NPU（当前 NPU 仅支持 Intel，trait 预留扩展）
     DirectML,    // Windows 通用 GPU 加速
     CPU,         // 纯 CPU（始终可用）
+    // 未来扩展：QualcommNPU, AppleANE, ...
 }
 
 /// 设备标识，用于传递给子进程
@@ -337,8 +346,34 @@ enum AssignStrategy {
 - 使用 **uv** 极速安装依赖（比 pip 快 10-100x）
 - 跟踪依赖版本，检测 requirements.txt 变更
 - 跨平台迁移时自动重建
+- **不内嵌 Python 或 uv**，调用系统已安装的版本
 
-#### 4.3.2 流程
+#### 4.3.2 前置依赖检测
+
+启动时检查系统环境：
+
+```
+1. 检测 uv:  which uv / where uv
+   - 存在 → 记录路径，继续
+   - 缺失 → 提示用户安装：
+     - Windows: 弹窗 "需要安装 uv"，按钮自动打开浏览器
+       → https://docs.astral.sh/uv/getting-started/installation/
+       （或提示 winget install uv / pip install uv）
+     - Linux: 提示 curl -LsSf https://astral.sh/uv/install.sh | sh
+              或 apt install uv / pip install uv
+   - uv 未安装时，所有 Python 类模块标记为 "环境未就绪"
+
+2. 检测 python: python3 --version / python --version
+   - 存在且版本满足 → 记录路径
+   - 缺失 → 提示用户安装：
+     - Windows: 弹窗 "需要安装 Python"，按钮自动打开
+       → https://www.python.org/downloads/
+       （或提示 winget install Python.Python.3.12）
+     - Linux: 提示 sudo apt install python3 / sudo dnf install python3
+   - 也可由 uv 代管: uv python install 3.12（安装到 uv 管理目录）
+```
+
+#### 4.3.3 venv 创建流程
 
 ```
 模块启动（首次或依赖变更时）:
@@ -350,13 +385,13 @@ enum AssignStrategy {
 6. 使用该 venv 的 python 启动模块
 ```
 
-#### 4.3.3 Python 解释器来源（优先级）
+#### 4.3.4 Python 解释器来源（优先级）
 
-1. `runtime/python/` — 应用内嵌 Python（由 uv 安装：`uv python install 3.12`）
-2. 系统 `python3` / `python` — 版本满足约束时使用
-3. 自动安装 — `uv python install <version>` 到 `runtime/python/`
+1. 用户手动指定 — `config/app.toml` 中 `[python].path`
+2. 系统 PATH — `python3` / `python`（版本需满足模块约束）
+3. uv 管理 — `uv python install <version>`（安装到 uv 默认目录，非应用内）
 
-#### 4.3.4 依赖锁定
+#### 4.3.5 依赖锁定
 
 - 首次安装后生成 `runtime/venvs/<module_id>/ep.lock`（`uv pip freeze` 输出）
 - 后续启动优先使用 lock 文件精确还原
@@ -364,35 +399,55 @@ enum AssignStrategy {
 
 ### 4.4 ModelManager — 模型下载管理
 
-#### 4.4.1 下载源
+#### 4.4.1 模型缓存目录
+
+模型文件**不强制存放在应用目录内**，用户可在 `config/app.toml` 中指定：
+
+```toml
+[models]
+cache_dir = "models"                    # 默认：应用根目录下的 models/
+# cache_dir = "D:/AI_Models"           # Windows 示例：指定到独立磁盘
+# cache_dir = "/data/shared-models"    # Linux 示例：多用户共享
+```
+
+- 支持绝对路径和相对路径（相对于应用根目录）
+- 用户可自行备份、复制、共享该目录
+- 多个 EntryPoint 实例可指向同一模型缓存目录（节省磁盘）
+- 模型目录内的文件夹名即 `module.toml` 中声明的 `target_dir`
+
+#### 4.4.2 下载源
 
 | 源 | 下载方式 | 说明 |
 |---|---|---|
-| HuggingFace | `huggingface-hub` Python 库 (`hf_hub_download` / `snapshot_download`) | 标准方式，支持断点续传、镜像站 |
+| HuggingFace | `huggingface-hub` Python 库 (`snapshot_download`) | 标准方式，支持断点续传、镜像站 |
 | ModelScope | `modelscope` Python 库 (`snapshot_download`) | 国内镜像，速度快 |
 | 直链 URL | HTTP 下载 (reqwest) | 兜底方案，用于特殊文件 |
 
-#### 4.4.2 下载流程
+#### 4.4.3 下载流程
 
 ```
 用户点击"下载模型" / 模块首次启动:
 1. 读取 module.toml 中 [[models]] 声明
-2. 检查 models/<target_dir>/ 是否已存在且完整
-   - 完整性校验：.ep_model_meta.json（记录文件列表 + 哈希）
-3. 不存在/不完整 → 调用对应下载器
-   - HuggingFace: 在模块 venv 中执行
+2. 检查 <cache_dir>/<target_dir>/ 是否已存在
+   - 存在且有 .ep_meta.json → 校验来源信息，视为已下载
+   - 存在但无 .ep_meta.json → 视为用户手动放置，直接使用（不校验）
+   - 不存在 → 执行下载
+3. 下载：在模块 venv 中执行
+   - HuggingFace:
      python -c "from huggingface_hub import snapshot_download;
                 snapshot_download(repo_id='...', local_dir='...')"
    - ModelScope: 类似
    - 支持 HF_ENDPOINT 环境变量（镜像站）
-4. 下载进度实时回传 UI（解析 stdout 或 HTTP Content-Length）
-5. 完成后写入 .ep_model_meta.json
+4. 下载进度实时回传 UI（解析 stdout）
+5. 完成后写入 .ep_meta.json
 ```
 
-#### 4.4.3 模型元数据
+#### 4.4.4 模型元数据（.ep_meta.json）
+
+轻量元数据文件，记录模型来源信息。**用户可安全删除**——删除后系统视为手动放置的模型，直接使用，仅失去自动检查更新的能力。
 
 ```json
-// models/faster-whisper-large-v3/.ep_model_meta.json
+// <cache_dir>/faster-whisper-large-v3/.ep_meta.json
 {
   "module_id": "faster-whisper",
   "model_id": "large-v3",
@@ -400,13 +455,14 @@ enum AssignStrategy {
   "repo_id": "Systran/faster-whisper-large-v3",
   "revision": "main",
   "downloaded_at": "2026-07-20T10:30:00Z",
-  "files": [
-    { "path": "model.bin", "size": 3094847392, "sha256": "abc..." },
-    { "path": "config.json", "size": 1234, "sha256": "def..." }
-  ],
   "total_size_bytes": 3094850000
 }
 ```
+
+设计取舍：
+- **不记录逐文件哈希**：模型文件通常数 GB，逐文件校验成本高且意义有限（用户自行维护完整性）
+- **仅记录来源**：核心目的是支持"检查更新"（对比远端 revision）和跨机器识别
+- **可删除**：不阻塞正常使用，尊重用户对模型目录的完全控制权
 
 ### 4.5 ProcessManager — 进程管理器
 
@@ -440,7 +496,7 @@ enum ServiceStatus {
 3. 构建环境变量：
    - 计算设备相关（`CUDA_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES` / ...）
    - `EP_PORT={port}`
-   - `EP_MODEL_DIR={root}/models/{target_dir}`
+   - `EP_MODEL_DIR={cache_dir}/{target_dir}`
    - `EP_ROOT={root}`
    - 模块 manifest 中声明的额外环境变量
 4. 构建启动命令（变量替换）
@@ -662,12 +718,14 @@ range_start = 18000
 range_end = 19000
 
 [models]
+cache_dir = "models"                    # 模型缓存目录（相对或绝对路径）
 hf_endpoint = "https://hf-mirror.com"   # HuggingFace 镜像（可选）
 default_source = "huggingface"          # huggingface | modelscope
 
 [python]
-# 留空则自动管理
-system_python = ""
+path = ""                           # 留空则自动检测系统 PATH
+# path = "C:/Python312/python.exe"  # Windows 手动指定
+# path = "/usr/bin/python3"         # Linux 手动指定
 ```
 
 ---
@@ -680,7 +738,7 @@ system_python = ""
 - 最近管线任务
 
 ### 5.2 模块管理 (Modules)
-- 模块列表（按 category 分组）
+- 模块列表（按 category 分组，同 genre 内聚合显示）
 - 每个模块卡片：
   - 状态指示灯（未安装 / 就绪 / 运行中 / 错误）
   - 模型下载状态 + 进度条
@@ -688,6 +746,8 @@ system_python = ""
   - 启动 / 停止按钮
   - 配置面板（从 capability params schema 自动生成）
   - 日志查看器
+- **多模型对比**：同 genre 的模块可勾选多个同时运行，
+  管线中同一节点位可选择"对比模式"——相同输入分发给多个模型，结果并列展示
 - 安装新模块（拖入文件夹 / 指定路径）
 
 ### 5.3 管线编辑器 (Pipeline Editor)
@@ -705,8 +765,9 @@ system_python = ""
 ### 5.5 设置 (Settings)
 - 计算设备策略
 - 端口范围
+- 模型缓存目录（路径选择器）
 - HuggingFace 镜像
-- Python 路径
+- Python / uv 路径（显示检测结果，缺失时提供安装引导）
 - 语言 / 主题
 
 ---
@@ -742,7 +803,112 @@ Python adapter 需遵守的环境变量契约：
 | `EP_DEVICE_INDEX` | 设备索引 | `0` |
 | `EP_BACKEND` | 计算后端 | `cuda` / `rocm` / `openvino` / `cpu` |
 
-### 6.3 Capability 类型系统
+### 6.3 Adapter 统一 REST 接口
+
+**核心设计**：无论底层工具使用 Gradio 3.x/4.x/5.x、Flask、FastAPI 还是其他框架，
+每个 Python 模块的 `adapter.py` 负责将其包装为**统一的 REST 接口**。
+EntryPoint 核心只与这套标准接口通信，不感知底层框架差异。
+
+#### 标准端点
+
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/health` | GET | 健康检查，返回 `{"status": "ok"}` |
+| `/info` | GET | 模块信息（名称、版本、capabilities 列表） |
+| `/predict/<capability>` | POST | 调用指定能力，请求体为 JSON 参数 |
+| `/predict/<capability>` | POST (multipart) | 文件上传类调用（音频/图片/视频） |
+
+#### 请求/响应格式
+
+```
+POST /predict/transcribe
+Content-Type: multipart/form-data
+
+file: <audio.wav>
+params: {"language": "auto", "timestamps": true}
+
+→ 200 OK
+{
+  "status": "completed",
+  "output_type": "text",
+  "result": "识别文本内容...",
+  "metadata": {
+    "segments": [
+      {"start": 0.0, "end": 2.5, "text": "你好世界"}
+    ]
+  }
+}
+```
+
+```
+POST /predict/denoise
+Content-Type: multipart/form-data
+
+file: <noisy.wav>
+
+→ 200 OK
+{
+  "status": "completed",
+  "output_type": "audio",
+  "result": "/workspace/task-1/denoise/output.wav"
+}
+```
+
+#### Adapter 模板（Python 伪代码）
+
+```python
+# adapter.py — 模块适配器模板
+import os, json
+from fastapi import FastAPI, UploadFile, Form
+from fastapi.responses import JSONResponse
+import uvicorn
+
+app = FastAPI()
+
+# 从环境变量获取配置
+PORT = int(os.environ.get("EP_PORT", 18000))
+MODEL_DIR = os.environ.get("EP_MODEL_DIR", "")
+DEVICE = os.environ.get("EP_DEVICE", "cpu")
+
+# 加载底层模型（各模块自行实现）
+model = None
+
+@app.on_event("startup")
+def load():
+    global model
+    model = load_model(MODEL_DIR, DEVICE)  # 模块自定义
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.get("/info")
+def info():
+    return {"name": "...", "version": "...", "capabilities": ["transcribe"]}
+
+@app.post("/predict/{capability}")
+async def predict(capability: str, file: UploadFile = None, params: str = "{}"):
+    params = json.loads(params)
+    if capability == "transcribe":
+        result = model.transcribe(file.file, **params)
+        return {"status": "completed", "output_type": "text", "result": result}
+    return {"status": "error", "message": f"Unknown capability: {capability}"}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
+```
+
+#### 设计要点
+
+- **Gradio 版本差异在 adapter 内部消化**：adapter 可以选择直接调用底层 Python API（绕过 Gradio），
+  或启动 Gradio 后通过内部 HTTP 调用再转发——对上层透明
+- **CLI 类模块无需 adapter**：由管线引擎直接构建命令行调用
+- **FastAPI + uvicorn 作为推荐 adapter 框架**：轻量、异步、自带 OpenAPI 文档；
+  已包含在模块的 `requirements.txt` 中
+- **文件传递**：输入文件通过 multipart 上传或传入文件路径（`params.input_path`）；
+  输出文件写入工作目录并返回路径
+
+### 6.4 Capability 类型系统
 
 管线引擎通过 input_type / output_type 验证连线合法性：
 
@@ -871,11 +1037,13 @@ EntryPoint/
 
 | # | 问题 | 当前倾向 |
 |---|---|---|
-| 1 | uv 是否作为内嵌二进制分发？还是要求用户预装？ | 内嵌（单文件 ~15MB，随主程序分发） |
-| 2 | Python 内嵌方案：uv 管理的 standalone Python vs 用户系统 Python | 优先 uv standalone，回退系统 Python |
-| 3 | NPU 支持范围：Intel NPU (OpenVINO) 先行？还是也考虑 Qualcomm/AMD NPU？ | 先 Intel OpenVINO，其他按需 |
-| 4 | 模块 adapter 是否强制要求 HTTP 接口？CLI 模块如何接入管线？ | 两种都支持；CLI 由引擎直接调用命令行 |
-| 5 | 模型下载是否需要支持离线导入（用户手动放入 models/ 目录）？ | 是，放入后自动识别 + 校验 |
-| 6 | Gradio 类模块的 API 适配：各版本 Gradio API 格式不同 | adapter.py 封装差异，对上层暴露统一接口 |
-| 7 | 多实例：同一模块能否启动多个实例（如两个不同模型的 ASR）？ | 支持，module_id + instance_id |
-| 8 | 是否需要 Docker 运行时支持？ | 暂不需要，优先原生进程管理 |
+| 1 | ~~uv 是否内嵌~~ | **已决定**：不内嵌，调用系统 uv，缺失时引导安装 |
+| 2 | ~~Python 内嵌方案~~ | **已决定**：不内嵌，系统 PATH 优先，回退 uv python install |
+| 3 | ~~NPU 支持范围~~ | **已决定**：当前仅 Intel (OpenVINO)，ComputeBackend trait 预留扩展 |
+| 4 | ~~Gradio API 适配~~ | **已决定**：Adapter 层统一 REST 接口，核心不感知 Gradio 版本 |
+| 5 | 模型离线导入 | 支持：用户手动放入模型目录，无 .ep_meta.json 时直接使用 |
+| 6 | 多实例：同一模块能否启动多个实例（如两个不同模型的 ASR）？ | 支持，module_id + instance_id |
+| 7 | 是否需要 Docker 运行时支持？ | 暂不需要，优先原生进程管理 |
+| 8 | genre 对比模式的管线集成方式 | 待设计：管线节点是否支持"扇出到多个同 genre 模块 → 合并/对比结果"？ |
+| 9 | 模型缓存目录变更时的迁移策略 | 待设计：更换 cache_dir 后是移动文件还是重新下载？ |
+| 10 | adapter.py 的 FastAPI/uvicorn 依赖由谁提供 | 模块 requirements.txt 自行声明，还是系统提供基础 adapter 运行时？ |
