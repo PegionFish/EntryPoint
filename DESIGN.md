@@ -746,8 +746,8 @@ path = ""                           # 留空则自动检测系统 PATH
   - 启动 / 停止按钮
   - 配置面板（从 capability params schema 自动生成）
   - 日志查看器
-- **多模型对比**：同 genre 的模块可勾选多个同时运行，
-  管线中同一节点位可选择"对比模式"——相同输入分发给多个模型，结果并列展示
+- **多模型对比**：同 genre 的模块可勾选多个同时运行；
+  管线中用户手动放置多个同 genre 节点接同一输入源，任务详情页并列展示各节点输出
 - 安装新模块（拖入文件夹 / 指定路径）
 
 ### 5.3 管线编辑器 (Pipeline Editor)
@@ -1035,15 +1035,17 @@ EntryPoint/
 
 ## 9. 开放问题
 
-| # | 问题 | 当前倾向 |
+| # | 问题 | 决定 |
 |---|---|---|
-| 1 | ~~uv 是否内嵌~~ | **已决定**：不内嵌，调用系统 uv，缺失时引导安装 |
-| 2 | ~~Python 内嵌方案~~ | **已决定**：不内嵌，系统 PATH 优先，回退 uv python install |
-| 3 | ~~NPU 支持范围~~ | **已决定**：当前仅 Intel (OpenVINO)，ComputeBackend trait 预留扩展 |
-| 4 | ~~Gradio API 适配~~ | **已决定**：Adapter 层统一 REST 接口，核心不感知 Gradio 版本 |
-| 5 | 模型离线导入 | 支持：用户手动放入模型目录，无 .ep_meta.json 时直接使用 |
-| 6 | 多实例：同一模块能否启动多个实例（如两个不同模型的 ASR）？ | 支持，module_id + instance_id |
-| 7 | 是否需要 Docker 运行时支持？ | 暂不需要，优先原生进程管理 |
-| 8 | genre 对比模式的管线集成方式 | 待设计：管线节点是否支持"扇出到多个同 genre 模块 → 合并/对比结果"？ |
-| 9 | 模型缓存目录变更时的迁移策略 | 待设计：更换 cache_dir 后是移动文件还是重新下载？ |
-| 10 | adapter.py 的 FastAPI/uvicorn 依赖由谁提供 | 模块 requirements.txt 自行声明，还是系统提供基础 adapter 运行时？ |
+| 1 | ~~uv 是否内嵌~~ | **不内嵌**，调用系统 uv，缺失时引导安装 |
+| 2 | ~~Python 内嵌方案~~ | **不内嵌**，系统 PATH 优先，回退 uv python install |
+| 3 | ~~NPU 支持范围~~ | 当前仅 Intel (OpenVINO)，ComputeBackend trait 预留扩展 |
+| 4 | ~~Gradio API 适配~~ | Adapter 层统一 REST 接口，核心不感知 Gradio 版本 |
+| 5 | ~~模型离线导入~~ | 支持：用户手动放入模型目录，无 .ep_meta.json 时直接使用 |
+| 6 | ~~多实例~~ | 支持 module_id + instance_id |
+| 7 | ~~Docker 支持~~ | 暂不需要，优先原生进程管理 |
+| 8 | ~~genre 对比模式~~ | **手动多节点**：DAG 天然支持一对多扇出，用户手动放置同 genre 的多个节点并接同一输入源，结果在任务详情页并列展示。不引入额外节点类型 |
+| 9 | ~~缓存目录迁移~~ | **不迁移**：更换 cache_dir 后系统只在新路径查找，找不到则提示下载。旧文件由用户自行处理 |
+| 10 | ~~adapter 依赖归属~~ | **模块自行声明**：每个模块的 requirements.txt 包含 fastapi/uvicorn 等 adapter 依赖，venv 完全独立 |
+
+> 所有开放问题已关闭。后续实现中如遇新设计决策，追加至此表。
