@@ -10,3 +10,6 @@ pub mod env;
 pub mod process;
 pub mod port;
 pub mod model;
+
+// Wave 3 modules
+pub mod pipeline;
