@@ -19,7 +19,7 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "EntryPoint",
         native_options,
-        Box::new(|cc| Ok(Box::new(ep_ui::App::new(cc)))),
+        Box::new(|cc| Ok(Box::new(ep_desktop::App::new(cc)))),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
 }

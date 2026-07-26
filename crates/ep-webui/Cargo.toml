@@ -1,0 +1,10 @@
+[package]
+name = "ep-webui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# This crate only holds static web files served by ep-daemon.
+# No Rust code needed — the static/ directory is served via tower-http ServeDir.
+
+[dependencies]

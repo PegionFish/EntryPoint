@@ -1,0 +1,19 @@
+[package]
+name = "ep-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "entrypoint"
+path = "src/main.rs"
+
+[dependencies]
+ep-core.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui_extras.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
