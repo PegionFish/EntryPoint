@@ -2,6 +2,7 @@
 
 pub mod discovery;
 pub mod manifest;
+pub mod lifecycle;
 
 pub use discovery::{discover_modules, DiscoveredModule, DiscoveryStatus};
 pub use manifest::{

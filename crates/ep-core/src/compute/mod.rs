@@ -2,6 +2,7 @@
 
 pub mod cpu;
 pub mod cuda;
+pub mod scheduler;
 
 pub use cpu::CpuDetector;
 pub use cuda::CudaDetector;

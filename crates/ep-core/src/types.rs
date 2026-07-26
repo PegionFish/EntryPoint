@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ─── 计算后端 ────────────────────────────────────────────────────────────────
 
@@ -209,4 +209,58 @@ pub enum Artifact {
     File(PathBuf),
     Text(String),
     Json(serde_json::Value),
+}
+
+// ─── 共享 Trait（Wave 0 定义，所有 agent 面向 trait 编程）───────────────────
+
+use std::collections::VecDeque;
+
+/// 模块启动配置
+#[derive(Debug, Clone)]
+pub struct StartConfig {
+    pub port: u16,
+    pub device: DeviceId,
+    pub env_vars: std::collections::HashMap<String, String>,
+}
+
+/// 进程管理 trait — Wave 1a Agent A 实现
+pub trait ModuleProcess: Send + Sync {
+    fn start(&mut self, module_id: &str, config: &StartConfig) -> anyhow::Result<()>;
+    fn stop(&mut self, module_id: &str) -> anyhow::Result<()>;
+    fn status(&self, module_id: &str) -> Option<&ServiceStatus>;
+    fn logs(&self, module_id: &str) -> Option<&VecDeque<String>>;
+    fn pid(&self, module_id: &str) -> Option<u32>;
+}
+
+/// 设备调度策略
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulingStrategy {
+    Manual,
+    LeastMemory,
+    RoundRobin,
+    Single,
+}
+
+/// 设备调度 trait — Wave 1a Agent B 实现
+pub trait DeviceScheduler: Send + Sync {
+    fn assign(
+        &self,
+        module_id: &str,
+        backends: &[ComputeBackend],
+        vram_mb: u32,
+    ) -> Option<DeviceId>;
+    fn release(&mut self, module_id: &str);
+    fn devices(&self) -> &[ComputeDevice];
+}
+
+/// 管线执行 trait — Wave 1b Agent C 实现
+pub trait PipelineRunner: Send + Sync {
+    fn execute(
+        &mut self,
+        pipeline: &crate::pipeline::dag::Pipeline,
+        work_dir: &Path,
+    ) -> anyhow::Result<()>;
+    fn task_status(&self) -> &TaskStatus;
+    fn node_status(&self, node_id: &str) -> Option<&crate::pipeline::executor::NodeState>;
 }

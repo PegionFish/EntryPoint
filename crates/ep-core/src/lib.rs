@@ -1,6 +1,6 @@
 pub mod types;
 
-// Wave 1 modules (由并行 agent 实现)
+// Wave 1 modules
 pub mod module;
 pub mod compute;
 pub mod config;
@@ -13,3 +13,6 @@ pub mod model;
 
 // Wave 3 modules
 pub mod pipeline;
+
+// Wave 0+ modules (skeleton)
+pub mod health;
