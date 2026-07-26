@@ -1,0 +1,37 @@
+[pipeline]
+id = "audio-extract"
+name = "音频提取"
+description = "从视频/音频文件提取音频轨道"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+label = "输入文件"
+
+[[nodes]]
+id = "extract"
+kind = "builtin"
+builtin = "ffmpeg"
+label = "FFmpeg 提取"
+
+[nodes.params]
+args = ["-i", "{input}", "-vn", "-acodec", "copy", "{output}"]
+output_extension = "m4a"
+
+[[nodes]]
+id = "output"
+kind = "builtin"
+builtin = "file_output"
+label = "输出音频"
+
+[nodes.params]
+extension = "m4a"
+
+[[edges]]
+from = ["input", "output"]
+to = ["extract", "input"]
+
+[[edges]]
+from = ["extract", "output"]
+to = ["output", "input"]

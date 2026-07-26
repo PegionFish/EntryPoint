@@ -1,0 +1,36 @@
+[general]
+language = "zh"
+theme = "dark"
+log_level = "info"
+check_updates = true
+
+[compute]
+strategy = "least_memory"
+disabled_backends = []
+refresh_interval_secs = 5
+allow_overcommit = false
+
+[ports]
+range_start = 18000
+range_end = 19000
+
+[models]
+cache_dir = "./models"
+hf_endpoint = "https://huggingface.co"
+default_source = "huggingface"
+max_concurrent_downloads = 2
+
+[python]
+path = "python"
+uv_path = "uv"
+
+[pipeline]
+max_parallel = 2
+default_timeout_secs = 300
+keep_workspace = false
+workspace_dir = "./workspace"
+
+[ui]
+scale_factor = 1.0
+font_size = 14.0
+dashboard_refresh_secs = 2

@@ -1,0 +1,52 @@
+[pipeline]
+id = "video-to-srt"
+name = "视频转字幕"
+description = "从视频提取音频 → ASR 识别 → 输出 SRT 字幕"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+label = "视频输入"
+
+[[nodes]]
+id = "extract-audio"
+kind = "builtin"
+builtin = "ffmpeg"
+label = "提取音频"
+
+[nodes.params]
+args = ["-i", "{input}", "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "{output}"]
+output_extension = "wav"
+
+[[nodes]]
+id = "asr"
+kind = "module"
+module_id = "faster-whisper"
+capability = "transcribe"
+label = "语音识别"
+
+[nodes.params]
+language = "zh"
+model_size = "large-v3"
+
+[[nodes]]
+id = "output"
+kind = "builtin"
+builtin = "file_output"
+label = "输出字幕"
+
+[nodes.params]
+extension = "srt"
+
+[[edges]]
+from = ["input", "output"]
+to = ["extract-audio", "input"]
+
+[[edges]]
+from = ["extract-audio", "output"]
+to = ["asr", "input"]
+
+[[edges]]
+from = ["asr", "output"]
+to = ["output", "input"]
