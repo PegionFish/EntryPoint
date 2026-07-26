@@ -1,0 +1,71 @@
+[module]
+id = "faster-whisper"
+name = "Faster-Whisper ASR"
+version = "1.1.0"
+description = "基于 CTranslate2 的高速语音识别，支持词级时间戳和多语言"
+category = "asr"
+genre = "whisper"
+authors = ["EntryPoint Community"]
+license = "MIT"
+homepage = "https://github.com/SYSTRAN/faster-whisper"
+tags = ["speech", "recognition", "multilingual", "timestamps"]
+
+[runtime]
+type = "python"
+python_version = ">=3.10,<3.13"
+requirements = "requirements.txt"
+entrypoint = "adapter.py"
+
+[compute]
+backends = ["cuda", "rocm", "cpu"]
+default_backend = "cuda"
+vram_estimate_mb = 4096
+min_vram_mb = 2048
+
+[compute.env]
+cuda = { CUDA_VISIBLE_DEVICES = "{device_index}" }
+rocm = { HIP_VISIBLE_DEVICES = "{device_index}" }
+
+[[models]]
+id = "large-v3"
+name = "Whisper Large V3 (最高精度)"
+source = "huggingface"
+repo_id = "Systran/faster-whisper-large-v3"
+target_dir = "faster-whisper-large-v3"
+size_estimate_mb = 3100
+default = true
+
+[[models]]
+id = "medium"
+name = "Whisper Medium (平衡)"
+source = "huggingface"
+repo_id = "Systran/faster-whisper-medium"
+target_dir = "faster-whisper-medium"
+size_estimate_mb = 1500
+
+[[models]]
+id = "small"
+name = "Whisper Small (轻量)"
+source = "huggingface"
+repo_id = "Systran/faster-whisper-small"
+target_dir = "faster-whisper-small"
+size_estimate_mb = 500
+
+[interface]
+type = "http"
+health_endpoint = "/health"
+ready_timeout_secs = 90
+
+[[interface.capabilities]]
+name = "transcribe"
+description = "语音转文字，支持词级时间戳"
+input_type = "audio"
+output_type = "json"
+max_file_size_mb = 2048
+
+[interface.capabilities.params]
+language = { type = "string", default = "auto", description = "语言代码或 auto" }
+timestamps = { type = "boolean", default = true, description = "输出词级时间戳" }
+beam_size = { type = "integer", default = 5, min = 1, max = 20 }
+vad_filter = { type = "boolean", default = true, description = "VAD 静音过滤" }
+condition_on_previous = { type = "boolean", default = true, description = "上下文条件推理" }
