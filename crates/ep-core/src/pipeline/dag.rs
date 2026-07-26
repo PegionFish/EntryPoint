@@ -162,11 +162,10 @@ impl Pipeline {
         }
 
         // 3. 无环检测（通过拓扑排序）
-        if errors.is_empty() {
-            if self.topological_layers().is_err() {
+        if errors.is_empty()
+            && self.topological_layers().is_err() {
                 errors.push(ValidationError::CycleDetected);
             }
-        }
 
         // 4. 至少一个 file_input 节点
         let has_file_input = self.nodes.iter().any(|n| {
@@ -186,6 +185,7 @@ impl Pipeline {
     /// 拓扑排序分层 — 同层节点无依赖关系，可并行执行
     ///
     /// 返回 `Err` 表示存在环。
+    #[allow(clippy::result_unit_err)]
     pub fn topological_layers(&self) -> Result<Vec<Vec<String>>, ()> {
         let node_ids: Vec<&str> = self.nodes.iter().map(|n| n.id.as_str()).collect();
         let node_set: HashSet<&str> = node_ids.iter().copied().collect();

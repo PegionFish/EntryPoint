@@ -11,8 +11,10 @@ const CONFIG_FILE_NAME: &str = "app.toml";
 // ─── AssignStrategy ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub enum AssignStrategy {
     Manual,
+    #[default]
     LeastMemory,
     RoundRobin,
     Single(Option<String>),
@@ -46,11 +48,6 @@ impl<'de> Deserialize<'de> for AssignStrategy {
     }
 }
 
-impl Default for AssignStrategy {
-    fn default() -> Self {
-        Self::LeastMemory
-    }
-}
 
 // ─── Section configs ────────────────────────────────────────────────────────
 
@@ -153,6 +150,7 @@ impl Default for ModelsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct PythonConfig {
     #[serde(default)]
     pub path: String,
@@ -160,14 +158,6 @@ pub struct PythonConfig {
     pub uv_path: String,
 }
 
-impl Default for PythonConfig {
-    fn default() -> Self {
-        Self {
-            path: String::new(),
-            uv_path: String::new(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineConfig {
@@ -215,6 +205,7 @@ impl Default for UiConfig {
 // ─── AppConfig ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct AppConfig {
     #[serde(default)]
     pub general: GeneralConfig,
@@ -232,19 +223,6 @@ pub struct AppConfig {
     pub ui: UiConfig,
 }
 
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            general: GeneralConfig::default(),
-            compute: ComputeConfig::default(),
-            ports: PortsConfig::default(),
-            models: ModelsConfig::default(),
-            python: PythonConfig::default(),
-            pipeline: PipelineConfig::default(),
-            ui: UiConfig::default(),
-        }
-    }
-}
 
 impl AppConfig {
     fn config_path(config_dir: &Path) -> PathBuf {

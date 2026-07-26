@@ -16,10 +16,13 @@ pub struct PipelineRunnerImpl {
     #[allow(dead_code)]
     work_dir: PathBuf,
     /// 节点开始执行时回调
+    #[allow(clippy::type_complexity)]
     pub on_node_start: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     /// 节点完成时回调
+    #[allow(clippy::type_complexity)]
     pub on_node_complete: Option<Arc<dyn Fn(&str, &Artifact) + Send + Sync>>,
     /// 节点失败时回调
+    #[allow(clippy::type_complexity)]
     pub on_node_error: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
 }
 

@@ -237,7 +237,7 @@ impl ModelManager {
     /// TODO: 实际需要网络请求对比远端最新 revision
     ///   - HuggingFace: GET /api/models/{repo_id}/revision/main
     ///   - ModelScope: 类似 API
-    ///   当前暂时返回 Ok(false)
+    ///     当前暂时返回 Ok(false)
     pub fn check_update_available(&self, model: &ModelDecl) -> Result<bool> {
         let _meta = self.read_meta(&model.target_dir);
 

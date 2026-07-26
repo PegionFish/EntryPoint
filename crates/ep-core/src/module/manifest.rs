@@ -189,7 +189,7 @@ impl ModuleManifest {
                     .runtime
                     .binaries
                     .as_ref()
-                    .map_or(true, |b| b.is_empty())
+                    .is_none_or(|b| b.is_empty())
                 {
                     errors.push(
                         "runtime.binaries is required when type = \"native\"".to_string(),
