@@ -1,0 +1,67 @@
+[module]
+id = "rembg"
+name = "RemBG 智能去背景"
+version = "2.0.50"
+description = "基于 U2-Net/ISNet 的 AI 图像背景移除"
+category = "image"
+genre = "rembg"
+authors = ["EntryPoint Community"]
+license = "MIT"
+homepage = "https://github.com/danielgatis/rembg"
+tags = ["background-removal", "segmentation", "image", "matting"]
+
+[runtime]
+type = "python"
+python_version = ">=3.10,<3.13"
+requirements = "requirements.txt"
+entrypoint = "adapter.py"
+
+[compute]
+backends = ["cuda", "cpu"]
+default_backend = "cuda"
+vram_estimate_mb = 1024
+min_vram_mb = 512
+
+[compute.env]
+cuda = { CUDA_VISIBLE_DEVICES = "{device_index}" }
+
+[[models]]
+id = "u2net"
+name = "U2-Net (通用)"
+source = "url"
+url = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net.onnx"
+target_dir = "rembg-u2net"
+size_estimate_mb = 176
+default = true
+
+[[models]]
+id = "isnet-general-use"
+name = "ISNet (高精度)"
+source = "url"
+url = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/isnet-general-use.onnx"
+target_dir = "rembg-isnet"
+size_estimate_mb = 176
+
+[[models]]
+id = "birefnet-general"
+name = "BiRefNet (最新)"
+source = "url"
+url = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/BiRefNet-general-epoch_244.onnx"
+target_dir = "rembg-birefnet"
+size_estimate_mb = 880
+
+[interface]
+type = "http"
+health_endpoint = "/health"
+ready_timeout_secs = 60
+
+[[interface.capabilities]]
+name = "remove_bg"
+description = "移除图片背景，输出透明 PNG"
+input_type = "image"
+output_type = "image"
+max_file_size_mb = 50
+
+[interface.capabilities.params]
+alpha_matting = { type = "boolean", default = false, description = "启用 alpha matting 精细边缘" }
+post_process = { type = "boolean", default = true, description = "后处理优化边缘" }
