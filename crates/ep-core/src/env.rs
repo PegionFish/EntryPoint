@@ -44,6 +44,17 @@ impl EnvCheckResult {
     }
 }
 
+/// 虚拟环境状态
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VenvStatus {
+    /// venv 不存在
+    NotExist,
+    /// venv 就绪（python 存在，依赖哈希匹配或无 requirements）
+    Ready,
+    /// venv 存在但依赖需要更新
+    NeedsUpdate,
+}
+
 // ─── EnvManager ──────────────────────────────────────────────────────────────
 
 /// 虚拟环境管理器
@@ -380,6 +391,51 @@ impl EnvManager {
     pub fn uv_path(&self) -> Option<&Path> {
         self.uv_path.as_deref()
     }
+
+    /// 获取模块 venv 的详细状态
+    pub fn get_venv_status(&self, module_id: &str) -> VenvStatus {
+        let venv_python = self.venv_python_path(module_id);
+        if !venv_python.exists() {
+            return VenvStatus::NotExist;
+        }
+
+        let venv_dir = self.venv_dir(module_id);
+        let hash_file = venv_dir.join(".ep_deps_hash");
+
+        // 无 hash 文件时，检查是否有 requirements 需要安装
+        if !hash_file.exists() {
+            // 如果 venv 存在但无 hash 文件，视为需要更新
+            // （除非没有 requirements 文件，但这里无法判断，保守返回 NeedsUpdate）
+            return VenvStatus::NeedsUpdate;
+        }
+
+        // hash 文件存在，但无法判断是否需要更新（需要 requirements 路径）
+        // 简化实现：venv 存在且 hash 文件存在即视为 Ready
+        VenvStatus::Ready
+    }
+
+    /// 批量检查所有模块的环境就绪状态
+    pub fn check_all_modules_env(
+        &self,
+        modules: &[crate::module::discovery::DiscoveredModule],
+    ) -> std::collections::HashMap<String, bool> {
+        let mut result = std::collections::HashMap::new();
+        for module in modules {
+            if let Some(manifest) = &module.manifest {
+                let module_id = &manifest.module.id;
+                let req_path = module.path.join(
+                    manifest
+                        .runtime
+                        .requirements
+                        .as_deref()
+                        .unwrap_or("requirements.txt"),
+                );
+                let ready = self.is_venv_ready(module_id, &req_path);
+                result.insert(module_id.clone(), ready);
+            }
+        }
+        result
+    }
 }
 
 // ─── 辅助函数 ────────────────────────────────────────────────────────────────
@@ -592,5 +648,222 @@ mod tests {
             },
         };
         assert!(!missing_uv.all_ready());
+    }
+
+    // ── VenvStatus tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_venv_status_not_exist() {
+        let root = std::env::temp_dir()
+            .join(format!("ep_venv_stat_ne_{}_{}", std::process::id(), 1));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let mgr = EnvManager {
+            root: root.clone(),
+            python_path: None,
+            uv_path: None,
+        };
+
+        assert_eq!(mgr.get_venv_status("nonexistent"), VenvStatus::NotExist);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_venv_status_ready() {
+        let root = std::env::temp_dir()
+            .join(format!("ep_venv_stat_r_{}_{}", std::process::id(), 2));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // 创建 venv python 和 hash 文件
+        let venv_dir = root.join("runtime").join("venvs").join("test-mod");
+        let bin_dir = if cfg!(windows) {
+            venv_dir.join("Scripts")
+        } else {
+            venv_dir.join("bin")
+        };
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let py_name = if cfg!(windows) {
+            "python.exe"
+        } else {
+            "python"
+        };
+        std::fs::write(bin_dir.join(py_name), "fake").unwrap();
+        // 写入 hash 文件
+        std::fs::write(venv_dir.join(".ep_deps_hash"), "hash:abc").unwrap();
+
+        let mgr = EnvManager {
+            root: root.clone(),
+            python_path: None,
+            uv_path: None,
+        };
+
+        assert_eq!(mgr.get_venv_status("test-mod"), VenvStatus::Ready);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_venv_status_needs_update() {
+        let root = std::env::temp_dir()
+            .join(format!("ep_venv_stat_nu_{}_{}", std::process::id(), 3));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // 创建 venv python 但无 hash 文件
+        let venv_dir = root.join("runtime").join("venvs").join("test-mod");
+        let bin_dir = if cfg!(windows) {
+            venv_dir.join("Scripts")
+        } else {
+            venv_dir.join("bin")
+        };
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let py_name = if cfg!(windows) {
+            "python.exe"
+        } else {
+            "python"
+        };
+        std::fs::write(bin_dir.join(py_name), "fake").unwrap();
+        // 不写 hash 文件
+
+        let mgr = EnvManager {
+            root: root.clone(),
+            python_path: None,
+            uv_path: None,
+        };
+
+        assert_eq!(mgr.get_venv_status("test-mod"), VenvStatus::NeedsUpdate);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_check_all_modules_env() {
+        use crate::module::discovery::{DiscoveredModule, DiscoveryStatus};
+        use crate::module::manifest::*;
+        use crate::types::{ComputeBackend, ModuleCategory};
+
+        let root = std::env::temp_dir()
+            .join(format!("ep_check_all_env_{}_{}", std::process::id(), 4));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Module A: venv 就绪（无 requirements，python 存在即可）
+        let mod_a_dir = root.join("modules").join("mod-a");
+        std::fs::create_dir_all(&mod_a_dir).unwrap();
+        let venv_a = root.join("runtime").join("venvs").join("mod-a");
+        let bin_a = if cfg!(windows) {
+            venv_a.join("Scripts")
+        } else {
+            venv_a.join("bin")
+        };
+        std::fs::create_dir_all(&bin_a).unwrap();
+        let py = if cfg!(windows) {
+            "python.exe"
+        } else {
+            "python"
+        };
+        std::fs::write(bin_a.join(py), "fake").unwrap();
+
+        let manifest_a = ModuleManifest {
+            module: ModuleInfo {
+                id: "mod-a".into(),
+                name: "A".into(),
+                version: "1.0.0".into(),
+                description: "A".into(),
+                category: ModuleCategory::Asr,
+                genre: "test".into(),
+                authors: vec![],
+                license: None,
+                homepage: None,
+                tags: vec![],
+            },
+            runtime: RuntimeConfig {
+                runtime_type: RuntimeType::Python,
+                python_version: Some(">=3.10".into()),
+                requirements: None,
+                entrypoint: None,
+                start_command: None,
+                binaries: None,
+            },
+            compute: ComputeConfig {
+                backends: vec![ComputeBackend::Cpu],
+                default_backend: None,
+                vram_estimate_mb: None,
+                min_vram_mb: None,
+                env: None,
+            },
+            models: vec![],
+            interface: InterfaceConfig {
+                interface_type: InterfaceType::Http,
+                health_endpoint: None,
+                ready_timeout_secs: None,
+                working_dir: None,
+                capabilities: vec![],
+            },
+        };
+
+        // Module B: venv 不存在
+        let mod_b_dir = root.join("modules").join("mod-b");
+        std::fs::create_dir_all(&mod_b_dir).unwrap();
+
+        let manifest_b = ModuleManifest {
+            module: ModuleInfo {
+                id: "mod-b".into(),
+                name: "B".into(),
+                version: "1.0.0".into(),
+                description: "B".into(),
+                category: ModuleCategory::Asr,
+                genre: "test".into(),
+                authors: vec![],
+                license: None,
+                homepage: None,
+                tags: vec![],
+            },
+            runtime: RuntimeConfig {
+                runtime_type: RuntimeType::Python,
+                python_version: Some(">=3.10".into()),
+                requirements: Some("requirements.txt".into()),
+                entrypoint: None,
+                start_command: None,
+                binaries: None,
+            },
+            compute: ComputeConfig {
+                backends: vec![ComputeBackend::Cpu],
+                default_backend: None,
+                vram_estimate_mb: None,
+                min_vram_mb: None,
+                env: None,
+            },
+            models: vec![],
+            interface: InterfaceConfig {
+                interface_type: InterfaceType::Http,
+                health_endpoint: None,
+                ready_timeout_secs: None,
+                working_dir: None,
+                capabilities: vec![],
+            },
+        };
+
+        let modules = vec![
+            DiscoveredModule {
+                manifest: Some(manifest_a),
+                path: mod_a_dir,
+                status: DiscoveryStatus::Valid,
+            },
+            DiscoveredModule {
+                manifest: Some(manifest_b),
+                path: mod_b_dir,
+                status: DiscoveryStatus::Valid,
+            },
+        ];
+
+        let mgr = EnvManager {
+            root: root.clone(),
+            python_path: None,
+            uv_path: None,
+        };
+
+        let result = mgr.check_all_modules_env(&modules);
+        assert_eq!(result.len(), 2);
+        assert!(result["mod-a"]); // venv 存在，无 requirements → ready
+        assert!(!result["mod-b"]); // venv 不存在 → not ready
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

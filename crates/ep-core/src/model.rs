@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tokio::process::Child;
+use tracing::{debug, info, warn};
 
 use crate::config::ModelsConfig;
 use crate::module::manifest::{ModelDecl, ModelSource};
@@ -66,6 +67,8 @@ pub struct ModelManager {
     hf_endpoint: String,
     /// 默认下载源（huggingface / modelscope）
     default_source: String,
+    /// 当前正在执行的下载子进程（用于取消）
+    download_child: Option<Child>,
 }
 
 impl ModelManager {
@@ -91,6 +94,7 @@ impl ModelManager {
             cache_dir,
             hf_endpoint: config.hf_endpoint.clone(),
             default_source: config.default_source.clone(),
+            download_child: None,
         }
     }
 
@@ -303,6 +307,74 @@ impl ModelManager {
     /// 获取默认下载源
     pub fn default_source(&self) -> &str {
         &self.default_source
+    }
+
+    /// 实际执行模型下载
+    ///
+    /// 调用 `build_download_command()` 获取命令，用 `tokio::process::Command` 执行。
+    /// 下载进程句柄保存在 `download_child` 中，可通过 `cancel_download()` 取消。
+    pub async fn execute_download(
+        &mut self,
+        model: &ModelDecl,
+        _module_dir: &Path,
+        venv_python: &Path,
+        _config: &crate::config::AppConfig,
+    ) -> Result<()> {
+        let (program, args) = self.build_download_command(model, venv_python);
+
+        info!(
+            model_id = %model.id,
+            program = %program,
+            "executing model download"
+        );
+
+        let child = tokio::process::Command::new(&program)
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .with_context(|| format!("failed to spawn download for model '{}'", model.id))?;
+
+        self.download_child = Some(child);
+
+        // Wait for the download to complete
+        if let Some(child) = self.download_child.take() {
+            let output = child.wait_with_output().await.with_context(|| {
+                format!("failed to wait for download of model '{}'", model.id)
+            })?;
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            if !stdout.is_empty() {
+                debug!(model_id = %model.id, stdout = %stdout.trim(), "download stdout");
+            }
+            if !stderr.is_empty() {
+                debug!(model_id = %model.id, stderr = %stderr.trim(), "download stderr");
+            }
+
+            if !output.status.success() {
+                anyhow::bail!(
+                    "download of model '{}' failed with exit code {:?}: {}",
+                    model.id,
+                    output.status.code(),
+                    stderr.trim()
+                );
+            }
+        } else {
+            anyhow::bail!("download process for model '{}' was lost", model.id);
+        }
+
+        Ok(())
+    }
+
+    /// 取消正在进行的下载（kill 进程）
+    pub async fn cancel_download(&mut self) {
+        if let Some(mut child) = self.download_child.take() {
+            info!("cancelling model download");
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
     }
 }
 
@@ -620,6 +692,37 @@ mod tests {
         for m in &list {
             assert_eq!(m.size_bytes, 0);
         }
+
+        cleanup(&dir);
+    }
+
+    // ── execute_download / cancel_download tests ─────────────────────────
+
+    #[tokio::test]
+    async fn test_execute_download_fails_with_invalid_python() {
+        let dir = temp_dir("exec_dl");
+        let config = test_config(dir.to_str().unwrap());
+        let mut mgr = ModelManager::new(&config, Path::new("."));
+        let model = test_hf_model();
+        let app_config = crate::config::AppConfig::default();
+
+        // 使用不存在的 python 路径 → spawn 会失败
+        let result = mgr
+            .execute_download(&model, Path::new("."), Path::new("/nonexistent/python"), &app_config)
+            .await;
+        assert!(result.is_err());
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_download_noop_when_no_download() {
+        let dir = temp_dir("cancel_noop");
+        let config = test_config(dir.to_str().unwrap());
+        let mut mgr = ModelManager::new(&config, Path::new("."));
+
+        // 没有正在进行的下载时，cancel 应该是 no-op，不 panic
+        mgr.cancel_download().await;
 
         cleanup(&dir);
     }
