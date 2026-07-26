@@ -1,0 +1,60 @@
+[module]
+id = "paddleocr"
+name = "PaddleOCR 文字识别"
+version = "2.8.0"
+description = "基于 PaddlePaddle 的多语言 OCR，支持检测+识别+方向分类"
+category = "ocr"
+genre = "paddleocr"
+authors = ["EntryPoint Community"]
+license = "Apache-2.0"
+homepage = "https://github.com/PaddlePaddle/PaddleOCR"
+tags = ["ocr", "text-recognition", "multilingual", "chinese"]
+
+[runtime]
+type = "python"
+python_version = ">=3.10,<3.13"
+requirements = "requirements.txt"
+entrypoint = "adapter.py"
+
+[compute]
+backends = ["cuda", "cpu"]
+default_backend = "cuda"
+vram_estimate_mb = 1024
+min_vram_mb = 512
+
+[compute.env]
+cuda = { CUDA_VISIBLE_DEVICES = "{device_index}" }
+
+[[models]]
+id = "v4-chinese"
+name = "PP-OCRv4 中文 (推荐)"
+source = "url"
+url = "auto"
+target_dir = "paddleocr-v4-chinese"
+size_estimate_mb = 200
+default = true
+
+[[models]]
+id = "v4-multilingual"
+name = "PP-OCRv4 多语言"
+source = "url"
+url = "auto"
+target_dir = "paddleocr-v4-multilingual"
+size_estimate_mb = 200
+
+[interface]
+type = "http"
+health_endpoint = "/health"
+ready_timeout_secs = 60
+
+[[interface.capabilities]]
+name = "recognize"
+description = "图片文字识别，返回文本+坐标+置信度"
+input_type = "image"
+output_type = "json"
+max_file_size_mb = 20
+
+[interface.capabilities.params]
+lang = { type = "string", default = "ch", description = "语言 (ch/en/japan/korean 等)" }
+use_angle_cls = { type = "boolean", default = true, description = "启用文字方向分类" }
+det_db_thresh = { type = "float", default = 0.3, min = 0.0, max = 1.0, step = 0.05, description = "检测阈值" }
