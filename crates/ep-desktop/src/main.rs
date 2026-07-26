@@ -43,9 +43,49 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "EntryPoint",
         native_options,
-        Box::new(move |_cc| Ok(Box::new(ep_desktop::App::new(rx, cmd_tx)))),
+        Box::new(move |cc| {
+            configure_fonts(&cc.egui_ctx);
+            Ok(Box::new(ep_desktop::App::new(rx, cmd_tx)))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
+}
+
+/// Load CJK fonts so Chinese text renders correctly.
+fn configure_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    // Try Windows system CJK fonts in order of preference
+    let cjk_font_paths = [
+        "C:\\Windows\\Fonts\\msyh.ttc",   // Microsoft YaHei
+        "C:\\Windows\\Fonts\\msyhbd.ttc",  // Microsoft YaHei Bold
+        "C:\\Windows\\Fonts\\simsun.ttc",  // SimSun
+        "C:\\Windows\\Fonts\\simhei.ttf",  // SimHei
+    ];
+
+    for path in &cjk_font_paths {
+        if let Ok(font_data) = std::fs::read(path) {
+            fonts.font_data.insert(
+                "cjk".to_owned(),
+                egui::FontData::from_owned(font_data).into(),
+            );
+            // Prepend CJK font to all font families so it's used for CJK glyphs
+            for family in [
+                egui::FontFamily::Proportional,
+                egui::FontFamily::Monospace,
+            ] {
+                fonts
+                    .families
+                    .entry(family)
+                    .or_default()
+                    .insert(0, "cjk".to_owned());
+            }
+            tracing::info!("Loaded CJK font from {path}");
+            break;
+        }
+    }
+
+    ctx.set_fonts(fonts);
 }
 
 /// Background event loop — owns ProcessManager, PortManager, runs on tokio runtime.
