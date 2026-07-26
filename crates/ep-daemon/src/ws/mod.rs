@@ -1,9 +1,13 @@
 pub mod logs;
 pub mod progress;
 
+use std::sync::Arc;
+
 use axum::Router;
 
-pub fn ws_router() -> Router {
+use crate::state::AppState;
+
+pub fn ws_router() -> Router<Arc<AppState>> {
     Router::new()
         .merge(logs::router())
         .merge(progress::router())
