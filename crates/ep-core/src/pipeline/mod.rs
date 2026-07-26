@@ -8,6 +8,7 @@ pub mod runner;
 
 pub use dag::{Edge, NodeKind, Pipeline, PipelineNode, ValidationError};
 pub use executor::{NodeState, PipelineTask};
+pub use runner::PipelineRunnerImpl;
 
 use std::path::Path;
 

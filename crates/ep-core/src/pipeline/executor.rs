@@ -1,17 +1,17 @@
-//! 管线执行引擎 — 状态机骨架
+//! 管线执行引擎 — 状态机 + 节点执行辅助函数
 //!
-//! 实际节点执行（HTTP 调用、进程 spawn）标注为 TODO，
-//! 本模块仅实现任务状态管理和节点状态转换。
+//! PipelineTask 提供任务状态管理和节点状态转换。
+//! 模块底部的辅助函数实现各类型节点的实际执行逻辑。
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::types::{Artifact, TaskStatus};
 
-use super::dag::Pipeline;
+use super::dag::{NodeKind, Pipeline, PipelineNode};
 
 // ─── 节点状态 ────────────────────────────────────────────────────────────────
 
@@ -310,4 +310,265 @@ to = ["save", "input"]
         assert!(task.is_complete());
         assert!(matches!(task.status, TaskStatus::Failed(_)));
     }
+}
+
+// ─── 节点执行辅助函数 ────────────────────────────────────────────────────────
+
+/// 收集指定节点的所有上游产物（按边在 pipeline.edges 中的出现顺序）
+pub(crate) fn collect_upstream_artifacts(
+    node_id: &str,
+    pipeline: &Pipeline,
+    task: &PipelineTask,
+) -> Vec<Artifact> {
+    pipeline
+        .edges
+        .iter()
+        .filter(|e| e.to.0 == node_id)
+        .filter_map(|e| {
+            if let Some(NodeState::Completed { artifact: Some(a) }) = task.node_state(&e.from.0) {
+                Some(a.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// 从上游产物中提取第一个文件路径
+#[allow(dead_code)]
+pub(crate) fn first_upstream_file_path(
+    node_id: &str,
+    pipeline: &Pipeline,
+    task: &PipelineTask,
+) -> Option<PathBuf> {
+    collect_upstream_artifacts(node_id, pipeline, task)
+        .into_iter()
+        .find_map(|a| match a {
+            Artifact::File(p) => Some(p),
+            _ => None,
+        })
+}
+
+/// 执行单个节点 — 根据 NodeKind 分派到具体执行逻辑
+pub(crate) async fn execute_node(
+    node: &PipelineNode,
+    pipeline: &Pipeline,
+    task: &PipelineTask,
+    work_dir: &Path,
+) -> anyhow::Result<Artifact> {
+    let upstream = collect_upstream_artifacts(&node.id, pipeline, task);
+
+    match &node.kind {
+        NodeKind::Builtin { builtin } => {
+            execute_builtin_node(builtin, node, &upstream, work_dir).await
+        }
+        NodeKind::Module { .. } => execute_module_node(node, &upstream, work_dir).await,
+        NodeKind::ExternalApi { .. } => execute_external_api_node(node, &upstream, work_dir).await,
+    }
+}
+
+/// 执行内置节点
+async fn execute_builtin_node(
+    builtin: &str,
+    node: &PipelineNode,
+    upstream: &[Artifact],
+    work_dir: &Path,
+) -> anyhow::Result<Artifact> {
+    match builtin {
+        "file_input" => execute_builtin_file_input(node, work_dir).await,
+        "file_output" => execute_builtin_file_output(node, upstream, work_dir).await,
+        "ffmpeg" => execute_builtin_ffmpeg(node, upstream, work_dir).await,
+        other => Err(anyhow::anyhow!("unknown builtin node type: {other}")),
+    }
+}
+
+/// FileInput: 验证源文件存在，复制到工作目录，返回 Artifact::File
+async fn execute_builtin_file_input(
+    node: &PipelineNode,
+    work_dir: &Path,
+) -> anyhow::Result<Artifact> {
+    let source = node
+        .params
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("file_input node '{}' missing 'path' param", node.id))?;
+
+    let source_path = Path::new(source);
+    if !source_path.exists() {
+        return Err(anyhow::anyhow!(
+            "input file not found: {}",
+            source_path.display()
+        ));
+    }
+
+    let dest = work_dir.join(source_path.file_name().unwrap_or_else(|| std::ffi::OsStr::new("input")));
+
+    // 如果源文件和目标是同一个文件，跳过复制（避免 Windows 文件锁冲突）
+    if dest != source_path {
+        std::fs::copy(source_path, &dest)?;
+    }
+
+    Ok(Artifact::File(dest))
+}
+
+/// FileOutput: 从上游获取文件，复制到目标路径，返回 Artifact::File
+async fn execute_builtin_file_output(
+    node: &PipelineNode,
+    upstream: &[Artifact],
+    _work_dir: &Path,
+) -> anyhow::Result<Artifact> {
+    let source_file = upstream
+        .iter()
+        .find_map(|a| match a {
+            Artifact::File(p) => Some(p.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| anyhow::anyhow!("file_output node '{}' has no file input from upstream", node.id))?;
+
+    let dest = node
+        .params
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("file_output node '{}' missing 'path' param", node.id))?;
+
+    let dest_path = Path::new(dest);
+    if let Some(parent) = dest_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(&source_file, dest_path)?;
+
+    Ok(Artifact::File(dest_path.to_path_buf()))
+}
+
+/// FFmpeg: 构建并执行 ffmpeg 命令，返回输出文件的 Artifact::File
+async fn execute_builtin_ffmpeg(
+    node: &PipelineNode,
+    upstream: &[Artifact],
+    work_dir: &Path,
+) -> anyhow::Result<Artifact> {
+    let mut cmd = tokio::process::Command::new("ffmpeg");
+    cmd.arg("-y"); // overwrite output
+
+    // 添加上游文件作为输入
+    for artifact in upstream {
+        if let Artifact::File(path) = artifact {
+            cmd.arg("-i").arg(path);
+        }
+    }
+
+    // 从 params 添加额外参数
+    if let Some(args) = node.params.get("args").and_then(|v| v.as_array()) {
+        for arg in args {
+            if let Some(s) = arg.as_str() {
+                cmd.arg(s);
+            }
+        }
+    }
+
+    // 确定输出路径
+    let output_path = if let Some(output) = node.params.get("output").and_then(|v| v.as_str()) {
+        PathBuf::from(output)
+    } else {
+        work_dir.join(format!("{}_output", node.id))
+    };
+
+    if let Some(parent) = output_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    cmd.arg(&output_path);
+
+    let output = cmd.output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("ffmpeg failed: {stderr}"));
+    }
+
+    Ok(Artifact::File(output_path))
+}
+
+/// 模块节点执行 — TODO: 实际 HTTP 调用待集成
+async fn execute_module_node(
+    node: &PipelineNode,
+    _upstream: &[Artifact],
+    _work_dir: &Path,
+) -> anyhow::Result<Artifact> {
+    // TODO: reqwest::post("http://localhost:{port}/{capability}") + multipart upload
+    Err(anyhow::anyhow!(
+        "module node '{}' execution not yet integrated (module service not available)",
+        node.id
+    ))
+}
+
+/// 外部 API 节点执行 — reqwest POST + JSON body
+async fn execute_external_api_node(
+    node: &PipelineNode,
+    upstream: &[Artifact],
+    _work_dir: &Path,
+) -> anyhow::Result<Artifact> {
+    let (endpoint, api_key_env) = match &node.kind {
+        NodeKind::ExternalApi {
+            endpoint,
+            api_key_env,
+            ..
+        } => (endpoint.clone(), api_key_env.clone()),
+        _ => unreachable!(),
+    };
+
+    // 解析 API key
+    let _api_key = api_key_env
+        .as_deref()
+        .map(|env_var| {
+            std::env::var(env_var)
+                .map_err(|_| anyhow::anyhow!("API key env var not set: {env_var}"))
+        })
+        .transpose()?;
+
+    // 构建请求 body
+    let mut body = serde_json::Map::new();
+    for artifact in upstream {
+        match artifact {
+            Artifact::File(p) => {
+                body.insert(
+                    "input_file".to_string(),
+                    serde_json::Value::String(p.to_string_lossy().to_string()),
+                );
+            }
+            Artifact::Text(t) => {
+                body.insert(
+                    "input_text".to_string(),
+                    serde_json::Value::String(t.clone()),
+                );
+            }
+            Artifact::Json(j) => {
+                body.insert("input_json".to_string(), j.clone());
+            }
+        }
+    }
+
+    // 合并节点 params
+    if let Some(obj) = node.params.as_object() {
+        for (k, v) in obj {
+            body.insert(k.clone(), v.clone());
+        }
+    }
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&endpoint)
+        .json(&body)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!(
+            "external API call to {endpoint} failed ({status}): {text}"
+        ));
+    }
+
+    let resp_body: serde_json::Value = resp.json().await?;
+    Ok(Artifact::Json(resp_body))
 }
