@@ -36,7 +36,7 @@ pub fn show(ui: &mut egui::Ui, config: &mut AppConfig) {
             ui.end_row();
 
             ui.label("刷新间隔 (秒):");
-            ui.add(egui::DragValue::new(&mut config.compute.refresh_interval_secs).clamp_range(1..=60));
+            ui.add(egui::DragValue::new(&mut config.compute.refresh_interval_secs).range(1..=60));
             ui.end_row();
         });
 
@@ -48,9 +48,9 @@ pub fn show(ui: &mut egui::Ui, config: &mut AppConfig) {
         egui::Grid::new("settings_ports").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
             ui.label("端口范围:");
             ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut config.ports.range_start).clamp_range(1024..=65535));
+                ui.add(egui::DragValue::new(&mut config.ports.range_start).range(1024..=65535));
                 ui.label("—");
-                ui.add(egui::DragValue::new(&mut config.ports.range_end).clamp_range(1024..=65535));
+                ui.add(egui::DragValue::new(&mut config.ports.range_end).range(1024..=65535));
             });
             ui.end_row();
         });
@@ -108,11 +108,11 @@ pub fn show(ui: &mut egui::Ui, config: &mut AppConfig) {
         ui.add_space(4.0);
         egui::Grid::new("settings_pipeline").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
             ui.label("最大并行数:");
-            ui.add(egui::DragValue::new(&mut config.pipeline.max_parallel).clamp_range(1..=16));
+            ui.add(egui::DragValue::new(&mut config.pipeline.max_parallel).range(1..=16));
             ui.end_row();
 
             ui.label("默认超时 (秒):");
-            ui.add(egui::DragValue::new(&mut config.pipeline.default_timeout_secs).clamp_range(10..=7200));
+            ui.add(egui::DragValue::new(&mut config.pipeline.default_timeout_secs).range(10..=7200));
             ui.end_row();
 
             ui.label("保留工作目录:");
@@ -127,11 +127,11 @@ pub fn show(ui: &mut egui::Ui, config: &mut AppConfig) {
         ui.add_space(4.0);
         egui::Grid::new("settings_ui").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
             ui.label("缩放:");
-            ui.add(egui::DragValue::new(&mut config.ui.scale_factor).clamp_range(0.5..=3.0).speed(0.1));
+            ui.add(egui::DragValue::new(&mut config.ui.scale_factor).range(0.5..=3.0).speed(0.1));
             ui.end_row();
 
             ui.label("字号:");
-            ui.add(egui::DragValue::new(&mut config.ui.font_size).clamp_range(10.0..=24.0));
+            ui.add(egui::DragValue::new(&mut config.ui.font_size).range(10.0..=24.0));
             ui.end_row();
         });
     });

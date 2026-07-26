@@ -16,7 +16,7 @@ use super::dag::Pipeline;
 // ─── 节点状态 ────────────────────────────────────────────────────────────────
 
 /// 单个节点的执行状态
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum NodeState {
     /// 等待执行
     Pending,

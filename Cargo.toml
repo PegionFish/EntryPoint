@@ -40,7 +40,7 @@ uuid = { version = "1", features = ["v4"] }
 # GUI
 eframe = "0.31"
 egui = "0.31"
-egui_extras = { version = "0.31", features = ["all"] }
+egui_extras = "0.31"
 
 # Internal
 ep-core = { path = "crates/ep-core" }

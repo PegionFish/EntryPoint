@@ -204,7 +204,7 @@ pub enum TaskStatus {
 // ─── 通用结果 ────────────────────────────────────────────────────────────────
 
 /// 管线节点输出
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Artifact {
     File(PathBuf),
     Text(String),

@@ -76,8 +76,8 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn setup_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join("ep_test_discovery");
+    fn setup_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ep_test_discovery_{name}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -85,7 +85,7 @@ mod tests {
 
     #[test]
     fn test_discover_valid_and_invalid() {
-        let dir = setup_dir();
+        let dir = setup_dir("valid_invalid");
 
         let valid_dir = dir.join("good-module");
         fs::create_dir_all(&valid_dir).unwrap();
@@ -143,7 +143,7 @@ type = "http"
 
     #[test]
     fn test_discover_empty_dir() {
-        let dir = setup_dir();
+        let dir = setup_dir("empty");
         let empty = dir.join("empty_modules");
         fs::create_dir_all(&empty).unwrap();
 
