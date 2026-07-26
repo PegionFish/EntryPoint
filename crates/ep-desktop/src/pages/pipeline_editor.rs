@@ -1,59 +1,109 @@
 use eframe::egui;
 use ep_core::pipeline::dag::{NodeKind, Pipeline, ValidationError};
 
+/// Shared state for the pipeline editor page.
+#[derive(Clone)]
+struct PipelineEditorState {
+    path: String,
+    loaded_pipeline: Option<Pipeline>,
+    validation_msg: Option<String>,
+}
+
+impl Default for PipelineEditorState {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            loaded_pipeline: None,
+            validation_msg: None,
+        }
+    }
+}
+
+fn state_id() -> egui::Id {
+    egui::Id::new("pipeline_editor_state")
+}
+
 pub fn show(ui: &mut egui::Ui) {
     ui.heading("管线编辑器");
     ui.add_space(4.0);
 
-    // ── 加载区域 ──
+    // Ensure state exists
+    ui.data_mut(|d| {
+        d.get_temp_mut_or_default::<PipelineEditorState>(state_id());
+    });
+
+    // Read current state (may have been updated by set_value via UIA)
+    let mut state = ui.data(|d| {
+        d.get_temp::<PipelineEditorState>(state_id())
+    }).unwrap_or_default();
+
+    let edit_id = egui::Id::new("pipeline_path_edit");
+
     ui.horizontal(|ui| {
         ui.label("管线文件:");
-        // Use a static-ish path buffer via ui data
-        let mut path_buf = ui
-            .data_mut(|d| {
-                d.get_temp_mut_or_default::<String>(egui::Id::new("pipeline_path"))
-                    .clone()
-            });
-        if ui.text_edit_singleline(&mut path_buf).changed() {
+
+        // Use TextEdit with persistent ID so set_value via UIA syncs properly
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut state.path)
+                .id(edit_id)
+                .desired_width(300.0)
+        );
+
+        if response.changed() {
             ui.data_mut(|d| {
-                d.insert_temp(egui::Id::new("pipeline_path"), path_buf.clone());
+                d.get_temp_mut_or_default::<PipelineEditorState>(state_id()).path = state.path.clone();
             });
         }
 
         if ui.button("加载").clicked() {
-            let path = std::path::Path::new(&path_buf);
+            // Read path from state (synced via changed() or set_value)
+            let latest = ui.data(|d| {
+                d.get_temp::<PipelineEditorState>(state_id())
+            }).unwrap_or_default();
+            let path_to_load = if latest.path.is_empty() {
+                state.path.clone()
+            } else {
+                latest.path.clone()
+            };
+
+            let path = std::path::Path::new(&path_to_load);
             match Pipeline::from_toml(path) {
                 Ok(pipeline) => {
                     let validation = match pipeline.validate() {
-                        Ok(()) => "✅ 验证通过".to_string(),
-                        Err(errors) => format!("❌ {}", format_errors(&errors)),
+                        Ok(()) => "验证通过".to_string(),
+                        Err(errors) => format!("{}", format_errors(&errors)),
                     };
                     ui.data_mut(|d| {
-                        d.insert_temp(egui::Id::new("pipeline_loaded"), pipeline);
-                        d.insert_temp(egui::Id::new("pipeline_validation"), validation);
+                        let s = d.get_temp_mut_or_default::<PipelineEditorState>(state_id());
+                        s.loaded_pipeline = Some(pipeline);
+                        s.validation_msg = Some(validation);
                     });
                 }
                 Err(e) => {
                     ui.data_mut(|d| {
-                        d.insert_temp(
-                            egui::Id::new("pipeline_validation"),
-                            format!("❌ 加载失败: {e}"),
-                        );
-                        d.remove::<Pipeline>(egui::Id::new("pipeline_loaded"));
+                        let s = d.get_temp_mut_or_default::<PipelineEditorState>(state_id());
+                        s.validation_msg = Some(format!("加载失败: {e}"));
+                        s.loaded_pipeline = None;
                     });
                 }
             }
         }
     });
 
+    // Sync state back
+    ui.data_mut(|d| {
+        d.get_temp_mut_or_default::<PipelineEditorState>(state_id()).path = state.path.clone();
+    });
+
     ui.add_space(4.0);
 
-    // ── 验证状态 ──
+    // Validation status
     let validation = ui.data(|d| {
-        d.get_temp::<String>(egui::Id::new("pipeline_validation"))
+        d.get_temp::<PipelineEditorState>(state_id())
+            .and_then(|s| s.validation_msg.clone())
     });
     if let Some(ref v) = validation {
-        if v.starts_with("✅") {
+        if v.starts_with("验证通过") {
             ui.colored_label(egui::Color32::from_rgb(80, 220, 80), v);
         } else {
             ui.colored_label(egui::Color32::from_rgb(255, 100, 100), v);
@@ -64,9 +114,10 @@ pub fn show(ui: &mut egui::Ui) {
     ui.separator();
     ui.add_space(4.0);
 
-    // ── 管线详情 ──
+    // Pipeline details
     let pipeline = ui.data(|d| {
-        d.get_temp::<Pipeline>(egui::Id::new("pipeline_loaded"))
+        d.get_temp::<PipelineEditorState>(state_id())
+            .and_then(|s| s.loaded_pipeline.clone())
     });
 
     match pipeline {
@@ -87,7 +138,6 @@ pub fn show(ui: &mut egui::Ui) {
 
 fn pipeline_detail(ui: &mut egui::Ui, pipeline: &Pipeline) {
     egui::ScrollArea::vertical().show(ui, |ui| {
-        // ── 管线信息 ──
         ui.strong(&pipeline.name);
         ui.label(format!("ID: {}", pipeline.id));
         if !pipeline.description.is_empty() {
@@ -95,7 +145,6 @@ fn pipeline_detail(ui: &mut egui::Ui, pipeline: &Pipeline) {
         }
         ui.add_space(8.0);
 
-        // ── 拓扑分层 ──
         if let Ok(layers) = pipeline.topological_layers() {
             ui.strong(format!("执行层数: {}", layers.len()));
             ui.add_space(4.0);
@@ -105,7 +154,6 @@ fn pipeline_detail(ui: &mut egui::Ui, pipeline: &Pipeline) {
             ui.add_space(8.0);
         }
 
-        // ── 节点列表 ──
         ui.strong(format!("节点 ({}):", pipeline.nodes.len()));
         ui.add_space(4.0);
 
@@ -131,7 +179,6 @@ fn pipeline_detail(ui: &mut egui::Ui, pipeline: &Pipeline) {
 
         ui.add_space(12.0);
 
-        // ── 边列表 ──
         ui.strong(format!("连接 ({}):", pipeline.edges.len()));
         ui.add_space(4.0);
 
@@ -151,7 +198,7 @@ fn pipeline_detail(ui: &mut egui::Ui, pipeline: &Pipeline) {
                     for edge in &pipeline.edges {
                         ui.label(&edge.from.0);
                         ui.label(&edge.from.1);
-                        ui.label("→");
+                        ui.label("->");
                         ui.label(&edge.to.0);
                         ui.label(&edge.to.1);
                         ui.end_row();
@@ -168,7 +215,7 @@ fn node_kind_info(kind: &NodeKind) -> (&'static str, String) {
             capability,
             model_id,
         } => (
-            "🧩 模块",
+            "模块",
             format!(
                 "{}::{}{}",
                 module_id,
@@ -179,10 +226,10 @@ fn node_kind_info(kind: &NodeKind) -> (&'static str, String) {
                     .unwrap_or_default()
             ),
         ),
-        NodeKind::Builtin { builtin } => ("🔧 内置", builtin.clone()),
+        NodeKind::Builtin { builtin } => ("内置", builtin.clone()),
         NodeKind::ExternalApi {
             endpoint, api_type, ..
-        } => ("🌐 API", format!("{api_type}: {endpoint}")),
+        } => ("API", format!("{api_type}: {endpoint}")),
     }
 }
 
