@@ -1,0 +1,51 @@
+[module]
+id = "deep-filter"
+name = "DeepFilter 音频降噪"
+version = "0.5.6"
+description = "基于 DeepFilterNet 的深度学习语音增强/降噪"
+category = "denoise"
+genre = "deep-filter"
+authors = ["EntryPoint Community"]
+license = "MIT"
+homepage = "https://github.com/Rikorose/DeepFilterNet"
+tags = ["denoise", "audio", "enhancement", "realtime"]
+
+[runtime]
+type = "python"
+python_version = ">=3.10,<3.13"
+requirements = "requirements.txt"
+entrypoint = "adapter.py"
+
+[compute]
+backends = ["cuda", "cpu"]
+default_backend = "cpu"
+vram_estimate_mb = 512
+min_vram_mb = 256
+
+[compute.env]
+cuda = { CUDA_VISIBLE_DEVICES = "{device_index}" }
+
+[[models]]
+id = "df3"
+name = "DeepFilterNet3 (默认)"
+source = "url"
+url = "https://github.com/Rikorose/DeepFilterNet/releases/download/v0.5.6/DeepFilterNet3_onnx.tar.gz"
+target_dir = "deep-filter-df3"
+size_estimate_mb = 50
+default = true
+
+[interface]
+type = "http"
+health_endpoint = "/health"
+ready_timeout_secs = 30
+
+[[interface.capabilities]]
+name = "denoise"
+description = "AI 语音降噪，输出增强后的音频文件"
+input_type = "audio"
+output_type = "audio"
+max_file_size_mb = 500
+
+[interface.capabilities.params]
+attenuation = { type = "integer", default = 100, min = 0, max = 100, description = "降噪强度 (dB)" }
+min_db = { type = "float", default = -60.0, min = -100.0, max = 0.0, step = 1.0, description = "最小增益 (dB)" }
