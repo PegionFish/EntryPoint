@@ -1,21 +1,34 @@
 use eframe::egui;
 use ep_core::types::{ComputeDevice, ServiceStatus};
 
-use crate::app::ModuleStatus;
+use crate::app::ModuleEntry;
 
-pub fn show(ui: &mut egui::Ui, devices: &[ComputeDevice], modules: &[ModuleStatus]) {
+pub fn show(ui: &mut egui::Ui, devices: &[ComputeDevice], modules: &[ModuleEntry]) {
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.heading("仪表盘");
         ui.add_space(8.0);
 
-        ui.label("计算设备");
+        // ── 计算设备 ──
+        ui.strong("计算设备");
         ui.add_space(4.0);
-        device_cards(ui, devices);
+
+        if devices.is_empty() {
+            ui.label("未检测到计算设备");
+        } else {
+            device_cards(ui, devices);
+        }
 
         ui.add_space(16.0);
-        ui.label("模块状态概览");
+
+        // ── 模块状态概览 ──
+        ui.strong("模块状态概览");
         ui.add_space(4.0);
-        module_table(ui, modules);
+
+        if modules.is_empty() {
+            ui.label("未发现模块（请检查 modules/ 目录）");
+        } else {
+            module_table(ui, modules);
+        }
     });
 }
 
@@ -28,9 +41,14 @@ fn device_cards(ui: &mut egui::Ui, devices: &[ComputeDevice]) {
                 ui.label(format!("后端: {}", dev.backend));
 
                 if let (Some(total), Some(used)) = (dev.total_memory_mb, dev.used_memory_mb) {
-                    let frac = used as f32 / total as f32;
+                    let frac = used as f32 / total.max(1) as f32;
                     ui.label(format!("显存: {used} / {total} MB"));
-                    ui.add(egui::ProgressBar::new(frac).text(format!("{:.0}%", frac * 100.0)));
+                    ui.add(
+                        egui::ProgressBar::new(frac)
+                            .text(format!("{:.0}%", frac * 100.0)),
+                    );
+                } else {
+                    ui.label("显存: 未知");
                 }
 
                 if let Some(util) = dev.utilization {
@@ -44,7 +62,7 @@ fn device_cards(ui: &mut egui::Ui, devices: &[ComputeDevice]) {
     });
 }
 
-fn module_table(ui: &mut egui::Ui, modules: &[ModuleStatus]) {
+fn module_table(ui: &mut egui::Ui, modules: &[ModuleEntry]) {
     egui::Grid::new("dashboard_modules")
         .striped(true)
         .min_col_width(80.0)
@@ -61,7 +79,11 @@ fn module_table(ui: &mut egui::Ui, modules: &[ModuleStatus]) {
                 ui.label(m.category.to_string());
                 ui.label(status_text(&m.status));
                 ui.label(m.device.as_deref().unwrap_or("-"));
-                ui.label(m.port.map(|p| p.to_string()).unwrap_or_else(|| "-".into()));
+                ui.label(
+                    m.port
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "-".into()),
+                );
                 ui.end_row();
             }
         });

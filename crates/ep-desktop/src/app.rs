@@ -1,130 +1,94 @@
 use eframe::egui;
 use ep_core::config::AppConfig;
-use ep_core::types::{
-    ComputeBackend, ComputeDevice, DeviceId, ModuleCategory, ServiceStatus, TaskStatus,
-};
+use ep_core::module::DiscoveredModule;
+use ep_core::types::{ComputeDevice, ServiceStatus};
 
 use crate::pages;
-use crate::pages::tasks::TaskEntry;
+
+// ─── Messages: background → UI ──────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-pub struct ModuleStatus {
+pub enum AppMsg {
+    DevicesRefreshed(Vec<ComputeDevice>),
+    ModulesDiscovered(Vec<DiscoveredModule>),
+    ModuleStarted(String, u16, String),
+    ModuleStopped(String),
+    ModuleStatusUpdate(String, ServiceStatus),
+    LogLine(String, String),
+    Error(String),
+}
+
+// ─── Commands: UI → background ──────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum AppCmd {
+    StartModule(String),
+    StopModule(String),
+    Shutdown,
+}
+
+// ─── UI-side module entry ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ModuleEntry {
+    pub id: String,
     pub name: String,
     pub version: String,
     pub description: String,
-    pub category: ModuleCategory,
+    pub category: ep_core::types::ModuleCategory,
     pub status: ServiceStatus,
     pub device: Option<String>,
     pub port: Option<u16>,
+    pub logs: Vec<String>,
 }
 
-pub struct AppState {
-    pub devices: Vec<ComputeDevice>,
-    pub modules: Vec<ModuleStatus>,
-    pub config: AppConfig,
-    pub tasks: Vec<TaskEntry>,
-}
-
-impl AppState {
-    fn placeholder() -> Self {
-        let devices = vec![
-            ComputeDevice {
-                id: DeviceId::Cuda(0),
-                backend: ComputeBackend::Cuda,
-                name: "NVIDIA RTX 4090".into(),
-                total_memory_mb: Some(24576),
-                used_memory_mb: Some(8192),
-                utilization: Some(35),
-                temperature: Some(62),
-            },
-            ComputeDevice {
-                id: DeviceId::Cpu,
-                backend: ComputeBackend::Cpu,
-                name: "Intel Core i9-14900K".into(),
-                total_memory_mb: Some(65536),
-                used_memory_mb: Some(12288),
-                utilization: Some(12),
-                temperature: Some(45),
-            },
-        ];
-
-        let modules = vec![
-            ModuleStatus {
-                name: "Faster-Whisper ASR".into(),
-                version: "1.1.0".into(),
-                description: "基于 CTranslate2 的高速语音识别，支持词级时间戳".into(),
-                category: ModuleCategory::Asr,
-                status: ServiceStatus::Running,
-                device: Some("cuda:0".into()),
-                port: Some(18001),
-            },
-            ModuleStatus {
-                name: "Qwen3-ASR".into(),
-                version: "0.9.0".into(),
-                description: "Qwen3 语音识别模型，支持多语言".into(),
-                category: ModuleCategory::Asr,
+impl ModuleEntry {
+    pub fn from_discovered(dm: &DiscoveredModule) -> Self {
+        match &dm.manifest {
+            Some(mf) => Self {
+                id: mf.module.id.clone(),
+                name: mf.module.name.clone(),
+                version: mf.module.version.clone(),
+                description: mf.module.description.clone(),
+                category: mf.module.category,
                 status: ServiceStatus::Stopped,
                 device: None,
                 port: None,
+                logs: Vec::new(),
             },
-            ModuleStatus {
-                name: "DeepFilter".into(),
-                version: "3.0.0".into(),
-                description: "实时音频降噪，基于深度滤波".into(),
-                category: ModuleCategory::Denoise,
-                status: ServiceStatus::Running,
-                device: Some("cuda:0".into()),
-                port: Some(18002),
-            },
-            ModuleStatus {
-                name: "PaddleOCR".into(),
-                version: "2.7.0".into(),
-                description: "PP-StructureV3 文档结构化识别".into(),
-                category: ModuleCategory::Ocr,
-                status: ServiceStatus::NotReady,
-                device: None,
-                port: None,
-            },
-        ];
-
-        let tasks = vec![
-            TaskEntry {
-                id: "t-001".into(),
-                pipeline_name: "视频转字幕".into(),
-                status: TaskStatus::Completed,
-                elapsed: "2m 34s".into(),
-            },
-            TaskEntry {
-                id: "t-002".into(),
-                pipeline_name: "音频降噪 + 转写".into(),
-                status: TaskStatus::Running,
-                elapsed: "0m 47s".into(),
-            },
-            TaskEntry {
-                id: "t-003".into(),
-                pipeline_name: "批量 OCR".into(),
-                status: TaskStatus::Failed("模型未加载".into()),
-                elapsed: "0m 03s".into(),
-            },
-        ];
-
-        Self {
-            devices,
-            modules,
-            config: AppConfig::default(),
-            tasks,
+            None => {
+                let id = dm
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "unknown".into());
+                Self {
+                    id: id.clone(),
+                    name: id.clone(),
+                    version: "?".into(),
+                    description: "manifest 加载失败".into(),
+                    category: ep_core::types::ModuleCategory::Custom,
+                    status: ServiceStatus::NotReady,
+                    device: None,
+                    port: None,
+                    logs: Vec::new(),
+                }
+            }
         }
+    }
+
+    pub fn append_log(&mut self, line: String) {
+        if self.logs.len() >= 500 {
+            self.logs.remove(0);
+        }
+        self.logs.push(line);
     }
 }
 
-pub struct App {
-    current_page: Page,
-    state: AppState,
-    selected_module: Option<usize>,
-}
+// ─── Page enum ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Page {
+pub enum Page {
     Dashboard,
     Modules,
     PipelineEditor,
@@ -140,31 +104,125 @@ const NAV_ITEMS: &[(Page, &str, &str)] = &[
     (Page::Settings, "⚙", "设置"),
 ];
 
+// ─── App ────────────────────────────────────────────────────────────────────
+
+pub struct App {
+    current_page: Page,
+    pub state: AppState,
+    selected_module: Option<usize>,
+    rx: std::sync::mpsc::Receiver<AppMsg>,
+    pub cmd_tx: tokio::sync::mpsc::UnboundedSender<AppCmd>,
+    status_message: Option<(String, std::time::Instant)>,
+    last_repaint: std::time::Instant,
+}
+
+pub struct AppState {
+    pub devices: Vec<ComputeDevice>,
+    pub modules: Vec<ModuleEntry>,
+    pub config: AppConfig,
+}
+
 impl App {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(
+        rx: std::sync::mpsc::Receiver<AppMsg>,
+        cmd_tx: tokio::sync::mpsc::UnboundedSender<AppCmd>,
+    ) -> Self {
+        let config = AppConfig::default();
         Self {
             current_page: Page::Dashboard,
-            state: AppState::placeholder(),
+            state: AppState {
+                devices: Vec::new(),
+                modules: Vec::new(),
+                config,
+            },
             selected_module: None,
+            rx,
+            cmd_tx,
+            status_message: None,
+            last_repaint: std::time::Instant::now(),
+        }
+    }
+
+    fn process_messages(&mut self) {
+        while let Ok(msg) = self.rx.try_recv() {
+            match msg {
+                AppMsg::DevicesRefreshed(devs) => {
+                    self.state.devices = devs;
+                }
+                AppMsg::ModulesDiscovered(dms) => {
+                    self.state.modules = dms.iter().map(ModuleEntry::from_discovered).collect();
+                }
+                AppMsg::ModuleStarted(id, port, device) => {
+                    if let Some(m) = self.state.modules.iter_mut().find(|m| m.id == id) {
+                        m.status = ServiceStatus::Running;
+                        m.port = Some(port);
+                        m.device = Some(device);
+                    }
+                }
+                AppMsg::ModuleStopped(id) => {
+                    if let Some(m) = self.state.modules.iter_mut().find(|m| m.id == id) {
+                        m.status = ServiceStatus::Stopped;
+                        m.port = None;
+                        m.device = None;
+                    }
+                }
+                AppMsg::ModuleStatusUpdate(id, status) => {
+                    if let Some(m) = self.state.modules.iter_mut().find(|m| m.id == id) {
+                        m.status = status;
+                    }
+                }
+                AppMsg::LogLine(id, line) => {
+                    if let Some(m) = self.state.modules.iter_mut().find(|m| m.id == id) {
+                        m.append_log(line);
+                    }
+                }
+                AppMsg::Error(e) => {
+                    self.status_message = Some((e, std::time::Instant::now()));
+                }
+            }
         }
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Poll messages from background thread
+        self.process_messages();
+
+        // Request periodic repaint (~2s) for device/status refresh
+        if self.last_repaint.elapsed() > std::time::Duration::from_secs(2) {
+            ctx.request_repaint();
+            self.last_repaint = std::time::Instant::now();
+        }
+
+        // Clear status message after 5 seconds
+        if let Some((_, instant)) = &self.status_message {
+            if instant.elapsed() > std::time::Duration::from_secs(5) {
+                self.status_message = None;
+            }
+        }
+
+        // ── Top menu bar ──
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("文件", |ui| {
                     if ui.button("退出").clicked() {
+                        let _ = self.cmd_tx.send(AppCmd::Shutdown);
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
                 ui.menu_button("帮助", |ui| {
-                    ui.label("EntryPoint v0.1.0");
+                    ui.label("EntryPoint v0.2.0");
                 });
             });
+
+            // Status message bar
+            if let Some((ref msg, _)) = self.status_message {
+                ui.colored_label(egui::Color32::from_rgb(255, 180, 80), msg);
+            }
         });
 
+        // ── Left navigation ──
         egui::SidePanel::left("nav")
             .default_width(160.0)
             .show(ctx, |ui| {
@@ -183,30 +241,34 @@ impl eframe::App for App {
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.separator();
                     ui.label(
-                        egui::RichText::new("v0.1.0")
+                        egui::RichText::new("v0.2.0")
                             .small()
                             .color(egui::Color32::from_gray(120)),
                     );
                 });
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            match self.current_page {
-                Page::Dashboard => {
-                    pages::dashboard::show(ui, &self.state.devices, &self.state.modules);
-                }
-                Page::Modules => {
-                    pages::modules::show(ui, &self.state.modules, &mut self.selected_module);
-                }
-                Page::PipelineEditor => {
-                    pages::pipeline_editor::show(ui);
-                }
-                Page::Tasks => {
-                    pages::tasks::show(ui, &self.state.tasks);
-                }
-                Page::Settings => {
-                    pages::settings::show(ui, &mut self.state.config);
-                }
+        // ── Central panel — dispatch to page ──
+        egui::CentralPanel::default().show(ctx, |ui| match self.current_page {
+            Page::Dashboard => {
+                pages::dashboard::show(ui, &self.state.devices, &self.state.modules);
+            }
+            Page::Modules => {
+                pages::modules::show(
+                    ui,
+                    &mut self.state.modules,
+                    &mut self.selected_module,
+                    &self.cmd_tx,
+                );
+            }
+            Page::PipelineEditor => {
+                pages::pipeline_editor::show(ui);
+            }
+            Page::Tasks => {
+                pages::tasks::show(ui, &self.state.modules);
+            }
+            Page::Settings => {
+                pages::settings::show(ui, &mut self.state.config, &mut self.status_message);
             }
         });
     }
