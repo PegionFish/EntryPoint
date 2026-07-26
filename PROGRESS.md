@@ -56,4 +56,45 @@
 - [x] cargo test — 118/118 passed
 - [x] cargo build --release — 成功（47.73s）
 ### Git
-- commit: TBD — "chore(wave-3): clippy fixes + integration smoke"
+- commit: `c2210bd` — "chore(wave-3): clippy fixes + integration smoke + PROGRESS.md"
+
+## Wave 4 — ✅ 完成
+### 完成
+- [x] Agent F (TestHawk): 13 个集成测试（模块生命周期/管线/设备调度）
+- [x] Agent G (PolishCat): 默认配置 + 2 个示例管线
+### 编译状态
+- cargo test: 131/131 passed (111 unit + 13 integration + 7 daemon)
+### Git
+- commit: `2c5c9e9` — "test(wave-4/agent-f): add integration tests"
+- commit: `dfc33b1` — "feat(wave-4/agent-g): add default config + example pipelines"
+
+## Wave 5 — ✅ 完成
+### 完成
+- [x] Daemon API 测试: /health, /devices, /modules, /config 全部 200
+- [x] Desktop GUI 测试: 启动/导航/GPU检测/设置页面 全部通过
+- [x] RTX 5090 D 正确检测 (32607 MB, 42°C)
+- [x] 测试报告: reports/e2e_test_report.md
+### Git
+- commit: TBD — "test(wave-5): e2e test results"
+
+## Wave 6 — ✅ 完成
+### 完成
+- [x] cargo check ✅
+- [x] cargo test — 131/131 passed
+- [x] cargo clippy — 0 warnings
+- [x] cargo build --release — 成功
+- [x] 实机测试通过
+- [x] 最终报告
+
+---
+
+## 最终统计
+
+| 指标 | 值 |
+|---|---|
+| 总测试数 | 131 (111 unit + 13 integration + 7 daemon) |
+| Git commits | 14 |
+| 源文件数 | ~50 .rs files |
+| Crate 数 | 4 (ep-core, ep-daemon, ep-desktop, ep-webui) |
+| Release 构建时间 | 47.73s |
+| Clippy warnings | 0 |
