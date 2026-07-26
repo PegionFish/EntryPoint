@@ -2,6 +2,7 @@ mod api;
 mod state;
 mod ws;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -14,6 +15,7 @@ use ep_core::compute::detect_all_devices;
 use ep_core::config::AppConfig;
 use ep_core::module::discovery::discover_modules;
 use ep_core::port::PortManager;
+use ep_core::process::ProcessManager;
 
 use crate::state::AppState;
 
@@ -26,6 +28,125 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Parse CLI args
+    let args: Vec<String> = std::env::args().collect();
+
+    if let Some(pos) = args.iter().position(|a| a == "--run-module") {
+        let module_id = args
+            .get(pos + 1)
+            .ok_or_else(|| anyhow::anyhow!("--run-module requires a module ID"))?;
+        return run_module_standalone(module_id).await;
+    }
+
+    run_server().await
+}
+
+/// Standalone module runner — start a single module and keep it running.
+async fn run_module_standalone(module_id: &str) -> anyhow::Result<()> {
+    tracing::info!("Standalone mode: running module '{}'", module_id);
+
+    // Load config
+    let config_dir = std::path::Path::new("config");
+    let config = AppConfig::load_or_create(config_dir).unwrap_or_default();
+
+    // Discover modules
+    let modules_dir = std::path::Path::new("modules");
+    let modules = discover_modules(modules_dir);
+
+    // Find the target module
+    let discovered = modules
+        .iter()
+        .find(|m| {
+            m.manifest
+                .as_ref()
+                .map(|mf| mf.module.id == module_id)
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| anyhow::anyhow!("Module '{}' not found in modules/", module_id))?;
+
+    let manifest = discovered
+        .manifest
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Module '{}' has invalid manifest", module_id))?;
+
+    tracing::info!(
+        "Found module: {} v{} ({})",
+        manifest.module.name,
+        manifest.module.version,
+        manifest.module.category
+    );
+
+    // Detect devices and pick the best one
+    let devices = detect_all_devices(&config.compute.disabled_backends);
+    let device = devices
+        .iter()
+        .find(|d| {
+            manifest
+                .compute
+                .backends
+                .contains(&d.backend)
+        })
+        .map(|d| d.id.clone())
+        .unwrap_or(ep_core::types::DeviceId::Cpu);
+
+    tracing::info!("Using device: {}", device);
+
+    // Allocate port
+    let (port_start, port_end) = config.port_range();
+    let mut port_manager = PortManager::new(port_start, port_end);
+    let port = port_manager.allocate(module_id)?;
+    tracing::info!("Allocated port: {}", port);
+
+    // Build environment variables
+    let root = std::env::current_dir()?;
+    let module_dir = root.join("modules").join(module_id);
+    let model_dir = if let Some(model) = manifest.models.iter().find(|m| m.default) {
+        root.join("models").join(&model.target_dir)
+    } else if let Some(model) = manifest.models.first() {
+        root.join("models").join(&model.target_dir)
+    } else {
+        module_dir.clone()
+    };
+
+    let mut env_vars = HashMap::new();
+    env_vars.insert("EP_ROOT".to_string(), root.to_string_lossy().to_string());
+    env_vars.insert("EP_MODULE_DIR".to_string(), module_dir.to_string_lossy().to_string());
+    env_vars.insert("EP_MODULE_ID".to_string(), module_id.to_string());
+    env_vars.insert("EP_MODEL_DIR".to_string(), model_dir.to_string_lossy().to_string());
+    env_vars.insert("EP_WORKSPACE".to_string(), root.join("workspace").to_string_lossy().to_string());
+    env_vars.insert("EP_LOG_LEVEL".to_string(), "info".to_string());
+
+    if let Some(model) = manifest.models.iter().find(|m| m.default).or(manifest.models.first()) {
+        env_vars.insert("EP_MODEL_ID".to_string(), model.id.clone());
+    }
+
+    // Start the module
+    let mut process_manager = ProcessManager::new();
+    process_manager
+        .start_module(module_id, manifest, device.clone(), port, env_vars)
+        .await?;
+
+    tracing::info!(
+        "Module '{}' started on port {} (device: {})",
+        module_id,
+        port,
+        device
+    );
+    tracing::info!("Press Ctrl+C to stop");
+
+    // Wait for shutdown signal
+    tokio::signal::ctrl_c().await?;
+
+    tracing::info!("Shutting down module '{}'...", module_id);
+    process_manager.stop_module(module_id).await?;
+    port_manager.release(module_id);
+    tracing::info!("Module '{}' stopped", module_id);
+
+    Ok(())
+}
+
+/// Normal HTTP server mode.
+async fn run_server() -> anyhow::Result<()> {
     tracing::info!("EntryPoint Daemon starting...");
 
     // 1. Load configuration
