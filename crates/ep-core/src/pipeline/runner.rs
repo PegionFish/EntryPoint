@@ -3,11 +3,12 @@
 //! 基于 PipelineTask 状态机，实际执行各类型节点。
 //! 支持进度回调、分层拓扑执行、失败传播。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::pipeline::dag::Pipeline;
-use crate::pipeline::executor::{execute_node, NodeState, PipelineTask};
+use crate::pipeline::executor::{execute_node, ModuleCallError, NodeState, PipelineTask};
 use crate::types::{Artifact, PipelineRunner, TaskStatus};
 
 /// 管线运行器
@@ -15,6 +16,8 @@ pub struct PipelineRunnerImpl {
     task: Option<PipelineTask>,
     #[allow(dead_code)]
     work_dir: PathBuf,
+    /// 模块端口注册表：module_id → port
+    module_ports: HashMap<String, u16>,
     /// 节点开始执行时回调
     #[allow(clippy::type_complexity)]
     pub on_node_start: Option<Arc<dyn Fn(&str) + Send + Sync>>,
@@ -31,10 +34,23 @@ impl PipelineRunnerImpl {
         Self {
             task: None,
             work_dir,
+            module_ports: HashMap::new(),
             on_node_start: None,
             on_node_complete: None,
             on_node_error: None,
         }
+    }
+
+    /// 注册模块服务端口
+    ///
+    /// 管线执行时，模块节点将通过 `http://127.0.0.1:{port}/predict/{capability}` 调用。
+    pub fn set_module_port(&mut self, module_id: impl Into<String>, port: u16) {
+        self.module_ports.insert(module_id.into(), port);
+    }
+
+    /// 批量注册模块端口
+    pub fn set_module_ports(&mut self, ports: HashMap<String, u16>) {
+        self.module_ports.extend(ports);
     }
 
     /// 异步执行管线（内部实现）
@@ -76,7 +92,7 @@ impl PipelineRunnerImpl {
                     .find(|n| &n.id == node_id)
                     .ok_or_else(|| anyhow::anyhow!("node '{node_id}' not found in pipeline"))?;
 
-                match execute_node(node, pipeline, &task, work_dir).await {
+                match execute_node(node, pipeline, &task, work_dir, &self.module_ports).await {
                     Ok(artifact) => {
                         // 回调：节点完成
                         if let Some(ref cb) = self.on_node_complete {
@@ -86,11 +102,16 @@ impl PipelineRunnerImpl {
                     }
                     Err(e) => {
                         let err_msg = e.to_string();
+                        // 从 ModuleCallError 提取可重试标志
+                        let retryable = e
+                            .downcast_ref::<ModuleCallError>()
+                            .map(|mce| mce.retryable)
+                            .unwrap_or(false);
                         // 回调：节点错误
                         if let Some(ref cb) = self.on_node_error {
                             cb(node_id, &err_msg);
                         }
-                        task.mark_failed_with_pipeline(node_id, err_msg, pipeline);
+                        task.mark_failed_with_pipeline(node_id, err_msg, retryable, pipeline);
                         break; // 停止当前层的执行
                     }
                 }
@@ -126,10 +147,12 @@ impl PipelineRunner for PipelineRunnerImpl {
                 let on_start = self.on_node_start.take();
                 let on_complete = self.on_node_complete.take();
                 let on_error = self.on_node_error.take();
+                let module_ports = self.module_ports.clone();
 
                 let mut temp_runner = PipelineRunnerImpl {
                     task: None,
                     work_dir: work_dir_path.clone(),
+                    module_ports,
                     on_node_start: on_start,
                     on_node_complete: on_complete,
                     on_node_error: on_error,
@@ -145,6 +168,7 @@ impl PipelineRunner for PipelineRunnerImpl {
 
                 // 恢复状态
                 self.task = returned_runner.task;
+                self.module_ports = returned_runner.module_ports;
                 self.on_node_start = returned_runner.on_node_start;
                 self.on_node_complete = returned_runner.on_node_complete;
                 self.on_node_error = returned_runner.on_node_error;
