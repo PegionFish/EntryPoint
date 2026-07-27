@@ -76,19 +76,7 @@ impl EnvManager {
     /// - 否则在系统 PATH 中检测 `python3` / `python`
     /// - 同理检测 uv（`config.uv_path` 或 PATH 中的 `uv`）
     pub fn new(root: &Path, config: &PythonConfig) -> Self {
-        let python_path = if !config.path.is_empty() {
-            let p = PathBuf::from(&config.path);
-            if p.exists() {
-                debug!(path = %p.display(), "using configured python path");
-                Some(p)
-            } else {
-                warn!(path = %p.display(), "configured python path does not exist, falling back to detection");
-                Self::detect_python()
-            }
-        } else {
-            Self::detect_python()
-        };
-
+        // 先检测 uv，detect_python 需要借助 uv python find 查找兼容版本
         let uv_path = if !config.uv_path.is_empty() {
             let p = PathBuf::from(&config.uv_path);
             if p.exists() {
@@ -102,6 +90,19 @@ impl EnvManager {
             Self::detect_uv()
         };
 
+        let python_path = if !config.path.is_empty() {
+            let p = PathBuf::from(&config.path);
+            if p.exists() {
+                debug!(path = %p.display(), "using configured python path");
+                Some(p)
+            } else {
+                warn!(path = %p.display(), "configured python path does not exist, falling back to detection");
+                Self::detect_python(uv_path.as_deref())
+            }
+        } else {
+            Self::detect_python(uv_path.as_deref())
+        };
+
         Self {
             root: root.to_path_buf(),
             python_path,
@@ -110,11 +111,12 @@ impl EnvManager {
     }
 
     /// 检测系统 PATH 中的 python（优先 python3，其次 python）
-    fn detect_python() -> Option<PathBuf> {
+    /// 若 PATH 中无兼容版本，则借助 uv python find 查找 uv 管理的 Python
+    fn detect_python(uv: Option<&Path>) -> Option<PathBuf> {
+        // 1. 尝试 PATH 中的 python3 / python
         for name in ["python3", "python"] {
             if let Ok(output) = Command::new(name).arg("--version").output() {
                 if output.status.success() {
-                    // 找到可执行的 python
                     if let Some(path) = Self::which(name) {
                         debug!(python = %path.display(), "detected python in PATH");
                         return Some(path);
@@ -122,12 +124,34 @@ impl EnvManager {
                 }
             }
         }
-        debug!("no python found in PATH");
+
+        // 2. 借助 uv python find 查找兼容版本（优先 3.12，其次 3.11/3.10）
+        let uv_exe = uv.map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("uv"));
+        for ver in ["3.12", "3.11", "3.10"] {
+            if let Ok(output) = Command::new(&uv_exe)
+                .args(["python", "find", ver])
+                .output()
+            {
+                if output.status.success() {
+                    let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if !path_str.is_empty() {
+                        let p = PathBuf::from(&path_str);
+                        if p.is_file() {
+                            debug!(python = %p.display(), version = ver, "detected uv-managed python");
+                            return Some(p);
+                        }
+                    }
+                }
+            }
+        }
+
+        debug!("no compatible python found in PATH or uv");
         None
     }
 
-    /// 检测系统 PATH 中的 uv
+    /// 检测系统 PATH 中的 uv，并扫描 Windows 常见 Python Scripts 目录作为后备
     fn detect_uv() -> Option<PathBuf> {
+        // 1. 尝试 PATH
         if let Ok(output) = Command::new("uv").arg("--version").output() {
             if output.status.success() {
                 if let Some(path) = Self::which("uv") {
@@ -136,7 +160,54 @@ impl EnvManager {
                 }
             }
         }
+
+        // 2. Windows：扫描 C:\Program Files\Python*\Scripts\uv.exe
+        #[cfg(windows)]
+        {
+            if let Some(path) = Self::scan_windows_uv() {
+                debug!(uv = %path.display(), "detected uv in Python Scripts dir");
+                return Some(path);
+            }
+        }
+
         debug!("no uv found in PATH");
+        None
+    }
+
+    /// Windows 专用：在 Program Files 和用户 AppData 的 Python Scripts 目录中查找 uv.exe
+    #[cfg(windows)]
+    fn scan_windows_uv() -> Option<PathBuf> {
+        let mut search_dirs: Vec<PathBuf> = Vec::new();
+
+        // C:\Program Files\Python*\Scripts\
+        if let Ok(entries) = std::fs::read_dir(r"C:\Program Files") {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("Python") {
+                    search_dirs.push(entry.path().join("Scripts"));
+                }
+            }
+        }
+
+        // %LOCALAPPDATA%\Programs\Python\Python*\Scripts\
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let base = PathBuf::from(local).join("Programs").join("Python");
+            if let Ok(entries) = std::fs::read_dir(&base) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with("Python") {
+                        search_dirs.push(entry.path().join("Scripts"));
+                    }
+                }
+            }
+        }
+
+        for dir in search_dirs {
+            let candidate = dir.join("uv.exe");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
         None
     }
 
