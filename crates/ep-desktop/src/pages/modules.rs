@@ -304,7 +304,7 @@ fn log_viewer(ui: &mut egui::Ui, m: &mut ModuleEntry) {
 
     ui.add_space(4.0);
 
-    let log_height = ui.available_height().min(400.0).max(120.0);
+    let log_height = ui.available_height().clamp(120.0, 400.0);
     egui::Frame::group(ui.style()).show(ui, |ui| {
         egui::ScrollArea::vertical()
             .max_height(log_height)
