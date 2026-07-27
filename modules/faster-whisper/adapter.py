@@ -3,10 +3,18 @@
 import json
 import logging
 import os
+import sys
 import tempfile
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+# Windows: 将 venv Scripts 目录加入 DLL 搜索路径（CUDA 库等）
+if sys.platform == "win32":
+    _scripts = Path(sys.executable).parent
+    if hasattr(os, "add_dll_directory"):
+        os.add_dll_directory(str(_scripts))
+    os.environ["PATH"] = str(_scripts) + os.pathsep + os.environ.get("PATH", "")
 
 import uvicorn
 from fastapi import FastAPI, Request, UploadFile, File, Form
