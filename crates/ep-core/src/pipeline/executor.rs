@@ -680,7 +680,7 @@ async fn send_module_request(
         }
 
         // 将节点 params 作为 JSON 字符串附加到 params 字段
-        if !node.params.is_null() && node.params.as_object().map_or(false, |o| !o.is_empty()) {
+        if !node.params.is_null() && node.params.as_object().is_some_and(|o| !o.is_empty()) {
             form = form.text("params", node.params.to_string());
         }
 

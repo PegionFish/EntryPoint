@@ -2,21 +2,11 @@ use eframe::egui;
 use ep_core::pipeline::dag::{NodeKind, Pipeline, ValidationError};
 
 /// Shared state for the pipeline editor page.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct PipelineEditorState {
     path: String,
     loaded_pipeline: Option<Pipeline>,
     validation_msg: Option<String>,
-}
-
-impl Default for PipelineEditorState {
-    fn default() -> Self {
-        Self {
-            path: String::new(),
-            loaded_pipeline: None,
-            validation_msg: None,
-        }
-    }
 }
 
 fn state_id() -> egui::Id {
@@ -71,7 +61,7 @@ pub fn show(ui: &mut egui::Ui) {
                 Ok(pipeline) => {
                     let validation = match pipeline.validate() {
                         Ok(()) => "验证通过".to_string(),
-                        Err(errors) => format!("{}", format_errors(&errors)),
+                        Err(errors) => format_errors(&errors).to_string(),
                     };
                     ui.data_mut(|d| {
                         let s = d.get_temp_mut_or_default::<PipelineEditorState>(state_id());
