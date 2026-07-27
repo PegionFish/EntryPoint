@@ -25,7 +25,11 @@ pub enum NodeState {
     /// 执行完成，附带输出产物
     Completed { artifact: Option<Artifact> },
     /// 执行失败
-    Failed { error: String },
+    Failed {
+        error: String,
+        /// 是否为可重试错误（连接失败 / 超时等瞬态故障）
+        retryable: bool,
+    },
     /// 因上游失败而跳过
     Skipped,
 }
@@ -106,9 +110,9 @@ impl PipelineTask {
     }
 
     /// 标记节点执行失败，并将所有下游节点标记为 Skipped
-    pub fn mark_failed(&mut self, node_id: &str, error: String) {
+    pub fn mark_failed(&mut self, node_id: &str, error: String, retryable: bool) {
         if let Some(state) = self.node_states.get_mut(node_id) {
-            *state = NodeState::Failed { error };
+            *state = NodeState::Failed { error, retryable };
         }
 
         // 标记所有下游为 Skipped（需要管线信息来获取下游）
@@ -121,9 +125,9 @@ impl PipelineTask {
     }
 
     /// 标记节点失败并跳过其下游（需要管线引用以计算传递闭包）
-    pub fn mark_failed_with_pipeline(&mut self, node_id: &str, error: String, pipeline: &Pipeline) {
+    pub fn mark_failed_with_pipeline(&mut self, node_id: &str, error: String, retryable: bool, pipeline: &Pipeline) {
         if let Some(state) = self.node_states.get_mut(node_id) {
-            *state = NodeState::Failed { error };
+            *state = NodeState::Failed { error, retryable };
         }
 
         // 获取所有传递下游并标记为 Skipped
@@ -176,7 +180,7 @@ impl PipelineTask {
                 .node_states
                 .values()
                 .find_map(|s| match s {
-                    NodeState::Failed { error } => Some(error.clone()),
+                    NodeState::Failed { error, .. } => Some(error.clone()),
                     _ => None,
                 })
                 .unwrap_or_default();
@@ -297,13 +301,15 @@ to = ["save", "input"]
         task.mark_failed_with_pipeline(
             "process",
             "model not found".to_string(),
+            false,
             &pipeline,
         );
 
         assert_eq!(
             task.node_states["process"],
             NodeState::Failed {
-                error: "model not found".to_string()
+                error: "model not found".to_string(),
+                retryable: false,
             }
         );
         assert_eq!(task.node_states["save"], NodeState::Skipped);
@@ -355,6 +361,7 @@ pub(crate) async fn execute_node(
     pipeline: &Pipeline,
     task: &PipelineTask,
     work_dir: &Path,
+    module_ports: &HashMap<String, u16>,
 ) -> anyhow::Result<Artifact> {
     let upstream = collect_upstream_artifacts(&node.id, pipeline, task);
 
@@ -362,7 +369,7 @@ pub(crate) async fn execute_node(
         NodeKind::Builtin { builtin } => {
             execute_builtin_node(builtin, node, &upstream, work_dir).await
         }
-        NodeKind::Module { .. } => execute_module_node(node, &upstream, work_dir).await,
+        NodeKind::Module { .. } => execute_module_node(node, &upstream, work_dir, module_ports).await,
         NodeKind::ExternalApi { .. } => execute_external_api_node(node, &upstream, work_dir).await,
     }
 }
@@ -488,17 +495,335 @@ async fn execute_builtin_ffmpeg(
     Ok(Artifact::File(output_path))
 }
 
-/// 模块节点执行 — TODO: 实际 HTTP 调用待集成
+/// 模块 HTTP 调用错误 — 携带可重试标志
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("module call to `{module_id}` failed: {message}")]
+pub struct ModuleCallError {
+    pub module_id: String,
+    pub message: String,
+    /// 是否为可重试错误（连接失败 / 超时等瞬态故障）
+    pub retryable: bool,
+}
+
+/// 模块 HTTP 响应体
+#[derive(Debug, serde::Deserialize)]
+struct ModuleResponse {
+    status: String,
+    output_type: Option<String>,
+    result: Option<serde_json::Value>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    metadata: Option<serde_json::Value>,
+}
+
+/// 最大重试次数（不含首次尝试）
+const MAX_RETRIES: u32 = 1;
+/// 重试间隔（秒）
+const RETRY_DELAY_SECS: u64 = 2;
+/// HTTP 请求超时（秒）
+const HTTP_TIMEOUT_SECS: u64 = 300;
+
+/// 模块节点执行 — 通过 HTTP 调用本地模块服务
+///
+/// 请求 URL: `http://127.0.0.1:{port}/predict/{capability}`
+///
+/// - 文件类上游产物（audio/video/image/file）→ multipart/form-data
+/// - 文本/JSON 类上游产物 → JSON body
+///
+/// 可重试错误（连接失败、超时）最多重试 1 次，间隔 2 秒。
 async fn execute_module_node(
     node: &PipelineNode,
-    _upstream: &[Artifact],
+    upstream: &[Artifact],
+    work_dir: &Path,
+    module_ports: &HashMap<String, u16>,
+) -> anyhow::Result<Artifact> {
+    let (module_id, capability) = match &node.kind {
+        NodeKind::Module {
+            module_id,
+            capability,
+            ..
+        } => (module_id.clone(), capability.clone()),
+        _ => unreachable!(),
+    };
+
+    // ── 解析端口：优先 module_ports 注册表，其次 node params ──────────────
+    let port = module_ports.get(&module_id).copied().or_else(|| {
+        node.params
+            .get("port")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u16)
+    });
+
+    let port = port.ok_or_else(|| {
+        anyhow::anyhow!(ModuleCallError {
+            module_id: module_id.clone(),
+            message: format!(
+                "no port registered for module '{module_id}' and no 'port' param in node '{}'",
+                node.id
+            ),
+            retryable: false,
+        })
+    })?;
+
+    let url = format!("http://127.0.0.1:{port}/predict/{capability}");
+
+    // ── 判断上游是否包含文件类产物 ────────────────────────────────────────
+    let has_file_input = upstream
+        .iter()
+        .any(|a| matches!(a, Artifact::File(_)));
+
+    // ── 构建 HTTP 客户端 ──────────────────────────────────────────────────
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| {
+            anyhow::anyhow!(ModuleCallError {
+                module_id: module_id.clone(),
+                message: format!("failed to build HTTP client: {e}"),
+                retryable: false,
+            })
+        })?;
+
+    // ── 重试循环 ──────────────────────────────────────────────────────────
+    let mut last_error: Option<ModuleCallError> = None;
+
+    for attempt in 0..=MAX_RETRIES {
+        if attempt > 0 {
+            tracing::info!(
+                module_id = %module_id,
+                attempt,
+                "retrying module HTTP call after {RETRY_DELAY_SECS}s"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(RETRY_DELAY_SECS)).await;
+        }
+
+        tracing::debug!(
+            module_id = %module_id,
+            capability = %capability,
+            url = %url,
+            attempt,
+            "executing module HTTP call"
+        );
+
+        match send_module_request(&client, &url, &module_id, node, upstream, has_file_input, work_dir).await {
+            Ok(artifact) => return Ok(artifact),
+            Err(e) => {
+                let mce: ModuleCallError = match e.downcast_ref::<ModuleCallError>() {
+                    Some(mce) => (*mce).clone(),
+                    None => ModuleCallError {
+                        module_id: module_id.clone(),
+                        message: e.to_string(),
+                        retryable: false,
+                    },
+                };
+
+                tracing::warn!(
+                    module_id = %module_id,
+                    attempt,
+                    retryable = mce.retryable,
+                    error = %mce.message,
+                    "module HTTP call failed"
+                );
+
+                if !mce.retryable {
+                    // 不可重试 — 立即返回
+                    return Err(anyhow::anyhow!(mce));
+                }
+
+                last_error = Some(mce);
+            }
+        }
+    }
+
+    // 所有重试耗尽
+    Err(anyhow::anyhow!(
+        last_error.unwrap_or_else(|| ModuleCallError {
+            module_id: module_id.clone(),
+            message: "unknown error after retries".to_string(),
+            retryable: true,
+        })
+    ))
+}
+
+/// 发送单次模块 HTTP 请求并解析响应
+async fn send_module_request(
+    client: &reqwest::Client,
+    url: &str,
+    module_id: &str,
+    node: &PipelineNode,
+    upstream: &[Artifact],
+    has_file_input: bool,
     _work_dir: &Path,
 ) -> anyhow::Result<Artifact> {
-    // TODO: reqwest::post("http://localhost:{port}/{capability}") + multipart upload
-    Err(anyhow::anyhow!(
-        "module node '{}' execution not yet integrated (module service not available)",
-        node.id
-    ))
+    let resp = if has_file_input {
+        // ── multipart/form-data：文件上传 ─────────────────────────────────
+        let mut form = reqwest::multipart::Form::new();
+
+        for artifact in upstream {
+            if let Artifact::File(path) = artifact {
+                let file_name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "input".to_string());
+
+                let bytes = tokio::fs::read(path).await.map_err(|e| {
+                    anyhow::anyhow!(ModuleCallError {
+                        module_id: module_id.to_string(),
+                        message: format!("failed to read input file '{}': {e}", path.display()),
+                        retryable: false,
+                    })
+                })?;
+
+                let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name);
+                form = form.part("file", part);
+            }
+        }
+
+        // 将节点 params 作为 JSON 字符串附加到 params 字段
+        if !node.params.is_null() && node.params.as_object().map_or(false, |o| !o.is_empty()) {
+            form = form.text("params", node.params.to_string());
+        }
+
+        client
+            .post(url)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| classify_reqwest_error(e, module_id))?
+    } else {
+        // ── JSON body：文本 / JSON 输入 ───────────────────────────────────
+        let mut body = serde_json::Map::new();
+
+        // 合并节点 params
+        if let Some(obj) = node.params.as_object() {
+            body.insert("params".to_string(), serde_json::Value::Object(obj.clone()));
+        }
+
+        // 从上游提取文本 / JSON 输入
+        for artifact in upstream {
+            match artifact {
+                Artifact::Text(t) => {
+                    body.insert(
+                        "input".to_string(),
+                        serde_json::Value::String(t.clone()),
+                    );
+                }
+                Artifact::Json(j) => {
+                    body.insert("input".to_string(), j.clone());
+                }
+                Artifact::File(p) => {
+                    body.insert(
+                        "input".to_string(),
+                        serde_json::Value::String(p.to_string_lossy().to_string()),
+                    );
+                }
+            }
+        }
+
+        client
+            .post(url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| classify_reqwest_error(e, module_id))?
+    };
+
+    // ── 解析响应 ──────────────────────────────────────────────────────────
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!(ModuleCallError {
+            module_id: module_id.to_string(),
+            message: format!("HTTP {status}: {text}"),
+            retryable: false,
+        }));
+    }
+
+    let module_resp: ModuleResponse = resp.json().await.map_err(|e| {
+        anyhow::anyhow!(ModuleCallError {
+            module_id: module_id.to_string(),
+            message: format!("failed to parse response JSON: {e}"),
+            retryable: false,
+        })
+    })?;
+
+    if module_resp.status != "completed" {
+        return Err(anyhow::anyhow!(ModuleCallError {
+            module_id: module_id.to_string(),
+            message: format!(
+                "module returned non-completed status: '{}'",
+                module_resp.status
+            ),
+            retryable: false,
+        }));
+    }
+
+    // ── 将 result 转为 Artifact ───────────────────────────────────────────
+    let artifact = match module_resp.output_type.as_deref() {
+        Some("file") => {
+            let path_str = module_resp
+                .result
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(ModuleCallError {
+                        module_id: module_id.to_string(),
+                        message: "output_type is 'file' but result is not a string path".to_string(),
+                        retryable: false,
+                    })
+                })?;
+            Artifact::File(PathBuf::from(path_str))
+        }
+        Some("text") => {
+            let text = module_resp
+                .result
+                .as_ref()
+                .map(|v| match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_default();
+            Artifact::Text(text)
+        }
+        Some("json") | None => {
+            // json 或未指定 output_type → 返回完整 result 作为 Json
+            Artifact::Json(module_resp.result.unwrap_or(serde_json::Value::Null))
+        }
+        Some(other) => {
+            tracing::warn!(
+                module_id = %module_id,
+                output_type = other,
+                "unknown output_type, treating as JSON"
+            );
+            Artifact::Json(module_resp.result.unwrap_or(serde_json::Value::Null))
+        }
+    };
+
+    tracing::info!(
+        module_id = %module_id,
+        output_type = ?module_resp.output_type,
+        "module HTTP call completed successfully"
+    );
+
+    Ok(artifact)
+}
+
+/// 将 reqwest 错误分类为可重试 / 不可重试
+fn classify_reqwest_error(e: reqwest::Error, module_id: &str) -> anyhow::Error {
+    let retryable = e.is_connect() || e.is_timeout() || e.is_request();
+    let message = if e.is_connect() {
+        format!("connection failed: {e}")
+    } else if e.is_timeout() {
+        format!("request timed out: {e}")
+    } else {
+        format!("request error: {e}")
+    };
+
+    anyhow::anyhow!(ModuleCallError {
+        module_id: module_id.to_string(),
+        message,
+        retryable,
+    })
 }
 
 /// 外部 API 节点执行 — reqwest POST + JSON body
