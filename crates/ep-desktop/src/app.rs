@@ -40,6 +40,8 @@ pub struct ModuleEntry {
     pub device: Option<String>,
     pub port: Option<u16>,
     pub logs: Vec<String>,
+    /// UI-side timestamp of when the module was started (for uptime display)
+    pub started_at: Option<std::time::Instant>,
 }
 
 impl ModuleEntry {
@@ -55,6 +57,7 @@ impl ModuleEntry {
                 device: None,
                 port: None,
                 logs: Vec::new(),
+                started_at: None,
             },
             None => {
                 let id = dm
@@ -72,6 +75,7 @@ impl ModuleEntry {
                     device: None,
                     port: None,
                     logs: Vec::new(),
+                    started_at: None,
                 }
             }
         }
@@ -157,6 +161,7 @@ impl App {
                         m.status = ServiceStatus::Running;
                         m.port = Some(port);
                         m.device = Some(device);
+                        m.started_at = Some(std::time::Instant::now());
                     }
                 }
                 AppMsg::ModuleStopped(id) => {
@@ -164,6 +169,7 @@ impl App {
                         m.status = ServiceStatus::Stopped;
                         m.port = None;
                         m.device = None;
+                        m.started_at = None;
                     }
                 }
                 AppMsg::ModuleStatusUpdate(id, status) => {
