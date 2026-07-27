@@ -167,17 +167,17 @@ pub async fn start_module(
         };
 
         let mut vars = HashMap::new();
-        vars.insert("EP_ROOT".to_string(), root.to_string_lossy().to_string());
-        vars.insert("EP_MODULE_DIR".to_string(), module_dir.to_string_lossy().to_string());
-        vars.insert("EP_MODEL_DIR".to_string(), model_dir.to_string_lossy().to_string());
-        vars.insert("EP_PORT".to_string(), port.to_string());
-        vars.insert("EP_DEVICE".to_string(), device.to_string());
-        vars.insert("EP_BACKEND".to_string(), device.backend().to_string());
+        vars.insert("ROOT".to_string(), root.to_string_lossy().to_string());
+        vars.insert("MODULE_DIR".to_string(), module_dir.to_string_lossy().to_string());
+        vars.insert("MODEL_DIR".to_string(), model_dir.to_string_lossy().to_string());
+        vars.insert("PORT".to_string(), port.to_string());
+        vars.insert("DEVICE".to_string(), device.to_string());
+        vars.insert("BACKEND".to_string(), device.backend().to_string());
         vars.insert(
-            "EP_DEVICE_INDEX".to_string(),
+            "DEVICE_INDEX".to_string(),
             device.index().map(|i| i.to_string()).unwrap_or_default(),
         );
-        vars.insert("EP_WORKSPACE".to_string(), root.join("workspace").to_string_lossy().to_string());
+        vars.insert("WORKSPACE".to_string(), root.join("workspace").to_string_lossy().to_string());
         vars
     };
 
