@@ -88,13 +88,50 @@
 
 ---
 
+## WebUI 实现（2026-07-28 ~ 2026-07-29）
+
+### Wave 0 (WebUI) — ✅ 完成
+#### 完成
+- [x] 开发环境搭建：Rust 1.97.1, uv 0.11.33, ffmpeg 5.1.10
+- [x] Node.js 20 (v20.20.2) 确认可用
+- [x] 验证 cargo test / clippy 基线通过
+
+### Wave 1 (WebUI) — ✅ 完成
+#### 完成
+- [x] Linux 适配：路径处理、信号管理、平台检测（134 tests, 0 clippy warnings）
+- [x] React 前端脚手架：Vite + React 19 + TypeScript + TailwindCSS 4 + shadcn/ui（52 files）
+- [x] 部署脚本：scripts/build.sh, scripts/install-service.sh, scripts/entrypoint.service
+- [x] 桌面端 CJK 字体支持（Noto Sans SC）
+
+### Wave 2 (WebUI) — ✅ 完成
+#### 完成
+- [x] 7 个业务页面实现：仪表盘、模块管理、模块详情、管线编辑器、任务中心、模型管理、设置
+- [x] 共享组件：status-badge, confirm-dialog, empty-state, loading-skeleton, device-card, module-card, log-viewer
+- [x] 自定义 hooks：use-polling, use-module-actions, use-ws-state 等
+- [x] 前端规模：25 个核心业务文件，5376 行新增代码
+
+### Wave 3 (WebUI) — ✅ 完成
+#### 完成
+- [x] API 路由修复：SPA fallback + 静态资源服务
+- [x] Release 构建验证：cargo build --release + npm run build
+- [x] E2E 测试：全部 API 端点 200，页面组件 TS 检查通过
+- [x] 测试报告：reports/webui_test_report.md
+
+### Wave 4 (WebUI) — ✅ 完成
+#### 完成
+- [x] 文档更新：README, PROGRESS, DESIGN, docs/DEPLOYMENT.md
+
+---
+
 ## 最终统计
 
 | 指标 | 值 |
 |---|---|
-| 总测试数 | 131 (111 unit + 13 integration + 7 daemon) |
-| Git commits | 14 |
-| 源文件数 | ~50 .rs files |
-| Crate 数 | 4 (ep-core, ep-daemon, ep-desktop, ep-webui) |
-| Release 构建时间 | 47.73s |
+| Rust 测试数 | 134 (111 unit + 13 integration + 7 daemon + 3 linux) |
 | Clippy warnings | 0 |
+| Rust 源文件数 | ~50 .rs files |
+| 前端源文件数 | 57 (.ts/.tsx) |
+| 前端代码行数 | ~8200 行 |
+| Crate 数 | 4 (ep-core, ep-daemon, ep-desktop, ep-webui) |
+| Release 构建时间 | ~3m 34s (含前端) |
+| Git commits | 14+ |
