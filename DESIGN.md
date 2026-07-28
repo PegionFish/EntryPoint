@@ -1,6 +1,9 @@
 # EntryPoint — AI 工具管控平台 设计文档
 
-> 状态：草案 v0.3 | 日期：2026-07-20
+> 状态：草案 v0.4 | 日期：2026-07-29
+>
+> v0.4 变更：新增 WebUI 技术栈（React + Vite + TypeScript）、引用 DESIGN_SYSTEM.md、
+> 更新 UI 页面规划为已实现状态
 >
 > v0.3 变更：模型缓存目录用户可指定、uv/Python 不内嵌（系统调用+引导安装）、
 > NPU 仅 Intel（可扩展）、Adapter 统一 REST 接口、genre 分类与多模型对比
@@ -12,7 +15,7 @@
 
 ## 1. 项目概述
 
-EntryPoint 是一个 **Windows/Linux 原生桌面应用**，用于统一管控本地部署的多个 AI 模型服务。
+EntryPoint 是一个 **Windows/Linux 原生桌面应用 + WebUI 管理界面**，用于统一管控本地部署的多个 AI 模型服务。桌面端（egui）提供本地操作体验，WebUI（React）支持浏览器远程管控。
 
 核心能力：
 
@@ -44,12 +47,18 @@ EntryPoint 是一个 **Windows/Linux 原生桌面应用**，用于统一管控�
 
 | 层级 | 选型 | 说明 |
 |---|---|---|
-| GUI | **egui + eframe** | 纯 Rust 即时模式 GUI，wgpu 自绘渲染，跨平台 |
+| 桌面 GUI | **egui + eframe** | 纯 Rust 即时模式 GUI，wgpu 自绘渲染，跨平台 |
+| **WebUI** | **React 19 + TypeScript** | 浏览器管理界面，远程管控（见 [DESIGN_SYSTEM.md](docs/DESIGN_SYSTEM.md)） |
+| WebUI 构建 | **Vite 8** | 前端构建 + 开发服务器（HMR） |
+| WebUI 样式 | **TailwindCSS 4 + shadcn/ui** | 原子化 CSS + 无障碍组件库（new-york 风格） |
+| WebUI 节点编辑器 | **@xyflow/react (React Flow)** | DAG 管线可视化编排 |
+| WebUI 状态管理 | **Zustand** | 轻量全局状态（主题、连接状态） |
 | 后端 | **Rust** | 进程管理、计算调度、管线引擎 |
+| HTTP 服务 | **axum** | REST API + WebSocket + 静态资源服务 |
 | 异步运行时 | **tokio** | 异步进程管理、HTTP、并发任务 |
 | HTTP 客户端 | **reqwest** | 调用模块 HTTP API、外部 LLM API、模型下载 |
 | 序列化 | **serde + toml / json** | 配置、模块清单、管线定义 |
-| 节点编辑器 | **egui_node_graph** 或自研 | DAG 可视化 |
+| 桌面节点编辑器 | **egui_node_graph** 或自研 | DAG 可视化（桌面端） |
 | 日志 | **tracing** | 结构化日志 |
 | Python 环境 | **uv**（系统安装） | 极速 venv 创建 + 依赖安装；不内嵌，调用系统 uv/python |
 | 模型下载 | **huggingface-hub** / **modelscope** (Python) | 标准模型下载，支持断点续传 |
@@ -732,43 +741,53 @@ path = ""                           # 留空则自动检测系统 PATH
 
 ## 5. UI 页面规划
 
-### 5.1 仪表盘 (Dashboard)
+> WebUI 视觉与交互规范见 [docs/DESIGN_SYSTEM.md](docs/DESIGN_SYSTEM.md)（唯一权威参考）。
+> 以下页面已在 WebUI 中实现（`crates/ep-webui/frontend/src/pages/`），桌面端（egui）保持同步。
+
+### 5.1 仪表盘 (Dashboard) — ✅ 已实现
 - 计算设备卡片：每个设备的名称、后端类型、显存/内存用量、利用率、温度
 - 模块状态概览：运行中 / 已停止 / 错误 / 未安装
 - 最近管线任务
+- 统计数字：设备数、模块数、运行中数量
 
-### 5.2 模块管理 (Modules)
+### 5.2 模块管理 (Modules) — ✅ 已实现
 - 模块列表（按 category 分组，同 genre 内聚合显示）
 - 每个模块卡片：
-  - 状态指示灯（未安装 / 就绪 / 运行中 / 错误）
+  - 状态徽章（StatusBadge 组件，含过渡态脉冲动画）
   - 模型下载状态 + 进度条
   - 计算设备分配下拉框
-  - 启动 / 停止按钮
-  - 配置面板（从 capability params schema 自动生成）
-  - 日志查看器
+  - 启动 / 停止按钮（乐观更新 + 确认对话框）
+  - 日志查看器（LogViewer 组件，等宽字体，自动滚动）
+- **模块详情页** (`/modules/:id`)：完整配置、日志、模型信息
 - **多模型对比**：同 genre 的模块可勾选多个同时运行；
   管线中用户手动放置多个同 genre 节点接同一输入源，任务详情页并列展示各节点输出
 - 安装新模块（拖入文件夹 / 指定路径）
 
-### 5.3 管线编辑器 (Pipeline Editor)
-- 节点画布：拖拽、连线、删除
+### 5.3 管线编辑器 (Pipeline Editor) — ✅ 已实现
+- 基于 @xyflow/react (React Flow) 的节点画布：拖拽、连线、删除
 - 左侧面板：可用节点列表（已安装模块的 capabilities + 内置节点）
 - 右侧面板：选中节点的参数编辑
 - 运行时状态着色：灰=等待 / 蓝=运行 / 绿=完成 / 红=失败
 - 保存 / 加载 / 导入 / 导出
 
-### 5.4 任务中心 (Tasks)
+### 5.4 任务中心 (Tasks) — ✅ 已实现
 - 管线任务列表：状态、进度、耗时
 - 任务详情：各节点执行状态 + 日志
 - 输出文件浏览 / 打开所在目录
 
-### 5.5 设置 (Settings)
+### 5.5 模型管理 (Models) — ✅ 已实现
+- 模型列表：按模块分组，显示来源、大小、下载状态
+- 模型下载 / 导入 / 删除
+- 下载进度实时反馈
+
+### 5.6 设置 (Settings) — ✅ 已实现
+- 服务器配置（端口、公开访问）
 - 计算设备策略
 - 端口范围
 - 模型缓存目录（路径选择器）
 - HuggingFace 镜像
 - Python / uv 路径（显示检测结果，缺失时提供安装引导）
-- 语言 / 主题
+- 语言 / 主题（深色/浅色切换）
 
 ---
 
@@ -1017,17 +1036,38 @@ EntryPoint/
 │   │       │   └── nodes/
 │   │       ├── config.rs
 │   │       └── lib.rs
-│   └── ep-ui/                     # egui 前端
-│       └── src/
-│           ├── app.rs
-│           ├── pages/
-│           │   ├── dashboard.rs
-│           │   ├── modules.rs
-│           │   ├── pipeline_editor.rs
-│           │   ├── tasks.rs
-│           │   └── settings.rs
-│           ├── widgets/
-│           └── main.rs
+│   ├── ep-desktop/                # egui 桌面前端
+│   │   └── src/
+│   │       ├── app.rs
+│   │       ├── pages/
+│   │       │   ├── dashboard.rs
+│   │       │   ├── modules.rs
+│   │       │   ├── pipeline_editor.rs
+│   │       │   ├── tasks.rs
+│   │       │   └── settings.rs
+│   │       ├── widgets/
+│   │       └── main.rs
+│   └── ep-webui/                  # WebUI（axum 静态服务 + React 前端）
+│       ├── src/
+│       │   └── lib.rs             # 静态资源嵌入
+│       ├── static/                # 构建产物（vite build 输出）
+│       └── frontend/              # React 前端源码
+│           ├── src/
+│           │   ├── api/           # REST 客户端 + WebSocket 管理器
+│           │   ├── components/    # 布局 + shadcn/ui + 共享业务组件
+│           │   ├── hooks/         # 自定义 hooks（轮询、WS 状态）
+│           │   ├── lib/           # 工具函数 + 常量
+│           │   ├── pages/         # 路由页面（7 个业务页 + 404）
+│           │   ├── store/         # Zustand 状态（主题）
+│           │   ├── App.tsx        # 布局 + 路由
+│           │   └── main.tsx       # 入口
+│           ├── package.json
+│           └── vite.config.ts
+├── scripts/
+│   ├── build.sh                   # 统一构建（cargo + npm）
+│   ├── install-service.sh         # systemd 服务安装
+│   ├── entrypoint.service         # systemd unit 文件
+│   └── start.sh                   # 开发启动脚本
 └── assets/
 ```
 
