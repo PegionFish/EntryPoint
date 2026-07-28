@@ -3,9 +3,11 @@ import { Route, Routes } from 'react-router-dom'
 import { Header } from '@/components/layout/header'
 import { Sidebar } from '@/components/layout/sidebar'
 import { TooltipProvider } from '@/components/ui/tooltip'
+import { Toaster } from '@/components/ui/sonner'
 import { wsManager } from '@/api/ws'
 import { DashboardPage } from '@/pages/dashboard'
 import { ModulesPage } from '@/pages/modules'
+import ModuleDetailPage from '@/pages/module-detail'
 import { PipelinePage } from '@/pages/pipeline'
 import { TasksPage } from '@/pages/tasks'
 import { ModelsPage } from '@/pages/models'
@@ -29,6 +31,7 @@ export default function App() {
             <Routes>
               <Route path="/" element={<DashboardPage />} />
               <Route path="/modules" element={<ModulesPage />} />
+              <Route path="/modules/:id" element={<ModuleDetailPage />} />
               <Route path="/pipeline" element={<PipelinePage />} />
               <Route path="/tasks" element={<TasksPage />} />
               <Route path="/models" element={<ModelsPage />} />
@@ -38,6 +41,7 @@ export default function App() {
           </main>
         </div>
       </div>
+      <Toaster richColors closeButton position="top-right" />
     </TooltipProvider>
   )
 }
