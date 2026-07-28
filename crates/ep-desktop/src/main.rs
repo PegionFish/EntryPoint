@@ -55,12 +55,20 @@ fn main() -> anyhow::Result<()> {
 fn configure_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
-    // Try Windows system CJK fonts in order of preference
+    // Try system CJK fonts in order of preference (Windows + Linux)
     let cjk_font_paths = [
+        // Windows
         "C:\\Windows\\Fonts\\msyh.ttc",   // Microsoft YaHei
         "C:\\Windows\\Fonts\\msyhbd.ttc",  // Microsoft YaHei Bold
         "C:\\Windows\\Fonts\\simsun.ttc",  // SimSun
         "C:\\Windows\\Fonts\\simhei.ttf",  // SimHei
+        // Linux
+        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",
     ];
 
     for path in &cjk_font_paths {

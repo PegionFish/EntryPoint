@@ -1,3 +1,8 @@
+[server]
+host = "0.0.0.0"
+port = 9800
+allow_public = false
+
 [general]
 language = "zh"
 theme = "dark"
@@ -20,7 +25,7 @@ hf_endpoint = "https://huggingface.co"
 default_source = "huggingface"
 max_concurrent_downloads = 2
 # 本地模型缓存搜索路径（按优先级排序），用于发现用户已有的模型文件
-cache_paths = ["D:/AI_Applications"]
+cache_paths = []
 
 [python]
 path = "python"

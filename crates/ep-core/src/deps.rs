@@ -37,12 +37,14 @@ pub struct TorchCudaStatus {
 /// 检测 ffmpeg 是否可用
 ///
 /// 搜索顺序：
-/// 1. `{root}/runtime/bin/ffmpeg.exe`（项目内置）
+/// 1. `{root}/runtime/bin/ffmpeg`（项目内置）
 /// 2. 系统 PATH 中的 ffmpeg
 /// 3. 常见安装路径
 pub fn check_ffmpeg(root: &Path) -> DepStatus {
+    let ffmpeg_name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+
     // 1. 项目内置
-    let bundled = root.join("runtime").join("bin").join("ffmpeg.exe");
+    let bundled = root.join("runtime").join("bin").join(ffmpeg_name);
     if bundled.is_file() {
         let version = get_ffmpeg_version(&bundled);
         return DepStatus {
@@ -74,7 +76,12 @@ pub fn check_ffmpeg(root: &Path) -> DepStatus {
         r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
     ];
     #[cfg(not(windows))]
-    let candidates: [&str; 0] = [];
+    let candidates = [
+        "/usr/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        "/snap/bin/ffmpeg",
+        "/opt/ffmpeg/bin/ffmpeg",
+    ];
 
     for c in &candidates {
         let p = PathBuf::from(c);
@@ -90,8 +97,8 @@ pub fn check_ffmpeg(root: &Path) -> DepStatus {
         }
     }
 
-    // 4. modules/test-ffmpeg/ffmpeg.exe (fallback)
-    let fallback = root.join("modules").join("test-ffmpeg").join("ffmpeg.exe");
+    // 4. modules/test-ffmpeg/ffmpeg (fallback)
+    let fallback = root.join("modules").join("test-ffmpeg").join(ffmpeg_name);
     if fallback.is_file() {
         let version = get_ffmpeg_version(&fallback);
         return DepStatus {
@@ -108,14 +115,21 @@ pub fn check_ffmpeg(root: &Path) -> DepStatus {
         available: false,
         version: None,
         path: None,
-        guidance: Some(
+        guidance: Some(if cfg!(windows) {
             "ffmpeg 未找到。管线中的音频/视频提取节点需要 ffmpeg。\n\
              安装方式（任选其一）：\n\
              1. 下载 portable 版: https://www.gyan.dev/ffmpeg/builds/ → 解压后将 ffmpeg.exe 放入 runtime/bin/\n\
              2. winget install ffmpeg\n\
              3. 从已有项目复制 ffmpeg.exe 到 runtime/bin/"
-                .into(),
-        ),
+                .into()
+        } else {
+            "ffmpeg 未找到。管线中的音频/视频提取节点需要 ffmpeg。\n\
+             安装方式（任选其一）：\n\
+             1. sudo dnf install ffmpeg-free（RHEL/CentOS）\n\
+             2. sudo apt install ffmpeg（Debian/Ubuntu）\n\
+             3. 下载静态构建: https://johnvansickle.com/ffmpeg/ → 解压后将 ffmpeg 放入 runtime/bin/"
+                .into()
+        }),
     }
 }
 
@@ -205,12 +219,12 @@ pub fn check_all_deps(root: &Path, module_ids: &[&str]) -> DepReport {
     let torch_cuda: Vec<TorchCudaStatus> = module_ids
         .iter()
         .filter_map(|id| {
-            let python = root
-                .join("runtime")
-                .join("venvs")
-                .join(id)
-                .join("Scripts")
-                .join("python.exe");
+            let venv_dir = root.join("runtime").join("venvs").join(id);
+            let python = if cfg!(windows) {
+                venv_dir.join("Scripts").join("python.exe")
+            } else {
+                venv_dir.join("bin").join("python")
+            };
             if python.is_file() {
                 Some(check_torch_cuda(id, &python))
             } else {
@@ -226,7 +240,8 @@ pub fn check_all_deps(root: &Path, module_ids: &[&str]) -> DepReport {
 ///
 /// 返回 Some(path) 如果找到，None 如果未找到
 pub fn find_ffmpeg(root: &Path) -> Option<PathBuf> {
-    let bundled = root.join("runtime").join("bin").join("ffmpeg.exe");
+    let ffmpeg_name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+    let bundled = root.join("runtime").join("bin").join(ffmpeg_name);
     if bundled.is_file() {
         return Some(bundled);
     }
@@ -275,8 +290,15 @@ mod tests {
     fn test_check_ffmpeg_not_found() {
         let root = PathBuf::from("/nonexistent/path");
         let status = check_ffmpeg(&root);
-        assert!(!status.available);
-        assert!(status.guidance.is_some());
+        // ffmpeg 可能通过系统 PATH 找到（如已安装），因此不强制 assert !available
+        // 但 bundled 路径一定不存在
+        if !status.available {
+            assert!(status.guidance.is_some());
+        } else {
+            // 系统 PATH 找到了 ffmpeg，path 不应为 /nonexistent 下的路径
+            let p = status.path.unwrap();
+            assert!(!p.starts_with("/nonexistent"));
+        }
     }
 
     #[test]
