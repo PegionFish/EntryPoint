@@ -18,6 +18,8 @@ desktop.ini
 workspace/
 logs/
 *.log
+runtime/bin/
+runtime/ffmpeg.zip
 
 # Config overrides (user-specific)
 config/gpu_assignments.toml
