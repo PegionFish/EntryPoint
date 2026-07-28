@@ -185,7 +185,7 @@ async fn run_server() -> anyhow::Result<()> {
     // 7. Build router with SPA fallback
     let static_dir = "crates/ep-webui/static";
     let app = Router::new()
-        .merge(api::api_router())
+        .nest("/api", api::api_router())
         .merge(ws::ws_router())
         .fallback_service(
             ServeDir::new(static_dir)
