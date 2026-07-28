@@ -142,7 +142,11 @@ Environment=LD_LIBRARY_PATH=/usr/local/cuda/lib64
 
 ---
 
-## 5. 防火墙配置
+## 5. 防火墙与 SELinux 配置
+
+> 💡 运行 `scripts/install-service.sh` 会**自动**完成下述防火墙与 SELinux 配置（幂等，可重复执行）。以下内容用于手动操作或排障。
+
+### 5.1 防火墙（firewalld）
 
 开放 WebUI 端口（默认 9800）：
 
@@ -156,6 +160,38 @@ sudo firewall-cmd --list-ports
 ```
 
 如修改了 `config/app.toml` 中的端口，需对应调整防火墙规则。
+
+### 5.2 SELinux
+
+RHEL 默认 SELinux 为 `Enforcing`。daemon 绑定 9800 端口前，需为该端口添加 SELinux 标签，否则在 systemd 受限域下启动可能被拒绝绑定。
+
+```bash
+# 查看当前 SELinux 状态
+getenforce
+
+# 为 9800/tcp 添加 http_port_t 标签（幂等：已存在则用 -m 修改）
+sudo semanage port -a -t http_port_t -p tcp 9800
+# 若提示已存在不同标签，改用：
+# sudo semanage port -m -t http_port_t -p tcp 9800
+
+# 验证
+sudo semanage port -l | grep 9800
+```
+
+若缺少 `semanage` 命令，先安装：
+
+```bash
+sudo dnf install -y policycoreutils-python-utils
+```
+
+**关于服务域**：`entrypoint.service` 未指定 `SELinuxContext=`，systemd 默认以 `unconfined_service_t` 运行——这对需要派生 Python 模块、ffmpeg 等子进程的应用是合适的（完全受限策略会阻断子进程派生）。配合上面的端口标签即可正常工作。
+
+**排障**：若 systemd 启动后仍被 SELinux 拦截，查看拒绝日志并生成策略：
+
+```bash
+sudo ausearch -m avc -ts recent          # 查看最近的 SELinux 拒绝
+sudo journalctl -u entrypoint -n 50      # 查看服务日志
+```
 
 ---
 
