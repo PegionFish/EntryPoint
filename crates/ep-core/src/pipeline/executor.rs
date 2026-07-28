@@ -447,29 +447,60 @@ async fn execute_builtin_file_output(
     Ok(Artifact::File(dest_path.to_path_buf()))
 }
 
+/// 解析 ffmpeg 可执行文件路径
+///
+/// 优先查找项目根目录下的 `runtime/bin/ffmpeg.exe`（portable 版本），
+/// 通过从当前可执行文件目录逐级向上搜索包含 `runtime/bin/ffmpeg.exe` 的祖先目录。
+/// 若未找到，回退到 PATH 中的 `ffmpeg`。
+pub(crate) fn resolve_ffmpeg_path() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        let mut dir = exe.parent();
+        while let Some(d) = dir {
+            let candidate = d.join("runtime").join("bin").join("ffmpeg.exe");
+            if candidate.exists() {
+                return candidate;
+            }
+            dir = d.parent();
+        }
+    }
+    PathBuf::from("ffmpeg")
+}
+
 /// FFmpeg: 构建并执行 ffmpeg 命令，返回输出文件的 Artifact::File
 async fn execute_builtin_ffmpeg(
     node: &PipelineNode,
     upstream: &[Artifact],
     work_dir: &Path,
 ) -> anyhow::Result<Artifact> {
-    let mut cmd = tokio::process::Command::new("ffmpeg");
+    let ffmpeg_bin = resolve_ffmpeg_path();
+    let mut cmd = tokio::process::Command::new(&ffmpeg_bin);
     cmd.arg("-y"); // overwrite output
 
-    // 添加上游文件作为输入
-    for artifact in upstream {
-        if let Artifact::File(path) = artifact {
-            cmd.arg("-i").arg(path);
+    // 检查 params args 是否已包含 -i（用户自行指定输入源，如 lavfi）
+    let args_vec: Vec<String> = node
+        .params
+        .get("args")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| a.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let args_has_input = args_vec.iter().any(|a| a == "-i");
+
+    // 仅在 args 未指定 -i 时，添加上游文件作为输入
+    if !args_has_input {
+        for artifact in upstream {
+            if let Artifact::File(path) = artifact {
+                cmd.arg("-i").arg(path);
+            }
         }
     }
 
     // 从 params 添加额外参数
-    if let Some(args) = node.params.get("args").and_then(|v| v.as_array()) {
-        for arg in args {
-            if let Some(s) = arg.as_str() {
-                cmd.arg(s);
-            }
-        }
+    for arg in &args_vec {
+        cmd.arg(arg);
     }
 
     // 确定输出路径
