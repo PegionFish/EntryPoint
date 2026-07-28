@@ -3,6 +3,9 @@
 **/*.rs.bk
 Cargo.lock
 
+# Node
+node_modules/
+
 # IDE
 .idea/
 .vscode/

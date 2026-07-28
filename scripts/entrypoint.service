@@ -1,0 +1,19 @@
+[Unit]
+Description=EntryPoint AI Module Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=bob
+WorkingDirectory=/server/EntryPoint
+ExecStart=/server/EntryPoint/target/release/ep-daemon
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=ep_daemon=info,ep_core=info
+Environment=LD_LIBRARY_PATH=/usr/local/cuda/lib64
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=entrypoint
+
+[Install]
+WantedBy=multi-user.target
