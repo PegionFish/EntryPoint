@@ -94,6 +94,7 @@ fn test_model_manager(root: &Path) -> ModelManager {
         hf_endpoint: String::new(),
         default_source: "huggingface".to_string(),
         max_concurrent_downloads: 2,
+        cache_paths: Vec::new(),
     };
     ModelManager::new(&config, root)
 }

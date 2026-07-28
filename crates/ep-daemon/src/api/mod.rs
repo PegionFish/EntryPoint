@@ -1,4 +1,5 @@
 pub mod config;
+pub mod deps;
 pub mod devices;
 pub mod health;
 pub mod models;
@@ -20,4 +21,5 @@ pub fn api_router() -> Router<Arc<AppState>> {
         .merge(config::router())
         .merge(pipelines::router())
         .merge(models::router())
+        .merge(deps::router())
 }
