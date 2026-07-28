@@ -19,6 +19,8 @@ cache_dir = "./models"
 hf_endpoint = "https://huggingface.co"
 default_source = "huggingface"
 max_concurrent_downloads = 2
+# 本地模型缓存搜索路径（按优先级排序），用于发现用户已有的模型文件
+cache_paths = ["D:/AI_Applications"]
 
 [python]
 path = "python"

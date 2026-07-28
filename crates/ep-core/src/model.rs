@@ -3,6 +3,7 @@
 //! 负责模型缓存目录管理、元数据读写、下载命令构建。
 //! 不实际执行下载（只构建命令），实际执行由 ProcessManager / UI 层驱动。
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -12,7 +13,7 @@ use tokio::process::Child;
 use tracing::{debug, info, warn};
 
 use crate::config::ModelsConfig;
-use crate::module::manifest::{ModelDecl, ModelSource};
+use crate::module::manifest::{ModelDecl, ModelSource, ModuleManifest};
 
 // ─── 常量 ────────────────────────────────────────────────────────────────────
 
@@ -55,6 +56,55 @@ pub struct DownloadedModel {
     pub size_bytes: u64,
 }
 
+// ─── ModelStatus ─────────────────────────────────────────────────────────────
+
+/// 模型状态
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelStatus {
+    /// 模型文件完整（目录存在且包含文件）
+    Ready,
+    /// 模型目录不存在
+    Missing,
+    /// 模型目录存在但文件不完整（空目录）
+    Incomplete,
+    /// 在配置的本地缓存路径中找到可导入的模型
+    Importable,
+}
+
+impl std::fmt::Display for ModelStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Ready => "ready",
+            Self::Missing => "missing",
+            Self::Incomplete => "incomplete",
+            Self::Importable => "importable",
+        };
+        write!(f, "{s}")
+    }
+}
+
+// ─── ModelInfo ───────────────────────────────────────────────────────────────
+
+/// 模型详细信息（用于 API 响应和 UI 展示）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelInfo {
+    /// 模型 ID（对应 module.toml 中 [[models]].id）
+    pub model_id: String,
+    /// 模型显示名称
+    pub name: String,
+    /// 相对于 cache_dir 的目标目录
+    pub target_dir: String,
+    /// 当前状态
+    pub status: ModelStatus,
+    /// 目录总大小（字节）
+    pub size_bytes: u64,
+    /// 文件数量
+    pub file_count: usize,
+    /// 如果在本地缓存路径中找到，记录该路径
+    pub local_cache_path: Option<PathBuf>,
+}
+
 // ─── ModelManager ────────────────────────────────────────────────────────────
 
 /// 模型下载管理器
@@ -67,6 +117,8 @@ pub struct ModelManager {
     hf_endpoint: String,
     /// 默认下载源（huggingface / modelscope）
     default_source: String,
+    /// 本地模型缓存搜索路径（按优先级排序）
+    cache_paths: Vec<PathBuf>,
     /// 当前正在执行的下载子进程（用于取消）
     download_child: Option<Child>,
 }
@@ -83,10 +135,24 @@ impl ModelManager {
             root.join(cache_path)
         };
 
+        let cache_paths: Vec<PathBuf> = config
+            .cache_paths
+            .iter()
+            .map(|p| {
+                let pb = Path::new(p);
+                if pb.is_absolute() {
+                    pb.to_path_buf()
+                } else {
+                    root.join(pb)
+                }
+            })
+            .collect();
+
         debug!(
             cache_dir = %cache_dir.display(),
             hf_endpoint = %config.hf_endpoint,
             default_source = %config.default_source,
+            cache_paths = ?cache_paths,
             "ModelManager initialized"
         );
 
@@ -94,6 +160,7 @@ impl ModelManager {
             cache_dir,
             hf_endpoint: config.hf_endpoint.clone(),
             default_source: config.default_source.clone(),
+            cache_paths,
             download_child: None,
         }
     }
@@ -376,6 +443,283 @@ impl ModelManager {
             let _ = child.wait().await;
         }
     }
+
+    // ─── 模型状态检查与管理 ────────────────────────────────────────────────
+
+    /// 检查指定模块所有模型的状态
+    ///
+    /// 返回 model_id → ModelStatus 的映射。
+    /// 检查逻辑：
+    /// 1. cache_dir/target_dir 存在且有文件 → Ready
+    /// 2. cache_dir/target_dir 存在但为空 → Incomplete
+    /// 3. 在 cache_paths 中找到匹配目录 → Importable
+    /// 4. 以上均不满足 → Missing
+    pub fn check_model_status(
+        &self,
+        _module_id: &str,
+        manifest: &ModuleManifest,
+    ) -> HashMap<String, ModelStatus> {
+        let mut statuses = HashMap::new();
+
+        for model in &manifest.models {
+            let status = self.check_single_model_status(&model.target_dir);
+            statuses.insert(model.id.clone(), status);
+        }
+
+        statuses
+    }
+
+    /// 检查单个模型的状态
+    fn check_single_model_status(&self, target_dir: &str) -> ModelStatus {
+        let dir = self.model_dir(target_dir);
+
+        if dir.is_dir() {
+            // 目录存在，检查是否有文件
+            if self.dir_has_files(&dir) {
+                return ModelStatus::Ready;
+            } else {
+                return ModelStatus::Incomplete;
+            }
+        }
+
+        // 目录不存在，搜索本地缓存路径
+        if self.find_in_cache_paths(target_dir).is_some() {
+            return ModelStatus::Importable;
+        }
+
+        ModelStatus::Missing
+    }
+
+    /// 检查目录是否包含至少一个文件（非递归，仅检查直接子条目）
+    fn dir_has_files(&self, dir: &Path) -> bool {
+        match fs::read_dir(dir) {
+            Ok(mut entries) => entries.next().is_some(),
+            Err(_) => false,
+        }
+    }
+
+    /// 在配置的本地缓存路径中搜索匹配的模型目录
+    ///
+    /// 按优先级顺序搜索，返回第一个找到的路径。
+    /// 匹配规则：cache_path 下存在与 target_dir 同名的子目录且包含文件。
+    fn find_in_cache_paths(&self, target_dir: &str) -> Option<PathBuf> {
+        for cache_path in &self.cache_paths {
+            // 直接匹配: cache_path/target_dir
+            let candidate = cache_path.join(target_dir);
+            if candidate.is_dir() && self.dir_has_files(&candidate) {
+                debug!(
+                    target_dir = %target_dir,
+                    found_at = %candidate.display(),
+                    "model found in local cache path"
+                );
+                return Some(candidate);
+            }
+
+            // 模糊匹配: 遍历 cache_path 下的子目录，查找名称包含 target_dir 关键词的目录
+            // 例如 target_dir = "faster-whisper-large-v3"，
+            // 可以匹配 "models--Systran--faster-whisper-large-v3"
+            if let Ok(entries) = fs::read_dir(cache_path) {
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+                    if !entry_path.is_dir() {
+                        continue;
+                    }
+                    if let Some(dir_name) = entry_path.file_name().and_then(|n| n.to_str()) {
+                        if dir_name.contains(target_dir) && self.dir_has_files(&entry_path) {
+                            debug!(
+                                target_dir = %target_dir,
+                                found_at = %entry_path.display(),
+                                "model found via fuzzy match in local cache path"
+                            );
+                            return Some(entry_path);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// 从本地路径导入模型
+    ///
+    /// 将 source_path 下的所有文件异步复制到 cache_dir/target_dir。
+    /// 大文件复制时通过 tracing 日志输出进度。
+    pub async fn import_model(
+        &self,
+        module_id: &str,
+        model_id: &str,
+        source_path: &Path,
+    ) -> Result<()> {
+        // 验证源路径
+        if !source_path.is_dir() {
+            anyhow::bail!(
+                "source path '{}' does not exist or is not a directory",
+                source_path.display()
+            );
+        }
+
+        // 确定目标目录：使用 model_id 作为 target_dir 的基础
+        // 实际 target_dir 需要从 manifest 获取，但这里用 model_id 构建合理路径
+        let target_dir = self.model_dir(model_id);
+
+        info!(
+            module_id = %module_id,
+            model_id = %model_id,
+            source = %source_path.display(),
+            target = %target_dir.display(),
+            "importing model from local path"
+        );
+
+        // 创建目标目录
+        tokio::fs::create_dir_all(&target_dir)
+            .await
+            .with_context(|| format!("failed to create target dir {}", target_dir.display()))?;
+
+        // 递归复制文件
+        let stats = self.copy_dir_recursive(source_path, &target_dir).await?;
+
+        info!(
+            module_id = %module_id,
+            model_id = %model_id,
+            files_copied = stats.0,
+            total_bytes = stats.1,
+            "model import completed"
+        );
+
+        // 写入元数据
+        let meta = ModelMeta {
+            module_id: module_id.to_string(),
+            model_id: model_id.to_string(),
+            source: "local_import".to_string(),
+            repo_id: String::new(),
+            revision: String::new(),
+            downloaded_at: chrono::Utc::now().to_rfc3339(),
+            total_size_bytes: stats.1,
+        };
+        self.write_meta(model_id, &meta)?;
+
+        Ok(())
+    }
+
+    /// 递归复制目录，返回 (文件数, 总字节数)
+    async fn copy_dir_recursive(&self, src: &Path, dst: &Path) -> Result<(usize, u64)> {
+        let mut file_count: usize = 0;
+        let mut total_bytes: u64 = 0;
+
+        let mut entries = tokio::fs::read_dir(src)
+            .await
+            .with_context(|| format!("failed to read dir {}", src.display()))?;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let src_path = entry.path();
+            let file_name = entry.file_name();
+            let dst_path = dst.join(&file_name);
+
+            if src_path.is_dir() {
+                tokio::fs::create_dir_all(&dst_path).await.with_context(|| {
+                    format!("failed to create dir {}", dst_path.display())
+                })?;
+                let (sub_count, sub_bytes) =
+                    Box::pin(self.copy_dir_recursive(&src_path, &dst_path)).await?;
+                file_count += sub_count;
+                total_bytes += sub_bytes;
+            } else {
+                let file_size = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
+
+                debug!(
+                    file = %src_path.display(),
+                    size_bytes = file_size,
+                    "copying file"
+                );
+
+                tokio::fs::copy(&src_path, &dst_path).await.with_context(|| {
+                    format!(
+                        "failed to copy {} -> {}",
+                        src_path.display(),
+                        dst_path.display()
+                    )
+                })?;
+
+                file_count += 1;
+                total_bytes += file_size;
+
+                // 每 10 个文件输出一次进度
+                if file_count % 10 == 0 {
+                    info!(
+                        files_copied = file_count,
+                        total_bytes = total_bytes,
+                        "import progress"
+                    );
+                }
+            }
+        }
+
+        Ok((file_count, total_bytes))
+    }
+
+    /// 获取指定模块所有模型的详细信息
+    pub fn get_model_info(&self, _module_id: &str, manifest: &ModuleManifest) -> Vec<ModelInfo> {
+        manifest
+            .models
+            .iter()
+            .map(|model| {
+                let dir = self.model_dir(&model.target_dir);
+                let status = self.check_single_model_status(&model.target_dir);
+
+                let (size_bytes, file_count) = if dir.is_dir() {
+                    self.dir_stats(&dir)
+                } else {
+                    (0, 0)
+                };
+
+                let local_cache_path = if status == ModelStatus::Importable {
+                    self.find_in_cache_paths(&model.target_dir)
+                } else {
+                    None
+                };
+
+                ModelInfo {
+                    model_id: model.id.clone(),
+                    name: model.name.clone(),
+                    target_dir: model.target_dir.clone(),
+                    status,
+                    size_bytes,
+                    file_count,
+                    local_cache_path,
+                }
+            })
+            .collect()
+    }
+
+    /// 递归统计目录大小和文件数量
+    fn dir_stats(&self, dir: &Path) -> (u64, usize) {
+        let mut total_size: u64 = 0;
+        let mut file_count: usize = 0;
+
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return (0, 0),
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let (sub_size, sub_count) = self.dir_stats(&path);
+                total_size += sub_size;
+                file_count += sub_count;
+            } else if let Ok(metadata) = entry.metadata() {
+                total_size += metadata.len();
+                file_count += 1;
+            }
+        }
+
+        (total_size, file_count)
+    }
+
+    /// 获取配置的本地缓存搜索路径
+    pub fn cache_paths(&self) -> &[PathBuf] {
+        &self.cache_paths
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -391,6 +735,7 @@ mod tests {
             hf_endpoint: String::new(),
             default_source: "huggingface".to_string(),
             max_concurrent_downloads: 2,
+            cache_paths: Vec::new(),
         }
     }
 

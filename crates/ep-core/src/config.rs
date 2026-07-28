@@ -136,6 +136,9 @@ pub struct ModelsConfig {
     pub default_source: String,
     #[serde(default = "default_max_concurrent_downloads")]
     pub max_concurrent_downloads: u32,
+    /// 本地模型缓存搜索路径（按优先级排序），用于发现用户已有的模型文件
+    #[serde(default)]
+    pub cache_paths: Vec<String>,
 }
 
 impl Default for ModelsConfig {
@@ -145,6 +148,7 @@ impl Default for ModelsConfig {
             hf_endpoint: String::new(),
             default_source: default_source(),
             max_concurrent_downloads: 2,
+            cache_paths: Vec::new(),
         }
     }
 }
