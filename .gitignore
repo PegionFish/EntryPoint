@@ -24,5 +24,9 @@ runtime/ffmpeg.zip
 # Fallback binaries (not in git/release)
 modules/test-ffmpeg/
 
+# Build artifacts & model files (user-managed)
+dist/
+models/
+
 # Config overrides (user-specific)
 config/gpu_assignments.toml
