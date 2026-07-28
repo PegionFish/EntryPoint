@@ -21,5 +21,8 @@ logs/
 runtime/bin/
 runtime/ffmpeg.zip
 
+# Fallback binaries (not in git/release)
+modules/test-ffmpeg/
+
 # Config overrides (user-specific)
 config/gpu_assignments.toml

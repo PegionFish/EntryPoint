@@ -90,6 +90,19 @@ pub fn check_ffmpeg(root: &Path) -> DepStatus {
         }
     }
 
+    // 4. modules/test-ffmpeg/ffmpeg.exe (fallback)
+    let fallback = root.join("modules").join("test-ffmpeg").join("ffmpeg.exe");
+    if fallback.is_file() {
+        let version = get_ffmpeg_version(&fallback);
+        return DepStatus {
+            name: "ffmpeg".into(),
+            available: true,
+            version,
+            path: Some(fallback.to_string_lossy().to_string()),
+            guidance: None,
+        };
+    }
+
     DepStatus {
         name: "ffmpeg".into(),
         available: false,

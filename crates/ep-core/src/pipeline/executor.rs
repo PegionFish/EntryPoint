@@ -449,10 +449,12 @@ async fn execute_builtin_file_output(
 
 /// 解析 ffmpeg 可执行文件路径
 ///
-/// 优先查找项目根目录下的 `runtime/bin/ffmpeg.exe`（portable 版本），
-/// 通过从当前可执行文件目录逐级向上搜索包含 `runtime/bin/ffmpeg.exe` 的祖先目录。
-/// 若未找到，回退到 PATH 中的 `ffmpeg`。
+/// 搜索优先级：
+/// 1. `runtime/bin/ffmpeg.exe`（项目内置 portable 版本）
+/// 2. 系统 PATH 中的 `ffmpeg`（用户环境变量）
+/// 3. `modules/test-ffmpeg/ffmpeg.exe`（fallback，不入 git/发包）
 pub(crate) fn resolve_ffmpeg_path() -> PathBuf {
+    // 1. runtime/bin/ffmpeg.exe
     if let Ok(exe) = std::env::current_exe() {
         let mut dir = exe.parent();
         while let Some(d) = dir {
@@ -463,6 +465,33 @@ pub(crate) fn resolve_ffmpeg_path() -> PathBuf {
             dir = d.parent();
         }
     }
+
+    // 2. 系统 PATH
+    let which_cmd = if cfg!(windows) { "where" } else { "which" };
+    if let Ok(output) = std::process::Command::new(which_cmd).arg("ffmpeg").output() {
+        if output.status.success() {
+            if let Some(line) = String::from_utf8_lossy(&output.stdout).lines().next() {
+                let p = PathBuf::from(line.trim());
+                if p.is_file() {
+                    return p;
+                }
+            }
+        }
+    }
+
+    // 3. modules/test-ffmpeg/ffmpeg.exe (fallback)
+    if let Ok(exe) = std::env::current_exe() {
+        let mut dir = exe.parent();
+        while let Some(d) = dir {
+            let candidate = d.join("modules").join("test-ffmpeg").join("ffmpeg.exe");
+            if candidate.exists() {
+                return candidate;
+            }
+            dir = d.parent();
+        }
+    }
+
+    // 最终回退：裸名，让 OS 报错
     PathBuf::from("ffmpeg")
 }
 
