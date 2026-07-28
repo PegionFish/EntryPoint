@@ -3,12 +3,14 @@ mod state;
 mod ws;
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use axum::extract::ConnectInfo;
+use axum::response::IntoResponse;
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::services::ServeDir;
+use tower_http::services::{ServeDir, ServeFile};
 use tracing_subscriber::EnvFilter;
 
 use ep_core::compute::detect_all_devices;
@@ -170,30 +172,78 @@ async fn run_server() -> anyhow::Result<()> {
     // 5. Build AppState (creates broadcast channels internally)
     let state = Arc::new(AppState::new(config, devices, modules, port_manager));
 
-    // 6. Build router
+    // 6. Log public access setting
+    {
+        let cfg = state.config.read().await;
+        if cfg.server.allow_public {
+            tracing::warn!("public access ENABLED — no built-in auth/encryption, use at your own risk");
+        } else {
+            tracing::info!("public access blocked — only private/loopback IPs allowed (set allow_public=true to change)");
+        }
+    }
+
+    // 7. Build router with SPA fallback
+    let static_dir = "crates/ep-webui/static";
     let app = Router::new()
         .merge(api::api_router())
         .merge(ws::ws_router())
-        .fallback_service(ServeDir::new("crates/ep-webui/static"))
+        .fallback_service(
+            ServeDir::new(static_dir)
+                .not_found_service(ServeFile::new(format!("{static_dir}/index.html"))),
+        )
+        .layer(axum::middleware::from_fn_with_state(state.clone(), ip_filter))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)
                 .allow_headers(Any),
         )
-        .with_state(state);
+        .with_state(state.clone());
 
-    // 7. Start server
-    let addr = SocketAddr::from(([0, 0, 0, 0], 9800));
+    // 8. Start server
+    let cfg = state.config.read().await;
+    let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port)
+        .parse()
+        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 9800)));
+    drop(cfg);
     tracing::info!("Listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app.into_make_service())
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     tracing::info!("Daemon shut down gracefully");
     Ok(())
+}
+
+/// 判断 IP 是否为私有/本地地址（RFC 1918 + loopback + link-local）
+fn is_private_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local(),
+    }
+}
+
+/// IP 过滤中间件：allow_public = false 时拒绝非私有 IP
+async fn ip_filter(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let allow_public = {
+        let config = state.config.read().await;
+        config.server.allow_public
+    };
+    if !allow_public && !is_private_ip(&addr.ip()) {
+        tracing::warn!(ip = %addr.ip(), "blocked public access attempt");
+        return axum::http::StatusCode::FORBIDDEN.into_response();
+    }
+    next.run(request).await
 }
 
 async fn shutdown_signal() {

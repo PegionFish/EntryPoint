@@ -381,7 +381,7 @@ mod tests {
     #[tokio::test]
     async fn test_start_and_stop_module() {
         let mut pm = ProcessManager::new();
-        let manifest = test_manifest(Some("cmd /C echo hello"));
+        let manifest = test_manifest(Some("echo hello"));
         let device = DeviceId::Cuda(0);
         let env = HashMap::new();
 
@@ -410,7 +410,7 @@ mod tests {
     #[tokio::test]
     async fn test_start_already_running() {
         let mut pm = ProcessManager::new();
-        let manifest = test_manifest(Some("cmd /C timeout /t 30"));
+        let manifest = test_manifest(Some("sleep 30"));
         let device = DeviceId::Cpu;
         let env = HashMap::new();
 
@@ -440,7 +440,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_running() {
         let mut pm = ProcessManager::new();
-        let manifest = test_manifest(Some("cmd /C timeout /t 30"));
+        let manifest = test_manifest(Some("sleep 30"));
         let env = HashMap::new();
 
         pm.start_module("mod-a", &manifest, DeviceId::Cpu, 18000, env.clone())
@@ -462,7 +462,7 @@ mod tests {
     #[tokio::test]
     async fn test_append_log_ring_buffer() {
         let mut pm = ProcessManager::new();
-        let manifest = test_manifest(Some("cmd /C echo hello"));
+        let manifest = test_manifest(Some("echo hello"));
         pm.start_module("mod-a", &manifest, DeviceId::Cpu, 18000, HashMap::new())
             .await
             .unwrap();
@@ -494,7 +494,7 @@ mod tests {
     async fn test_spawn_and_kill() {
         let mut pm = ProcessManager::new();
         // Use a long-running command
-        let manifest = test_manifest(Some("cmd /C timeout /t 60"));
+        let manifest = test_manifest(Some("sleep 60"));
         let env = HashMap::new();
 
         pm.start_module("long-runner", &manifest, DeviceId::Cpu, 19000, env)
@@ -516,7 +516,7 @@ mod tests {
     async fn test_stdout_capture() {
         // Verify we can spawn a command that produces output and it doesn't deadlock
         let mut pm = ProcessManager::new();
-        let manifest = test_manifest(Some("cmd /C echo hello_from_test"));
+        let manifest = test_manifest(Some("echo hello_from_test"));
         let env = HashMap::new();
 
         pm.start_module("echo-mod", &manifest, DeviceId::Cpu, 19001, env)
@@ -545,7 +545,7 @@ mod tests {
     async fn test_monitor_detects_exit() {
         let mut pm = ProcessManager::new();
         // Start a short-lived process
-        let manifest = test_manifest(Some("cmd /C echo done"));
+        let manifest = test_manifest(Some("echo done"));
         let env = HashMap::new();
 
         pm.start_module("short-lived", &manifest, DeviceId::Cpu, 19002, env)
@@ -570,7 +570,7 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_modules() {
         let mut pm = ProcessManager::new();
-        let manifest = test_manifest(Some("cmd /C timeout /t 30"));
+        let manifest = test_manifest(Some("sleep 30"));
         let env = HashMap::new();
 
         pm.start_module("mod-x", &manifest, DeviceId::Cpu, 19010, env.clone())
@@ -596,7 +596,7 @@ mod tests {
     #[tokio::test]
     async fn test_stop_cleans_up() {
         let mut pm = ProcessManager::new();
-        let manifest = test_manifest(Some("cmd /C timeout /t 60"));
+        let manifest = test_manifest(Some("sleep 60"));
         let env = HashMap::new();
 
         pm.start_module("cleanup-mod", &manifest, DeviceId::Cpu, 19020, env)

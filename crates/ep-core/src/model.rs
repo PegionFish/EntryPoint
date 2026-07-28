@@ -644,7 +644,7 @@ impl ModelManager {
                 total_bytes += file_size;
 
                 // 每 10 个文件输出一次进度
-                if file_count % 10 == 0 {
+                if file_count.is_multiple_of(10) {
                     info!(
                         files_copied = file_count,
                         total_bytes = total_bytes,
@@ -809,15 +809,23 @@ mod tests {
 
     #[test]
     fn test_model_dir_absolute() {
-        let root = Path::new("G:/EntryPoint");
-        let config = test_config("D:/AI_Models");
-        let mgr = ModelManager::new(&config, root);
-
-        // 绝对路径不基于 root
-        assert_eq!(
-            mgr.model_dir("some-model"),
-            PathBuf::from("D:/AI_Models/some-model")
-        );
+        if cfg!(windows) {
+            let root = Path::new("G:/EntryPoint");
+            let config = test_config("D:/AI_Models");
+            let mgr = ModelManager::new(&config, root);
+            assert_eq!(
+                mgr.model_dir("some-model"),
+                PathBuf::from("D:/AI_Models/some-model")
+            );
+        } else {
+            let root = Path::new("/opt/entrypoint");
+            let config = test_config("/opt/models");
+            let mgr = ModelManager::new(&config, root);
+            assert_eq!(
+                mgr.model_dir("some-model"),
+                PathBuf::from("/opt/models/some-model")
+            );
+        }
     }
 
     // ── is_model_present ────────────────────────────────────────────────

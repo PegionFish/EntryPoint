@@ -206,11 +206,33 @@ impl Default for UiConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    #[serde(default = "default_host")]
+    pub host: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub allow_public: bool,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: default_host(),
+            port: default_port(),
+            allow_public: false,
+        }
+    }
+}
+
 // ─── AppConfig ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[derive(Default)]
 pub struct AppConfig {
+    #[serde(default)]
+    pub server: ServerConfig,
     #[serde(default)]
     pub general: GeneralConfig,
     #[serde(default)]
@@ -295,6 +317,12 @@ impl AppConfig {
 
 // ─── Default value functions ────────────────────────────────────────────────
 
+fn default_host() -> String {
+    "0.0.0.0".into()
+}
+fn default_port() -> u16 {
+    9800
+}
 fn default_language() -> String {
     "zh-CN".into()
 }
@@ -441,23 +469,42 @@ disabled_backends = ["directml", "rocm"]
     #[test]
     fn resolve_paths() {
         let config = AppConfig::default();
-        let root = Path::new("G:/EntryPoint");
 
-        assert_eq!(
-            config.resolve_model_cache_dir(root),
-            PathBuf::from("G:/EntryPoint/models")
-        );
-        assert_eq!(
-            config.resolve_workspace_dir(root),
-            PathBuf::from("G:/EntryPoint/workspace")
-        );
+        if cfg!(windows) {
+            let root = Path::new("G:/EntryPoint");
+            assert_eq!(
+                config.resolve_model_cache_dir(root),
+                PathBuf::from("G:/EntryPoint/models")
+            );
+            assert_eq!(
+                config.resolve_workspace_dir(root),
+                PathBuf::from("G:/EntryPoint/workspace")
+            );
 
-        let mut config2 = AppConfig::default();
-        config2.models.cache_dir = "D:/AI_Models".into();
-        assert_eq!(
-            config2.resolve_model_cache_dir(root),
-            PathBuf::from("D:/AI_Models")
-        );
+            let mut config2 = AppConfig::default();
+            config2.models.cache_dir = "D:/AI_Models".into();
+            assert_eq!(
+                config2.resolve_model_cache_dir(root),
+                PathBuf::from("D:/AI_Models")
+            );
+        } else {
+            let root = Path::new("/opt/entrypoint");
+            assert_eq!(
+                config.resolve_model_cache_dir(root),
+                PathBuf::from("/opt/entrypoint/models")
+            );
+            assert_eq!(
+                config.resolve_workspace_dir(root),
+                PathBuf::from("/opt/entrypoint/workspace")
+            );
+
+            let mut config2 = AppConfig::default();
+            config2.models.cache_dir = "/opt/models".into();
+            assert_eq!(
+                config2.resolve_model_cache_dir(root),
+                PathBuf::from("/opt/models")
+            );
+        }
     }
 
     #[test]

@@ -450,15 +450,17 @@ async fn execute_builtin_file_output(
 /// 解析 ffmpeg 可执行文件路径
 ///
 /// 搜索优先级：
-/// 1. `runtime/bin/ffmpeg.exe`（项目内置 portable 版本）
+/// 1. `runtime/bin/ffmpeg`（项目内置 portable 版本）
 /// 2. 系统 PATH 中的 `ffmpeg`（用户环境变量）
-/// 3. `modules/test-ffmpeg/ffmpeg.exe`（fallback，不入 git/发包）
+/// 3. `modules/test-ffmpeg/ffmpeg`（fallback，不入 git/发包）
 pub(crate) fn resolve_ffmpeg_path() -> PathBuf {
-    // 1. runtime/bin/ffmpeg.exe
+    let ffmpeg_name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+
+    // 1. runtime/bin/ffmpeg
     if let Ok(exe) = std::env::current_exe() {
         let mut dir = exe.parent();
         while let Some(d) = dir {
-            let candidate = d.join("runtime").join("bin").join("ffmpeg.exe");
+            let candidate = d.join("runtime").join("bin").join(ffmpeg_name);
             if candidate.exists() {
                 return candidate;
             }
@@ -479,11 +481,11 @@ pub(crate) fn resolve_ffmpeg_path() -> PathBuf {
         }
     }
 
-    // 3. modules/test-ffmpeg/ffmpeg.exe (fallback)
+    // 3. modules/test-ffmpeg/ffmpeg (fallback)
     if let Ok(exe) = std::env::current_exe() {
         let mut dir = exe.parent();
         while let Some(d) = dir {
-            let candidate = d.join("modules").join("test-ffmpeg").join("ffmpeg.exe");
+            let candidate = d.join("modules").join("test-ffmpeg").join(ffmpeg_name);
             if candidate.exists() {
                 return candidate;
             }
