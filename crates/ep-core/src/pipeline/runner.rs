@@ -203,9 +203,10 @@ mod tests {
     use crate::pipeline::dag::Pipeline;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// 检查 ffmpeg 是否可用
+    /// 检查 ffmpeg 是否可用（优先使用 portable 版本）
     fn ffmpeg_available() -> bool {
-        std::process::Command::new("ffmpeg")
+        let ffmpeg = crate::pipeline::executor::resolve_ffmpeg_path();
+        std::process::Command::new(&ffmpeg)
             .arg("-version")
             .output()
             .is_ok()
