@@ -196,6 +196,30 @@ async fn background_loop(
                         port_manager.release(&module_id);
                         let _ = tx.send(AppMsg::ModuleStopped(module_id));
                     }
+                    Some(AppCmd::DownloadModel(module_id, model_id)) => {
+                        let _ = tx.send(AppMsg::Error(format!(
+                            "模型下载功能待集成: {module_id}/{model_id}"
+                        )));
+                    }
+                    Some(AppCmd::DeleteModel(target_dir)) => {
+                        let _ = tx.send(AppMsg::Error(format!(
+                            "模型删除功能待集成: {target_dir}"
+                        )));
+                    }
+                    Some(AppCmd::ImportModel(target_dir, source)) => {
+                        let _ = tx.send(AppMsg::Error(format!(
+                            "模型导入功能待集成: {target_dir} <- {}",
+                            source.display()
+                        )));
+                    }
+                    Some(AppCmd::RefreshModels) => {
+                        // TODO: 调用 ModelManager::list_all_models 并发送 ModelsRefreshed
+                    }
+                    Some(AppCmd::RefreshDeps) => {
+                        let root = std::env::current_dir().unwrap_or_default();
+                        let report = ep_core::deps::DepReport::check_all(&root);
+                        let _ = tx.send(AppMsg::DepReportRefreshed(report));
+                    }
                     Some(AppCmd::Shutdown) => break,
                     None => break,
                 }
