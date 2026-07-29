@@ -1,12 +1,16 @@
 //! 进程管理器 — 管理模块服务实例的生命周期（启动/停止/状态/日志）
 
 use std::collections::{HashMap, VecDeque};
+use std::time::Duration;
 
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use crate::health::{check_health, HealthStatus};
 use crate::module::manifest::ModuleManifest;
 use crate::types::{DeviceId, ServiceStatus};
 
@@ -26,6 +30,12 @@ pub struct ServiceInstance {
     pub log_buffer: VecDeque<String>,
     /// 实际子进程句柄
     pub child: Option<Child>,
+    /// 日志接收端：reader task 通过此 channel 回传 stdout/stderr 行
+    log_rx: Option<mpsc::UnboundedReceiver<String>>,
+    /// 健康检查端点（如 "/health"）
+    health_endpoint: Option<String>,
+    /// 健康检查超时（秒）
+    ready_timeout_secs: u32,
 }
 
 impl ServiceInstance {
@@ -38,6 +48,9 @@ impl ServiceInstance {
             started_at: None,
             log_buffer: VecDeque::with_capacity(MAX_LOG_LINES),
             child: None,
+            log_rx: None,
+            health_endpoint: None,
+            ready_timeout_secs: 30,
         }
     }
 
@@ -103,6 +116,21 @@ impl ProcessManager {
             }
         }
 
+        // M1: 注入平台自适应的 venv python 路径
+        // 模块 TOML 可用 {venv_python} 替代硬编码的 bin/python
+        if let Some(root) = vars.get("ROOT").or_else(|| vars.get("root")).cloned() {
+            let venv_dir = std::path::Path::new(&root)
+                .join("runtime")
+                .join("venvs")
+                .join(module_id);
+            let python = if cfg!(windows) {
+                venv_dir.join("Scripts").join("python.exe")
+            } else {
+                venv_dir.join("bin").join("python")
+            };
+            vars.insert("venv_python".to_string(), python.to_string_lossy().to_string());
+        }
+
         let command = Self::build_start_command(manifest, &vars);
         info!(module_id, %command, "built start command");
 
@@ -138,11 +166,34 @@ impl ProcessManager {
         let pid = child.id();
         debug!(module_id, ?pid, "spawned child process");
 
-        // Drop stdout/stderr handles to prevent the child from blocking on full pipe buffers.
-        // In a production system, these would be piped to a background reader task that
-        // appends lines to instance.log_buffer via a shared channel.
-        child.stdout.take();
-        child.stderr.take();
+        // H1: 捕获 stdout/stderr 到日志缓冲区（通过 channel 回传）
+        let (log_tx, log_rx) = mpsc::unbounded_channel::<String>();
+
+        if let Some(stdout) = child.stdout.take() {
+            let tx = log_tx.clone();
+            tokio::spawn(async move {
+                let reader = BufReader::new(stdout);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        if let Some(stderr) = child.stderr.take() {
+            let tx = log_tx.clone();
+            tokio::spawn(async move {
+                let reader = BufReader::new(stderr);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if tx.send(format!("[stderr] {line}")).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
 
         // Store the instance
         let instance = self
@@ -155,6 +206,9 @@ impl ProcessManager {
         instance.port = Some(port);
         instance.started_at = Some(Utc::now());
         instance.child = Some(child);
+        instance.log_rx = Some(log_rx);
+        instance.health_endpoint = manifest.interface.health_endpoint.clone();
+        instance.ready_timeout_secs = manifest.interface.ready_timeout_secs.unwrap_or(30);
 
         Ok(())
     }
@@ -179,15 +233,20 @@ impl ProcessManager {
         Ok(())
     }
 
-    /// 检查子进程是否意外退出，更新状态为 Error。
-    pub fn monitor_process(&mut self, module_id: &str) -> Result<()> {
+    /// 检查子进程是否意外退出；对 Starting 状态的实例执行健康检查轮询。
+    ///
+    /// H2: Starting → Running 转换现在依赖 /health 端点返回 200，
+    /// 而非仅检查进程是否存活。
+    pub async fn monitor_process(&mut self, module_id: &str) -> Result<()> {
+        // 先轮询日志 channel，将新行写入 log_buffer
+        self.poll_logs(module_id);
+
         let instance = self
             .instances
             .get_mut(module_id)
             .ok_or_else(|| anyhow::anyhow!("module '{}' not found", module_id))?;
 
         if let Some(ref mut child) = instance.child {
-            // try_wait returns Ok(Some(status)) if exited, Ok(None) if still running
             match child.try_wait() {
                 Ok(Some(status)) => {
                     warn!(module_id, ?status, "child process exited unexpectedly");
@@ -198,9 +257,43 @@ impl ProcessManager {
                     instance.child = None;
                 }
                 Ok(None) => {
-                    // still running
+                    // 进程仍在运行
                     if instance.status == ServiceStatus::Starting {
-                        instance.status = ServiceStatus::Running;
+                        // H2: 执行健康检查
+                        if let Some(port) = instance.port {
+                            let endpoint = instance
+                                .health_endpoint
+                                .clone()
+                                .unwrap_or_else(|| "/health".to_string());
+                            let timeout = Duration::from_secs(1); // 单次探测超时
+                            match check_health(port, &endpoint, timeout).await {
+                                HealthStatus::Healthy => {
+                                    info!(module_id, "health check passed → Running");
+                                    instance.status = ServiceStatus::Running;
+                                }
+                                _ => {
+                                    // 尚未就绪，检查是否超过总超时
+                                    let elapsed = instance
+                                        .started_at
+                                        .map(|t| Utc::now().signed_duration_since(t))
+                                        .unwrap_or_default();
+                                    let timeout_secs = instance.ready_timeout_secs as i64;
+                                    if elapsed.num_seconds() > timeout_secs {
+                                        warn!(
+                                            module_id,
+                                            elapsed_secs = elapsed.num_seconds(),
+                                            timeout_secs,
+                                            "health check timeout"
+                                        );
+                                        instance.status = ServiceStatus::Error(format!(
+                                            "health check timed out after {}s",
+                                            timeout_secs
+                                        ));
+                                    }
+                                    // 否则保持 Starting，下次轮询再试
+                                }
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -212,6 +305,20 @@ impl ProcessManager {
         }
 
         Ok(())
+    }
+
+    /// 从日志 channel 中取出所有待处理行，写入 log_buffer 环形缓冲区
+    pub fn poll_logs(&mut self, module_id: &str) {
+        if let Some(instance) = self.instances.get_mut(module_id) {
+            if let Some(rx) = instance.log_rx.as_mut() {
+                while let Ok(line) = rx.try_recv() {
+                    if instance.log_buffer.len() >= MAX_LOG_LINES {
+                        instance.log_buffer.pop_front();
+                    }
+                    instance.log_buffer.push_back(line);
+                }
+            }
+        }
     }
 
     /// 查询模块当前状态
@@ -527,7 +634,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         // Monitor should detect it exited
-        pm.monitor_process("echo-mod").unwrap();
+        pm.monitor_process("echo-mod").await.unwrap();
         let status = pm.get_status("echo-mod").unwrap();
         // Process should have exited (either Error with exit status or still Starting depending on timing)
         // The key is it doesn't hang
@@ -556,7 +663,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         // Monitor should detect exit
-        pm.monitor_process("short-lived").unwrap();
+        pm.monitor_process("short-lived").await.unwrap();
         let status = pm.get_status("short-lived").unwrap();
         // Should be Error (exited) or still Starting->Running transition
         // Since echo exits fast, it should be Error

@@ -346,7 +346,7 @@ fn unique_categories(modules: &[ModuleEntry]) -> Vec<ModuleCategory> {
     let mut cats = Vec::new();
     for m in modules {
         if !cats.contains(&m.category) {
-            cats.push(m.category);
+            cats.push(m.category.clone());
         }
     }
     cats
@@ -386,6 +386,7 @@ fn category_label(c: &ModuleCategory) -> String {
         ModuleCategory::Video => "视频处理".into(),
         ModuleCategory::Face => "人脸识别".into(),
         ModuleCategory::Custom => "自定义".into(),
+        ModuleCategory::Other(s) => s.clone(),
     }
 }
 

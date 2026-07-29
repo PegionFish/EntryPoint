@@ -106,8 +106,10 @@ pub struct ComputeDevice {
 // ─── 模块分类 ────────────────────────────────────────────────────────────────
 
 /// 模块功能类别
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+///
+/// 已知类别有专用变体，未知类别通过 `Other(String)` 承载，
+/// 第三方模块无需修改 Rust 代码即可引入新类别。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ModuleCategory {
     Asr,
     Tts,
@@ -118,6 +120,8 @@ pub enum ModuleCategory {
     Video,
     Face,
     Custom,
+    /// 第三方/未来新增类别（manifest 中的原始字符串）
+    Other(String),
 }
 
 impl fmt::Display for ModuleCategory {
@@ -132,8 +136,45 @@ impl fmt::Display for ModuleCategory {
             Self::Video => "video",
             Self::Face => "face",
             Self::Custom => "custom",
+            Self::Other(s) => s.as_str(),
         };
         write!(f, "{s}")
+    }
+}
+
+impl From<&str> for ModuleCategory {
+    fn from(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "asr" => Self::Asr,
+            "tts" => Self::Tts,
+            "denoise" => Self::Denoise,
+            "ocr" => Self::Ocr,
+            "image" => Self::Image,
+            "translate" => Self::Translate,
+            "video" => Self::Video,
+            "face" => Self::Face,
+            "custom" => Self::Custom,
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
+impl Serialize for ModuleCategory {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for ModuleCategory {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(Self::from(s.as_str()))
     }
 }
 

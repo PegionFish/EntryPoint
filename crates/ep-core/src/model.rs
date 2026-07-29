@@ -299,13 +299,45 @@ impl ModelManager {
                 )
             }
             ModelSource::Url => {
-                // URL 直链下载由上层使用 reqwest 实现，此处返回占位命令
-                // TODO: 实现 URL 直链下载（reqwest 流式下载 + 进度回调）
                 let url = model.url.as_deref().unwrap_or_default();
-                format!(
-                    "import sys; print('URL download not yet implemented: {}', file=sys.stderr); sys.exit(1)",
-                    url
-                )
+
+                if url == "auto" {
+                    // 模块自行管理模型下载（如 PaddleOCR 首次运行时自动下载）
+                    // 生成一个空操作命令，标记为已就绪
+                    format!(
+                        "import os; os.makedirs('{}', exist_ok=True); print('auto-download model: skipped (managed by module)')",
+                        local_dir_str
+                    )
+                } else if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
+                    // 下载 .tar.gz 并解压到目标目录
+                    format!(
+                        "import urllib.request, tarfile, os, sys; \
+                         os.makedirs('{dir}', exist_ok=True); \
+                         tmp = os.path.join('{dir}', '_download.tar.gz'); \
+                         print('Downloading {url} ...'); \
+                         urllib.request.urlretrieve('{url}', tmp); \
+                         print('Extracting...'); \
+                         t = tarfile.open(tmp); t.extractall('{dir}'); t.close(); \
+                         os.remove(tmp); \
+                         print('Done.')",
+                        dir = local_dir_str,
+                        url = url
+                    )
+                } else {
+                    // 单文件下载（.onnx 等）
+                    let file_name = url.rsplit('/').next().unwrap_or("model.bin");
+                    format!(
+                        "import urllib.request, os; \
+                         os.makedirs('{dir}', exist_ok=True); \
+                         dst = os.path.join('{dir}', '{fname}'); \
+                         print('Downloading {url} ...'); \
+                         urllib.request.urlretrieve('{url}', dst); \
+                         print('Done.')",
+                        dir = local_dir_str,
+                        fname = file_name,
+                        url = url
+                    )
+                }
             }
         };
 
