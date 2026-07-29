@@ -4,13 +4,14 @@ EntryPoint是一款AI创意/内容处理工具管控平台，能够统一调度�
 
 ## 特性
 
-- 🖥️ 原生桌面 GUI（egui + Rust）
+- 🖥️ 原生桌面 GUI（egui + Rust）— 模型管理、可视化管线编辑器、深色/浅色主题
 - 🌐 WebUI 管理界面（React + TypeScript）— 浏览器远程管控
 - 🎮 多 GPU 调度 — 不同模型跑在不同显卡上
-- 🔧 服务生命周期管理 — 启动/停止/监控/日志
+- 🔧 服务生命周期管理 — 启动/停止/监控/日志捕获/健康检查
 - 🔗 DAG 管线引擎 — 视频→降噪→ASR→翻译→SRT 一键完成
-- 📦 模型管理 — 独立配置/下载/更新
+- 📦 模型管理 — 下载/导入/手动复制，HuggingFace/ModelScope/URL 三源支持
 - 🐧 Linux 服务器部署 — systemd 服务 + 防火墙配置
+- 📦 Arch Linux 打包 — PKGBUILD + .desktop 启动器
 
 ## 文档
 
@@ -119,6 +120,29 @@ journalctl -u entrypoint -n 100
 
 详细部署文档见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
 
+## 桌面端构建
+
+```bash
+./scripts/build-desktop.sh
+```
+
+产物：`target/release/entrypoint`（egui 原生窗口应用）
+
+功能：模型管理（下载/导入/手动复制）、可视化管线编辑器（节点画布+贝塞尔连线）、仪表盘（统计卡片+依赖检测）、任务中心、深色/浅色主题切换、Toast 通知。
+
+## Arch Linux 打包
+
+打包文件位于 `packaging/` 目录：
+
+```bash
+cd packaging
+makepkg -si
+```
+
+包含：PKGBUILD、entrypoint.desktop（桌面启动器）、entrypoint.service（systemd 服务）、entrypoint.install（安装钩子）。
+
+> 注：`makepkg` 需在 Arch Linux 环境执行。RHEL/Fedora 上仅提供打包定义。
+
 ## 状态
 
-✅ 核心功能已完成，WebUI 已实现
+✅ 核心功能已完成，WebUI + 桌面 GUI 反向移植已实现，E2E 全流程测试通过

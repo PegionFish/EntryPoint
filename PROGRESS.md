@@ -123,15 +123,74 @@
 
 ---
 
+## 桌面 GUI 反向移植 + 架构优化（2026-07-30）
+
+### Phase 1 — ep-core 架构修复 ✅
+#### 完成
+- [x] H1 日志捕获：spawn stdout/stderr reader task → channel → log_buffer（原：丢弃管道句柄）
+- [x] H2 健康检查：monitor_process 轮询 /health 端点，Starting→Running 依赖 200 响应
+- [x] H3 URL 模型下载：Python urllib 实现（tar.gz 解压 + 单文件 + auto 占位）
+- [x] M1 平台路径：注入 {venv_python} 变量（Windows: Scripts/python.exe, Linux: bin/python）
+- [x] M2 类别扩展：ModuleCategory::Other(String) 支持第三方类别无需重编译
+#### 验证
+- cargo test: 全部通过
+- cargo clippy: 零警告
+#### Git
+- commit: `5e7e370` — "feat(core): implement log capture, health check polling, URL model download, extensible ModuleCategory, platform-adaptive venv python"
+
+### Phase 2-4 — 桌面 GUI 页面 + 集成 ✅
+#### 完成
+- [x] 模型管理页（pages/models.rs）：按模块分组、下载/导入/删除、状态徽章、大小格式化
+- [x] 可视化管线编辑器（pages/pipeline_editor.rs 重写）：egui Painter 节点画布、贝塞尔连线、拖拽/缩放
+- [x] 仪表盘增强（pages/dashboard.rs）：统计卡片 + 依赖检测报告区
+- [x] 任务中心增强（pages/tasks.rs）：管线任务列表 + 节点详情展开
+- [x] 主题系统（theme.rs）：深色/浅色 Visuals，DESIGN_SYSTEM.md 色板映射
+- [x] Toast 通知（toast.rs）：右下角弹出、3 秒自动消失、淡出动画
+- [x] app.rs 集成：Models 页面、Toast、主题切换、新 AppCmd/AppMsg 变体
+- [x] main.rs：DownloadModel/DeleteModel/ImportModel/RefreshDeps 命令处理
+#### 验证
+- cargo check: ✅
+- cargo clippy: 零警告
+#### Git
+- commit: `daf24c5` — "feat(desktop): add models page, visual pipeline editor, enhanced dashboard/tasks, theme + toast"
+
+### Arch Linux 打包 ✅
+#### 完成
+- [x] packaging/PKGBUILD：cargo release + WebUI 前端构建 + systemd 服务
+- [x] packaging/entrypoint.desktop：freedesktop 启动器
+- [x] packaging/entrypoint.install：post-install/upgrade/remove 钩子
+- [x] packaging/entrypoint.service：systemd 单元（安全加固）
+- [x] scripts/build-desktop.sh：一键 release 构建脚本
+#### Git
+- commit: `6742410` — "feat(pkg): Arch Linux PKGBUILD + packaging infrastructure + build-desktop.sh"
+
+### E2E 全流程测试 ✅
+#### 测试流程
+1. 从 /server/samba/Media 提取 10s FLAC → WAV 测试音频
+2. 重建 faster-whisper Linux venv（uv venv + uv pip install）
+3. 修复 adapter.py Python 3.9 兼容性（PEP 604 → typing.Optional/Union）
+4. 修复 compute type 回退（float16 → int8，Tesla P4 不支持 FP16）
+5. Daemon 启动 → 模块发现（5 模块）→ 模块启动 → 健康检查通过 → ASR 推理完成
+#### 结果
+- 推理状态: completed
+- 耗时: 45.4s（CPU, large-v3 模型）
+- 测试音频为 BGM 纯音乐，无语音内容是预期结果
+#### Git
+- commit: `f3371c3` — "fix(module): Python 3.9 compatibility + compute type fallback for faster-whisper adapter"
+
+---
+
 ## 最终统计
 
 | 指标 | 值 |
 |---|---|
 | Rust 测试数 | 134 (111 unit + 13 integration + 7 daemon + 3 linux) |
 | Clippy warnings | 0 |
-| Rust 源文件数 | ~50 .rs files |
+| Rust 源文件数 | ~60 .rs files |
 | 前端源文件数 | 57 (.ts/.tsx) |
 | 前端代码行数 | ~8200 行 |
+| 桌面端代码行数 | ~2800 行 (含反向移植) |
 | Crate 数 | 4 (ep-core, ep-daemon, ep-desktop, ep-webui) |
 | Release 构建时间 | ~3m 34s (含前端) |
-| Git commits | 14+ |
+| Git commits | 20+ |
+| E2E 测试 | ✅ 全流程通过 (ASR 推理) |
