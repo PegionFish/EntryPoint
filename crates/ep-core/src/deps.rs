@@ -2,13 +2,13 @@
 //!
 //! 不自动安装任何依赖，仅提供检测结果和用户引导信息。
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, warn};
 
 /// 单个依赖的检测结果
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DepStatus {
     pub name: String,
     pub available: bool,
@@ -18,20 +18,65 @@ pub struct DepStatus {
 }
 
 /// 所有外部依赖的检测结果
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DepReport {
     pub ffmpeg: DepStatus,
     pub torch_cuda: Vec<TorchCudaStatus>,
 }
 
 /// 单个 venv 的 torch CUDA 状态
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TorchCudaStatus {
     pub module_id: String,
     pub venv_path: String,
     pub torch_version: Option<String>,
     pub cuda_available: bool,
     pub guidance: Option<String>,
+}
+
+impl DepReport {
+    /// 便捷方法：聚合 ffmpeg + 所有模块 venv 的 torch CUDA 检测
+    ///
+    /// 自动扫描 `runtime/venvs/` 下的所有模块 venv 目录。
+    pub fn check_all(root: &Path) -> Self {
+        let ffmpeg = check_ffmpeg(root);
+
+        // 扫描 runtime/venvs/ 下的所有子目录作为模块 ID
+        let venvs_dir = root.join("runtime").join("venvs");
+        let module_ids: Vec<String> = match std::fs::read_dir(&venvs_dir) {
+            Ok(entries) => entries
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| e.file_name().to_str().map(String::from))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+
+        let torch_cuda: Vec<TorchCudaStatus> = module_ids
+            .iter()
+            .filter_map(|id| {
+                let venv_dir = venvs_dir.join(id);
+                let python = if cfg!(windows) {
+                    venv_dir.join("Scripts").join("python.exe")
+                } else {
+                    venv_dir.join("bin").join("python")
+                };
+                if python.is_file() {
+                    Some(check_torch_cuda(id, &python))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        debug!(
+            ffmpeg_available = ffmpeg.available,
+            torch_modules = torch_cuda.len(),
+            "dependency check completed"
+        );
+
+        Self { ffmpeg, torch_cuda }
+    }
 }
 
 /// 检测 ffmpeg 是否可用
@@ -322,5 +367,25 @@ mod tests {
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("ffmpeg"));
+    }
+
+    #[test]
+    fn test_dep_report_deserialization() {
+        let json = r#"{
+            "ffmpeg": {"name":"ffmpeg","available":true,"version":"6.0","path":"/usr/bin/ffmpeg","guidance":null},
+            "torch_cuda": [{"module_id":"m1","venv_path":"/venvs/m1","torch_version":"2.1","cuda_available":true,"guidance":null}]
+        }"#;
+        let report: DepReport = serde_json::from_str(json).unwrap();
+        assert!(report.ffmpeg.available);
+        assert_eq!(report.torch_cuda.len(), 1);
+        assert!(report.torch_cuda[0].cuda_available);
+    }
+
+    #[test]
+    fn test_check_all_nonexistent_root() {
+        let root = PathBuf::from("/nonexistent/ep_root");
+        let report = DepReport::check_all(&root);
+        // ffmpeg 可能通过系统 PATH 找到，但 torch_cuda 应为空（无 venvs 目录）
+        assert!(report.torch_cuda.is_empty());
     }
 }

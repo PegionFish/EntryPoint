@@ -58,6 +58,8 @@ pub struct PipelineTask {
     pub work_dir: PathBuf,
     /// 任务启动时间
     pub started_at: DateTime<Utc>,
+    /// 任务完成时间（所有节点终结时设置）
+    pub finished_at: Option<DateTime<Utc>>,
 }
 
 impl PipelineTask {
@@ -78,6 +80,7 @@ impl PipelineTask {
             node_states,
             work_dir,
             started_at: Utc::now(),
+            finished_at: None,
         }
     }
 
@@ -168,6 +171,11 @@ impl PipelineTask {
     fn check_completion(&mut self) {
         if !self.is_complete() {
             return;
+        }
+
+        // 记录完成时间
+        if self.finished_at.is_none() {
+            self.finished_at = Some(Utc::now());
         }
 
         let has_failure = self

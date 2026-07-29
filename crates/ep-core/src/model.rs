@@ -105,6 +105,31 @@ pub struct ModelInfo {
     pub local_cache_path: Option<PathBuf>,
 }
 
+// ─── ModelView ───────────────────────────────────────────────────────────────
+
+/// 每个模型的展示信息（含状态），用于桌面 GUI 模型列表
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelView {
+    /// 所属模块 ID
+    pub module_id: String,
+    /// 所属模块显示名称
+    pub module_name: String,
+    /// 模型 ID（对应 module.toml 中 [[models]].id）
+    pub model_id: String,
+    /// 模型显示名称
+    pub model_name: String,
+    /// 下载源："huggingface" | "modelscope" | "url"
+    pub source: String,
+    /// 仓库 ID（HuggingFace / ModelScope）
+    pub repo_id: String,
+    /// 相对于 cache_dir 的目标目录
+    pub target_dir: String,
+    /// 当前状态
+    pub status: ModelStatus,
+    /// 目录总大小（字节），目录不存在时为 None
+    pub size_bytes: Option<u64>,
+}
+
 // ─── ModelManager ────────────────────────────────────────────────────────────
 
 /// 模型下载管理器
@@ -720,6 +745,54 @@ impl ModelManager {
     pub fn cache_paths(&self) -> &[PathBuf] {
         &self.cache_paths
     }
+
+    // ─── 跨模块模型列表 ──────────────────────────────────────────────────
+
+    /// 列出所有已发现模块的所有模型声明，附带当前状态
+    ///
+    /// 遍历每个 manifest 的 `[[models]]` 声明，检查 cache_dir 下对应目录是否存在，
+    /// 填充 status 和 size_bytes。用于桌面 GUI 的统一模型列表展示。
+    pub fn list_all_models(&self, manifests: &[ModuleManifest]) -> Vec<ModelView> {
+        let mut views = Vec::new();
+
+        for manifest in manifests {
+            let module_id = &manifest.module.id;
+            let module_name = &manifest.module.name;
+
+            for model in &manifest.models {
+                let status = self.check_single_model_status(&model.target_dir);
+
+                // 目录存在时统计大小，否则为 None
+                let dir = self.model_dir(&model.target_dir);
+                let size_bytes = if dir.is_dir() {
+                    Some(self.dir_stats(&dir).0)
+                } else {
+                    None
+                };
+
+                let source = match model.source {
+                    ModelSource::Huggingface => "huggingface",
+                    ModelSource::Modelscope => "modelscope",
+                    ModelSource::Url => "url",
+                };
+
+                views.push(ModelView {
+                    module_id: module_id.clone(),
+                    module_name: module_name.clone(),
+                    model_id: model.id.clone(),
+                    model_name: model.name.clone(),
+                    source: source.to_string(),
+                    repo_id: model.repo_id.clone().unwrap_or_default(),
+                    target_dir: model.target_dir.clone(),
+                    status,
+                    size_bytes,
+                });
+            }
+        }
+
+        debug!(count = views.len(), "listed all models across modules");
+        views
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -1078,5 +1151,170 @@ mod tests {
         mgr.cancel_download().await;
 
         cleanup(&dir);
+    }
+
+    // ── list_all_models ────────────────────────────────────────────────
+
+    /// 创建测试用 ModuleManifest
+    fn test_manifest(module_id: &str, module_name: &str, models: Vec<ModelDecl>) -> ModuleManifest {
+        use crate::module::manifest::*;
+        use crate::types::{ComputeBackend, DataType, ModuleCategory};
+
+        ModuleManifest {
+            module: ModuleInfo {
+                id: module_id.to_string(),
+                name: module_name.to_string(),
+                version: "1.0.0".to_string(),
+                description: "test module".to_string(),
+                category: ModuleCategory::Asr,
+                genre: "test".to_string(),
+                authors: vec![],
+                license: None,
+                homepage: None,
+                tags: vec![],
+            },
+            runtime: RuntimeConfig {
+                runtime_type: RuntimeType::Python,
+                python_version: Some(">=3.10".to_string()),
+                requirements: None,
+                entrypoint: None,
+                start_command: None,
+                binaries: None,
+            },
+            compute: ComputeConfig {
+                backends: vec![ComputeBackend::Cpu],
+                default_backend: None,
+                vram_estimate_mb: None,
+                min_vram_mb: None,
+                env: None,
+            },
+            models,
+            interface: InterfaceConfig {
+                interface_type: InterfaceType::Http,
+                health_endpoint: None,
+                ready_timeout_secs: None,
+                working_dir: None,
+                capabilities: vec![CapabilityDecl {
+                    name: "test".to_string(),
+                    description: "test cap".to_string(),
+                    input_type: DataType::Audio,
+                    output_type: DataType::Json,
+                    max_file_size_mb: None,
+                    supports_batch: false,
+                    params: None,
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn test_list_all_models_empty() {
+        let dir = temp_dir("list_all_empty");
+        let config = test_config(dir.to_str().unwrap());
+        let mgr = ModelManager::new(&config, Path::new("."));
+
+        let views = mgr.list_all_models(&[]);
+        assert!(views.is_empty());
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_list_all_models_mixed_status() {
+        let dir = temp_dir("list_all_mixed");
+        let config = test_config(dir.to_str().unwrap());
+        let mgr = ModelManager::new(&config, Path::new("."));
+
+        // 创建一个已就绪的模型目录
+        let ready_dir = dir.join("ready-model");
+        fs::create_dir_all(&ready_dir).unwrap();
+        fs::write(ready_dir.join("model.bin"), b"fake weights").unwrap();
+
+        let manifest = test_manifest(
+            "test-module",
+            "Test Module",
+            vec![
+                ModelDecl {
+                    id: "ready".to_string(),
+                    name: "Ready Model".to_string(),
+                    source: ModelSource::Huggingface,
+                    repo_id: Some("org/ready-model".to_string()),
+                    url: None,
+                    target_dir: "ready-model".to_string(),
+                    revision: Some("main".to_string()),
+                    size_estimate_mb: Some(100),
+                    default: true,
+                },
+                ModelDecl {
+                    id: "missing".to_string(),
+                    name: "Missing Model".to_string(),
+                    source: ModelSource::Modelscope,
+                    repo_id: Some("org/missing-model".to_string()),
+                    url: None,
+                    target_dir: "missing-model".to_string(),
+                    revision: None,
+                    size_estimate_mb: None,
+                    default: false,
+                },
+            ],
+        );
+
+        let views = mgr.list_all_models(&[manifest]);
+        assert_eq!(views.len(), 2);
+
+        // 第一个模型：Ready
+        let ready = &views[0];
+        assert_eq!(ready.module_id, "test-module");
+        assert_eq!(ready.module_name, "Test Module");
+        assert_eq!(ready.model_id, "ready");
+        assert_eq!(ready.source, "huggingface");
+        assert_eq!(ready.repo_id, "org/ready-model");
+        assert_eq!(ready.status, ModelStatus::Ready);
+        assert!(ready.size_bytes.is_some());
+        assert!(ready.size_bytes.unwrap() > 0);
+
+        // 第二个模型：Missing
+        let missing = &views[1];
+        assert_eq!(missing.model_id, "missing");
+        assert_eq!(missing.source, "modelscope");
+        assert_eq!(missing.status, ModelStatus::Missing);
+        assert!(missing.size_bytes.is_none());
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_list_all_models_multiple_modules() {
+        let dir = temp_dir("list_all_multi");
+        let config = test_config(dir.to_str().unwrap());
+        let mgr = ModelManager::new(&config, Path::new("."));
+
+        let m1 = test_manifest("mod-a", "Module A", vec![test_hf_model()]);
+        let m2 = test_manifest("mod-b", "Module B", vec![test_ms_model()]);
+
+        let views = mgr.list_all_models(&[m1, m2]);
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].module_id, "mod-a");
+        assert_eq!(views[1].module_id, "mod-b");
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_model_view_serialization() {
+        let view = ModelView {
+            module_id: "test".to_string(),
+            module_name: "Test".to_string(),
+            model_id: "m1".to_string(),
+            model_name: "Model 1".to_string(),
+            source: "huggingface".to_string(),
+            repo_id: "org/model".to_string(),
+            target_dir: "model-dir".to_string(),
+            status: ModelStatus::Ready,
+            size_bytes: Some(1024),
+        };
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(json.contains("\"status\":\"ready\""));
+        assert!(json.contains("\"size_bytes\":1024"));
     }
 }
