@@ -1,0 +1,60 @@
+# Maintainer: EntryPoint Community
+pkgname=entrypoint
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="AI 模块编排平台 — 管线式推理引擎"
+arch=('x86_64')
+url="https://github.com/entrypoint-project/entrypoint"
+license=('MIT')
+
+depends=('gcc-libs' 'libxkbcommon' 'wayland' 'libxdo' 'fontconfig')
+makedepends=('rust' 'npm')
+optdepends=(
+    'nvidia-utils: CUDA GPU 支持'
+    'ffmpeg: 视频/音频处理'
+    'uv: Python 环境管理'
+)
+
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+    cd "$srcdir/$pkgname-$pkgver"
+
+    # Rust 后端 + 桌面端
+    cargo build --release --locked
+
+    # WebUI 前端
+    cd crates/ep-webui/frontend
+    npm ci
+    npm run build
+}
+
+package() {
+    cd "$srcdir/$pkgname-$pkgver"
+
+    # 二进制
+    install -Dm755 target/release/entrypoint-daemon "$pkgdir/usr/bin/entrypoint-daemon"
+    install -Dm755 target/release/entrypoint "$pkgdir/usr/bin/entrypoint"
+
+    # systemd 服务
+    install -Dm644 packaging/entrypoint.service "$pkgdir/usr/lib/systemd/system/entrypoint.service"
+
+    # 默认配置
+    install -dm755 "$pkgdir/etc/entrypoint"
+    install -Dm644 config/*.toml "$pkgdir/etc/entrypoint/" 2>/dev/null || true
+
+    # 桌面启动器
+    install -Dm644 packaging/entrypoint.desktop "$pkgdir/usr/share/applications/entrypoint.desktop"
+
+    # WebUI 静态文件
+    install -dm755 "$pkgdir/usr/share/entrypoint/static"
+    cp -r crates/ep-webui/frontend/dist/* "$pkgdir/usr/share/entrypoint/static/" 2>/dev/null || true
+
+    # 模块目录
+    install -dm755 "$pkgdir/usr/share/entrypoint/modules"
+    cp -r modules/* "$pkgdir/usr/share/entrypoint/modules/" 2>/dev/null || true
+
+    # License
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE" 2>/dev/null || true
+}

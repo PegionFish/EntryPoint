@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=EntryPoint
+Comment=AI 模块编排平台
+Exec=entrypoint
+Icon=entrypoint
+Terminal=false
+Type=Application
+Categories=Development;Utility;
+Keywords=AI;Pipeline;Module;
