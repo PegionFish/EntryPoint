@@ -1,0 +1,24 @@
+post_install() {
+    echo "=== EntryPoint 安装完成 ==="
+    echo ""
+    echo "启动守护进程:  systemctl start entrypoint"
+    echo "开机自启:      systemctl enable entrypoint"
+    echo "桌面启动:      在应用菜单中搜索 EntryPoint"
+    echo ""
+    echo "WebUI 默认地址: http://localhost:18080"
+    echo "配置文件:       /etc/entrypoint/"
+    echo "模块目录:       /usr/share/entrypoint/modules/"
+    echo ""
+    echo "首次使用请运行 'entrypoint-daemon' 初始化运行时环境。"
+}
+
+post_upgrade() {
+    echo "=== EntryPoint 已升级 ==="
+    echo "如需重启服务: systemctl restart entrypoint"
+}
+
+post_remove() {
+    echo "=== EntryPoint 已卸载 ==="
+    echo "配置和模型文件保留在 /etc/entrypoint/ 和 /var/lib/entrypoint/"
+    echo "如需完全清理，请手动删除上述目录。"
+}

@@ -1,0 +1,22 @@
+[Unit]
+Description=EntryPoint AI Module Orchestrator
+After=network.target
+
+[Service]
+Type=simple
+User=entrypoint
+Group=entrypoint
+WorkingDirectory=/var/lib/entrypoint
+ExecStart=/usr/bin/entrypoint-daemon
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+
+# 安全加固
+NoNewPrivileges=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/var/lib/entrypoint
+
+[Install]
+WantedBy=multi-user.target
