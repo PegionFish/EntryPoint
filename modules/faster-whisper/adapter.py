@@ -8,6 +8,7 @@ import tempfile
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional, Union
 
 # Windows: 将 venv Scripts 目录加入 DLL 搜索路径（CUDA 库等）
 if sys.platform == "win32":
@@ -50,7 +51,7 @@ DEVICE_MAP = {
 
 # ── 模型状态 ──────────────────────────────────────────────
 model = None
-model_load_error: str | None = None
+model_load_error: Optional[str] = None
 
 
 def _load_model():
@@ -78,11 +79,24 @@ def _load_model():
             "Loading model from %s | device=%s compute_type=%s",
             EP_MODEL_DIR, device, compute_type,
         )
-        model = WhisperModel(
-            str(model_dir),
-            device=device,
-            compute_type=compute_type,
-        )
+        try:
+            model = WhisperModel(
+                str(model_dir),
+                device=device,
+                compute_type=compute_type,
+            )
+        except ValueError:
+            # 部分 GPU（如 Tesla P4）不支持 float16，回退到 int8
+            fallback = "int8" if device == "cuda" else "int8"
+            logger.warning(
+                "compute_type=%s not supported, falling back to %s",
+                compute_type, fallback,
+            )
+            model = WhisperModel(
+                str(model_dir),
+                device=device,
+                compute_type=fallback,
+            )
         logger.info("Model loaded successfully")
     except Exception as exc:
         model_load_error = f"Failed to load model: {exc}"
@@ -105,7 +119,7 @@ app = FastAPI(title=MODULE_NAME, version=MODULE_VERSION, lifespan=lifespan)
 
 # ── 辅助函数 ──────────────────────────────────────────────
 
-def error_response(status_code: int, error_code: str, message: str, detail: str | None = None):
+def error_response(status_code: int, error_code: str, message: str, detail: Optional[str] = None):
     return JSONResponse(
         status_code=status_code,
         content={
@@ -117,7 +131,7 @@ def error_response(status_code: int, error_code: str, message: str, detail: str 
     )
 
 
-def _parse_params(raw: dict | str | None) -> dict:
+def _parse_params(raw: Union[dict, str, None]) -> dict:
     """解析参数，支持 dict 或 JSON 字符串"""
     if raw is None:
         return {}
@@ -181,8 +195,8 @@ def info():
 async def predict(
     capability: str,
     request: Request,
-    file: UploadFile | None = File(None),
-    params_form: str | None = Form(None, alias="params"),
+    file: Optional[UploadFile] = File(None),
+    params_form: Optional[str] = Form(None, alias="params"),
 ):
     # 1) 校验 capability
     if capability != "transcribe":
@@ -202,9 +216,9 @@ async def predict(
 
     # 3) 解析输入 —— 根据 Content-Type 区分 multipart 与 JSON
     content_type = request.headers.get("content-type", "")
-    audio_path: str | None = None
+    audio_path: Optional[str] = None
     params_dict: dict = {}
-    tmp_file: Path | None = None
+    tmp_file: Optional[Path] = None
 
     try:
         if "multipart/form-data" in content_type:
