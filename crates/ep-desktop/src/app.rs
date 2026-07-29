@@ -1,9 +1,14 @@
 use eframe::egui;
 use ep_core::config::AppConfig;
+use ep_core::deps::DepReport;
+use ep_core::model::ModelView;
 use ep_core::module::DiscoveredModule;
+use ep_core::pipeline::runner::TaskSummary;
 use ep_core::types::{ComputeDevice, ServiceStatus};
 
 use crate::pages;
+use crate::theme;
+use crate::toast::ToastManager;
 
 // ─── Messages: background → UI ──────────────────────────────────────────────
 
@@ -16,6 +21,16 @@ pub enum AppMsg {
     ModuleStatusUpdate(String, ServiceStatus),
     LogLine(String, String),
     Error(String),
+    /// 模型列表刷新
+    ModelsRefreshed(Vec<ModelView>),
+    /// 模型下载进度 (model_id, 0.0~1.0)
+    ModelDownloadProgress(String, f32),
+    /// 模型下载完成 (model_id, success)
+    ModelDownloadFinished(String, bool),
+    /// 依赖检测报告
+    DepReportRefreshed(DepReport),
+    /// 管线任务列表刷新
+    TasksRefreshed(Vec<TaskSummary>),
 }
 
 // ─── Commands: UI → background ──────────────────────────────────────────────
@@ -25,6 +40,16 @@ pub enum AppCmd {
     StartModule(String),
     StopModule(String),
     Shutdown,
+    /// 下载模型 (module_id, model_id)
+    DownloadModel(String, String),
+    /// 删除模型 (target_dir)
+    DeleteModel(String),
+    /// 导入本地模型 (target_dir, source_path)
+    ImportModel(String, std::path::PathBuf),
+    /// 刷新模型列表
+    RefreshModels,
+    /// 刷新依赖检测
+    RefreshDeps,
 }
 
 // ─── UI-side module entry ───────────────────────────────────────────────────
@@ -95,6 +120,7 @@ impl ModuleEntry {
 pub enum Page {
     Dashboard,
     Modules,
+    Models,
     PipelineEditor,
     Tasks,
     Settings,
@@ -103,6 +129,7 @@ pub enum Page {
 const NAV_ITEMS: &[(Page, &str, &str)] = &[
     (Page::Dashboard, "📊", "仪表盘"),
     (Page::Modules, "🧩", "模块"),
+    (Page::Models, "📦", "模型"),
     (Page::PipelineEditor, "🔗", "管线"),
     (Page::Tasks, "📋", "任务"),
     (Page::Settings, "⚙", "设置"),
@@ -118,12 +145,24 @@ pub struct App {
     pub cmd_tx: tokio::sync::mpsc::UnboundedSender<AppCmd>,
     status_message: Option<(String, std::time::Instant)>,
     last_repaint: std::time::Instant,
+    /// Toast 通知管理器
+    pub toasts: ToastManager,
+    /// 深色主题（默认 true）
+    pub dark_theme: bool,
 }
 
 pub struct AppState {
     pub devices: Vec<ComputeDevice>,
     pub modules: Vec<ModuleEntry>,
     pub config: AppConfig,
+    /// 模型列表（跨模块）
+    pub models: Vec<ModelView>,
+    /// 模型缓存目录
+    pub model_cache_dir: String,
+    /// 依赖检测报告
+    pub dep_report: Option<DepReport>,
+    /// 管线任务列表
+    pub tasks: Vec<TaskSummary>,
 }
 
 impl App {
@@ -132,18 +171,25 @@ impl App {
         cmd_tx: tokio::sync::mpsc::UnboundedSender<AppCmd>,
     ) -> Self {
         let config = AppConfig::default();
+        let model_cache_dir = config.models.cache_dir.clone();
         Self {
             current_page: Page::Dashboard,
             state: AppState {
                 devices: Vec::new(),
                 modules: Vec::new(),
                 config,
+                models: Vec::new(),
+                model_cache_dir,
+                dep_report: None,
+                tasks: Vec::new(),
             },
             selected_module: None,
             rx,
             cmd_tx,
             status_message: None,
             last_repaint: std::time::Instant::now(),
+            toasts: ToastManager::new(),
+            dark_theme: true,
         }
     }
 
@@ -163,6 +209,7 @@ impl App {
                         m.device = Some(device);
                         m.started_at = Some(std::time::Instant::now());
                     }
+                    self.toasts.success(format!("模块 {id} 已启动"));
                 }
                 AppMsg::ModuleStopped(id) => {
                     if let Some(m) = self.state.modules.iter_mut().find(|m| m.id == id) {
@@ -171,6 +218,7 @@ impl App {
                         m.device = None;
                         m.started_at = None;
                     }
+                    self.toasts.info(format!("模块 {id} 已停止"));
                 }
                 AppMsg::ModuleStatusUpdate(id, status) => {
                     if let Some(m) = self.state.modules.iter_mut().find(|m| m.id == id) {
@@ -183,7 +231,27 @@ impl App {
                     }
                 }
                 AppMsg::Error(e) => {
+                    self.toasts.error(&e);
                     self.status_message = Some((e, std::time::Instant::now()));
+                }
+                AppMsg::ModelsRefreshed(models) => {
+                    self.state.models = models;
+                }
+                AppMsg::ModelDownloadProgress(_model_id, _progress) => {
+                    // TODO: 更新下载进度 UI
+                }
+                AppMsg::ModelDownloadFinished(model_id, success) => {
+                    if success {
+                        self.toasts.success(format!("模型 {model_id} 下载完成"));
+                    } else {
+                        self.toasts.error(format!("模型 {model_id} 下载失败"));
+                    }
+                }
+                AppMsg::DepReportRefreshed(report) => {
+                    self.state.dep_report = Some(report);
+                }
+                AppMsg::TasksRefreshed(tasks) => {
+                    self.state.tasks = tasks;
                 }
             }
         }
@@ -192,6 +260,9 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 应用主题
+        theme::apply_theme(ctx, self.dark_theme);
+
         // Poll messages from background thread
         self.process_messages();
 
@@ -246,6 +317,11 @@ impl eframe::App for App {
 
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.separator();
+                    // 主题切换
+                    let theme_label = if self.dark_theme { "🌙 深色" } else { "☀️ 浅色" };
+                    if ui.button(theme_label).clicked() {
+                        self.dark_theme = !self.dark_theme;
+                    }
                     ui.label(
                         egui::RichText::new("v0.2.0")
                             .small()
@@ -257,7 +333,12 @@ impl eframe::App for App {
         // ── Central panel — dispatch to page ──
         egui::CentralPanel::default().show(ctx, |ui| match self.current_page {
             Page::Dashboard => {
-                pages::dashboard::show(ui, &self.state.devices, &self.state.modules);
+                pages::dashboard::show(
+                    ui,
+                    &self.state.devices,
+                    &self.state.modules,
+                    self.state.dep_report.as_ref(),
+                );
             }
             Page::Modules => {
                 pages::modules::show(
@@ -267,15 +348,26 @@ impl eframe::App for App {
                     &self.cmd_tx,
                 );
             }
+            Page::Models => {
+                pages::models::show(
+                    ui,
+                    &self.state.models,
+                    &self.state.model_cache_dir,
+                    &self.cmd_tx,
+                );
+            }
             Page::PipelineEditor => {
                 pages::pipeline_editor::show(ui);
             }
             Page::Tasks => {
-                pages::tasks::show(ui, &self.state.modules);
+                pages::tasks::show(ui, &self.state.modules, &self.state.tasks);
             }
             Page::Settings => {
                 pages::settings::show(ui, &mut self.state.config, &mut self.status_message);
             }
         });
+
+        // ── Toast 通知（最上层） ──
+        self.toasts.show(ctx);
     }
 }

@@ -3,10 +3,41 @@ use ep_core::types::{ComputeDevice, ServiceStatus};
 
 use crate::app::ModuleEntry;
 
-pub fn show(ui: &mut egui::Ui, devices: &[ComputeDevice], modules: &[ModuleEntry]) {
+// ─── 颜色常量 ────────────────────────────────────────────────────────────────
+
+const COLOR_GOOD: egui::Color32 = egui::Color32::from_rgb(80, 220, 80);
+const COLOR_ERROR: egui::Color32 = egui::Color32::from_rgb(255, 80, 80);
+const COLOR_NEUTRAL: egui::Color32 = egui::Color32::from_rgb(120, 120, 120);
+
+// ─── 主入口 ──────────────────────────────────────────────────────────────────
+
+pub fn show(
+    ui: &mut egui::Ui,
+    devices: &[ComputeDevice],
+    modules: &[ModuleEntry],
+    dep_report: Option<&ep_core::deps::DepReport>,
+) {
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.heading("仪表盘");
         ui.add_space(8.0);
+
+        // ── 统计卡片 ──
+        stats_cards(ui, devices, modules);
+
+        ui.add_space(16.0);
+
+        // ── 依赖检测 ──
+        ui.strong("依赖检测");
+        ui.add_space(4.0);
+
+        match dep_report {
+            Some(report) => dep_section(ui, report),
+            None => {
+                ui.colored_label(COLOR_NEUTRAL, "点击刷新检测依赖");
+            }
+        }
+
+        ui.add_space(16.0);
 
         // ── 计算设备 ──
         ui.strong("计算设备");
@@ -30,6 +61,119 @@ pub fn show(ui: &mut egui::Ui, devices: &[ComputeDevice], modules: &[ModuleEntry
             module_table(ui, modules);
         }
     });
+}
+
+// ─── 统计卡片 ────────────────────────────────────────────────────────────────
+
+fn stats_cards(ui: &mut egui::Ui, devices: &[ComputeDevice], modules: &[ModuleEntry]) {
+    let running = modules
+        .iter()
+        .filter(|m| m.status.is_running())
+        .count();
+    let errors = modules
+        .iter()
+        .filter(|m| matches!(m.status, ServiceStatus::Error(_)))
+        .count();
+
+    let cards: [(&str, String, egui::Color32); 4] = [
+        ("设备", devices.len().to_string(), COLOR_NEUTRAL),
+        ("模块", modules.len().to_string(), COLOR_NEUTRAL),
+        ("运行中", running.to_string(), if running > 0 { COLOR_GOOD } else { COLOR_NEUTRAL }),
+        ("错误", errors.to_string(), if errors > 0 { COLOR_ERROR } else { COLOR_GOOD }),
+    ];
+
+    ui.horizontal_wrapped(|ui| {
+        for (label, value, color) in &cards {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_min_width(120.0);
+                ui.vertical_centered(|ui| {
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        *color,
+                        egui::RichText::new(value).size(28.0).strong(),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(*label);
+                    ui.add_space(4.0);
+                });
+            });
+        }
+    });
+}
+
+// ─── 依赖检测 ────────────────────────────────────────────────────────────────
+
+fn dep_section(ui: &mut egui::Ui, report: &ep_core::deps::DepReport) {
+    // ffmpeg 状态
+    ui.horizontal(|ui| {
+        if report.ffmpeg.available {
+            ui.colored_label(COLOR_GOOD, "✅");
+            let mut text = "ffmpeg: 可用".to_string();
+            if let Some(v) = &report.ffmpeg.version {
+                text.push_str(&format!(" ({v}"));
+                if let Some(p) = &report.ffmpeg.path {
+                    text.push_str(&format!(", {p}"));
+                }
+                text.push(')');
+            } else if let Some(p) = &report.ffmpeg.path {
+                text.push_str(&format!(" ({p})"));
+            }
+            ui.colored_label(COLOR_GOOD, &text);
+        } else {
+            ui.colored_label(COLOR_ERROR, "❌");
+            ui.colored_label(COLOR_ERROR, "ffmpeg: 未找到");
+        }
+    });
+
+    if let Some(guidance) = &report.ffmpeg.guidance {
+        if !report.ffmpeg.available {
+            ui.indent("ffmpeg_guidance", |ui| {
+                ui.colored_label(COLOR_NEUTRAL, guidance);
+            });
+        }
+    }
+
+    // torch CUDA 状态
+    if !report.torch_cuda.is_empty() {
+        ui.add_space(8.0);
+        ui.label("torch CUDA:");
+        ui.indent("torch_cuda_list", |ui| {
+            for tc in &report.torch_cuda {
+                ui.horizontal(|ui| {
+                    if tc.cuda_available {
+                        ui.colored_label(COLOR_GOOD, "✅");
+                        let mut text = format!("{}: ", tc.module_id);
+                        if let Some(v) = &tc.torch_version {
+                            text.push_str(&format!("torch {v}, CUDA 可用"));
+                        } else {
+                            text.push_str("CUDA 可用");
+                        }
+                        ui.colored_label(COLOR_GOOD, &text);
+                    } else if tc.torch_version.is_some() {
+                        ui.colored_label(COLOR_ERROR, "❌");
+                        let text = format!(
+                            "{}: torch {}, CUDA 不可用",
+                            tc.module_id,
+                            tc.torch_version.as_deref().unwrap_or("?")
+                        );
+                        ui.colored_label(COLOR_ERROR, &text);
+                    } else {
+                        ui.colored_label(COLOR_ERROR, "❌");
+                        ui.colored_label(
+                            COLOR_ERROR,
+                            format!("{}: torch 未安装", tc.module_id),
+                        );
+                    }
+                });
+
+                if let Some(guidance) = &tc.guidance {
+                    ui.indent(format!("{}_guidance", tc.module_id), |ui| {
+                        ui.colored_label(COLOR_NEUTRAL, guidance);
+                    });
+                }
+            }
+        });
+    }
 }
 
 fn device_cards(ui: &mut egui::Ui, devices: &[ComputeDevice]) {
