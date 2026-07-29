@@ -7,13 +7,66 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::Serialize;
+
 use crate::pipeline::dag::Pipeline;
 use crate::pipeline::executor::{execute_node, ModuleCallError, NodeState, PipelineTask};
 use crate::types::{Artifact, PipelineRunner, TaskStatus};
 
+// ─── 任务摘要与详情（GUI 列表展示用） ─────────────────────────────────────────
+
+/// 管线任务摘要（用于列表展示）
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskSummary {
+    /// 任务唯一 ID
+    pub id: String,
+    /// 关联的管线名称/ID
+    pub pipeline_name: String,
+    /// 任务整体状态
+    pub status: TaskStatus,
+    /// 任务启动时间（ISO 8601）
+    pub started_at: Option<String>,
+    /// 任务完成时间（ISO 8601）
+    pub finished_at: Option<String>,
+    /// 节点总数
+    pub node_count: usize,
+    /// 已完成节点数
+    pub completed_nodes: usize,
+}
+
+/// 单个节点的详细状态（用于任务详情展示）
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeDetail {
+    /// 节点 ID
+    pub node_id: String,
+    /// 节点状态描述
+    pub state: String,
+    /// 失败时的错误信息
+    pub error: Option<String>,
+}
+
+/// 管线任务详情（含各节点状态）
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskDetail {
+    /// 任务唯一 ID
+    pub id: String,
+    /// 关联的管线名称/ID
+    pub pipeline_name: String,
+    /// 任务整体状态
+    pub status: TaskStatus,
+    /// 任务启动时间（ISO 8601）
+    pub started_at: Option<String>,
+    /// 任务完成时间（ISO 8601）
+    pub finished_at: Option<String>,
+    /// 各节点的详细状态
+    pub nodes: Vec<NodeDetail>,
+}
+
 /// 管线运行器
 pub struct PipelineRunnerImpl {
     task: Option<PipelineTask>,
+    /// 历史任务存储：task_id → PipelineTask
+    tasks: HashMap<String, PipelineTask>,
     #[allow(dead_code)]
     work_dir: PathBuf,
     /// 模块端口注册表：module_id → port
@@ -33,6 +86,7 @@ impl PipelineRunnerImpl {
     pub fn new(work_dir: PathBuf) -> Self {
         Self {
             task: None,
+            tasks: HashMap::new(),
             work_dir,
             module_ports: HashMap::new(),
             on_node_start: None,
@@ -51,6 +105,68 @@ impl PipelineRunnerImpl {
     /// 批量注册模块端口
     pub fn set_module_ports(&mut self, ports: HashMap<String, u16>) {
         self.module_ports.extend(ports);
+    }
+
+    // ─── 任务列表 API（GUI 展示用） ─────────────────────────────────────
+
+    /// 列出所有已知任务的摘要信息
+    pub fn list_tasks(&self) -> Vec<TaskSummary> {
+        self.tasks
+            .values()
+            .map(|task| {
+                let node_count = task.node_states.len();
+                let completed_nodes = task
+                    .node_states
+                    .values()
+                    .filter(|s| matches!(s, NodeState::Completed { .. }))
+                    .count();
+
+                TaskSummary {
+                    id: task.id.clone(),
+                    pipeline_name: task.pipeline_id.clone(),
+                    status: task.status.clone(),
+                    started_at: Some(task.started_at.to_rfc3339()),
+                    finished_at: task.finished_at.map(|t| t.to_rfc3339()),
+                    node_count,
+                    completed_nodes,
+                }
+            })
+            .collect()
+    }
+
+    /// 获取单个任务的详细节点状态
+    pub fn get_task_detail(&self, task_id: &str) -> Option<TaskDetail> {
+        let task = self.tasks.get(task_id)?;
+
+        let nodes = task
+            .node_states
+            .iter()
+            .map(|(node_id, state)| {
+                let (state_str, error) = match state {
+                    NodeState::Pending => ("pending".to_string(), None),
+                    NodeState::Running => ("running".to_string(), None),
+                    NodeState::Completed { .. } => ("completed".to_string(), None),
+                    NodeState::Failed { error, .. } => {
+                        ("failed".to_string(), Some(error.clone()))
+                    }
+                    NodeState::Skipped => ("skipped".to_string(), None),
+                };
+                NodeDetail {
+                    node_id: node_id.clone(),
+                    state: state_str,
+                    error,
+                }
+            })
+            .collect();
+
+        Some(TaskDetail {
+            id: task.id.clone(),
+            pipeline_name: task.pipeline_id.clone(),
+            status: task.status.clone(),
+            started_at: Some(task.started_at.to_rfc3339()),
+            finished_at: task.finished_at.map(|t| t.to_rfc3339()),
+            nodes,
+        })
     }
 
     /// 异步执行管线（内部实现）
@@ -121,10 +237,12 @@ impl PipelineRunnerImpl {
         // 检查任务最终状态
         if let TaskStatus::Failed(ref e) = task.status {
             let err = anyhow::anyhow!("pipeline execution failed: {e}");
+            self.tasks.insert(task.id.clone(), task.clone());
             self.task = Some(task);
             return Err(err);
         }
 
+        self.tasks.insert(task.id.clone(), task.clone());
         self.task = Some(task);
         Ok(())
     }
@@ -151,6 +269,7 @@ impl PipelineRunner for PipelineRunnerImpl {
 
                 let mut temp_runner = PipelineRunnerImpl {
                     task: None,
+                    tasks: HashMap::new(),
                     work_dir: work_dir_path.clone(),
                     module_ports,
                     on_node_start: on_start,
@@ -168,6 +287,7 @@ impl PipelineRunner for PipelineRunnerImpl {
 
                 // 恢复状态
                 self.task = returned_runner.task;
+                self.tasks.extend(returned_runner.tasks);
                 self.module_ports = returned_runner.module_ports;
                 self.on_node_start = returned_runner.on_node_start;
                 self.on_node_complete = returned_runner.on_node_complete;
@@ -555,5 +675,142 @@ to = ["output", "input"]
         assert_eq!(error_count.load(Ordering::SeqCst), 0);
 
         cleanup_dir(&work_dir);
+    }
+
+    // ─── Test 6: list_tasks / get_task_detail ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_tasks_and_detail() {
+        let work_dir = temp_work_dir("tasklist");
+        let input_file = work_dir.join("source.txt");
+        let output_file = work_dir.join("output.txt");
+        std::fs::write(&input_file, "task list test").unwrap();
+
+        let toml_str = format!(
+            r#"
+[pipeline]
+id = "test-tasklist"
+name = "Task List Test"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = {{ path = "{}" }}
+
+[[nodes]]
+id = "output"
+kind = "builtin"
+builtin = "file_output"
+params = {{ path = "{}" }}
+
+[[edges]]
+from = ["input", "output"]
+to = ["output", "input"]
+"#,
+            input_file.to_string_lossy().replace('\\', "/"),
+            output_file.to_string_lossy().replace('\\', "/"),
+        );
+
+        let pipeline = Pipeline::from_toml_str(&toml_str).unwrap();
+        let mut runner = PipelineRunnerImpl::new(work_dir.clone());
+
+        // 执行前无任务
+        assert!(runner.list_tasks().is_empty());
+
+        let result = runner.execute_async(&pipeline, &work_dir).await;
+        assert!(result.is_ok());
+
+        // 执行后有一个任务
+        let tasks = runner.list_tasks();
+        assert_eq!(tasks.len(), 1);
+
+        let summary = &tasks[0];
+        assert_eq!(summary.pipeline_name, "test-tasklist");
+        assert_eq!(summary.status, TaskStatus::Completed);
+        assert_eq!(summary.node_count, 2);
+        assert_eq!(summary.completed_nodes, 2);
+        assert!(summary.started_at.is_some());
+        assert!(summary.finished_at.is_some());
+
+        // 获取详情
+        let detail = runner.get_task_detail(&summary.id).unwrap();
+        assert_eq!(detail.pipeline_name, "test-tasklist");
+        assert_eq!(detail.nodes.len(), 2);
+        for node in &detail.nodes {
+            assert_eq!(node.state, "completed");
+            assert!(node.error.is_none());
+        }
+
+        // 不存在的任务返回 None
+        assert!(runner.get_task_detail("nonexistent").is_none());
+
+        cleanup_dir(&work_dir);
+    }
+
+    #[tokio::test]
+    async fn test_list_tasks_after_failure() {
+        let work_dir = temp_work_dir("taskfail");
+        let input_file = work_dir.join("source.txt");
+        std::fs::write(&input_file, "test").unwrap();
+
+        let toml_str = format!(
+            r#"
+[pipeline]
+id = "test-taskfail"
+name = "Task Fail Test"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = {{ path = "{}" }}
+
+[[nodes]]
+id = "bad"
+kind = "module"
+module_id = "nonexistent"
+capability = "do_thing"
+
+[[edges]]
+from = ["input", "output"]
+to = ["bad", "input"]
+"#,
+            input_file.to_string_lossy().replace('\\', "/"),
+        );
+
+        let pipeline = Pipeline::from_toml_str(&toml_str).unwrap();
+        let mut runner = PipelineRunnerImpl::new(work_dir.clone());
+
+        let result = runner.execute_async(&pipeline, &work_dir).await;
+        assert!(result.is_err());
+
+        // 失败的任务也应被记录
+        let tasks = runner.list_tasks();
+        assert_eq!(tasks.len(), 1);
+        assert!(matches!(tasks[0].status, TaskStatus::Failed(_)));
+
+        let detail = runner.get_task_detail(&tasks[0].id).unwrap();
+        let bad_node = detail.nodes.iter().find(|n| n.node_id == "bad").unwrap();
+        assert_eq!(bad_node.state, "failed");
+        assert!(bad_node.error.is_some());
+
+        cleanup_dir(&work_dir);
+    }
+
+    #[test]
+    fn test_task_summary_serialization() {
+        let summary = TaskSummary {
+            id: "abc-123".to_string(),
+            pipeline_name: "test-pipe".to_string(),
+            status: TaskStatus::Completed,
+            started_at: Some("2026-07-30T10:00:00Z".to_string()),
+            finished_at: Some("2026-07-30T10:01:00Z".to_string()),
+            node_count: 3,
+            completed_nodes: 3,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("\"pipeline_name\":\"test-pipe\""));
+        assert!(json.contains("\"node_count\":3"));
     }
 }
