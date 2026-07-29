@@ -15,7 +15,7 @@ type = "python"
 python_version = ">=3.10,<3.13"
 requirements = "requirements.txt"
 entrypoint = "adapter.py"
-start_command = "{ROOT}/runtime/venvs/qwen3-tts/bin/python {MODULE_DIR}/{entrypoint}"
+start_command = "{venv_python} {MODULE_DIR}/{entrypoint}"
 
 [compute]
 backends = ["cuda", "cpu"]

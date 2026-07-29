@@ -52,7 +52,7 @@ impl ModuleEntry {
                 name: mf.module.name.clone(),
                 version: mf.module.version.clone(),
                 description: mf.module.description.clone(),
-                category: mf.module.category,
+                category: mf.module.category.clone(),
                 status: ServiceStatus::Stopped,
                 device: None,
                 port: None,

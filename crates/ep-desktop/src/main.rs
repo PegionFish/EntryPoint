@@ -216,7 +216,7 @@ async fn background_loop(
                     })
                     .collect();
                 for mid in &module_ids {
-                    let _ = process_manager.monitor_process(mid);
+                    let _ = process_manager.monitor_process(mid).await;
                     if let Some(status) = process_manager.get_status(mid) {
                         let _ = tx.send(AppMsg::ModuleStatusUpdate(
                             mid.clone(),
