@@ -1,11 +1,13 @@
 //! 外部依赖检测 — 检查 torch CUDA / ffmpeg 等可选依赖的可用性
 //!
-//! 不自动安装任何依赖，仅提供检测结果和用户引导信息。
+//! 检测后可通过 `deps_install` 模块自动安装缺失依赖（主流发行版）。
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
+
+use crate::deps_install::{self, InstallResult, SystemDep};
 
 /// 单个依赖的检测结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +78,26 @@ impl DepReport {
         );
 
         Self { ffmpeg, torch_cuda }
+    }
+
+    /// 检测依赖并在缺失时尝试自动安装（仅 Linux 主流发行版）。
+    ///
+    /// 返回安装结果摘要。调用方可据此决定是否继续启动。
+    pub fn check_and_install_missing(root: &Path) -> Vec<(SystemDep, InstallResult)> {
+        let report = Self::check_all(root);
+        let mut missing = Vec::new();
+
+        if !report.ffmpeg.available {
+            missing.push(SystemDep::Ffmpeg);
+        }
+
+        if missing.is_empty() {
+            info!("all system dependencies present");
+            return vec![(SystemDep::Ffmpeg, InstallResult::AlreadyPresent)];
+        }
+
+        info!(missing = ?missing, "attempting auto-install of missing dependencies");
+        deps_install::ensure_deps(&missing)
     }
 }
 

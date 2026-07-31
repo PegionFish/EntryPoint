@@ -20,7 +20,7 @@ range_start = 18000
 range_end = 19000
 
 [models]
-cache_dir = "./models"
+cache_dir = "models"
 hf_endpoint = "https://huggingface.co"
 default_source = "huggingface"
 max_concurrent_downloads = 2
@@ -35,7 +35,7 @@ uv_path = "uv"
 max_parallel = 2
 default_timeout_secs = 300
 keep_workspace = false
-workspace_dir = "./workspace"
+workspace_dir = "workspace"
 
 [ui]
 scale_factor = 1.0
