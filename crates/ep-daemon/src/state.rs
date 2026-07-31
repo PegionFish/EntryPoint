@@ -1,5 +1,6 @@
 //! Daemon application state — holds all ep-core managers behind Arc<RwLock<…>>.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -33,6 +34,8 @@ pub struct ProgressMessage {
 /// Shared application state injected into every handler via `State<Arc<AppState>>`.
 #[derive(Clone)]
 pub struct AppState {
+    /// 项目根目录（绝对路径），所有相对路径的基准
+    pub root: PathBuf,
     pub config: Arc<RwLock<AppConfig>>,
     pub devices: Arc<RwLock<Vec<ComputeDevice>>>,
     pub modules: Arc<RwLock<Vec<DiscoveredModule>>>,
@@ -45,6 +48,7 @@ pub struct AppState {
 impl AppState {
     /// Build a fully-wired `AppState` from startup artefacts.
     pub fn new(
+        root: PathBuf,
         config: AppConfig,
         devices: Vec<ComputeDevice>,
         modules: Vec<DiscoveredModule>,
@@ -54,6 +58,7 @@ impl AppState {
         let (progress_tx, _) = broadcast::channel(256);
 
         Self {
+            root,
             config: Arc::new(RwLock::new(config)),
             devices: Arc::new(RwLock::new(devices)),
             modules: Arc::new(RwLock::new(modules)),

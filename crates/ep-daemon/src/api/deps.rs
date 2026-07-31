@@ -15,12 +15,11 @@ pub fn router() -> Router<Arc<AppState>> {
 }
 
 async fn check_deps(State(state): State<Arc<AppState>>) -> Json<deps::DepReport> {
-    let root = std::env::current_dir().unwrap_or_default();
     let modules = state.modules.read().await;
     let ids: Vec<&str> = modules
         .iter()
         .filter_map(|m| m.manifest.as_ref().map(|mf| mf.module.id.as_str()))
         .collect();
-    let report = deps::check_all_deps(&root, &ids);
+    let report = deps::check_all_deps(&state.root, &ids);
     Json(report)
 }

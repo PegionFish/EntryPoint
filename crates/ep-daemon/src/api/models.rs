@@ -41,8 +41,7 @@ pub struct ImportRequest {
 /// 从 AppState 构建 ModelManager
 async fn build_model_manager(state: &AppState) -> ModelManager {
     let config = state.config.read().await;
-    let root = std::env::current_dir().unwrap_or_default();
-    ModelManager::new(&config.models, &root)
+    ModelManager::new(&config.models, &state.root)
 }
 
 /// 查找模块的 manifest（通过 module_id）
