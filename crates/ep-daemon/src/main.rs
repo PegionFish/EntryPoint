@@ -200,7 +200,45 @@ async fn run_server() -> anyhow::Result<()> {
         )
         .with_state(state.clone());
 
-    // 8. Start server
+    // 8. Spawn background monitor loop (H1 log capture + H2 health check polling)
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
+            loop {
+                interval.tick().await;
+
+                // Collect module IDs that have active process instances
+                let module_ids: Vec<String> = {
+                    let pm = state.process_manager.read().await;
+                    pm.list_running()
+                        .iter()
+                        .map(|inst| inst.module_id.clone())
+                        .collect()
+                };
+
+                for mid in &module_ids {
+                    let mut pm = state.process_manager.write().await;
+                    let _ = pm.monitor_process(mid).await;
+
+                    // Broadcast new log lines to WebSocket subscribers
+                    if let Some(inst) = pm.get_instance(mid) {
+                        let lines: Vec<String> = inst.log_buffer.iter().cloned().collect();
+                        if !lines.is_empty() {
+                            if let Some(last) = lines.last() {
+                                let _ = state.log_tx.send(crate::state::LogMessage {
+                                    module_id: mid.clone(),
+                                    line: last.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // 9. Start server
     let cfg = state.config.read().await;
     let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port)
         .parse()
