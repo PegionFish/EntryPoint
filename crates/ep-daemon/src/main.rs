@@ -195,7 +195,7 @@ async fn run_server() -> anyhow::Result<()> {
     let port_manager = PortManager::new(port_start, port_end);
 
     // 6. Build AppState (creates broadcast channels internally)
-    let state = Arc::new(AppState::new(cfg, devices, modules, port_manager));
+    let state = Arc::new(AppState::new(root.clone(), cfg, devices, modules, port_manager));
 
     // 7. Log public access setting
     {
@@ -346,6 +346,7 @@ mod tests {
         }];
 
         Arc::new(AppState::new(
+            std::path::PathBuf::from("/tmp/ep-test"),
             AppConfig::default(),
             devices,
             vec![],

@@ -193,9 +193,7 @@ pub fn show(
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui.button("💾 保存配置").clicked() {
-                let config_dir = std::env::current_dir()
-                    .unwrap_or_default()
-                    .join("config");
+                let config_dir = ep_core::config::resolve_root().join("config");
                 match config.save(&config_dir) {
                     Ok(()) => {
                         *status_message = Some((
@@ -213,9 +211,7 @@ pub fn show(
             }
 
             if ui.button("🔄 重新加载").clicked() {
-                let config_dir = std::env::current_dir()
-                    .unwrap_or_default()
-                    .join("config");
+                let config_dir = ep_core::config::resolve_root().join("config");
                 match AppConfig::load(&config_dir) {
                     Ok(loaded) => {
                         *config = loaded;

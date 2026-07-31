@@ -156,7 +156,7 @@ pub async fn start_module(
 
     // Build environment variables for the module process
     let env_vars = {
-        let root = std::env::current_dir().unwrap_or_default();
+        let root = &state.root;
         let module_dir = &module.path;
         let model_dir = if let Some(model) = manifest.models.iter().find(|m| m.default) {
             root.join("models").join(&model.target_dir)

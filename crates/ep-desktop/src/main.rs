@@ -8,10 +8,9 @@ fn main() -> anyhow::Result<()> {
 
     tracing::info!("EntryPoint starting...");
 
-    // Config directory
-    let config_dir = std::env::current_dir()
-        .unwrap_or_default()
-        .join("config");
+    // Resolve project root and config directory
+    let root = ep_core::config::resolve_root();
+    let config_dir = root.join("config");
     let _ = std::fs::create_dir_all(&config_dir);
 
     // Load config on main thread before spawning anything
@@ -26,9 +25,10 @@ fn main() -> anyhow::Result<()> {
 
     // Spawn tokio runtime on a dedicated background thread
     let bg_tx = tx.clone();
+    let bg_root = root.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(background_loop(bg_tx, cmd_rx, config));
+        rt.block_on(background_loop(bg_tx, cmd_rx, config, bg_root));
     });
 
     // eframe runs on the main thread
@@ -101,6 +101,7 @@ async fn background_loop(
     tx: std::sync::mpsc::Sender<ep_desktop::app::AppMsg>,
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<ep_desktop::app::AppCmd>,
     config: ep_core::config::AppConfig,
+    root: std::path::PathBuf,
 ) {
     use ep_desktop::app::{AppCmd, AppMsg};
 
@@ -114,9 +115,7 @@ async fn background_loop(
     let _ = tx.send(AppMsg::DevicesRefreshed(devices.clone()));
 
     // Initial module discovery
-    let modules_dir = std::env::current_dir()
-        .unwrap_or_default()
-        .join("modules");
+    let modules_dir = root.join("modules");
     let discovered = ep_core::module::discover_modules(&modules_dir);
     let _ = tx.send(AppMsg::ModulesDiscovered(discovered.clone()));
 
@@ -216,7 +215,6 @@ async fn background_loop(
                         // TODO: 调用 ModelManager::list_all_models 并发送 ModelsRefreshed
                     }
                     Some(AppCmd::RefreshDeps) => {
-                        let root = std::env::current_dir().unwrap_or_default();
                         let report = ep_core::deps::DepReport::check_all(&root);
                         let _ = tx.send(AppMsg::DepReportRefreshed(report));
                     }
