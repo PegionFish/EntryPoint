@@ -14,7 +14,8 @@ use tower_http::services::{ServeDir, ServeFile};
 use tracing_subscriber::EnvFilter;
 
 use ep_core::compute::detect_all_devices;
-use ep_core::config::AppConfig;
+use ep_core::config::{self, AppConfig};
+use ep_core::deps::DepReport;
 use ep_core::module::discovery::discover_modules;
 use ep_core::port::PortManager;
 use ep_core::process::ProcessManager;
@@ -47,13 +48,15 @@ async fn main() -> anyhow::Result<()> {
 async fn run_module_standalone(module_id: &str) -> anyhow::Result<()> {
     tracing::info!("Standalone mode: running module '{}'", module_id);
 
-    // Load config
-    let config_dir = std::path::Path::new("config");
-    let config = AppConfig::load_or_create(config_dir).unwrap_or_default();
+    // Resolve root directory and load config
+    let root = config::resolve_root();
+    let config_dir = root.join("config");
+    let mut cfg = AppConfig::load_or_create(&config_dir).unwrap_or_default();
+    cfg.resolve_paths(&root);
 
     // Discover modules
-    let modules_dir = std::path::Path::new("modules");
-    let modules = discover_modules(modules_dir);
+    let modules_dir = root.join("modules");
+    let modules = discover_modules(&modules_dir);
 
     // Find the target module
     let discovered = modules
@@ -79,7 +82,7 @@ async fn run_module_standalone(module_id: &str) -> anyhow::Result<()> {
     );
 
     // Detect devices and pick the best one
-    let devices = detect_all_devices(&config.compute.disabled_backends);
+    let devices = detect_all_devices(&cfg.compute.disabled_backends);
     let device = devices
         .iter()
         .find(|d| {
@@ -94,13 +97,12 @@ async fn run_module_standalone(module_id: &str) -> anyhow::Result<()> {
     tracing::info!("Using device: {}", device);
 
     // Allocate port
-    let (port_start, port_end) = config.port_range();
+    let (port_start, port_end) = cfg.port_range();
     let mut port_manager = PortManager::new(port_start, port_end);
     let port = port_manager.allocate(module_id)?;
     tracing::info!("Allocated port: {}", port);
 
-    // Build environment variables
-    let root = std::env::current_dir()?;
+    // Build environment variables (root already resolved above)
     let module_dir = root.join("modules").join(module_id);
     let model_dir = if let Some(model) = manifest.models.iter().find(|m| m.default) {
         root.join("models").join(&model.target_dir)
@@ -151,28 +153,51 @@ async fn run_module_standalone(module_id: &str) -> anyhow::Result<()> {
 async fn run_server() -> anyhow::Result<()> {
     tracing::info!("EntryPoint Daemon starting...");
 
-    // 1. Load configuration
-    let config_dir = std::path::Path::new("config");
-    let config = AppConfig::load_or_create(config_dir)?;
+    // 1. Resolve root directory and load configuration
+    let root = config::resolve_root();
+    tracing::info!(root = %root.display(), "project root resolved");
+
+    let config_dir = root.join("config");
+    let mut cfg = AppConfig::load_or_create(&config_dir)?;
+    cfg.resolve_paths(&root);
     tracing::info!("Configuration loaded");
 
-    // 2. Detect compute devices
-    let devices = detect_all_devices(&config.compute.disabled_backends);
+    // 2. Check and auto-install missing system dependencies
+    {
+        let results = DepReport::check_and_install_missing(&root);
+        for (dep, result) in &results {
+            match result {
+                ep_core::deps_install::InstallResult::Installed => {
+                    tracing::info!(dep = ?dep, "dependency auto-installed");
+                }
+                ep_core::deps_install::InstallResult::AlreadyPresent => {}
+                ep_core::deps_install::InstallResult::Failed(msg) => {
+                    tracing::warn!(dep = ?dep, msg = %msg, "dependency auto-install failed");
+                }
+                ep_core::deps_install::InstallResult::ManualRequired(msg) => {
+                    tracing::warn!(dep = ?dep, msg = %msg, "manual installation required");
+                }
+            }
+        }
+    }
+
+    // 3. Detect compute devices
+    let devices = detect_all_devices(&cfg.compute.disabled_backends);
     tracing::info!(count = devices.len(), "Compute devices detected");
 
-    // 3. Discover modules
-    let modules_dir = std::path::Path::new("modules");
-    let modules = discover_modules(modules_dir);
+    // 4. Discover modules
+    let modules_dir = root.join("modules");
+    let modules = discover_modules(&modules_dir);
     tracing::info!(count = modules.len(), "Modules discovered");
 
-    // 4. Create managers
-    let (port_start, port_end) = config.port_range();
+    // 5. Create managers
+    let (port_start, port_end) = cfg.port_range();
     let port_manager = PortManager::new(port_start, port_end);
 
-    // 5. Build AppState (creates broadcast channels internally)
-    let state = Arc::new(AppState::new(config, devices, modules, port_manager));
+    // 6. Build AppState (creates broadcast channels internally)
+    let state = Arc::new(AppState::new(cfg, devices, modules, port_manager));
 
-    // 6. Log public access setting
+    // 7. Log public access setting
     {
         let cfg = state.config.read().await;
         if cfg.server.allow_public {
@@ -182,14 +207,17 @@ async fn run_server() -> anyhow::Result<()> {
         }
     }
 
-    // 7. Build router with SPA fallback
-    let static_dir = "crates/ep-webui/static";
+    // 8. Build router with SPA fallback (absolute path)
+    let static_dir = root.join("crates").join("ep-webui").join("static");
+    let static_dir_str = static_dir.to_string_lossy().to_string();
+    let index_path = static_dir.join("index.html");
+    let index_path_str = index_path.to_string_lossy().to_string();
     let app = Router::new()
         .nest("/api", api::api_router())
         .merge(ws::ws_router())
         .fallback_service(
-            ServeDir::new(static_dir)
-                .not_found_service(ServeFile::new(format!("{static_dir}/index.html"))),
+            ServeDir::new(&static_dir_str)
+                .not_found_service(ServeFile::new(&index_path_str)),
         )
         .layer(axum::middleware::from_fn_with_state(state.clone(), ip_filter))
         .layer(

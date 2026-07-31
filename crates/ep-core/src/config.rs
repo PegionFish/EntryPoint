@@ -2,11 +2,51 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::types::ComputeBackend;
 
 const CONFIG_FILE_NAME: &str = "app.toml";
+
+// ─── Root 目录解析 ──────────────────────────────────────────────────────────
+
+/// 解析项目根目录（所有相对路径的基准）。
+///
+/// 优先级：
+/// 1. `EP_ROOT` 环境变量
+/// 2. 可执行文件所在目录的父目录（检查是否含 `config/` + `modules/`）
+/// 3. 当前工作目录（兜底）
+pub fn resolve_root() -> PathBuf {
+    // 1. 环境变量
+    if let Ok(ep_root) = std::env::var("EP_ROOT") {
+        let p = PathBuf::from(&ep_root);
+        if p.is_dir() {
+            info!(root = %p.display(), "resolved root from EP_ROOT");
+            return p;
+        }
+    }
+
+    // 2. 可执行文件位置推断
+    if let Ok(exe) = std::env::current_exe() {
+        // 典型布局: <root>/target/release/ep-daemon → root = exe/../../..
+        // 安装布局: /usr/bin/ep-daemon → 不适用，跳过
+        if let Some(bin_dir) = exe.parent() {
+            if let Some(build_dir) = bin_dir.parent() {
+                if let Some(candidate) = build_dir.parent() {
+                    if candidate.join("config").is_dir() && candidate.join("modules").is_dir() {
+                        info!(root = %candidate.display(), "resolved root from executable path");
+                        return candidate.to_path_buf();
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. 当前工作目录
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    info!(root = %cwd.display(), "resolved root from current directory");
+    cwd
+}
 
 // ─── AssignStrategy ─────────────────────────────────────────────────────────
 
@@ -308,6 +348,38 @@ impl AppConfig {
         } else {
             root.join(p)
         }
+    }
+
+    /// 将所有相对路径字段解析为绝对路径（基于 root）。
+    ///
+    /// 调用后 `models.cache_dir`、`pipeline.workspace_dir`、`models.cache_paths`
+    /// 中的相对路径均变为绝对路径。已经是绝对路径的不变。
+    pub fn resolve_paths(&mut self, root: &Path) {
+        // models.cache_dir
+        let p = Path::new(&self.models.cache_dir);
+        if p.is_relative() {
+            self.models.cache_dir = root.join(p).to_string_lossy().to_string();
+        }
+
+        // pipeline.workspace_dir
+        let p = Path::new(&self.pipeline.workspace_dir);
+        if p.is_relative() {
+            self.pipeline.workspace_dir = root.join(p).to_string_lossy().to_string();
+        }
+
+        // models.cache_paths（逐项解析）
+        for cp in &mut self.models.cache_paths {
+            let p = Path::new(cp.as_str());
+            if p.is_relative() {
+                *cp = root.join(p).to_string_lossy().to_string();
+            }
+        }
+
+        debug!(
+            cache_dir = %self.models.cache_dir,
+            workspace_dir = %self.pipeline.workspace_dir,
+            "config paths resolved to absolute"
+        );
     }
 
     pub fn port_range(&self) -> (u16, u16) {

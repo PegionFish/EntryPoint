@@ -17,3 +17,4 @@ pub mod pipeline;
 // Wave 0+ modules (skeleton)
 pub mod health;
 pub mod deps;
+pub mod deps_install;
