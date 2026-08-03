@@ -1,0 +1,22 @@
+{
+  "execute.eitherRequired": "必须提供 pipeline_id 或 spec 之一",
+  "execute.mutuallyExclusive": "pipeline_id 与 spec 不能同时提供",
+  "execute.pipelineNotFound": "管线不存在: {{id}}",
+  "execute.inputsUnknownNode": "inputs 引用的节点不存在: {{nodeId}}",
+  "execute.inputsNotObject": "inputs[\"{{nodeId}}\"] 必须是参数对象",
+  "execute.cycleDetected": "管线 `{{id}}` 存在环，无法执行",
+  "execute.internalError": "管线执行提交失败: {{detail}}",
+  "specInvalid": "管线 spec 结构无效: {{detail}}",
+  "pipelines.notFound": "管线不存在",
+  "pipelines.invalidId": "管线 id 格式非法（只允许小写字母、数字和连字符，且以字母或数字开头）",
+  "pipelines.specNotJson": "管线 spec 不是合法 JSON: {{detail}}",
+  "pipelines.specMalformed": "管线 spec 结构不合法: {{detail}}",
+  "pipelines.idMismatch": "spec 中的 pipeline.id（{{specId}}）与路径 id（{{pathId}}）不一致",
+  "pipelines.saveFailed": "保存管线失败: {{detail}}",
+  "pipelines.builtinReadOnly": "内置管线不可删除",
+  "pipelines.deleteFailed": "删除管线文件失败: {{detail}}",
+  "tasks.taskNotFound": "任务不存在: {{taskId}}",
+  "tasks.nodeNotFound": "任务中不存在节点: {{nodeId}}",
+  "tasks.noArtifact": "节点 `{{nodeId}}` 没有可下载的产物",
+  "tasks.artifactPathInvalid": "节点 `{{nodeId}}` 的产物路径无效"
+}

@@ -1,0 +1,13 @@
+{
+  "apiNotFound": "接口不存在",
+  "module.notFound": "模块不存在：{{id}}",
+  "module.invalidManifest": "模块清单无效，无法启动：{{id}}",
+  "module.alreadyRunning": "模块已在运行或正在启动：{{id}}",
+  "module.alreadyRunningWithStatus": "模块已在运行或正在启动（当前状态：{{status}}）",
+  "module.modelNotReady": "模型未就绪：{{model}}，请先在模型管理页下载或导入",
+  "module.portAllocationFailed": "端口分配失败：{{detail}}",
+  "module.startFailed": "启动模块失败：{{detail}}",
+  "module.notRunning": "模块未在运行：{{id}}",
+  "module.stopFailed": "停止模块失败：{{detail}}",
+  "config.saveFailed": "保存配置失败：{{detail}}"
+}

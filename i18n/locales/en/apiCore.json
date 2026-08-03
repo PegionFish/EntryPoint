@@ -1,0 +1,13 @@
+{
+  "apiNotFound": "API endpoint not found",
+  "module.notFound": "Module not found: {{id}}",
+  "module.invalidManifest": "Cannot start '{{id}}': module manifest is invalid",
+  "module.alreadyRunning": "Module is already running or starting: {{id}}",
+  "module.alreadyRunningWithStatus": "Module is already running or starting (current status: {{status}})",
+  "module.modelNotReady": "Model not ready: {{model}}. Please download or import it on the model management page first",
+  "module.portAllocationFailed": "Failed to allocate port: {{detail}}",
+  "module.startFailed": "Failed to start module: {{detail}}",
+  "module.notRunning": "Module is not running: {{id}}",
+  "module.stopFailed": "Failed to stop module: {{detail}}",
+  "config.saveFailed": "Failed to save configuration: {{detail}}"
+}

@@ -1,5 +1,8 @@
 pub mod types;
 
+// 共享基础设施：i18n（嵌入式翻译加载器，资源见仓库根 i18n/locales/）
+pub mod i18n;
+
 // Wave 1 modules
 pub mod module;
 pub mod compute;

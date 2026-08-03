@@ -172,6 +172,14 @@ impl AppState {
             downloads: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
+
+    /// 当前 UI 语言码：读取 `config.general.language` 并归一化为 `"zh-CN"` / `"en"`。
+    ///
+    /// 供 `crate::api::err_response`（i18n 错误响应）使用。
+    pub async fn lang(&self) -> String {
+        let raw = self.config.read().await.general.language.clone();
+        ep_core::i18n::normalize_language(&raw).to_string()
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -223,5 +231,25 @@ mod tests {
         assert_eq!(v["percent"], 42.5);
         assert_eq!(v["state"], "downloading");
         assert_eq!(v["bytes"], 12345);
+    }
+
+    // lang()：读取 config.general.language 并归一化
+    #[tokio::test]
+    async fn lang_normalizes_config_language() {
+        let state = AppState::new(
+            std::env::temp_dir().join(format!("ep_state_lang_{}", std::process::id())),
+            AppConfig::default(),
+            vec![],
+            vec![],
+            PortManager::new(18000, 19000),
+        );
+        // 默认配置 zh-CN
+        assert_eq!(state.lang().await, "zh-CN");
+
+        state.config.write().await.general.language = "en-US".into();
+        assert_eq!(state.lang().await, "en");
+
+        state.config.write().await.general.language = "fr".into();
+        assert_eq!(state.lang().await, "zh-CN");
     }
 }
