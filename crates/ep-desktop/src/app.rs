@@ -9,6 +9,7 @@ use ep_core::types::{ComputeDevice, ServiceStatus};
 use crate::pages;
 use crate::theme;
 use crate::toast::ToastManager;
+use crate::ui::Palette;
 
 // ─── Messages: background → UI ──────────────────────────────────────────────
 
@@ -44,8 +45,12 @@ pub enum AppCmd {
     DownloadModel(String, String),
     /// 删除模型 (target_dir)
     DeleteModel(String),
-    /// 导入本地模型 (target_dir, source_path)
-    ImportModel(String, std::path::PathBuf),
+    /// 导入本地模型：module_id 指定目标模块，model_id 指定模型声明，source 为本地文件/目录路径
+    ImportModel {
+        module_id: String,
+        model_id: String,
+        source: std::path::PathBuf,
+    },
     /// 刷新模型列表
     RefreshModels,
     /// 刷新依赖检测
@@ -135,6 +140,11 @@ const NAV_ITEMS: &[(Page, &str, &str)] = &[
     (Page::Settings, "⚙", "设置"),
 ];
 
+/// 侧栏导航行高
+const NAV_ROW_HEIGHT: f32 = 36.0;
+/// 紧凑模式（仅图标）的窗口宽度阈值
+const COMPACT_WIDTH_THRESHOLD: f32 = 1000.0;
+
 // ─── App ────────────────────────────────────────────────────────────────────
 
 pub struct App {
@@ -143,12 +153,21 @@ pub struct App {
     selected_module: Option<usize>,
     rx: std::sync::mpsc::Receiver<AppMsg>,
     pub cmd_tx: tokio::sync::mpsc::UnboundedSender<AppCmd>,
+    /// 状态消息（设置页仍在写入，保留 5 秒过期逻辑，但不再绘制；错误反馈由 Toast 承担）
     status_message: Option<(String, std::time::Instant)>,
     last_repaint: std::time::Instant,
     /// Toast 通知管理器
     pub toasts: ToastManager,
-    /// 深色主题（默认 true）
+    /// 深色主题（由 config.general.theme 决定）
     pub dark_theme: bool,
+    /// 已应用的缩放（与 config.ui.scale_factor 比对，变化时即时生效）
+    applied_scale: f32,
+    /// 已应用的字号（与 config.ui.font_size 比对，变化时即时生效）
+    applied_font_size: f32,
+    /// 是否已执行过首帧窗口尺寸保护
+    window_fitted: bool,
+    /// 上一帧的紧凑模式状态（切换时重置侧栏宽度缓存，使 default_width 重新生效）
+    last_compact: Option<bool>,
 }
 
 pub struct AppState {
@@ -169,9 +188,12 @@ impl App {
     pub fn new(
         rx: std::sync::mpsc::Receiver<AppMsg>,
         cmd_tx: tokio::sync::mpsc::UnboundedSender<AppCmd>,
+        config: AppConfig,
     ) -> Self {
-        let config = AppConfig::default();
+        let dark_theme = config.general.theme != "light";
         let model_cache_dir = config.models.cache_dir.clone();
+        let applied_scale = config.ui.scale_factor;
+        let applied_font_size = config.ui.font_size;
         Self {
             current_page: Page::Dashboard,
             state: AppState {
@@ -189,7 +211,11 @@ impl App {
             status_message: None,
             last_repaint: std::time::Instant::now(),
             toasts: ToastManager::new(),
-            dark_theme: true,
+            dark_theme,
+            applied_scale,
+            applied_font_size,
+            window_fitted: false,
+            last_compact: None,
         }
     }
 
@@ -256,12 +282,55 @@ impl App {
             }
         }
     }
+
+    /// 首帧窗口保护：窗口宽/高超过屏幕 92% 时收缩到 92%
+    fn fit_window_to_screen(&self, ctx: &egui::Context) {
+        // 视口信息暂不可用时跳过（兜底）
+        let Some(inner) = ctx.input(|i| i.viewport().inner_rect) else {
+            return;
+        };
+        let screen = ctx.screen_rect();
+        if screen.width() <= 0.0 || screen.height() <= 0.0 {
+            return;
+        }
+        let max_w = screen.width() * 0.92;
+        let max_h = screen.height() * 0.92;
+        let mut size = inner.size();
+        let mut need_shrink = false;
+        if size.x > max_w {
+            size.x = max_w;
+            need_shrink = true;
+        }
+        if size.y > max_h {
+            size.y = max_h;
+            need_shrink = true;
+        }
+        if need_shrink {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        }
+    }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 应用主题
         theme::apply_theme(ctx, self.dark_theme);
+
+        // ── 缩放 / 字号即时生效（设置页修改 config 后立即应用） ──
+        if self.state.config.ui.scale_factor != self.applied_scale {
+            self.applied_scale = self.state.config.ui.scale_factor;
+            ctx.set_zoom_factor(self.applied_scale);
+        }
+        if self.state.config.ui.font_size != self.applied_font_size {
+            self.applied_font_size = self.state.config.ui.font_size;
+            theme::apply_font_size(ctx, self.applied_font_size);
+        }
+
+        // ── 窗口尺寸保护（一次性） ──
+        if !self.window_fitted {
+            self.window_fitted = true;
+            self.fit_window_to_screen(ctx);
+        }
 
         // Poll messages from background thread
         self.process_messages();
@@ -272,61 +341,94 @@ impl eframe::App for App {
             self.last_repaint = std::time::Instant::now();
         }
 
-        // Clear status message after 5 seconds
+        // Clear status message after 5 seconds（保留字段逻辑，仅不再绘制）
         if let Some((_, instant)) = &self.status_message {
             if instant.elapsed() > std::time::Duration::from_secs(5) {
                 self.status_message = None;
             }
         }
 
-        // ── Top menu bar ──
-        egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
-                ui.menu_button("文件", |ui| {
-                    if ui.button("退出").clicked() {
-                        let _ = self.cmd_tx.send(AppCmd::Shutdown);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                });
-                ui.menu_button("帮助", |ui| {
-                    ui.label("EntryPoint v0.2.0");
-                });
-            });
+        let pal = Palette::new(self.dark_theme);
 
-            // Status message bar
-            if let Some((ref msg, _)) = self.status_message {
-                ui.colored_label(egui::Color32::from_rgb(255, 180, 80), msg);
-            }
+        // ── 响应式紧凑模式（窄窗口只显示图标） ──
+        let compact = ctx.input(|i| {
+            i.viewport()
+                .inner_rect
+                .map(|r| r.width() < COMPACT_WIDTH_THRESHOLD)
+                .unwrap_or(false)
         });
+        // 紧凑状态切换时清除侧栏宽度缓存，让新的 default_width 重新生效
+        if self.last_compact != Some(compact) {
+            self.last_compact = Some(compact);
+            ctx.data_mut(|d| {
+                d.remove::<egui::containers::panel::PanelState>(egui::Id::new("nav"));
+            });
+        }
 
         // ── Left navigation ──
         egui::SidePanel::left("nav")
-            .default_width(160.0)
+            .default_width(if compact { 68.0 } else { 180.0 })
+            .resizable(false)
             .show(ctx, |ui| {
-                ui.add_space(8.0);
-                ui.vertical_centered(|ui| {
-                    ui.heading("EntryPoint");
-                });
+                ui.add_space(10.0);
+                // 应用标识
+                if compact {
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("EP")
+                                .size(18.0)
+                                .strong()
+                                .color(pal.primary),
+                        );
+                    });
+                } else {
+                    ui.vertical_centered(|ui| {
+                        ui.heading("EntryPoint");
+                    });
+                }
+                ui.add_space(6.0);
                 ui.separator();
                 ui.add_space(4.0);
 
+                // 导航项
                 for &(page, icon, label) in NAV_ITEMS {
-                    let text = format!("{icon}  {label}");
-                    ui.selectable_value(&mut self.current_page, page, text);
+                    let active = self.current_page == page;
+                    if nav_item(ui, &pal, compact, icon, label, active).clicked() {
+                        self.current_page = page;
+                    }
+                    ui.add_space(2.0);
                 }
 
+                // 底部：退出、主题切换、版本号（bottom_up：先添加的在更下方）
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    ui.separator();
-                    // 主题切换
-                    let theme_label = if self.dark_theme { "🌙 深色" } else { "☀️ 浅色" };
-                    if ui.button(theme_label).clicked() {
-                        self.dark_theme = !self.dark_theme;
+                    ui.add_space(8.0);
+                    if !compact {
+                        ui.label(
+                            egui::RichText::new("v0.2.0").small().color(pal.text_faint),
+                        );
                     }
-                    ui.label(
-                        egui::RichText::new("v0.2.0")
-                            .small()
-                            .color(egui::Color32::from_gray(120)),
-                    );
+                    // 主题切换（持久化到 config/app.toml）
+                    let (theme_icon, theme_label) = if self.dark_theme {
+                        ("🌙", "深色")
+                    } else {
+                        ("☀️", "浅色")
+                    };
+                    if nav_item(ui, &pal, compact, theme_icon, theme_label, false).clicked() {
+                        self.dark_theme = !self.dark_theme;
+                        self.state.config.general.theme = if self.dark_theme {
+                            "dark".to_string()
+                        } else {
+                            "light".to_string()
+                        };
+                        let config_dir = ep_core::config::resolve_root().join("config");
+                        let _ = self.state.config.save(&config_dir);
+                    }
+                    ui.add_space(2.0);
+                    // 退出
+                    if nav_item(ui, &pal, compact, "⏻", "退出", false).clicked() {
+                        let _ = self.cmd_tx.send(AppCmd::Shutdown);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
                 });
             });
 
@@ -369,5 +471,78 @@ impl eframe::App for App {
 
         // ── Toast 通知（最上层） ──
         self.toasts.show(ctx);
+    }
+}
+
+// ─── 侧栏导航行 ─────────────────────────────────────────────────────────────
+
+/// 绘制一行侧栏条目（自绘背景 + 文本）：
+/// - 激活态：card_raised 背景 + 左侧 3px primary 指示条 + primary 加粗文字
+/// - 悬停态：弱化的 card_raised 背景
+/// - compact 模式只显示居中图标，悬停显示文字 tooltip
+fn nav_item(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    compact: bool,
+    icon: &str,
+    label: &str,
+    active: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), NAV_ROW_HEIGHT),
+        egui::Sense::click(),
+    );
+
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let rounding = egui::CornerRadius::same(8);
+        if active {
+            painter.rect_filled(rect, rounding, pal.card_raised);
+            // 左侧 3px 圆角指示条
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(rect.min.x + 1.0, rect.min.y + 9.0),
+                egui::pos2(rect.min.x + 4.0, rect.max.y - 9.0),
+            );
+            painter.rect_filled(bar, egui::CornerRadius::same(2), pal.primary);
+        } else if response.hovered() {
+            // hover 背景：bg 向 card_raised 插值，两套主题下均弱于激活态
+            painter.rect_filled(rect, rounding, pal.bg.lerp_to_gamma(pal.card_raised, 0.6));
+        }
+
+        // 文本 / 图标（激活时加粗、primary 色）
+        let color = if active { pal.primary } else { pal.text_dim };
+        let text = if compact {
+            icon.to_string()
+        } else {
+            format!("{icon}  {label}")
+        };
+        let mut rich = egui::RichText::new(text).color(color);
+        if active {
+            rich = rich.strong();
+        }
+        let galley = egui::WidgetText::from(rich).into_galley(
+            ui,
+            Some(egui::TextWrapMode::Extend),
+            f32::INFINITY,
+            egui::FontSelection::Default,
+        );
+        let pos = if compact {
+            egui::pos2(
+                rect.center().x - galley.size().x / 2.0,
+                rect.center().y - galley.size().y / 2.0,
+            )
+        } else {
+            egui::pos2(
+                rect.min.x + 12.0,
+                rect.center().y - galley.size().y / 2.0,
+            )
+        };
+        painter.galley(pos, galley, color);
+    }
+
+    if compact {
+        response.on_hover_text(label)
+    } else {
+        response
     }
 }

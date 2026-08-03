@@ -1,7 +1,9 @@
-//! Toast 通知 — 右下角弹出消息，3 秒自动消失
+//! Toast 通知 — 右下角弹出消息，3 秒自动消失，颜色随主题（Palette）。
 
 use eframe::egui;
 use std::time::Instant;
+
+use crate::ui::Palette;
 
 /// 单条 Toast 消息
 #[derive(Debug, Clone)]
@@ -28,19 +30,12 @@ impl ToastKind {
         }
     }
 
-    fn color(&self) -> egui::Color32 {
+    /// 类型对应的语义色（描边与图标着色）
+    fn color(&self, pal: &Palette) -> egui::Color32 {
         match self {
-            Self::Success => egui::Color32::from_rgb(80, 220, 80),
-            Self::Error => egui::Color32::from_rgb(255, 80, 80),
-            Self::Info => egui::Color32::from_rgb(80, 160, 255),
-        }
-    }
-
-    fn bg_color(&self) -> egui::Color32 {
-        match self {
-            Self::Success => egui::Color32::from_rgb(20, 40, 20),
-            Self::Error => egui::Color32::from_rgb(50, 20, 20),
-            Self::Info => egui::Color32::from_rgb(20, 30, 50),
+            Self::Success => pal.success,
+            Self::Error => pal.danger,
+            Self::Info => pal.info,
         }
     }
 }
@@ -95,6 +90,9 @@ impl ToastManager {
             return;
         }
 
+        // 主题感知：跟随当前 egui visuals 的深/浅模式取色
+        let pal = Palette::new(ctx.style().visuals.dark_mode);
+
         let panel = egui::Area::new(egui::Id::new("toast_area"))
             .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
             .order(egui::Order::Foreground)
@@ -102,42 +100,36 @@ impl ToastManager {
 
         panel.show(ctx, |ui| {
             ui.vertical(|ui| {
+                // 多条 Toast 垂直排列间距
+                ui.spacing_mut().item_spacing.y = 6.0;
                 // 从下往上排列（最新的在最下面）
                 for toast in &self.toasts {
-                    let alpha = {
-                        let elapsed = toast.created_at.elapsed().as_secs_f32();
-                        let remaining = TOAST_DURATION_SECS as f32 - elapsed;
-                        // 最后 0.5 秒淡出
-                        if remaining < 0.5 {
-                            (remaining / 0.5).clamp(0.0, 1.0)
-                        } else {
-                            1.0
-                        }
+                    let elapsed = toast.created_at.elapsed().as_secs_f32();
+                    let remaining = TOAST_DURATION_SECS as f32 - elapsed;
+                    // 最后 0.5 秒淡出
+                    let alpha = if remaining < 0.5 {
+                        (remaining / 0.5).clamp(0.0, 1.0)
+                    } else {
+                        1.0
                     };
 
-                    let bg = toast.kind.bg_color();
-                    let bg = egui::Color32::from_rgba_premultiplied(
-                        bg.r(),
-                        bg.g(),
-                        bg.b(),
-                        (alpha * 230.0) as u8,
-                    );
+                    // 预乘色直接 gamma_multiply 即向透明淡出
+                    let accent = toast.kind.color(&pal).gamma_multiply(alpha);
+                    let fill = pal.card.gamma_multiply(alpha);
 
                     egui::Frame::new()
-                        .fill(bg)
-                        .corner_radius(egui::CornerRadius::same(8))
-                        .inner_margin(egui::Margin::same(10))
-                        .outer_margin(egui::Margin::symmetric(0, 3))
+                        .fill(fill)
+                        .stroke(egui::Stroke::new(1.0_f32, accent))
+                        .corner_radius(egui::CornerRadius::same(10))
+                        .inner_margin(egui::Margin::symmetric(12, 9))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label(
-                                    egui::RichText::new(toast.kind.icon())
-                                        .color(toast.kind.color())
-                                        .strong(),
+                                    egui::RichText::new(toast.kind.icon()).color(accent),
                                 );
                                 ui.label(
                                     egui::RichText::new(&toast.message)
-                                        .color(egui::Color32::from_rgb(229, 229, 229)),
+                                        .color(pal.text.gamma_multiply(alpha)),
                                 );
                             });
                         });
