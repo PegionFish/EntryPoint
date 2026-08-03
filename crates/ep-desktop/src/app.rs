@@ -153,8 +153,6 @@ pub struct App {
     selected_module: Option<usize>,
     rx: std::sync::mpsc::Receiver<AppMsg>,
     pub cmd_tx: tokio::sync::mpsc::UnboundedSender<AppCmd>,
-    /// 状态消息（设置页仍在写入，保留 5 秒过期逻辑，但不再绘制；错误反馈由 Toast 承担）
-    status_message: Option<(String, std::time::Instant)>,
     last_repaint: std::time::Instant,
     /// Toast 通知管理器
     pub toasts: ToastManager,
@@ -208,7 +206,6 @@ impl App {
             selected_module: None,
             rx,
             cmd_tx,
-            status_message: None,
             last_repaint: std::time::Instant::now(),
             toasts: ToastManager::new(),
             dark_theme,
@@ -258,7 +255,6 @@ impl App {
                 }
                 AppMsg::Error(e) => {
                     self.toasts.error(&e);
-                    self.status_message = Some((e, std::time::Instant::now()));
                 }
                 AppMsg::ModelsRefreshed(models) => {
                     self.state.models = models;
@@ -339,13 +335,6 @@ impl eframe::App for App {
         if self.last_repaint.elapsed() > std::time::Duration::from_secs(2) {
             ctx.request_repaint();
             self.last_repaint = std::time::Instant::now();
-        }
-
-        // Clear status message after 5 seconds（保留字段逻辑，仅不再绘制）
-        if let Some((_, instant)) = &self.status_message {
-            if instant.elapsed() > std::time::Duration::from_secs(5) {
-                self.status_message = None;
-            }
         }
 
         let pal = Palette::new(self.dark_theme);
@@ -465,7 +454,7 @@ impl eframe::App for App {
                 pages::tasks::show(ui, &self.state.modules, &self.state.tasks);
             }
             Page::Settings => {
-                pages::settings::show(ui, &mut self.state.config, &mut self.status_message);
+                pages::settings::show(ui, &mut self.state.config, &mut self.toasts);
             }
         });
 

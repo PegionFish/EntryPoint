@@ -109,8 +109,13 @@ mod tests {
     }
 
     #[test]
-    fn font_size_factor_clamped() {
-        // 通过 apply_font_size 的 clamp 逻辑间接验证：此处仅保证常量合理
-        assert!(BASE_FONT_SIZE >= 10.0 && BASE_FONT_SIZE <= 24.0);
+    fn apply_font_size_scales_text_styles() {
+        let ctx = egui::Context::default();
+        apply_font_size(&ctx, 21.0); // 21/14 = 1.5x
+        let style = ctx.style();
+        let heading = style.text_styles[&egui::TextStyle::Heading].size;
+        let body = style.text_styles[&egui::TextStyle::Body].size;
+        assert!((heading - 30.0).abs() < 0.01);
+        assert!((body - 21.0).abs() < 0.01);
     }
 }
