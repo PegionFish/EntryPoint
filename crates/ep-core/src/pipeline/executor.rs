@@ -212,7 +212,7 @@ mod tests {
         let toml_str = r#"
 [pipeline]
 id = "test-exec"
-name = "执行测试"
+name = "Execution test"
 
 [[nodes]]
 id = "input"
@@ -403,7 +403,7 @@ to = ["save", "input"]
         );
         assert!(
             output_substituted,
-            "{{output}} 被替换后不得再追加输出参数"
+            "no output argument may be appended once {{output}} has been substituted"
         );
         // 无残留占位符字面量进入命令行
         assert!(replaced
@@ -425,22 +425,25 @@ to = ["save", "input"]
             substitute_ffmpeg_placeholders(&args, "encode", None, Path::new("/tmp/o")).unwrap();
 
         assert_eq!(replaced, args);
-        assert!(!output_substituted, "无 {{output}} 占位符 → 保持末尾追加行为");
+        assert!(
+            !output_substituted,
+            "no {{output}} placeholder → keep trailing-append behavior"
+        );
     }
 
     #[test]
-    fn test_substitute_placeholders_missing_upstream_chinese_error() {
+    fn test_substitute_placeholders_missing_upstream_error() {
         let args = vec!["-i".to_string(), "{input}".to_string(), "{output}".to_string()];
 
         let err =
             substitute_ffmpeg_placeholders(&args, "extract-audio", None, Path::new("/tmp/o"))
-                .expect_err("含 {input} 但无上游文件必须报错");
+                .expect_err("must error when {input} is present without an upstream file");
         let msg = err.to_string();
 
-        assert!(msg.contains("extract-audio"), "错误应指出节点 id: {msg}");
+        assert!(msg.contains("extract-audio"), "error should name the node id: {msg}");
         assert!(
-            msg.contains("占位符") && msg.contains("上游"),
-            "错误信息应为中文: {msg}"
+            msg.contains("placeholder") && msg.contains("upstream"),
+            "error message should be English: {msg}"
         );
     }
 
@@ -522,14 +525,14 @@ to = ["save", "input"]
         let artifact =
             execute_builtin_ffmpeg(&node, &[Artifact::File(input_file)], &work_dir)
                 .await
-                .expect("占位符替换后 ffmpeg 应成功");
+                .expect("ffmpeg should succeed after placeholder substitution");
 
         let output = match artifact {
             Artifact::File(p) => p,
             other => panic!("expected file artifact, got {other:?}"),
         };
         assert_eq!(output, work_dir.join("extract-audio_output.wav"));
-        assert!(output.exists(), "输出文件应生成");
+        assert!(output.exists(), "output file should be created");
         assert!(std::fs::metadata(&output).unwrap().len() > 0);
 
         cleanup_ffmpeg_dir(&work_dir);
@@ -562,7 +565,7 @@ to = ["save", "input"]
         let artifact =
             execute_builtin_ffmpeg(&node, &[Artifact::File(input_file)], &work_dir)
                 .await
-                .expect("无占位符的旧行为应保持不变");
+                .expect("legacy behavior without placeholders should be unchanged");
 
         let Artifact::File(output) = artifact else {
             panic!("expected file artifact");
@@ -588,11 +591,11 @@ to = ["save", "input"]
 
         let err = execute_builtin_ffmpeg(&node, &[], &work_dir)
             .await
-            .expect_err("无上游输入必须失败");
+            .expect_err("must fail without upstream input");
         let msg = err.to_string();
         assert!(
-            msg.contains("上游") && msg.contains("占位符"),
-            "应为中文错误: {msg}"
+            msg.contains("upstream") && msg.contains("placeholder"),
+            "expected English error: {msg}"
         );
 
         cleanup_ffmpeg_dir(&work_dir);
@@ -621,7 +624,7 @@ to = ["save", "input"]
             r#"
 [pipeline]
 id = "audio-extract-shape"
-name = "音频提取（shipped 形状）"
+name = "Audio extraction (shipped shape)"
 
 [[nodes]]
 id = "input"
@@ -660,15 +663,15 @@ to = ["output", "input"]
         let mut runner = PipelineRunnerImpl::new(work_dir.clone());
 
         let result = runner.execute(&pipeline, &work_dir);
-        assert!(result.is_ok(), "shipped 形状管线应成功: {result:?}");
+        assert!(result.is_ok(), "shipped-shape pipeline should succeed: {result:?}");
         assert_eq!(*runner.task_status(), TaskStatus::Completed);
 
         // ffmpeg 节点中间产物：output_extension 生效
         let mid = work_dir.join("extract_output.m4a");
-        assert!(mid.exists(), "ffmpeg 节点输出应落盘");
+        assert!(mid.exists(), "ffmpeg node output should be written");
 
         // file_output 复制产物
-        assert!(final_output.exists(), "最终输出应落盘");
+        assert!(final_output.exists(), "final output should be written");
         let mid_bytes = std::fs::read(&mid).unwrap();
         let out_bytes = std::fs::read(&final_output).unwrap();
         assert!(!mid_bytes.is_empty());
@@ -900,8 +903,9 @@ pub(crate) fn substitute_ffmpeg_placeholders(
         if replaced.contains(INPUT_PLACEHOLDER) {
             let input = input_file.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "ffmpeg 节点 '{node_id}' 的 args 含 {INPUT_PLACEHOLDER} 占位符，\
-                     但该节点没有可用的上游输入文件；请确认上游节点已连接且执行成功"
+                    "ffmpeg node '{node_id}' has the {INPUT_PLACEHOLDER} placeholder in its args, \
+                     but the node has no usable upstream input file; \
+                     ensure the upstream node is connected and has succeeded"
                 )
             })?;
             replaced = replaced.replace(INPUT_PLACEHOLDER, &input.to_string_lossy());

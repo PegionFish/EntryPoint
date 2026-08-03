@@ -305,12 +305,12 @@ impl EnvManager {
     /// 平台相关的 python 安装提示
     fn python_install_hint() -> String {
         if cfg!(windows) {
-            "Python 未找到。请从 https://www.python.org/downloads/ 下载安装，\
-             安装时勾选 \"Add Python to PATH\"。"
+            "Python not found. Download it from https://www.python.org/downloads/ \
+             and check \"Add Python to PATH\" during installation."
                 .to_string()
         } else {
-            "Python 未找到。请运行: sudo apt install python3 python3-venv \
-             (Debian/Ubuntu) 或 sudo dnf install python3 (Fedora)"
+            "Python not found. Run: sudo apt install python3 python3-venv \
+             (Debian/Ubuntu) or sudo dnf install python3 (Fedora)"
                 .to_string()
         }
     }
@@ -318,11 +318,11 @@ impl EnvManager {
     /// 平台相关的 uv 安装提示
     fn uv_install_hint() -> String {
         if cfg!(windows) {
-            "uv 未找到。请从 https://github.com/astral-sh/uv/releases 下载，\
-             或运行: powershell -c \"irm https://astral.sh/uv/install.ps1 | iex\""
+            "uv not found. Download it from https://github.com/astral-sh/uv/releases, \
+             or run: powershell -c \"irm https://astral.sh/uv/install.ps1 | iex\""
                 .to_string()
         } else {
-            "uv 未找到。请运行: curl -LsSf https://astral.sh/uv/install.sh | sh"
+            "uv not found. Run: curl -LsSf https://astral.sh/uv/install.sh | sh"
                 .to_string()
         }
     }

@@ -493,7 +493,7 @@ impl ModelManager {
         if model.source == ModelSource::Url {
             return UpdateCheckResult {
                 available: false,
-                reason: "URL 来源不支持更新检查".to_string(),
+                reason: "URL source does not support update checks".to_string(),
                 remote_modified: None,
             };
         }
@@ -503,7 +503,7 @@ impl ModelManager {
             _ => {
                 return UpdateCheckResult {
                     available: false,
-                    reason: "模型未声明 repo_id，无法检查更新".to_string(),
+                    reason: "model does not declare repo_id, cannot check for updates".to_string(),
                     remote_modified: None,
                 };
             }
@@ -515,7 +515,7 @@ impl ModelManager {
             None => {
                 return UpdateCheckResult {
                     available: false,
-                    reason: "缺少下载元数据，无法比较".to_string(),
+                    reason: "missing download metadata".to_string(),
                     remote_modified: None,
                 };
             }
@@ -526,7 +526,10 @@ impl ModelManager {
             Err(_) => {
                 return UpdateCheckResult {
                     available: false,
-                    reason: format!("本地下载时间格式无效（{}），无法比较", meta.downloaded_at),
+                    reason: format!(
+                        "invalid local download timestamp ({}), cannot compare",
+                        meta.downloaded_at
+                    ),
                     remote_modified: None,
                 };
             }
@@ -537,7 +540,7 @@ impl ModelManager {
             Err(e) => {
                 return UpdateCheckResult {
                     available: false,
-                    reason: format!("构建 HTTP 客户端失败：{e}"),
+                    reason: format!("failed to build HTTP client: {e}"),
                     remote_modified: None,
                 };
             }
@@ -561,23 +564,20 @@ impl ModelManager {
                 if remote > local_time {
                     UpdateCheckResult {
                         available: true,
-                        reason: format!(
-                            "远端仓库有更新（远端修改于 {remote_str}，本地下载于 {}）",
-                            meta.downloaded_at
-                        ),
+                        reason: "update available".to_string(),
                         remote_modified: Some(remote_str),
                     }
                 } else {
                     UpdateCheckResult {
                         available: false,
-                        reason: "已是最新版本".to_string(),
+                        reason: "already up to date".to_string(),
                         remote_modified: Some(remote_str),
                     }
                 }
             }
             Err(e) => UpdateCheckResult {
                 available: false,
-                reason: format!("检查更新失败：{e}"),
+                reason: format!("update check failed: {e}"),
                 remote_modified: None,
             },
         }
@@ -965,7 +965,7 @@ impl ModelManager {
             .find(|m| m.id == model_id)
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "在模块 '{module_id}' 的清单中未找到模型 '{model_id}'，无法导入"
+                    "model '{model_id}' not found in manifest of module '{module_id}', cannot import"
                 )
             })?;
         self.import_model_into(module_id, model_id, &decl.target_dir, source_path)
@@ -1255,8 +1255,8 @@ impl DownloadHandle {
         match self.done_rx.take() {
             Some(rx) => rx
                 .await
-                .unwrap_or_else(|_| Err("下载监督任务异常退出".to_string())),
-            None => Err("该下载句柄已被等待过".to_string()),
+                .unwrap_or_else(|_| Err("download supervisor task exited abnormally".to_string())),
+            None => Err("this download handle has already been awaited".to_string()),
         }
     }
 }
@@ -1371,7 +1371,7 @@ async fn supervise_download(
                 let _ = child.wait().await; // 回收子进程
                 let bytes = dir_total_size(&poll_dir);
                 emit(compute_percent(bytes, size_estimate_mb), bytes, DownloadState::Cancelled);
-                let _ = done_tx.send(Err("下载已取消".to_string()));
+                let _ = done_tx.send(Err("download cancelled".to_string()));
                 return;
             }
             wait_res = child.wait() => {
@@ -1402,9 +1402,9 @@ async fn supervise_download(
                         };
                         let summary = truncate_chars(&summary, ERROR_SUMMARY_MAX_CHARS);
                         let msg = if summary.trim().is_empty() {
-                            format!("下载失败（退出码 {:?}）", status.code())
+                            format!("download failed (exit code {:?})", status.code())
                         } else {
-                            format!("下载失败（退出码 {:?}）：{}", status.code(), summary)
+                            format!("download failed (exit code {:?}): {}", status.code(), summary)
                         };
                         let bytes = dir_total_size(&poll_dir);
                         emit(
@@ -1416,7 +1416,7 @@ async fn supervise_download(
                         return;
                     }
                     Err(e) => {
-                        let msg = format!("等待下载进程失败：{e}");
+                        let msg = format!("failed to wait for download process: {e}");
                         emit(0.0, 0, DownloadState::Failed(msg.clone()));
                         let _ = done_tx.send(Err(msg));
                         return;
@@ -1477,7 +1477,7 @@ pub const HF_CACHE_DIR_NAMES: &[&str] = &["blobs", "snapshots", "refs", ".cache"
 ///    才删除缓存目录内的对应副本；其余文件一律保留。
 pub fn cleanup_hf_cache(model_dir: &Path) -> Result<u64> {
     if !model_dir.is_dir() {
-        anyhow::bail!("模型目录不存在：{}", model_dir.display());
+        anyhow::bail!("model directory does not exist: {}", model_dir.display());
     }
 
     let mut reclaimed = 0u64;
@@ -1631,13 +1631,13 @@ fn build_proxied_http_client(
 
     if !network.https_proxy.is_empty() {
         let proxy = reqwest::Proxy::https(&network.https_proxy)
-            .with_context(|| format!("无效的 HTTPS 代理地址：{}", network.https_proxy))?;
+            .with_context(|| format!("invalid HTTPS proxy address: {}", network.https_proxy))?;
         builder = builder.proxy(proxy);
         has_proxy = true;
     }
     if !network.http_proxy.is_empty() {
         let proxy = reqwest::Proxy::http(&network.http_proxy)
-            .with_context(|| format!("无效的 HTTP 代理地址：{}", network.http_proxy))?;
+            .with_context(|| format!("invalid HTTP proxy address: {}", network.http_proxy))?;
         builder = builder.proxy(proxy);
         has_proxy = true;
     }
@@ -1645,7 +1645,7 @@ fn build_proxied_http_client(
         builder = builder.no_proxy();
     }
 
-    builder.build().context("构建 HTTP 客户端失败")
+    builder.build().context("failed to build HTTP client")
 }
 
 /// 查询 HuggingFace 仓库最后修改时间：GET {endpoint}/api/models/{repo_id}
@@ -1659,24 +1659,24 @@ async fn fetch_hf_modified(
         .get(&url)
         .send()
         .await
-        .with_context(|| format!("请求 HuggingFace API 失败（{url}）"))?;
+        .with_context(|| format!("HuggingFace API request failed ({url})"))?;
 
     let status = resp.status();
     if !status.is_success() {
-        anyhow::bail!("HuggingFace API 返回非成功状态码 {status}");
+        anyhow::bail!("HuggingFace API returned non-success status code {status}");
     }
 
     let body: serde_json::Value = resp
         .json()
         .await
-        .context("解析 HuggingFace API 响应失败")?;
+        .context("failed to parse HuggingFace API response")?;
     let last_modified = body
         .get("lastModified")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("HuggingFace API 响应缺少 lastModified 字段"))?;
+        .ok_or_else(|| anyhow::anyhow!("HuggingFace API response missing lastModified field"))?;
 
     let dt = chrono::DateTime::parse_from_rfc3339(last_modified).with_context(|| {
-        format!("无法解析 lastModified 时间（{last_modified}）")
+        format!("failed to parse lastModified time ({last_modified})")
     })?;
     Ok((dt.with_timezone(&chrono::Utc), last_modified.to_string()))
 }
@@ -1695,25 +1695,25 @@ async fn fetch_modelscope_modified(
         .get(&url)
         .send()
         .await
-        .with_context(|| format!("请求 ModelScope API 失败（{url}）"))?;
+        .with_context(|| format!("ModelScope API request failed ({url})"))?;
 
     let status = resp.status();
     let body: serde_json::Value = resp
         .json()
         .await
-        .context("解析 ModelScope API 响应失败")?;
+        .context("failed to parse ModelScope API response")?;
 
     if !status.is_success() || body.get("Success").and_then(|v| v.as_bool()) == Some(false) {
         let message = body
             .get("Message")
             .and_then(|v| v.as_str())
-            .unwrap_or("未知错误");
-        anyhow::bail!("ModelScope API 查询失败（状态码 {status}）：{message}");
+            .unwrap_or("unknown error");
+        anyhow::bail!("ModelScope API query failed (status code {status}): {message}");
     }
 
     let data = body
         .get("Data")
-        .ok_or_else(|| anyhow::anyhow!("ModelScope API 响应缺少 Data 字段"))?;
+        .ok_or_else(|| anyhow::anyhow!("ModelScope API response missing Data field"))?;
 
     // 主字段：LastUpdatedTime（Unix 秒；哨兵值 <= 0 视为无效）
     if let Some(secs) = data.get("LastUpdatedTime").and_then(|v| v.as_i64()) {
@@ -1731,7 +1731,7 @@ async fn fetch_modelscope_modified(
         }
     }
 
-    anyhow::bail!("ModelScope API 响应中没有可用的修改时间字段")
+    anyhow::bail!("no usable modification time field in ModelScope API response")
 }
 
 /// 写入 `.ep_meta.json` 到指定模型目录（自动创建目录）
@@ -2064,7 +2064,7 @@ mod tests {
 
         let result = mgr.check_update_available(&model).await;
         assert!(!result.available);
-        assert_eq!(result.reason, "URL 来源不支持更新检查");
+        assert_eq!(result.reason, "URL source does not support update checks");
         assert!(result.remote_modified.is_none());
         cleanup(&dir);
     }
@@ -2080,7 +2080,7 @@ mod tests {
         let result = mgr.check_update_available(&model).await;
         assert!(!result.available);
         assert!(
-            result.reason.contains("缺少下载元数据"),
+            result.reason.contains("missing download metadata"),
             "reason: {}",
             result.reason
         );
@@ -2095,13 +2095,13 @@ mod tests {
         let model = test_hf_model();
 
         let mut meta = test_meta();
-        meta.downloaded_at = "不是合法的时间".to_string();
+        meta.downloaded_at = "not-a-valid-timestamp".to_string();
         mgr.write_meta(&model.target_dir, &meta).unwrap();
 
         let result = mgr.check_update_available(&model).await;
         assert!(!result.available);
         assert!(
-            result.reason.contains("本地下载时间格式无效"),
+            result.reason.contains("invalid local download timestamp"),
             "reason: {}",
             result.reason
         );
@@ -2417,8 +2417,8 @@ mod tests {
             .build_download_command_with_source(&model, Path::new("python"), Some(ModelSource::Modelscope))
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("不支持下载源"), "msg: {msg}");
-        assert!(msg.contains("可用来源"), "msg: {msg}");
+        assert!(msg.contains("does not support download source"), "msg: {msg}");
+        assert!(msg.contains("available sources"), "msg: {msg}");
     }
 
     // ── compute_percent 进度钳制 ────────────────────────────────────────
@@ -2443,10 +2443,10 @@ mod tests {
 
     #[test]
     fn test_truncate_chars() {
-        assert_eq!(truncate_chars("短文本", 10), "短文本");
-        let long = "长".repeat(20);
+        assert_eq!(truncate_chars("héllo", 10), "héllo");
+        let long = "é".repeat(20);
         let t = truncate_chars(&long, 5);
-        assert_eq!(t.chars().count(), 6); // 5 字符 + 省略号
+        assert_eq!(t.chars().count(), 6); // 5 chars + ellipsis
         assert!(t.ends_with('…'));
     }
 
@@ -2532,7 +2532,7 @@ mod tests {
     #[test]
     fn test_cleanup_hf_cache_nonexistent_dir() {
         let err = cleanup_hf_cache(Path::new("/nonexistent/model/dir")).unwrap_err();
-        assert!(err.to_string().contains("模型目录不存在"));
+        assert!(err.to_string().contains("model directory does not exist"));
     }
 
     #[test]
@@ -2618,7 +2618,7 @@ mod tests {
             .import_model_with_manifest("faster-whisper", "no-such-model", &src, &manifest)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("未找到模型"), "err: {err}");
+        assert!(err.to_string().contains("not found in manifest"), "err: {err}");
 
         cleanup(&dir);
     }
@@ -2778,7 +2778,7 @@ mod tests {
         handle.cancel();
 
         let err = handle.wait().await.unwrap_err();
-        assert!(err.contains("取消"), "err: {err}");
+        assert!(err.contains("cancelled"), "err: {err}");
 
         // 必达 Cancelled 终态事件（收到即验证通过）
         loop {
@@ -2803,7 +2803,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         let mut cmd = tokio::process::Command::new("/bin/sh");
-        cmd.args(["-c", "echo 模拟错误信息 >&2; exit 3"])
+        cmd.args(["-c", "echo simulated error message >&2; exit 3"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         let child = cmd.spawn().unwrap();
@@ -2820,8 +2820,8 @@ mod tests {
         let err = handle.wait().await.unwrap_err();
 
         // 错误摘要包含中文包装与 stderr 尾部
-        assert!(err.contains("下载失败"), "err: {err}");
-        assert!(err.contains("模拟错误信息"), "err: {err}");
+        assert!(err.contains("download failed"), "err: {err}");
+        assert!(err.contains("simulated error message"), "err: {err}");
 
         // 必达 Failed 终态事件（收到即验证通过）
         loop {

@@ -183,18 +183,18 @@ pub fn check_ffmpeg(root: &Path) -> DepStatus {
         version: None,
         path: None,
         guidance: Some(if cfg!(windows) {
-            "ffmpeg 未找到。管线中的音频/视频提取节点需要 ffmpeg。\n\
-             安装方式（任选其一）：\n\
-             1. 下载 portable 版: https://www.gyan.dev/ffmpeg/builds/ → 解压后将 ffmpeg.exe 放入 runtime/bin/\n\
+            "ffmpeg not found. Audio/video extraction nodes in pipelines require ffmpeg.\n\
+             Installation options (pick one):\n\
+             1. Download a portable build: https://www.gyan.dev/ffmpeg/builds/ → extract and place ffmpeg.exe in runtime/bin/\n\
              2. winget install ffmpeg\n\
-             3. 从已有项目复制 ffmpeg.exe 到 runtime/bin/"
+             3. Copy ffmpeg.exe from an existing project into runtime/bin/"
                 .into()
         } else {
-            "ffmpeg 未找到。管线中的音频/视频提取节点需要 ffmpeg。\n\
-             安装方式（任选其一）：\n\
-             1. sudo dnf install ffmpeg-free（RHEL/CentOS）\n\
-             2. sudo apt install ffmpeg（Debian/Ubuntu）\n\
-             3. 下载静态构建: https://johnvansickle.com/ffmpeg/ → 解压后将 ffmpeg 放入 runtime/bin/"
+            "ffmpeg not found. Audio/video extraction nodes in pipelines require ffmpeg.\n\
+             Installation options (pick one):\n\
+             1. sudo dnf install ffmpeg-free (RHEL/CentOS)\n\
+             2. sudo apt install ffmpeg (Debian/Ubuntu)\n\
+             3. Download a static build: https://johnvansickle.com/ffmpeg/ → extract and place ffmpeg in runtime/bin/"
                 .into()
         }),
     }
@@ -218,12 +218,12 @@ pub fn check_torch_cuda(module_id: &str, venv_python: &Path) -> TorchCudaStatus 
 
             let guidance = if !cuda {
                 Some(format!(
-                    "torch 已安装但 CUDA 不可用（当前为 CPU 版本）。\n\
-                     模块 '{module_id}' 的 GPU 加速需要 CUDA 版 torch。\n\
-                     安装方式：\n\
+                    "torch is installed but CUDA is unavailable (CPU-only build).\n\
+                     GPU acceleration for module '{module_id}' requires the CUDA build of torch.\n\
+                     Install with:\n\
                      uv pip install torch --index-url https://download.pytorch.org/whl/cu121 \\\n\
                        --python {venv}\n\
-                     国内镜像：--extra-index-url https://mirrors.aliyun.com/pytorch-wheels/cu121/ \\\n\
+                     China mirror: --extra-index-url https://mirrors.aliyun.com/pytorch-wheels/cu121/ \\\n\
                        --index-strategy unsafe-best-match",
                     venv = venv_python.display(),
                 ))
@@ -256,8 +256,8 @@ pub fn check_torch_cuda(module_id: &str, venv_python: &Path) -> TorchCudaStatus 
                 torch_version: None,
                 cuda_available: false,
                 guidance: Some(format!(
-                    "torch 未安装在模块 '{module_id}' 的 venv 中。\n\
-                     安装方式：uv pip install torch --python {}",
+                    "torch is not installed in the venv of module '{module_id}'.\n\
+                     Install with: uv pip install torch --python {}",
                     venv_python.display()
                 )),
             }
@@ -273,7 +273,7 @@ pub fn check_torch_cuda(module_id: &str, venv_python: &Path) -> TorchCudaStatus 
                     .unwrap_or_default(),
                 torch_version: None,
                 cuda_available: false,
-                guidance: Some(format!("无法执行 Python: {e}")),
+                guidance: Some(format!("failed to run Python: {e}")),
             }
         }
     }

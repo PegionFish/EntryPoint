@@ -157,14 +157,17 @@ impl ModelDecl {
                 ModelSource::Huggingface | ModelSource::Modelscope => {
                     self.repo_id.clone().ok_or_else(|| {
                         anyhow::anyhow!(
-                            "模型 '{}' 的来源为 '{}'，但未声明 repo_id 字段",
+                            "model '{}' has source '{}' but does not declare a repo_id field",
                             self.id,
                             self.source
                         )
                     })?
                 }
                 ModelSource::Url => self.url.clone().ok_or_else(|| {
-                    anyhow::anyhow!("模型 '{}' 的来源为 'url'，但未声明 url 字段", self.id)
+                    anyhow::anyhow!(
+                        "model '{}' has source 'url' but does not declare a url field",
+                        self.id
+                    )
                 })?,
             };
             return Ok((self.source, location, self.revision.clone()));
@@ -179,9 +182,9 @@ impl ModelDecl {
             .iter()
             .map(|s| s.as_str())
             .collect::<Vec<_>>()
-            .join("、");
+            .join(", ");
         anyhow::bail!(
-            "模型 '{}' 不支持下载源 '{}'，可用来源：{}",
+            "model '{}' does not support download source '{}', available sources: {}",
             self.id,
             target,
             list
@@ -617,8 +620,8 @@ type = "http"
 
         let err = model.resolve(Some(ModelSource::Url)).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("不支持下载源"), "msg: {msg}");
-        assert!(msg.contains("可用来源"), "msg: {msg}");
+        assert!(msg.contains("does not support download source"), "msg: {msg}");
+        assert!(msg.contains("available sources"), "msg: {msg}");
         assert!(msg.contains("huggingface"), "msg: {msg}");
     }
 
