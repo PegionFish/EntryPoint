@@ -4,6 +4,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::{Path, State},
+    http::StatusCode,
     routing::{get, post},
     Json,
 };
@@ -11,8 +12,9 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
-use ep_core::module::discovery::DiscoveryStatus;
-use ep_core::types::DeviceId;
+use ep_core::model::{ModelManager, ModelStatus};
+use ep_core::module::discovery::{DiscoveredModule, DiscoveryStatus};
+use ep_core::types::{DeviceId, ServiceStatus};
 
 use crate::state::AppState;
 
@@ -37,6 +39,39 @@ pub(crate) struct ModuleResponse {
     path: String,
     status: String,
     service_status: String,
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+/// 服务状态 → 规范小写串（供 list_modules / module_status 共用）
+pub(crate) fn status_str(status: &ServiceStatus) -> &'static str {
+    match status {
+        ServiceStatus::NotReady => "not_ready",
+        ServiceStatus::Stopped => "stopped",
+        ServiceStatus::Preparing => "preparing",
+        ServiceStatus::Starting => "starting",
+        ServiceStatus::Running => "running",
+        ServiceStatus::Error(_) => "error",
+    }
+}
+
+/// 统一错误响应：HTTP 状态码 + {"error": 中文说明}
+fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Value>) {
+    (status, Json(json!({ "error": msg.into() })))
+}
+
+/// 按 module_id 查找已发现的模块
+async fn find_module(state: &AppState, id: &str) -> Option<DiscoveredModule> {
+    let modules = state.modules.read().await;
+    modules
+        .iter()
+        .find(|m| {
+            m.manifest
+                .as_ref()
+                .map(|mf| mf.module.id == id)
+                .unwrap_or(false)
+        })
+        .cloned()
 }
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
@@ -79,10 +114,12 @@ pub async fn list_modules(
                 DiscoveryStatus::Invalid(reason) => format!("invalid: {reason}"),
             };
 
+            // 规范小写状态串（不再使用 Rust Debug 格式）
             let service_status = pm
                 .get_status(&id)
-                .map(|s| format!("{s:?}"))
-                .unwrap_or_else(|| "stopped".to_string());
+                .map(status_str)
+                .unwrap_or("stopped")
+                .to_string();
 
             ModuleResponse {
                 id,
@@ -100,51 +137,85 @@ pub async fn list_modules(
     Json(resp)
 }
 
+/// POST /api/modules/:id/start
+///
+/// 错误码语义：404 模块不存在 / 409 状态冲突或模型未就绪 / 500 内部错误。
 pub async fn start_module(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Json<Value> {
-    // Verify module exists
-    let modules = state.modules.read().await;
-    let module = match modules.iter().find(|m| {
-        m.manifest
-            .as_ref()
-            .map(|mf| mf.module.id == id)
-            .unwrap_or(false)
-    }) {
-        Some(m) => m.clone(),
-        None => {
-            return Json(json!({
-                "error": format!("module '{id}' not found")
-            }));
-        }
+) -> (StatusCode, Json<Value>) {
+    // 1. 模块必须存在
+    let module = match find_module(&state, &id).await {
+        Some(m) => m,
+        None => return err(StatusCode::NOT_FOUND, format!("模块不存在：{id}")),
     };
-    drop(modules);
 
     let manifest = match module.manifest {
         Some(mf) => mf,
         None => {
-            return Json(json!({
-                "error": format!("module '{id}' has no valid manifest")
-            }));
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("模块清单无效，无法启动：{id}"),
+            )
         }
     };
 
-    // Allocate a port
+    // 2. 状态冲突检查：已在运行/启动中/准备中 → 409
+    {
+        let pm = state.process_manager.read().await;
+        if let Some(s) = pm.get_status(&id) {
+            match s {
+                ServiceStatus::Running | ServiceStatus::Starting | ServiceStatus::Preparing => {
+                    return err(
+                        StatusCode::CONFLICT,
+                        format!("模块已在运行或正在启动（当前状态：{}）", status_str(s)),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // 3. 模型前置检查：default 模型缺失 → 409（依赖检查本期不做）
+    if !manifest.models.is_empty() {
+        let mgr = {
+            let config = state.config.read().await;
+            ModelManager::new(&config.models, &state.root)
+        };
+        let statuses = mgr.check_model_status(&id, &manifest);
+        if let Some(model) = manifest
+            .models
+            .iter()
+            .find(|m| m.default)
+            .or(manifest.models.first())
+        {
+            if matches!(statuses.get(&model.id), Some(ModelStatus::Missing)) {
+                return err(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "模型未就绪：{}，请先在模型管理页下载或导入",
+                        model.name
+                    ),
+                );
+            }
+        }
+    }
+
+    // 4. 分配端口
     let port = {
         let mut pm = state.port_manager.write().await;
         match pm.allocate(&id) {
             Ok(p) => p,
             Err(e) => {
-                return Json(json!({
-                    "error": format!("port allocation failed: {e}")
-                }));
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("端口分配失败：{e}"),
+                )
             }
         }
     };
 
-    // Pick the first device whose backend matches the manifest's compute.backends,
-    // otherwise fall back to CPU.
+    // 5. 选择设备：manifest 声明的后端优先，否则回退 CPU
     let device = {
         let devices = state.devices.read().await;
         devices
@@ -154,7 +225,7 @@ pub async fn start_module(
             .unwrap_or(DeviceId::Cpu)
     };
 
-    // Build environment variables for the module process
+    // 6. 构建环境变量
     let env_vars = {
         let root = &state.root;
         let module_dir = &module.path;
@@ -183,64 +254,87 @@ pub async fn start_module(
 
     info!(module_id = %id, %port, %device, "starting module");
 
-    // Start the module process
+    // 7. 启动模块进程
     let mut pm = state.process_manager.write().await;
     match pm
         .start_module(&id, &manifest, device, port, env_vars)
         .await
     {
-        Ok(()) => Json(json!({
-            "status": "starting",
-            "module_id": id,
-            "port": port
-        })),
-        Err(e) => {
-            // Release the port on failure
-            warn!(module_id = %id, error = %e, "failed to start module");
-            state.port_manager.write().await.release(&id);
+        Ok(()) => (
+            StatusCode::OK,
             Json(json!({
-                "error": format!("failed to start module: {e}")
-            }))
+                "status": "starting",
+                "module_id": id,
+                "port": port
+            })),
+        ),
+        Err(e) => {
+            warn!(module_id = %id, error = %e, "failed to start module");
+            // 启动失败：释放端口
+            state.port_manager.write().await.release(&id);
+            // "already running/starting" 属状态冲突，其余为内部错误
+            if e.to_string().contains("already running") {
+                err(
+                    StatusCode::CONFLICT,
+                    format!("模块已在运行或正在启动：{id}"),
+                )
+            } else {
+                err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("启动模块失败：{e}"),
+                )
+            }
         }
     }
 }
 
+/// POST /api/modules/:id/stop
 pub async fn stop_module(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
+    // 模块必须已被发现
+    if find_module(&state, &id).await.is_none() {
+        return err(StatusCode::NOT_FOUND, format!("模块不存在：{id}"));
+    }
+
     let mut pm = state.process_manager.write().await;
+    if pm.get_instance(&id).is_none() {
+        return err(StatusCode::NOT_FOUND, format!("模块未在运行：{id}"));
+    }
+
     match pm.stop_module(&id).await {
         Ok(()) => {
+            drop(pm);
             state.port_manager.write().await.release(&id);
             info!(module_id = %id, "module stopped");
-            Json(json!({
-                "status": "stopped",
-                "module_id": id
-            }))
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "stopped",
+                    "module_id": id
+                })),
+            )
         }
-        Err(e) => Json(json!({
-            "error": format!("failed to stop module: {e}")
-        })),
+        Err(e) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("停止模块失败：{e}"),
+        ),
     }
 }
 
+/// GET /api/modules/:id/status
 pub async fn module_status(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
+    if find_module(&state, &id).await.is_none() {
+        return err(StatusCode::NOT_FOUND, format!("模块不存在：{id}"));
+    }
+
     let pm = state.process_manager.read().await;
     match pm.get_instance(&id) {
         Some(inst) => {
-            let status_str = match &inst.status {
-                ep_core::types::ServiceStatus::Running => "running",
-                ep_core::types::ServiceStatus::Stopped => "stopped",
-                ep_core::types::ServiceStatus::Starting => "starting",
-                ep_core::types::ServiceStatus::Preparing => "preparing",
-                ep_core::types::ServiceStatus::NotReady => "not_ready",
-                ep_core::types::ServiceStatus::Error(_) => "error",
-            };
-
             let uptime_secs = inst
                 .started_at
                 .map(|t| {
@@ -252,38 +346,77 @@ pub async fn module_status(
                 })
                 .unwrap_or(0);
 
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "module_id": id,
+                    "status": status_str(&inst.status),
+                    "port": inst.port,
+                    "uptime_secs": uptime_secs
+                })),
+            )
+        }
+        None => (
+            StatusCode::OK,
             Json(json!({
                 "module_id": id,
-                "status": status_str,
-                "port": inst.port,
-                "uptime_secs": uptime_secs
-            }))
-        }
-        None => Json(json!({
-            "module_id": id,
-            "status": "stopped",
-            "port": null,
-            "uptime_secs": 0
-        })),
+                "status": "stopped",
+                "port": null,
+                "uptime_secs": 0
+            })),
+        ),
     }
 }
 
+/// GET /api/modules/:id/logs
+///
+/// 模块不存在 → 404；模块存在但未启动 → 200 + 空行列表。
 pub async fn module_logs(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
+    if find_module(&state, &id).await.is_none() {
+        return err(StatusCode::NOT_FOUND, format!("模块不存在：{id}"));
+    }
+
     let pm = state.process_manager.read().await;
     match pm.get_instance(&id) {
         Some(inst) => {
             let lines: Vec<&String> = inst.log_buffer.iter().collect();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "module_id": id,
+                    "lines": lines
+                })),
+            )
+        }
+        None => (
+            StatusCode::OK,
             Json(json!({
                 "module_id": id,
-                "lines": lines
-            }))
-        }
-        None => Json(json!({
-            "module_id": id,
-            "lines": []
-        })),
+                "lines": []
+            })),
+        ),
+    }
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_str_all_variants_are_canonical_lowercase() {
+        assert_eq!(status_str(&ServiceStatus::NotReady), "not_ready");
+        assert_eq!(status_str(&ServiceStatus::Stopped), "stopped");
+        assert_eq!(status_str(&ServiceStatus::Preparing), "preparing");
+        assert_eq!(status_str(&ServiceStatus::Starting), "starting");
+        assert_eq!(status_str(&ServiceStatus::Running), "running");
+        assert_eq!(
+            status_str(&ServiceStatus::Error("boom".into())),
+            "error"
+        );
     }
 }
