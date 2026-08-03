@@ -1,6 +1,7 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { Route, Routes } from 'react-router-dom'
 import { Header } from '@/components/layout/header'
+import { MobileNav } from '@/components/layout/mobile-nav'
 import { Sidebar } from '@/components/layout/sidebar'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { Toaster } from '@/components/ui/sonner'
@@ -15,6 +16,9 @@ import { SettingsPage } from '@/pages/settings'
 import { NotFoundPage } from '@/pages/not-found'
 
 export default function App() {
+  // 移动端（<lg）导航抽屉开关状态
+  const [mobileNavOpen, setMobileNavOpen] = useState(false)
+
   // 应用启动时建立全局 WebSocket 连接
   useEffect(() => {
     wsManager.connect()
@@ -24,7 +28,7 @@ export default function App() {
   return (
     <TooltipProvider>
       <div className="flex h-screen flex-col overflow-hidden">
-        <Header />
+        <Header onMenuClick={() => setMobileNavOpen(true)} />
         <div className="flex flex-1 overflow-hidden">
           <Sidebar />
           <main className="flex-1 overflow-hidden">
@@ -41,6 +45,7 @@ export default function App() {
           </main>
         </div>
       </div>
+      <MobileNav open={mobileNavOpen} onOpenChange={setMobileNavOpen} />
       <Toaster richColors closeButton position="top-right" />
     </TooltipProvider>
   )

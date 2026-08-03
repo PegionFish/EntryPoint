@@ -1,6 +1,6 @@
 import '@xyflow/react/dist/style.css'
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Background,
   BackgroundVariant,
@@ -54,6 +54,19 @@ import type {
 } from '@/components/shared/pipeline-node'
 import { PipelineSidebar } from '@/components/shared/pipeline-sidebar'
 import { PipelineToolbar } from '@/components/shared/pipeline-toolbar'
+
+/** 媒体查询订阅 hook（lg = 64rem 为桌面三栏布局断点） */
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() => window.matchMedia(query).matches)
+  useEffect(() => {
+    const mql = window.matchMedia(query)
+    const onChange = (event: MediaQueryListEvent) => setMatches(event.matches)
+    setMatches(mql.matches)
+    mql.addEventListener('change', onChange)
+    return () => mql.removeEventListener('change', onChange)
+  }, [query])
+  return matches
+}
 
 // ============================================================
 // React Flow 主题适配（映射到设计系统令牌）
@@ -293,13 +306,26 @@ interface NodeParamsPanelProps {
   onParamsChange: (patch: NodeParams) => void
   onDelete: () => void
   onClose: () => void
+  /** 附加布局类（窄屏 overlay 定位等） */
+  className?: string
 }
 
-function NodeParamsPanel({ node, onParamsChange, onDelete, onClose }: NodeParamsPanelProps) {
+function NodeParamsPanel({
+  node,
+  onParamsChange,
+  onDelete,
+  onClose,
+  className,
+}: NodeParamsPanelProps) {
   const specs = getParamSpecs(node.data)
   const status = NODE_STATUS_META[node.data.status]
   return (
-    <aside className="flex w-72 shrink-0 flex-col border-l border-border bg-card">
+    <aside
+      className={cn(
+        'flex h-full w-72 shrink-0 flex-col border-l border-border bg-card',
+        className,
+      )}
+    >
       <div className="flex shrink-0 items-start justify-between gap-2 border-b border-border px-4 py-3">
         <div className="min-w-0">
           <p className="truncate text-sm font-semibold">{node.data.label}</p>
@@ -373,6 +399,10 @@ function PipelineEditor() {
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(EXAMPLE.edges)
   const [name, setName] = useState('示例：音频转写摘要管线')
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
+  /** 窄屏（<lg）节点库抽屉开关 */
+  const [libraryOpen, setLibraryOpen] = useState(false)
+  const isDesktop = useMediaQuery('(min-width: 64rem)')
+  const canvasRef = useRef<HTMLDivElement>(null)
 
   const selectedNode = selectedNodeId
     ? (nodes.find((n) => n.id === selectedNodeId) ?? null)
@@ -408,12 +438,33 @@ function PipelineEditor() {
     [nodes],
   )
 
-  // ---- 拖放添加节点 ----
+  // ---- 添加节点（拖放 / 点击节点库项） ----
 
   const onDragOver = useCallback((event: React.DragEvent) => {
     event.preventDefault()
     event.dataTransfer.dropEffect = 'move'
   }, [])
+
+  /** 按载荷创建并添加节点；未指定位置时落在画布视口中央 */
+  const addNodeFromPayload = useCallback(
+    (payload: DragPayload, position?: { x: number; y: number }) => {
+      let target = position
+      if (!target) {
+        const rect = canvasRef.current?.getBoundingClientRect()
+        const center = rect
+          ? screenToFlowPosition({
+              x: rect.left + rect.width / 2,
+              y: rect.top + rect.height / 2,
+            })
+          : { x: 112, y: 40 }
+        target = center
+      }
+      const node = createPipelineNode(payload, { x: target.x - 112, y: target.y - 40 })
+      setNodes((nds) => [...nds, node])
+      toast.success(`已添加节点「${node.data.label}」`)
+    },
+    [screenToFlowPosition, setNodes],
+  )
 
   const onDrop = useCallback(
     (event: React.DragEvent) => {
@@ -423,14 +474,21 @@ function PipelineEditor() {
       try {
         const payload = JSON.parse(raw) as DragPayload
         const position = screenToFlowPosition({ x: event.clientX, y: event.clientY })
-        const node = createPipelineNode(payload, { x: position.x - 112, y: position.y - 40 })
-        setNodes((nds) => [...nds, node])
-        toast.success(`已添加节点「${node.data.label}」`)
+        addNodeFromPayload(payload, position)
       } catch {
         toast.error('无法添加节点', { description: '拖拽数据解析失败' })
       }
     },
-    [screenToFlowPosition, setNodes],
+    [addNodeFromPayload, screenToFlowPosition],
+  )
+
+  /** 点击节点库项：添加到画布中央；窄屏下同时收起抽屉 */
+  const handleLibraryAdd = useCallback(
+    (payload: DragPayload) => {
+      addNodeFromPayload(payload)
+      if (!isDesktop) setLibraryOpen(false)
+    },
+    [addNodeFromPayload, isDesktop],
   )
 
   // ---- 选择与参数编辑 ----
@@ -603,16 +661,29 @@ function PipelineEditor() {
         onNameChange={setName}
         nodeCount={nodes.length}
         edgeCount={edges.length}
+        libraryOpen={libraryOpen}
+        onToggleLibrary={() => setLibraryOpen((open) => !open)}
         onSave={handleSave}
         onLoad={handleLoad}
         onValidate={handleValidate}
         onExecute={handleExecute}
       />
 
-      <div className="flex min-h-0 flex-1 overflow-hidden">
-        <PipelineSidebar />
+      <div className="relative flex min-h-0 flex-1 overflow-hidden">
+        {/* 桌面（≥lg）：节点库常驻左栏；窄屏：抽屉式 overlay */}
+        {isDesktop ? (
+          <PipelineSidebar onAdd={handleLibraryAdd} />
+        ) : (
+          libraryOpen && (
+            <PipelineSidebar
+              onAdd={handleLibraryAdd}
+              onClose={() => setLibraryOpen(false)}
+              className="absolute inset-y-0 left-0 z-40 shadow-lg"
+            />
+          )
+        )}
 
-        <div className="relative min-w-0 flex-1">
+        <div ref={canvasRef} className="relative min-w-0 flex-1">
           <ReactFlow
             nodes={nodes}
             edges={edges}
@@ -637,7 +708,7 @@ function PipelineEditor() {
             <Controls position="bottom-left" showInteractive={false} />
             <MiniMap pannable zoomable nodeStrokeWidth={2} />
             <Panel position="bottom-center" className="pointer-events-none">
-              <div className="flex items-center gap-3 rounded-full border border-border bg-card/85 px-3.5 py-1.5 shadow-md backdrop-blur">
+              <div className="hidden max-w-[28rem] flex-wrap items-center justify-center gap-x-3 gap-y-1 rounded-lg border border-border bg-card/85 px-3.5 py-1.5 shadow-md backdrop-blur md:flex">
                 {Object.entries(NODE_STATUS_META).map(([key, meta]) => (
                   <span
                     key={key}
@@ -658,18 +729,22 @@ function PipelineEditor() {
               </span>
               <p className="text-sm font-medium">画布还是空的</p>
               <p className="text-xs text-muted-foreground">
-                从左侧节点库拖入模块或内置节点，开始编排你的第一条管线
+                从左侧节点库点击或拖入模块 / 内置节点，开始编排你的第一条管线
               </p>
             </div>
           )}
         </div>
 
+        {/* 桌面（≥lg）：参数面板常驻右栏；窄屏：右侧 overlay */}
         {selectedNode && (
           <NodeParamsPanel
             node={selectedNode}
             onParamsChange={(patch) => updateNodeParams(selectedNode.id, patch)}
             onDelete={() => deleteNode(selectedNode.id)}
             onClose={() => setSelectedNodeId(null)}
+            className={
+              isDesktop ? undefined : 'absolute inset-y-0 right-0 z-30 max-w-[85vw] shadow-lg'
+            }
           />
         )}
       </div>

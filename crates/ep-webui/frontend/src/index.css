@@ -33,6 +33,37 @@
   --status-preparing: hsl(45 93% 47%);
   --status-error: hsl(0 84% 60%);
   --status-notready: hsl(240 4% 35%);
+
+  /* Data type (port) colors — light theme uses deep shades for contrast */
+  --dtype-audio: hsl(32 95% 44%);
+  --dtype-video: hsl(262 83% 58%);
+  --dtype-image: hsl(192 91% 36%);
+  --dtype-text: hsl(200 98% 39%);
+  --dtype-file: hsl(240 5% 34%);
+  --dtype-any: hsl(175 84% 32%);
+
+  /* Module category colors */
+  --cat-asr: hsl(32 95% 44%);
+  --cat-tts: hsl(200 98% 39%);
+  --cat-denoise: hsl(175 84% 32%);
+  --cat-ocr: hsl(85 85% 35%);
+  --cat-image: hsl(192 91% 36%);
+  --cat-video: hsl(21 90% 48%);
+  --cat-audio: hsl(347 77% 50%);
+  --cat-translate: hsl(161 94% 30%);
+  --cat-llm: hsl(262 83% 58%);
+  --cat-other: hsl(240 5% 34%);
+
+  /* HTTP method colors */
+  --http-get: hsl(161 94% 30%);
+  --http-post: hsl(32 95% 44%);
+  --http-put: hsl(200 98% 39%);
+
+  /* Special node accents */
+  --node-file-input: hsl(200 98% 39%);
+  --node-file-output: hsl(161 94% 30%);
+  --node-ffmpeg: hsl(21 90% 48%);
+  --node-external: hsl(192 91% 36%);
 }
 
 .dark {
@@ -56,6 +87,37 @@
   --border: hsl(240 4% 16%);
   --input: hsl(240 4% 16%);
   --ring: hsl(217 91% 60%);
+
+  /* Data type (port) colors — dark theme uses bright shades */
+  --dtype-audio: hsl(43 96% 56%);
+  --dtype-video: hsl(255 92% 76%);
+  --dtype-image: hsl(188 86% 53%);
+  --dtype-text: hsl(198 93% 60%);
+  --dtype-file: hsl(240 5% 65%);
+  --dtype-any: hsl(172 66% 50%);
+
+  /* Module category colors */
+  --cat-asr: hsl(43 96% 56%);
+  --cat-tts: hsl(198 93% 60%);
+  --cat-denoise: hsl(172 66% 50%);
+  --cat-ocr: hsl(83 78% 56%);
+  --cat-image: hsl(188 86% 53%);
+  --cat-video: hsl(25 96% 61%);
+  --cat-audio: hsl(351 94% 71%);
+  --cat-translate: hsl(158 64% 52%);
+  --cat-llm: hsl(255 92% 76%);
+  --cat-other: hsl(240 5% 65%);
+
+  /* HTTP method colors */
+  --http-get: hsl(158 64% 52%);
+  --http-post: hsl(43 96% 56%);
+  --http-put: hsl(198 93% 60%);
+
+  /* Special node accents */
+  --node-file-input: hsl(198 93% 60%);
+  --node-file-output: hsl(158 64% 52%);
+  --node-ffmpeg: hsl(25 96% 61%);
+  --node-external: hsl(188 86% 53%);
 }
 
 @theme inline {
@@ -85,6 +147,33 @@
   --color-status-preparing: var(--status-preparing);
   --color-status-error: var(--status-error);
   --color-status-notready: var(--status-notready);
+
+  --color-dtype-audio: var(--dtype-audio);
+  --color-dtype-video: var(--dtype-video);
+  --color-dtype-image: var(--dtype-image);
+  --color-dtype-text: var(--dtype-text);
+  --color-dtype-file: var(--dtype-file);
+  --color-dtype-any: var(--dtype-any);
+
+  --color-cat-asr: var(--cat-asr);
+  --color-cat-tts: var(--cat-tts);
+  --color-cat-denoise: var(--cat-denoise);
+  --color-cat-ocr: var(--cat-ocr);
+  --color-cat-image: var(--cat-image);
+  --color-cat-video: var(--cat-video);
+  --color-cat-audio: var(--cat-audio);
+  --color-cat-translate: var(--cat-translate);
+  --color-cat-llm: var(--cat-llm);
+  --color-cat-other: var(--cat-other);
+
+  --color-http-get: var(--http-get);
+  --color-http-post: var(--http-post);
+  --color-http-put: var(--http-put);
+
+  --color-node-file-input: var(--node-file-input);
+  --color-node-file-output: var(--node-file-output);
+  --color-node-ffmpeg: var(--node-ffmpeg);
+  --color-node-external: var(--node-external);
 
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);

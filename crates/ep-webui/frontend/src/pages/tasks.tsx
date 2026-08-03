@@ -195,7 +195,7 @@ export function TasksPage() {
         )}
 
         {/* ── 概览 ── */}
-        <div className="flex items-center gap-8 rounded-lg border border-border bg-card px-6 py-4">
+        <div className="flex flex-wrap items-center gap-4 rounded-lg border border-border bg-card px-6 py-4 sm:gap-8">
           <div>
             <div className="font-mono text-3xl font-bold text-status-running">
               {modules === null ? '–' : runningCount}
@@ -204,7 +204,7 @@ export function TasksPage() {
               运行中服务
             </div>
           </div>
-          <div className="h-8 w-px bg-border" />
+          <div className="hidden h-8 w-px bg-border sm:block" />
           <div>
             <div className="font-mono text-3xl font-bold">
               {modules === null ? '–' : modules.length}
@@ -213,7 +213,7 @@ export function TasksPage() {
               全部模块
             </div>
           </div>
-          <div className="h-8 w-px bg-border" />
+          <div className="hidden h-8 w-px bg-border sm:block" />
           <div>
             <div className="font-mono text-3xl font-bold">
               {pipelines === null ? '–' : pipelines.length}
