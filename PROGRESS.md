@@ -226,20 +226,82 @@
 
 ---
 
+## WebUI 端到端可用性与模型管理强化（2026-08-03 ~ 2026-08-04）
+
+> 目标：WebUI 从"页面可见"升级为"端到端真实可用"——打通 WS / 日志 / 管线执行 / 模型全生命周期，以真实浏览器 + 真实媒体 E2E 验收。
+> 方式：4 并行审计代理摸底 → 四波并行子代理实施（Wave 1 ×3 / Wave 2 ×6 / Wave 3 ×5 / Wave 4 ×4）→ 集成门禁与缺陷修复。
+
+### 审计发现（4 并行审计代理）✅
+#### P0（4 项）
+- [x] WebSocket 三重断链：URL 不匹配 / 消息格式不一致 / 前端数据源未接
+- [x] 日志广播丢行 + 重复
+- [x] 管线执行零接线：执行引擎在 ep-core，daemon 无入口
+- [x] daemon 缺模型下载 / 删除 / 上传 API
+#### 关键 P1
+- [x] PUT /api/config 不落盘；SPA fallback 恒 404
+- [x] CUDA 依赖契约错（永远"未安装"）；GPU 数据静态不刷新
+- [x] default_source 死配置；下载不写 meta；桌面端导入 target_dir bug
+- [x] HF 下载 3 倍磁盘膨胀（faster-whisper-large-v3 实测 8.7G / 有效 2.9G）
+- [x] 全仓库无代理配置；412/409 全新安装死锁；df3 URL 死链 等
+
+### Wave 1 地基修复 ✅（3 代理并行）
+- [x] ep-core：`[[models.mirrors]]` 双源清单（faster-whisper 3 模型 ↔ ModelScope pengzhendong/*，在线核实）
+- [x] ep-core：`[network]` 代理配置节 + 三处子进程注入；下载写 meta；import target_dir 修复
+- [x] ep-core：磁盘轮询式下载进度（broadcast）；check_update_available（HF/MS API）；cleanup_hf_cache；reqwest no_proxy
+- [x] daemon：/ws 聚合端点（type 标签）；日志增量去重广播；SPA fallback 200 化 + /api JSON 404
+- [x] daemon：配置落盘；设备周期刷新；状态规范化 + 中文错误信息；Wave 2 全路由骨架
+- [x] 前端：契约修复（deps 字段 / 死代码清理）；日志查看器（搜索/过滤/导出/高亮）；确认框接线；12 个新 API 契约预置
+
+### Wave 2 后端能力 ✅（6 代理并行）
+- [x] 模型 API：download（202 + WS 进度 + 选源 + 防重）/ delete / check-update / downloads 列表（15 测试）
+- [x] multipart 上传：文件夹多文件 + zip/tar.gz 双形态、流式落盘、路径清洗 + zip-slip 防御、归档剥层（19 测试）
+- [x] 管线 CRUD：React Flow JSON ↔ TOML 桥接、builtin 保护、示例真实往返（20 测试）
+- [x] 执行引擎接线：PipelineRunnerImpl + 任务注册表 + WS 进度 + 产物 302 下载（23 测试，含真实 HTTP 冒烟）
+- [x] 桌面端：rfd 文件夹导入；下载后台化 + 进度条 + 取消；双源选择；更新管理；代理设置分区（Windows 交叉编译验证）
+
+### Wave 3 WebUI 页面 ✅（5 代理并行）
+- [x] 模型页全功能：XHR 真实进度上传 / 拖拽文件夹 / zip、选源下载、删除确认、更新检查
+- [x] 管线页接通服务端：管线库 / 保存 / 另存为 / 执行对话框 / 必填校验 / WS 节点状态 / 端口名归一
+- [x] 任务页真实数据：节点详情 / 产物下载 / 空态引导
+- [x] 设置页：代理分区 + 校验、误导项清理（English/system）、NumberField 加固
+- [x] 仪表盘 / 模块页打磨：异常计数 / 快捷启动 / not_ready 引导 / 日志截断提示
+
+### Wave 4 集成门禁 + E2E ✅（4 代理并行 + 门禁修复）
+- [x] API 冒烟 40 项通过（唯一偏差 D1 已修：模块详情/import 404 中文消息）
+- [x] 真实浏览器巡测：Playwright Chromium headless（手工补齐 6 个系统库），8 页面零控制台错误；修复内置管线边不渲染（端口名归一）、主题下拉不同步
+- [x] E2E 途中修复的产品缺陷：ffmpeg {input}/{output} 占位符失配（两条内置管线必挂）、output_extension 未尊重、faster-whisper CUDA→CPU 设备级回退、ASR SRT 导出（output_format/output_path 模块产物协议）、file_output extension 派生路径、412 下载死锁→自动 venv 准备、df3 URL 死链→HF 镜像（Serkan007/DeepFilterNet3-ONNX，内容已验证）、default_source 接线
+- [x] 真实媒体 E2E：video_to_srt 全流程通过（15s 视频 → WAV → ASR large-v3 CPU 回退 → SRT，85s；产物 302 下载；真实中文转写"这是美军现役最大的直升机 CH-53E超级种马"）
+- [x] 模型回环：rembg-u2net 删除 → 文件夹上传 → 删除 → zip 上传全通；isnet 经代理 URL 下载 178MB 进度采样完整、meta 写入；df3 全新安装路径（自动 venv 含 torch 约 16 分钟 + 下载 15s）
+- [x] HF 缓存回收：faster-whisper-large-v3 8.7G → 2.9G（-5.8G）
+- [x] 最终门禁：288 测试全过、clippy 零警告
+- [x] E2E 报告：reports/wave4_e2e_report.md
+
+### 已知限制（如实记录）
+- 首次下载自动 venv 准备含 torch 约 15-20 分钟，超常见客户端超时（重试即成功）
+- daemon 重启不回收模块子进程（重启前需先 stop 模块，否则端口占用）
+- deep-filter 模块启动健康检查 30s 超时（torch+CUDA 首次导入慢，待查）
+- max_concurrent_downloads 保留未实现；任务工作目录无自动清理
+- 桌面端 GUI 无头环境无法运行时验证（编译 + 单测 + Windows 交叉编译通过）
+
+#### Git
+- commit: TBD — 待提交（工作区 61 个文件变更/新增，尚未入库）
+
+---
+
 ## 最终统计
 
 | 指标 | 值 |
 |---|---|
-| Rust 测试数 | 134 (111 unit + 13 integration + 7 daemon + 3 linux) |
-| Clippy warnings | 0 |
-| Rust 源文件数 | ~60 .rs files |
-| 前端源文件数 | 57 (.ts/.tsx) |
-| 前端代码行数 | ~8200 行 |
-| 桌面端代码行数 | ~2800 行 (含反向移植) |
+| Rust 测试数 | 288（2026-08-04 WebUI E2E 强化后；含单元/集成/daemon/桌面端） |
+| Clippy warnings | 0（--workspace --all-targets -D warnings） |
+| Rust 源文件数 | ~70 .rs files |
+| 前端源文件数 | 58 (.ts/.tsx) |
+| 前端代码行数 | ~9500 行 |
+| 桌面端代码行数 | ~3100 行 |
 | Crate 数 | 4 (ep-core, ep-daemon, ep-desktop, ep-webui) |
 | Release 构建时间 | ~3m 34s (含前端) |
-| Git commits | 20+ |
-| E2E 测试 | ✅ 全流程通过 (ASR 推理) |
+| Git commits | 25+ |
+| E2E 测试 | ✅ 真实媒体全流程（视频→音频→ASR→SRT 产物下载，含 CPU 回退）+ 模型上传/下载回环 + 浏览器 8 页巡测零错误 |
 
 ---
 

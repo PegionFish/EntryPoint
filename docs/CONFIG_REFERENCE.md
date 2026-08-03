@@ -1,6 +1,6 @@
 # 配置参考 (Configuration Reference)
 
-> 版本：1.0 | 适用于 EntryPoint v0.x
+> 版本：1.1 | 适用于 EntryPoint v0.x（更新于 2026-08-04）
 
 本文档是 EntryPoint 所有配置项、环境变量和内部文件格式的完整参考。
 
@@ -70,18 +70,47 @@ range_end = 19000
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `cache_dir` | string | `"models"` | 模型缓存目录（相对或绝对路径） |
-| `hf_endpoint` | string | `""` | HuggingFace 镜像站 URL（空=官方） |
-| `default_source` | string | `"huggingface"` | 默认下载源 |
-| `max_concurrent_downloads` | u32 | `2` | 最大并行下载数 |
+| `cache_paths` | string[] | `[]` | 本地模型缓存搜索路径（按优先级排序），用于发现用户已有的模型文件 |
+| `hf_endpoint` | string | `""` | HuggingFace 镜像站 URL（空=官方）。**仅对 HuggingFace 源生效**（下载时注入 `HF_ENDPOINT`） |
+| `default_source` | string | `"huggingface"` | 默认下载源（见下方生效规则） |
+| `max_concurrent_downloads` | u32 | `2` | 最大并行下载数（**保留，暂未生效**——尚未实现并发下载调度） |
+
+**`default_source` 生效规则：**
+
+- 可选值：`huggingface` / `modelscope` / `url`
+- 下载请求**未显式指定下载源**时，若该值落在模型的可用来源（主源 + `[[models.mirrors]]` 镜像）之内，则使用它；否则回退模型声明的主源
+- 下载请求显式指定了下载源（如 WebUI 中手动选择）时，以请求为准
+
+**备选下载源（`[[models.mirrors]]`）：**
+
+每个模型可在 module.toml 中声明若干备选源，主源不可用时（如网络受限）可切换。格式与 `[[models]]` 完整声明见 [MODULE_SPEC.md](MODULE_SPEC.md)：
+
+```toml
+[[models]]
+id = "large-v3"
+source = "huggingface"
+repo_id = "Systran/faster-whisper-large-v3"
+target_dir = "faster-whisper-large-v3"
+
+[[models.mirrors]]
+source = "modelscope"
+repo_id = "pengzhendong/faster-whisper-large-v3"
+# revision = "master"   # 可选，缺省用该来源的默认分支
+```
+
+内置模块现状：faster-whisper 的 large-v3 / medium / small 均已配置 ModelScope 镜像（`pengzhendong/*`）；deep-filter 的 df3 模型 URL 源已指向 HuggingFace 仓库资产（`Serkan007/DeepFilterNet3-ONNX`，原 GitHub release 资产失效）。
+
+> **已知限制（首次下载与 venv 准备）**：模型下载前会自动准备模块的 Python 虚拟环境。全新安装时该步骤耗时取决于依赖规模（含 torch 的模块约 15–20 分钟），可能超过常见 HTTP 客户端超时。建议将客户端超时设为 ≥20 分钟，或超时后直接重试——venv 已存在时下载会立即开始。
 
 ```toml
 [models]
 cache_dir = "models"
 # cache_dir = "D:/AI_Models"
+cache_paths = []
 hf_endpoint = ""
 # hf_endpoint = "https://hf-mirror.com"
 default_source = "huggingface"
-max_concurrent_downloads = 2
+max_concurrent_downloads = 2   # 保留，暂未生效
 ```
 
 ### 1.5 `[python]` — Python 环境
@@ -136,6 +165,50 @@ font_size = 14.0
 dashboard_refresh_secs = 2
 ```
 
+### 1.8 `[server]` — HTTP 服务（daemon）
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `host` | string | `"0.0.0.0"` | 监听地址 |
+| `port` | u16 | `9800` | 监听端口（WebUI 与 REST API） |
+| `allow_public` | bool | `false` | 是否允许公网访问。`false` 时启用 IP 过滤，仅放行 RFC 1918 私有地址 |
+
+```toml
+[server]
+host = "0.0.0.0"
+port = 9800
+allow_public = false
+```
+
+### 1.9 `[network]` — 网络代理
+
+统一控制模型下载、依赖安装与模块子进程的出口代理。取代此前"子进程隐式继承 daemon 环境变量"的不可控方式：所有需要联网的子进程显式注入这里配置的环境变量。
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `http_proxy` | string | `""` | HTTP 代理地址。空 = 不覆盖（继承 daemon 进程的系统环境变量） |
+| `https_proxy` | string | `""` | HTTPS 代理地址。空 = 不覆盖（同上） |
+| `no_proxy` | string | `"localhost,127.0.0.1"` | 不走代理的地址列表 |
+
+**注入规则：**
+
+- 非空字段同时注入大写 + 小写两套键（`HTTP_PROXY`/`http_proxy`、`HTTPS_PROXY`/`https_proxy`、`NO_PROXY`/`no_proxy`），兼容不同工具的探测习惯
+- 字段为空则不注入对应键，不覆盖子进程从 daemon 继承的环境变量
+- 注入目标：模型下载 Python 子进程、uv/pip 依赖安装进程、模块运行子进程
+
+**生效时机：** 新启动的子进程。已运行的模块不受影响（需重启模块生效）。
+
+```toml
+[network]
+http_proxy = ""
+https_proxy = ""
+no_proxy = "localhost,127.0.0.1"
+
+# 有代理时示例：
+# http_proxy = "http://127.0.0.1:7890"
+# https_proxy = "http://127.0.0.1:7890"
+```
+
 ---
 
 ## 2. 完整 app.toml 示例
@@ -143,6 +216,11 @@ dashboard_refresh_secs = 2
 ```toml
 # EntryPoint 全局配置
 # 路径说明：相对路径基于应用根目录解析
+
+[server]
+host = "0.0.0.0"
+port = 9800
+allow_public = false
 
 [general]
 language = "zh-CN"
@@ -162,9 +240,10 @@ range_end = 19000
 
 [models]
 cache_dir = "models"
+cache_paths = []
 hf_endpoint = "https://hf-mirror.com"
 default_source = "huggingface"
-max_concurrent_downloads = 2
+max_concurrent_downloads = 2   # 保留，暂未生效
 
 [python]
 path = ""
@@ -178,7 +257,14 @@ keep_workspace = true
 [ui]
 scale_factor = 1.0
 font_size = 14.0
+
+[network]
+http_proxy = ""
+https_proxy = ""
+no_proxy = "localhost,127.0.0.1"
 ```
+
+> 通过 WebUI「设置」页或 `PUT /api/config` 修改配置会**直接落盘**到 `config/app.toml`，重启后不丢失。
 
 ---
 
@@ -190,19 +276,21 @@ font_size = 14.0
 |---|---|---|
 | `EP_ROOT` | 应用根目录 | `G:\AI_Applications\EntryPoint` |
 | `EP_MODULE_DIR` | 模块目录 | `...\modules\faster-whisper` |
-| `EP_MODULE_ID` | 模块 ID | `faster-whisper` |
+| `EP_MODULE_ID` | 模块 ID（保留，当前版本暂未注入） | `faster-whisper` |
 | `EP_MODEL_DIR` | 当前模型目录 | `D:\AI_Models\faster-whisper-large-v3` |
-| `EP_MODEL_ID` | 当前模型 ID | `large-v3` |
+| `EP_MODEL_ID` | 当前模型 ID（保留，当前版本暂未注入） | `large-v3` |
 | `EP_PORT` | 分配端口 | `18001` |
 | `EP_DEVICE` | 设备标识 | `cuda:0` / `cpu` / `npu:0` |
 | `EP_DEVICE_INDEX` | 设备索引 | `0` |
 | `EP_BACKEND` | 计算后端 | `cuda` / `rocm` / `openvino` / `cpu` |
 | `EP_WORKSPACE` | 任务工作目录 | `...\workspace\task-abc123` |
-| `EP_LOG_LEVEL` | 日志级别 | `info` |
+| `EP_LOG_LEVEL` | 日志级别（保留，当前版本暂未注入；模块适配器自行兜底默认值） | `info` |
 
-### 3.2 计算后端相关环境变量
+### 3.2 计算后端相关环境变量（计划中，暂未实现）
 
-由 `[compute.env]` 或默认规则注入：
+> ⚠️ 当前版本**尚未实现**按后端注入设备可见性变量。module.toml 中的 `[compute.env]` 段能被解析，但启动模块时不会应用；设备选择通过 `EP_DEVICE` / `EP_DEVICE_INDEX` / `EP_BACKEND` 传入，由模块适配器自行处理。
+
+计划中的注入规则：
 
 | 后端 | 变量 | 值 |
 |---|---|---|
@@ -215,11 +303,16 @@ font_size = 14.0
 
 | 变量 | 说明 | 默认 |
 |---|---|---|
-| `EP_CONFIG_DIR` | 配置文件目录覆盖 | `<root>/config` |
-| `EP_LOG_DIR` | 日志目录覆盖 | `<root>/logs` |
-| `HF_ENDPOINT` | HuggingFace 镜像（传递给下载进程） | — |
-| `HF_TOKEN` | HuggingFace 访问令牌（私有模型） | — |
-| `MODELSCOPE_CACHE` | ModelScope 缓存目录 | — |
+| `EP_ROOT` | 应用根目录覆盖（配置、模块、日志等均基于它解析） | 可执行文件位置推断，兜底当前工作目录 |
+
+**由系统注入（用户不直接设置）：**
+
+| 变量 | 说明 |
+|---|---|
+| `HF_ENDPOINT` | 由 `[models].hf_endpoint`（非空时）注入模型下载进程，仅 HuggingFace 源生效 |
+| `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` 等 | 由 `[network]` 节注入，见 §1.9 |
+
+**计划中（当前代码未实现，设置无效）：** `EP_CONFIG_DIR`（配置目录固定为 `<root>/config`）、`EP_LOG_DIR`（daemon 日志走 systemd journal / 控制台）、`HF_TOKEN`、`MODELSCOPE_CACHE`。后两者虽无显式处理，但仍可经 daemon 进程环境隐式继承到子进程（如通过 systemd `Environment=` 设置）。
 
 ---
 
@@ -365,12 +458,13 @@ EntryPoint/                        ← 应用根目录
 
 ## 6. 配置优先级
 
-当同一配置项有多个来源时，优先级从高到低：
+配置来源从高到低：
 
-1. 命令行参数（`--config-dir`、`--model-dir` 等）
-2. 环境变量（`EP_CONFIG_DIR`、`HF_ENDPOINT` 等）
-3. `config/app.toml`
-4. 内置默认值
+1. 运行时修改（WebUI 设置页 / `PUT /api/config`）——立即生效并落盘到 `config/app.toml`
+2. `config/app.toml`（启动时加载）
+3. 内置默认值（文件中缺失的字段用默认值补齐）
+
+应用根目录的解析顺序：环境变量 `EP_ROOT` → 可执行文件位置推断（需含 `config/` + `modules/`）→ 当前工作目录。
 
 ---
 
