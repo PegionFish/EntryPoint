@@ -41,3 +41,8 @@ workspace_dir = "workspace"
 scale_factor = 1.0
 font_size = 14.0
 dashboard_refresh_secs = 2
+
+[network]
+http_proxy = ""
+https_proxy = ""
+no_proxy = "localhost,127.0.0.1"
