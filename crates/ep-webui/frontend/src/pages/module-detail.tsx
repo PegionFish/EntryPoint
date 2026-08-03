@@ -1,9 +1,12 @@
-import { useNavigate, useParams } from 'react-router-dom'
+import { useState } from 'react'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 import { toast } from 'sonner'
 import {
   ChevronLeft,
   CircleAlert,
+  Copy,
   Database,
+  HardDrive,
   Loader2,
   Play,
   RotateCw,
@@ -12,6 +15,7 @@ import {
   TriangleAlert,
 } from 'lucide-react'
 import { PageContainer } from '@/components/layout/page-container'
+import { ConfirmDialog } from '@/components/shared/confirm-dialog'
 import { LogViewer } from '@/components/shared/log-viewer'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -23,7 +27,6 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Toaster } from '@/components/ui/sonner'
 import { useModuleDetail } from '@/hooks/use-module-detail'
 import { useWsState } from '@/hooks/use-ws-state'
 import { categoryLabel, statusMeta } from '@/lib/constants'
@@ -74,6 +77,30 @@ function DetailSkeleton() {
   )
 }
 
+/** 长路径旁的复制按钮：写入剪贴板并给出 toast 反馈 */
+function CopyPathButton({ value, label }: { value: string; label: string }) {
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(value)
+      toast.success(`${label}已复制`)
+    } catch {
+      toast.error('复制失败，请手动选择文本复制')
+    }
+  }
+  return (
+    <Button
+      variant="ghost"
+      size="xs"
+      className="shrink-0 text-muted-foreground/70 hover:text-foreground"
+      onClick={() => void handleCopy()}
+      title={`复制${label}`}
+      aria-label={`复制${label}`}
+    >
+      <Copy />
+    </Button>
+  )
+}
+
 export default function ModuleDetailPage() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
@@ -92,6 +119,8 @@ export default function ModuleDetailPage() {
     clearLogs,
   } = useModuleDetail(id)
 
+  const [stopConfirmOpen, setStopConfirmOpen] = useState(false)
+
   const rawStatus = status?.status ?? mod?.service_status ?? 'stopped'
   const statusKey = normalizeStatus(rawStatus)
   const meta = statusMeta(rawStatus)
@@ -109,12 +138,14 @@ export default function ModuleDetailPage() {
     }
   }
 
-  const handleStop = async () => {
+  /** 确认对话框内执行停止；失败时抛错让对话框保持打开以便重试 */
+  const handleStopConfirmed = async () => {
     try {
       await stopModule()
       toast.success(`「${name}」已停止`)
     } catch (e) {
       toast.error('停止失败', { description: failMsg(e) })
+      throw e
     }
   }
 
@@ -159,7 +190,7 @@ export default function ModuleDetailPage() {
           <Button
             variant="destructive"
             size="sm"
-            onClick={() => void handleStop()}
+            onClick={() => setStopConfirmOpen(true)}
           >
             <Square />
             停止
@@ -180,9 +211,6 @@ export default function ModuleDetailPage() {
 
   return (
     <>
-      {/* 页面级 Toaster：全局尚未挂载时保证操作反馈可见 */}
-      <Toaster richColors closeButton position="top-right" />
-
       <PageContainer
         title="模块详情"
         description="模块运行状态、操作与实时日志"
@@ -261,24 +289,52 @@ export default function ModuleDetailPage() {
                 </p>
               )}
               {mod?.path && (
-                <p className="mt-1.5 break-all font-mono text-xs text-muted-foreground/60">
-                  {mod.path}
+                <p className="mt-1.5 flex items-center gap-1 font-mono text-xs text-muted-foreground/60">
+                  <span className="min-w-0 break-all">{mod.path}</span>
+                  <CopyPathButton value={mod.path} label="模块路径" />
                 </p>
               )}
             </header>
 
-            {/* 未就绪提示 */}
+            {/* 未就绪提示：指明具体原因（缺模型/依赖），并给出两个处理入口 */}
             {statusKey === 'not_ready' && (
               <div
                 className="flex animate-[ep-fade-up_0.35s_ease_both] items-start gap-3 rounded-lg border border-status-preparing/40 bg-status-preparing/10 px-4 py-3"
                 role="alert"
               >
                 <TriangleAlert className="mt-0.5 size-4 shrink-0 text-status-preparing" />
-                <div className="text-sm">
-                  <p className="font-medium text-status-preparing">模块未就绪</p>
-                  <p className="mt-0.5 leading-relaxed text-status-preparing/75">
-                    依赖缺失或配置未完成。请检查模块清单、模型文件与运行环境后再启动。
+                <div className="min-w-0 flex-1 text-sm">
+                  <p className="font-medium text-status-preparing">
+                    模块未就绪：缺少模型或依赖
                   </p>
+                  <p className="mt-0.5 leading-relaxed text-status-preparing/75">
+                    该模块尚不满足启动条件——所需的模型文件可能未下载，或系统依赖（如
+                    FFmpeg、PyTorch CUDA）缺失。请确认以下两处就绪后再尝试启动。
+                  </p>
+                  <div className="mt-2.5 flex flex-wrap gap-2">
+                    <Button
+                      asChild
+                      variant="outline"
+                      size="xs"
+                      className="border-status-preparing/40 bg-transparent text-status-preparing hover:bg-status-preparing/10 hover:text-status-preparing"
+                    >
+                      <Link to="/models">
+                        <Database />
+                        前往模型管理
+                      </Link>
+                    </Button>
+                    <Button
+                      asChild
+                      variant="outline"
+                      size="xs"
+                      className="border-status-preparing/40 bg-transparent text-status-preparing hover:bg-status-preparing/10 hover:text-status-preparing"
+                    >
+                      <Link to="/">
+                        <HardDrive />
+                        查看依赖报告
+                      </Link>
+                    </Button>
+                  </div>
                 </div>
               </div>
             )}
@@ -322,7 +378,8 @@ export default function ModuleDetailPage() {
                       </Badge>
                     </dd>
                   </div>
-                  <InfoItem label="设备" value="—" />
+                  {/* API 无模块 → 设备映射，明示「暂不支持」而非占位符（与仪表盘一致） */}
+                  <InfoItem label="设备" value="暂不支持" />
                   <InfoItem
                     label="端口"
                     value={status?.port != null ? String(status.port) : '—'}
@@ -371,7 +428,15 @@ export default function ModuleDetailPage() {
                 </CardAction>
               </CardHeader>
               <CardContent>
-                <LogViewer lines={logs} onClear={clearLogs} />
+                <LogViewer
+                  lines={logs}
+                  onClear={clearLogs}
+                  exportName={`${id ?? 'module'}-logs.txt`}
+                />
+                {/* 后端日志缓冲上限 500 行，明示截断行为避免误解（P2-19） */}
+                <p className="mt-2 text-xs text-muted-foreground/60">
+                  仅保留最近 500 行，实时推送需保持页面连接
+                </p>
               </CardContent>
             </Card>
 
@@ -406,8 +471,14 @@ export default function ModuleDetailPage() {
                             <p className="truncate text-sm font-medium">
                               {m.name}
                             </p>
-                            <p className="truncate font-mono text-xs text-muted-foreground/70">
-                              {m.target_dir}
+                            <p className="flex items-center gap-1 font-mono text-xs text-muted-foreground/70">
+                              <span className="truncate" title={m.target_dir}>
+                                {m.target_dir}
+                              </span>
+                              <CopyPathButton
+                                value={m.target_dir}
+                                label="模型路径"
+                              />
                             </p>
                           </div>
                           <div className="flex shrink-0 items-center gap-4">
@@ -443,6 +514,17 @@ export default function ModuleDetailPage() {
           </div>
         )}
       </PageContainer>
+
+      {/* 停止模块确认（destructive，异步期间保持打开，失败可重试） */}
+      <ConfirmDialog
+        open={stopConfirmOpen}
+        onOpenChange={setStopConfirmOpen}
+        title={`停止「${name}」`}
+        description="停止后该模块的服务进程将被终止，正在处理的请求会中断，确定要停止吗？"
+        confirmLabel="停止模块"
+        variant="destructive"
+        onConfirm={() => handleStopConfirmed()}
+      />
     </>
   )
 }

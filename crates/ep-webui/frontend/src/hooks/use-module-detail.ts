@@ -6,7 +6,6 @@ import type {
   ModuleActionResult,
   ModuleResponse,
   ModuleStatusResponse,
-  WsLogMessage,
 } from '@/api/types'
 
 /** 模块状态轮询间隔 */
@@ -170,15 +169,12 @@ export function useModuleDetail(moduleId: string | undefined): UseModuleDetailRe
     }
   }, [id, refreshStatus])
 
-  // WebSocket 实时日志订阅（按 module_id 过滤）
+  // WebSocket 实时日志订阅（按 type='log' + module_id 过滤）
   useEffect(() => {
     if (!id) return
     return wsManager.onMessage((msg) => {
-      if (msg.type !== 'log') return
-      // WsMessage 联合中存在通配成员，此处显式收敛类型
-      const logMsg = msg as { type: 'log' } & WsLogMessage
-      if (logMsg.module_id !== id) return
-      setLogs((prev) => appendLine(prev, logMsg.line))
+      if (msg.type !== 'log' || msg.module_id !== id) return
+      setLogs((prev) => appendLine(prev, msg.line))
     })
   }, [id])
 

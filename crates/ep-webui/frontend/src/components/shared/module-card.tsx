@@ -1,5 +1,5 @@
-import { useNavigate } from 'react-router-dom'
-import { ChevronRight } from 'lucide-react'
+import { Link, useNavigate } from 'react-router-dom'
+import { ChevronRight, LoaderCircle, Play, Square, TriangleAlert } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { categoryLabel, statusMeta } from '@/lib/constants'
 import { cn } from '@/lib/utils'
@@ -11,10 +11,23 @@ interface ModuleCardProps {
   status?: string
   /** 服务端口（来自 /api/modules/:id/status，未运行时为 null） */
   port?: number | null
+  /** 提供时且模块已停止，在卡片右上角显示启动按钮 */
+  onStart?: () => void
+  /** 启动请求进行中：启动按钮显示旋转图标并禁用 */
+  starting?: boolean
+  /** 提供时且模块运行中，在卡片右上角显示停止按钮（回调内自行弹确认框） */
+  onStop?: () => void
 }
 
 /** 模块卡片：状态点 + 名称 + 版本 + 类别徽章 + 端口，点击跳转详情页 */
-export function ModuleCard({ module, status, port }: ModuleCardProps) {
+export function ModuleCard({
+  module,
+  status,
+  port,
+  onStart,
+  starting,
+  onStop,
+}: ModuleCardProps) {
   const navigate = useNavigate()
   const raw = status ?? module.service_status ?? ''
   const meta = statusMeta(raw)
@@ -55,10 +68,61 @@ export function ModuleCard({ module, status, port }: ModuleCardProps) {
           />
           <span className="truncate text-sm font-medium">{module.name}</span>
         </div>
-        <ChevronRight
-          className="size-4 shrink-0 text-muted-foreground/40 transition-all duration-200 group-hover:translate-x-0.5 group-hover:text-primary"
-          aria-hidden
-        />
+        <div className="flex shrink-0 items-center gap-0.5">
+          {onStart && key === 'stopped' && (
+            <button
+              type="button"
+              aria-label={`启动「${module.name}」`}
+              title={`启动「${module.name}」`}
+              disabled={starting}
+              onClick={(e) => {
+                e.stopPropagation()
+                onStart()
+              }}
+              onKeyDown={(e) => {
+                // 避免 Enter/Space 冒泡到卡片的导航逻辑
+                e.stopPropagation()
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault()
+                  if (!starting) onStart()
+                }
+              }}
+              className="rounded-md p-1 text-muted-foreground/60 transition-colors hover:bg-status-running/10 hover:text-status-running focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:opacity-50"
+            >
+              {starting ? (
+                <LoaderCircle className="size-3.5 animate-spin" aria-hidden />
+              ) : (
+                <Play className="size-3.5" aria-hidden />
+              )}
+            </button>
+          )}
+          {onStop && (key === 'running' || meta.transitional) && (
+            <button
+              type="button"
+              aria-label={`停止「${module.name}」`}
+              title={`停止「${module.name}」`}
+              onClick={(e) => {
+                e.stopPropagation()
+                onStop()
+              }}
+              onKeyDown={(e) => {
+                // 避免 Enter/Space 冒泡到卡片的导航逻辑
+                e.stopPropagation()
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault()
+                  onStop()
+                }
+              }}
+              className="rounded-md p-1 text-muted-foreground/60 transition-colors hover:bg-status-error/10 hover:text-status-error focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+            >
+              <Square className="size-3.5" aria-hidden />
+            </button>
+          )}
+          <ChevronRight
+            className="size-4 shrink-0 text-muted-foreground/40 transition-all duration-200 group-hover:translate-x-0.5 group-hover:text-primary"
+            aria-hidden
+          />
+        </div>
       </div>
 
       <div className="mt-3 flex items-center justify-between gap-2">
@@ -81,6 +145,34 @@ export function ModuleCard({ module, status, port }: ModuleCardProps) {
           {port != null ? `:${port}` : '—'}
         </span>
       </div>
+
+      {/* 未就绪引导：明确原因（缺模型/依赖）并给出处理入口，包裹层阻止事件冒泡到卡片导航 */}
+      {key === 'not_ready' && (
+        <div
+          className="mt-3 flex items-center justify-between gap-2 rounded-md border border-status-preparing/30 bg-status-preparing/10 px-2.5 py-1.5"
+          onClick={(e) => e.stopPropagation()}
+          onKeyDown={(e) => e.stopPropagation()}
+        >
+          <span className="flex min-w-0 items-center gap-1.5 text-xs text-status-preparing">
+            <TriangleAlert className="size-3.5 shrink-0" aria-hidden />
+            缺少模型或依赖
+          </span>
+          <span className="flex shrink-0 items-center gap-2.5 text-xs font-medium">
+            <Link
+              to="/models"
+              className="rounded-sm text-status-preparing underline-offset-2 transition-colors hover:text-status-preparing/80 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+            >
+              模型管理
+            </Link>
+            <Link
+              to="/"
+              className="rounded-sm text-status-preparing underline-offset-2 transition-colors hover:text-status-preparing/80 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+            >
+              依赖报告
+            </Link>
+          </span>
+        </div>
+      )}
     </div>
   )
 }

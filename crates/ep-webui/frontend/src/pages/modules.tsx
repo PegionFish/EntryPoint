@@ -1,15 +1,19 @@
 import { useMemo, useState } from 'react'
+import { toast } from 'sonner'
 import {
   Activity,
   CircleAlert,
   CircleStop,
   CircleX,
-  PackageOpen,
   Puzzle,
   RefreshCw,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
+import { api } from '@/api/client'
 import { PageContainer } from '@/components/layout/page-container'
+import { ConfirmDialog } from '@/components/shared/confirm-dialog'
+import { NoModulesState } from '@/components/shared/empty-state'
+import { CardSkeleton } from '@/components/shared/loading-skeleton'
 import { ModuleCard } from '@/components/shared/module-card'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -67,6 +71,10 @@ function SummaryStat({ icon: Icon, label, value, tone }: SummaryStatProps) {
 export function ModulesPage() {
   const { modules, statusMap, loading, error, refresh } = useModules()
   const [spinning, setSpinning] = useState(false)
+  /** 待确认停止的模块（非 null 时显示确认对话框） */
+  const [stopTarget, setStopTarget] = useState<ModuleResponse | null>(null)
+  /** 正在启动的模块 id（卡片启动按钮显示进行中状态） */
+  const [startingId, setStartingId] = useState<string | null>(null)
 
   const handleRefresh = async () => {
     setSpinning(true)
@@ -74,6 +82,39 @@ export function ModulesPage() {
       await refresh()
     } finally {
       setSpinning(false)
+    }
+  }
+
+  /** 卡片快捷启动已停止的模块；与详情页同一启动 API，成功后刷新同步最新状态 */
+  const handleStart = async (m: ModuleResponse) => {
+    setStartingId(m.id)
+    try {
+      const res = await api.startModule(m.id)
+      if (res.error) throw new Error(res.error)
+      toast.success(`「${m.name}」已开始启动`)
+      await refresh()
+    } catch (e) {
+      toast.error('启动失败', {
+        description: e instanceof Error ? e.message : String(e),
+      })
+    } finally {
+      setStartingId((cur) => (cur === m.id ? null : cur))
+    }
+  }
+
+  /** 确认对话框内执行停止；失败时抛错让对话框保持打开以便重试 */
+  const handleStopConfirmed = async () => {
+    if (!stopTarget) return
+    try {
+      const res = await api.stopModule(stopTarget.id)
+      if (res.error) throw new Error(res.error)
+      toast.success(`「${stopTarget.name}」已停止`)
+      await refresh()
+    } catch (e) {
+      toast.error('停止失败', {
+        description: e instanceof Error ? e.message : String(e),
+      })
+      throw e
     }
   }
 
@@ -133,9 +174,10 @@ export function ModulesPage() {
       {loading ? (
         <div className="space-y-6">
           <Skeleton className="h-[72px] rounded-lg" />
+          {/* 复用 shared/loading-skeleton 预设组件，避免各页面手写骨架 */}
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
             {Array.from({ length: 6 }).map((_, i) => (
-              <Skeleton key={i} className="h-[92px] rounded-lg" />
+              <CardSkeleton key={i} />
             ))}
           </div>
         </div>
@@ -157,12 +199,12 @@ export function ModulesPage() {
           </Button>
         </div>
       ) : modules.length === 0 ? (
-        <div className="flex flex-col items-center justify-center rounded-lg border border-dashed py-16 text-center">
-          <PackageOpen className="size-8 text-muted-foreground/60" />
-          <p className="mt-3 text-sm font-medium">暂无已安装模块</p>
-          <p className="mt-1 text-xs text-muted-foreground">
-            将模块放入 modules 目录后，点击右上角「刷新」重新扫描
-          </p>
+        /* 复用 shared/empty-state 预设组件，替代手写空态 */
+        <div className="rounded-lg border border-dashed">
+          <NoModulesState
+            description="暂无已安装模块。将模块放入 modules 目录后，点击右上角「刷新」重新扫描"
+            action={{ label: '刷新', onClick: () => void handleRefresh() }}
+          />
         </div>
       ) : (
         <div className="space-y-8">
@@ -242,6 +284,9 @@ export function ModulesPage() {
                       module={m}
                       status={statusMap[m.id]?.status}
                       port={statusMap[m.id]?.port ?? null}
+                      starting={startingId === m.id}
+                      onStart={() => void handleStart(m)}
+                      onStop={() => setStopTarget(m)}
                     />
                   ))}
                 </div>
@@ -250,6 +295,19 @@ export function ModulesPage() {
           })}
         </div>
       )}
+
+      {/* 停止模块确认（destructive，异步期间保持打开，失败可重试） */}
+      <ConfirmDialog
+        open={stopTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setStopTarget(null)
+        }}
+        title={`停止「${stopTarget?.name ?? ''}」`}
+        description="停止后该模块的服务进程将被终止，正在处理的请求会中断，确定要停止吗？"
+        confirmLabel="停止模块"
+        variant="destructive"
+        onConfirm={() => handleStopConfirmed()}
+      />
     </PageContainer>
   )
 }
