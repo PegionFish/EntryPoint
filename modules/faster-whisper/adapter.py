@@ -51,12 +51,13 @@ DEVICE_MAP = {
 
 # ── 模型状态 ──────────────────────────────────────────────
 model = None
+model_device = "cpu"  # 模型实际加载所用设备（回退后为 cpu）
 model_load_error: Optional[str] = None
 
 
 def _load_model():
     """加载 faster-whisper 模型"""
-    global model, model_load_error
+    global model, model_device, model_load_error
 
     if not EP_MODEL_DIR:
         model_load_error = "EP_MODEL_DIR environment variable is not set"
@@ -97,10 +98,28 @@ def _load_model():
                 device=device,
                 compute_type=fallback,
             )
+        model_device = device
         logger.info("Model loaded successfully")
     except Exception as exc:
         model_load_error = f"Failed to load model: {exc}"
         logger.exception(model_load_error)
+
+
+def _reload_model_on_cpu() -> bool:
+    """GPU 推理失败时的设备级回退：以 CPU 重新加载模型。成功返回 True。"""
+    global model, model_device, model_load_error
+    try:
+        from faster_whisper import WhisperModel
+
+        logger.warning("Reloading model on CPU (device-level fallback)")
+        model = WhisperModel(str(Path(EP_MODEL_DIR)), device="cpu", compute_type="int8")
+        model_device = "cpu"
+        model_load_error = None
+        return True
+    except Exception as exc:
+        model_load_error = f"CPU fallback reload failed: {exc}"
+        logger.exception(model_load_error)
+        return False
 
 
 @asynccontextmanager
@@ -149,6 +168,28 @@ def _clamp_beam_size(value) -> int:
         return max(1, min(20, v))
     except (TypeError, ValueError):
         return 5
+
+
+def _srt_timestamp(seconds: float) -> str:
+    """秒 → SRT 时间戳 HH:MM:SS,mmm"""
+    ms = int(round(seconds * 1000))
+    h, ms = divmod(ms, 3600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _segments_to_srt(segments) -> str:
+    """识别片段 → SRT 字幕文本"""
+    lines = []
+    for idx, seg in enumerate(segments, start=1):
+        lines.append(str(idx))
+        lines.append(
+            f"{_srt_timestamp(seg['start'])} --> {_srt_timestamp(seg['end'])}"
+        )
+        lines.append(seg.get("text", "").strip())
+        lines.append("")
+    return "\n".join(lines)
 
 
 # ── 标准端点 ──────────────────────────────────────────────
@@ -268,9 +309,9 @@ async def predict(
         vad_filter = bool(params_dict.get("vad_filter", True))
         condition_on_previous = bool(params_dict.get("condition_on_previous", True))
 
-        # 6) 执行推理
-        t0 = time.perf_counter()
-        try:
+        # 6) 执行推理（GPU 失败时设备级回退 CPU 重试一次）
+        def _do_transcribe():
+            t0 = time.perf_counter()
             segments_gen, transcribe_info = model.transcribe(
                 audio_path,
                 language=language,
@@ -317,12 +358,53 @@ async def predict(
                 "output_path": None,
                 "elapsed_seconds": elapsed,
             }
+
+        try:
+            result = _do_transcribe()
         except Exception as exc:
-            logger.exception("Inference failed")
-            return error_response(
-                500, "INFERENCE_ERROR",
-                f"Transcription failed: {exc}",
-            )
+            if model_device != "cpu" and _reload_model_on_cpu():
+                logger.warning(
+                    "GPU inference failed (%s); retrying on CPU", exc,
+                )
+                try:
+                    result = _do_transcribe()
+                except Exception as exc_cpu:
+                    logger.exception("Inference failed on CPU")
+                    return error_response(
+                        500, "INFERENCE_ERROR",
+                        f"Transcription failed: {exc_cpu}",
+                    )
+            else:
+                logger.exception("Inference failed")
+                return error_response(
+                    500, "INFERENCE_ERROR",
+                    f"Transcription failed: {exc}",
+                )
+
+        # 7) 文件导出：output_format=srt 时把识别结果写成字幕文件
+        #    （output_path 由管线执行器注入，见 MODULE_SPEC 模块产物协议）
+        output_format = str(params_dict.get("output_format") or "json").lower()
+        output_path = params_dict.get("output_path")
+        if output_format == "srt" and output_path:
+            try:
+                srt_text = _segments_to_srt(result["result"]["segments"])
+                Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+                Path(output_path).write_text(srt_text, encoding="utf-8")
+                logger.info("SRT written to %s", output_path)
+                return {
+                    "status": "completed",
+                    "output_type": "file",
+                    "result": str(output_path),
+                    "output_path": str(output_path),
+                    "elapsed_seconds": result["elapsed_seconds"],
+                }
+            except Exception as exc:
+                logger.exception("SRT export failed")
+                return error_response(
+                    500, "EXPORT_ERROR",
+                    f"SRT export failed: {exc}",
+                )
+        return result
     finally:
         # 清理临时文件
         if tmp_file is not None and tmp_file.exists():

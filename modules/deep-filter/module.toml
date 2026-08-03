@@ -30,9 +30,10 @@ cuda = { CUDA_VISIBLE_DEVICES = "{device_index}" }
 id = "df3"
 name = "DeepFilterNet3 (默认)"
 source = "url"
-url = "https://github.com/Rikorose/DeepFilterNet/releases/download/v0.5.6/DeepFilterNet3_onnx.tar.gz"
+# 原 GitHub release 资产已失效（所有 release 均无此文件）；改用 HuggingFace 镜像（文件内容与原版一致，2026-08-04 核实）
+url = "https://huggingface.co/Serkan007/DeepFilterNet3-ONNX/resolve/main/DeepFilterNet3_onnx.tar.gz"
 target_dir = "deep-filter-df3"
-size_estimate_mb = 50
+size_estimate_mb = 8
 default = true
 
 [interface]

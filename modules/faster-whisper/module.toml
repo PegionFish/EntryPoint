@@ -36,6 +36,10 @@ target_dir = "faster-whisper-large-v3"
 size_estimate_mb = 3100
 default = true
 
+[[models.mirrors]]
+source = "modelscope"
+repo_id = "pengzhendong/faster-whisper-large-v3"
+
 [[models]]
 id = "medium"
 name = "Whisper Medium (平衡)"
@@ -44,6 +48,10 @@ repo_id = "Systran/faster-whisper-medium"
 target_dir = "faster-whisper-medium"
 size_estimate_mb = 1500
 
+[[models.mirrors]]
+source = "modelscope"
+repo_id = "pengzhendong/faster-whisper-medium"
+
 [[models]]
 id = "small"
 name = "Whisper Small (轻量)"
@@ -51,6 +59,10 @@ source = "huggingface"
 repo_id = "Systran/faster-whisper-small"
 target_dir = "faster-whisper-small"
 size_estimate_mb = 500
+
+[[models.mirrors]]
+source = "modelscope"
+repo_id = "pengzhendong/faster-whisper-small"
 
 [interface]
 type = "http"

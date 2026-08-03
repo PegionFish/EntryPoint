@@ -33,3 +33,6 @@ models/
 
 # Config overrides (user-specific)
 config/gpu_assignments.toml
+
+# Python 缓存
+__pycache__/

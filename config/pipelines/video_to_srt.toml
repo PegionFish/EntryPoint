@@ -29,6 +29,7 @@ label = "语音识别"
 [nodes.params]
 language = "zh"
 model_size = "large-v3"
+output_format = "srt"
 
 [[nodes]]
 id = "output"

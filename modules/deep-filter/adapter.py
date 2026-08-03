@@ -71,6 +71,11 @@ def _load_model() -> None:
         model_dir = Path(EP_MODEL_DIR)
         candidate = model_dir / "deep-filter-df3"
         if candidate.is_dir():
+            # tar.gz 解压后可能带嵌套前缀（如 tmp/export/），定位到含 enc.onnx 的真实目录
+            if not (candidate / "enc.onnx").exists():
+                hits = sorted(candidate.rglob("enc.onnx"))
+                if hits:
+                    candidate = hits[0].parent
             # DeepFilterNet init_df 接受模型目录或 .tar.gz 路径
             model_path = str(candidate)
             log.info("使用本地模型目录: %s", model_path)
