@@ -1,8 +1,9 @@
-import { useState, type ComponentProps, type ReactNode } from 'react'
+import { useEffect, useState, type ComponentProps, type ReactNode } from 'react'
 import {
   Cpu,
   Database,
   GitBranch,
+  Globe,
   Loader2,
   Network,
   RotateCcw,
@@ -14,6 +15,7 @@ import {
 } from 'lucide-react'
 import { toast } from 'sonner'
 import type { AppConfig } from '@/api/types'
+import { useThemeStore } from '@/store/theme'
 import { PageContainer } from '@/components/layout/page-container'
 import { Button } from '@/components/ui/button'
 import {
@@ -76,16 +78,22 @@ function Section({
 function Field({
   label,
   description,
+  error,
   className,
+  field,
   children,
 }: {
   label: string
   description?: string
+  /** 内联校验错误（红字提示） */
+  error?: string
   className?: string
+  /** 校验锚点（data-field），保存失败时用于滚动定位 */
+  field?: string
   children: ReactNode
 }) {
   return (
-    <div className={cn('space-y-2', className)}>
+    <div className={cn('space-y-2', className)} data-field={field}>
       <div>
         <div className="text-sm font-medium">{label}</div>
         {description && (
@@ -95,6 +103,7 @@ function Field({
         )}
       </div>
       {children}
+      {error && <div className="text-xs text-status-error">{error}</div>}
     </div>
   )
 }
@@ -134,25 +143,114 @@ function NumberField({
   onValueChange,
   min,
   max,
+  invalid,
 }: {
   value: number
   onValueChange: (v: number) => void
   min?: number
   max?: number
+  /** 校验未通过（红色边框提示） */
+  invalid?: boolean
 }) {
+  // 本地文本镜像：容忍清空等过渡性无效输入，只在输入为合法数字时回写配置
+  const [text, setText] = useState(() =>
+    Number.isFinite(value) ? String(value) : '',
+  )
+
+  // 外部值变化（重置、重新加载、保存回写）时同步显示
+  useEffect(() => {
+    setText(Number.isFinite(value) ? String(value) : '')
+  }, [value])
+
   return (
     <Input
       type="number"
-      value={Number.isFinite(value) ? value : ''}
+      value={text}
       min={min}
       max={max}
+      aria-invalid={invalid || undefined}
       onChange={(e) => {
+        setText(e.target.value)
         const v = e.target.valueAsNumber
-        onValueChange(Number.isNaN(v) ? 0 : v)
+        // P2-52：非法 / NaN 输入保留原值，不再写 0
+        if (!Number.isNaN(v)) onValueChange(v)
+      }}
+      onBlur={() => {
+        // 失焦时回退显示为实际配置值，避免无效内容造成误导
+        setText(Number.isFinite(value) ? String(value) : '')
       }}
       className="font-mono"
     />
   )
+}
+
+/* ── 表单校验 ─────────────────────────────────────────────────── */
+
+/** 字段级校验错误（对应 key 缺失即无错误） */
+interface ValidationErrors {
+  server_port?: string
+  range_start?: string
+  range_end?: string
+  /** 交叉校验：起始端口必须小于结束端口（P2-53） */
+  ports_range?: string
+  http_proxy?: string
+  https_proxy?: string
+}
+
+/** 端口必须为 1–65535 的整数 */
+function portError(value: number): string | undefined {
+  return Number.isInteger(value) && value >= 1 && value <= 65535
+    ? undefined
+    : '端口必须为 1–65535 的整数'
+}
+
+/** 代理地址非空时必须以 http:// 或 https:// 开头 */
+function proxyError(value: string): string | undefined {
+  const v = value.trim()
+  return v === '' || /^https?:\/\//.test(v)
+    ? undefined
+    : '必须以 http:// 或 https:// 开头'
+}
+
+/** 对当前表单做整体校验，返回全部错误 */
+function validateConfig(config: AppConfig): ValidationErrors {
+  const errors: ValidationErrors = {}
+  const serverPort = portError(config.server.port)
+  if (serverPort) errors.server_port = serverPort
+  const rangeStart = portError(config.ports.range_start)
+  if (rangeStart) errors.range_start = rangeStart
+  const rangeEnd = portError(config.ports.range_end)
+  if (rangeEnd) errors.range_end = rangeEnd
+  if (
+    !rangeStart &&
+    !rangeEnd &&
+    config.ports.range_start >= config.ports.range_end
+  ) {
+    errors.ports_range = '起始端口必须小于结束端口'
+  }
+  const httpProxy = proxyError(config.network?.http_proxy ?? '')
+  if (httpProxy) errors.http_proxy = httpProxy
+  const httpsProxy = proxyError(config.network?.https_proxy ?? '')
+  if (httpsProxy) errors.https_proxy = httpsProxy
+  return errors
+}
+
+/** 校验失败时的滚动定位顺序：首个错误 → 页内锚点（data-field） */
+const VALIDATION_ORDER: { key: keyof ValidationErrors; anchor: string }[] = [
+  { key: 'server_port', anchor: 'server-port' },
+  { key: 'range_start', anchor: 'range-start' },
+  { key: 'range_end', anchor: 'range-end' },
+  { key: 'ports_range', anchor: 'range-end' },
+  { key: 'http_proxy', anchor: 'http-proxy' },
+  { key: 'https_proxy', anchor: 'https-proxy' },
+]
+
+function scrollToFirstError(errors: ValidationErrors) {
+  const first = VALIDATION_ORDER.find(({ key }) => errors[key] !== undefined)
+  if (!first) return
+  document
+    .querySelector(`[data-field="${first.anchor}"]`)
+    ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
 }
 
 /* ── 设置页 ──────────────────────────────────────────────────── */
@@ -162,6 +260,8 @@ export function SettingsPage() {
     useConfig()
   /** 开启「允许公网访问」前的安全确认对话框 */
   const [publicDialogOpen, setPublicDialogOpen] = useState(false)
+  /** 实时字段校验错误（由当前表单内容派生） */
+  const errors: ValidationErrors = config ? validateConfig(config) : {}
 
   /** 局部更新某个配置分区 */
   function patchSection<K extends keyof AppConfig>(
@@ -174,10 +274,29 @@ export function SettingsPage() {
   }
 
   async function handleSave() {
+    if (!config) return
+    // 校验未通过：阻止保存、汇总报错并滚动到首个出错字段
+    const validationErrors = validateConfig(config)
+    const messages = [
+      ...new Set(
+        Object.values(validationErrors).filter((m): m is string => Boolean(m)),
+      ),
+    ]
+    if (messages.length > 0) {
+      toast.error('配置校验未通过，请修正后再保存', {
+        description: messages.join('；'),
+      })
+      scrollToFirstError(validationErrors)
+      return
+    }
     const toastId = toast.loading('正在保存配置…')
     const ok = await save()
     if (ok) {
-      toast.success('配置已保存', { id: toastId })
+      toast.success('配置已保存', {
+        id: toastId,
+        // P2-51：server.host / port 等改动需重启 daemon 才生效
+        description: '服务器地址/端口等改动需重启服务后生效',
+      })
     } else {
       toast.error('配置保存失败', {
         id: toastId,
@@ -267,12 +386,18 @@ export function SettingsPage() {
                 className="font-mono text-xs"
               />
             </Field>
-            <Field label="端口" description="WebUI 与 API 服务端口">
+            <Field
+              label="端口"
+              description="WebUI 与 API 服务端口"
+              field="server-port"
+              error={errors.server_port}
+            >
               <NumberField
                 value={config.server.port}
                 onValueChange={(v) => patchSection('server', { port: v })}
                 min={1}
                 max={65535}
+                invalid={Boolean(errors.server_port)}
               />
             </Field>
             <SwitchRow
@@ -291,6 +416,7 @@ export function SettingsPage() {
             description="界面语言、主题与日志级别"
           >
             <Field label="界面语言">
+              {/* P1-43：后端暂无 i18n，English 等选项实际无效，已移除；i18n 接入后再开放 */}
               <Select
                 value={config.general.language}
                 onValueChange={(v) => patchSection('general', { language: v })}
@@ -300,14 +426,19 @@ export function SettingsPage() {
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="zh">简体中文</SelectItem>
-                  <SelectItem value="en">English</SelectItem>
                 </SelectContent>
               </Select>
             </Field>
             <Field label="主题">
               <Select
                 value={config.general.theme}
-                onValueChange={(v) => patchSection('general', { theme: v })}
+                onValueChange={(v) => {
+                  patchSection('general', { theme: v })
+                  // 同步本地主题 store：与顶栏切换共享同一视觉状态（W4-B 巡测发现不同步）
+                  if (v === 'dark' || v === 'light') {
+                    useThemeStore.getState().setTheme(v)
+                  }
+                }}
               >
                 <SelectTrigger className="w-full">
                   <SelectValue />
@@ -315,7 +446,7 @@ export function SettingsPage() {
                 <SelectContent>
                   <SelectItem value="dark">深色</SelectItem>
                   <SelectItem value="light">浅色</SelectItem>
-                  <SelectItem value="system">跟随系统</SelectItem>
+                  {/* P2-46：「跟随系统」已移除，theme store 仅实现 dark/light */}
                 </SelectContent>
               </Select>
             </Field>
@@ -396,7 +527,11 @@ export function SettingsPage() {
             title="端口"
             description="模块服务自动分配端口的可用范围"
           >
-            <Field label="起始端口">
+            <Field
+              label="起始端口"
+              field="range-start"
+              error={errors.range_start}
+            >
               <NumberField
                 value={config.ports.range_start}
                 onValueChange={(v) =>
@@ -404,14 +539,20 @@ export function SettingsPage() {
                 }
                 min={1024}
                 max={65535}
+                invalid={Boolean(errors.range_start)}
               />
             </Field>
-            <Field label="结束端口">
+            <Field
+              label="结束端口"
+              field="range-end"
+              error={errors.range_end ?? errors.ports_range}
+            >
               <NumberField
                 value={config.ports.range_end}
                 onValueChange={(v) => patchSection('ports', { range_end: v })}
                 min={1024}
                 max={65535}
+                invalid={Boolean(errors.range_end ?? errors.ports_range)}
               />
             </Field>
           </Section>
@@ -484,6 +625,58 @@ export function SettingsPage() {
                   })
                 }
                 placeholder="/data/models, /mnt/cache/models"
+                className="font-mono text-xs"
+              />
+            </Field>
+          </Section>
+
+          {/* ── 网络与代理 ── */}
+          <Section
+            icon={Globe}
+            title="网络与代理"
+            description="示例：http://127.0.0.1:7890；留空 = 跟随系统环境变量；生效范围：模型下载、Python 依赖安装、模块进程"
+          >
+            <Field
+              label="HTTP 代理（http_proxy）"
+              field="http-proxy"
+              error={errors.http_proxy}
+            >
+              <Input
+                value={config.network?.http_proxy ?? ''}
+                onChange={(e) =>
+                  patchSection('network', { http_proxy: e.target.value })
+                }
+                placeholder="http://127.0.0.1:7890"
+                aria-invalid={Boolean(errors.http_proxy) || undefined}
+                className="font-mono text-xs"
+              />
+            </Field>
+            <Field
+              label="HTTPS 代理（https_proxy）"
+              field="https-proxy"
+              error={errors.https_proxy}
+            >
+              <Input
+                value={config.network?.https_proxy ?? ''}
+                onChange={(e) =>
+                  patchSection('network', { https_proxy: e.target.value })
+                }
+                placeholder="http://127.0.0.1:7890"
+                aria-invalid={Boolean(errors.https_proxy) || undefined}
+                className="font-mono text-xs"
+              />
+            </Field>
+            <Field
+              label="代理排除列表（no_proxy）"
+              description="不走代理的地址列表，默认 localhost,127.0.0.1"
+              className="sm:col-span-2"
+            >
+              <Input
+                value={config.network?.no_proxy ?? ''}
+                onChange={(e) =>
+                  patchSection('network', { no_proxy: e.target.value })
+                }
+                placeholder="localhost,127.0.0.1"
                 className="font-mono text-xs"
               />
             </Field>

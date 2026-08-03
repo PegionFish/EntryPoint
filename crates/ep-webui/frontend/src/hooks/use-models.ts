@@ -19,13 +19,18 @@ export interface UseModelsResult {
     moduleId: string,
     req: ImportRequest,
   ) => Promise<ImportResponse>
+  /** 删除服务器上的模型目录，成功后自动刷新列表（及已展开的详情） */
+  deleteModel: (
+    moduleId: string,
+    modelId: string,
+  ) => Promise<{ ok: boolean }>
   /** 刷新模型列表 */
   refresh: () => Promise<void>
   loading: boolean
   error: string | null
 }
 
-/** 模型列表 / 详情 / 导入管理 */
+/** 模型列表 / 详情 / 导入 / 删除管理 */
 export function useModels(): UseModelsResult {
   const [models, setModels] = useState<ModelListResponse | null>(null)
   const [details, setDetails] = useState<Record<string, ModelDetailResponse>>(
@@ -68,5 +73,26 @@ export function useModels(): UseModelsResult {
     [refresh, moduleModels],
   )
 
-  return { models, details, moduleModels, importModel, refresh, loading, error }
+  const deleteModel = useCallback(
+    async (moduleId: string, modelId: string) => {
+      const resp = await api.deleteModel(moduleId, modelId)
+      // 删除成功后刷新列表；该模块详情若已展开则一并同步（均容错）
+      const jobs: Promise<unknown>[] = [refresh()]
+      if (details[moduleId]) jobs.push(moduleModels(moduleId))
+      await Promise.allSettled(jobs)
+      return resp
+    },
+    [refresh, moduleModels, details],
+  )
+
+  return {
+    models,
+    details,
+    moduleModels,
+    importModel,
+    deleteModel,
+    refresh,
+    loading,
+    error,
+  }
 }

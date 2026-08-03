@@ -15,6 +15,8 @@ import type {
 } from '@/api/types'
 import { PageContainer } from '@/components/layout/page-container'
 import { DeviceCard } from '@/components/shared/device-card'
+import { NoModulesState } from '@/components/shared/empty-state'
+import { CardSkeleton } from '@/components/shared/loading-skeleton'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -71,32 +73,9 @@ function SectionHeader({
 }
 
 /* ---------- 骨架屏 ---------- */
-
-function DeviceCardSkeleton() {
-  return (
-    <Card className="gap-0 py-0">
-      <div className="flex items-center gap-3 border-b border-border px-5 py-4">
-        <Skeleton className="size-9 rounded-lg" />
-        <div className="flex-1 space-y-1.5">
-          <Skeleton className="h-3.5 w-24" />
-          <Skeleton className="h-3 w-16" />
-        </div>
-        <Skeleton className="h-5 w-14 rounded-full" />
-      </div>
-      <div className="space-y-4 px-5 py-4">
-        <div className="space-y-2">
-          <div className="flex justify-between">
-            <Skeleton className="h-3 w-10" />
-            <Skeleton className="h-4 w-12" />
-          </div>
-          <Skeleton className="h-1.5 w-full rounded-full" />
-          <Skeleton className="h-3 w-32" />
-        </div>
-        <Skeleton className="h-12 w-full rounded-lg" />
-      </div>
-    </Card>
-  )
-}
+/* 设备卡片骨架复用 shared/loading-skeleton 的 CardSkeleton；
+   ModuleRowSkeleton / DepCardSkeleton 因分别绑定真实 Table 行结构与
+   依赖卡片的图标布局，shared 预设无法直接替换，保留手写。 */
 
 function ModuleRowSkeleton() {
   return (
@@ -164,9 +143,9 @@ function DevicesSection({
       />
       {loading && !devices ? (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-          <DeviceCardSkeleton />
-          <DeviceCardSkeleton />
-          <DeviceCardSkeleton />
+          <CardSkeleton />
+          <CardSkeleton />
+          <CardSkeleton />
         </div>
       ) : !devices || devices.length === 0 ? (
         <Card className="border-dashed py-0">
@@ -207,6 +186,11 @@ function isRunning(m: ModuleResponse): boolean {
   return (m.service_status || m.status).trim().toLowerCase() === 'running'
 }
 
+/** 后端规范状态值为小写串，error 表示模块异常 */
+function isError(m: ModuleResponse): boolean {
+  return (m.service_status || m.status).trim().toLowerCase() === 'error'
+}
+
 function ModulesSection({
   modules,
   moduleStatus,
@@ -217,6 +201,7 @@ function ModulesSection({
   loading: boolean
 }) {
   const runningCount = modules?.filter(isRunning).length ?? 0
+  const errorCount = modules?.filter(isError).length ?? 0
 
   return (
     <section>
@@ -225,14 +210,36 @@ function ModulesSection({
         title="模块状态"
         extra={
           modules ? (
-            <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              <span className="size-1.5 rounded-full bg-status-running" />
-              运行中{' '}
-              <span className="font-mono font-semibold text-foreground">
-                {runningCount}
+            <span className="flex items-center gap-3 text-xs text-muted-foreground">
+              <span className="flex items-center gap-1.5">
+                <span className="size-1.5 rounded-full bg-status-running" />
+                运行中{' '}
+                <span className="font-mono font-semibold text-foreground">
+                  {runningCount}
+                </span>
+                <span>/</span>
+                <span className="font-mono">{modules.length}</span>
               </span>
-              <span>/</span>
-              <span className="font-mono">{modules.length}</span>
+              {/* 异常模块计数：>0 时红色强调，为 0 时保持正常色（P2-38） */}
+              <span className="flex items-center gap-1.5">
+                <CircleAlert
+                  className={cn(
+                    'size-3.5',
+                    errorCount > 0
+                      ? 'text-status-error'
+                      : 'text-muted-foreground/50',
+                  )}
+                />
+                异常{' '}
+                <span
+                  className={cn(
+                    'font-mono font-semibold',
+                    errorCount > 0 ? 'text-status-error' : 'text-foreground',
+                  )}
+                >
+                  {errorCount}
+                </span>
+              </span>
             </span>
           ) : undefined
         }
@@ -265,11 +272,12 @@ function ModulesSection({
               ))
             ) : !modules || modules.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={5} className="h-28 text-center">
-                  <Puzzle className="mx-auto size-5 text-muted-foreground/60" />
-                  <p className="mt-2 text-sm text-muted-foreground">
-                    暂无已注册模块
-                  </p>
+                <TableCell colSpan={5} className="p-0">
+                  {/* 复用 shared/empty-state 预设组件，替代手写空态 */}
+                  <NoModulesState
+                    className="py-8"
+                    description="暂无已注册模块，请确认 modules 目录内容后等待自动扫描"
+                  />
                 </TableCell>
               </TableRow>
             ) : (
@@ -294,8 +302,11 @@ function ModulesSection({
                     <TableCell>
                       <StatusBadge status={m.service_status || m.status} />
                     </TableCell>
-                    {/* 当前 API 未提供模块 → 设备映射，暂以占位符显示 */}
-                    <TableCell className="text-muted-foreground/70">—</TableCell>
+                    {/* API 无模块 → 设备映射，无法给出真实设备归属；
+                        明示「暂不支持」而非占用符号，避免误以为数据缺失（P2-37） */}
+                    <TableCell className="text-xs text-muted-foreground/60">
+                      暂不支持
+                    </TableCell>
                     <TableCell className="text-right font-mono text-xs">
                       {st?.port != null ? (
                         <span className="text-foreground">{st.port}</span>
@@ -425,9 +436,11 @@ function DepsSection({
               key={t.module_id}
               title="PyTorch CUDA"
               tag={t.module_id}
-              available={t.available}
+              available={t.cuda_available}
               detail={
-                t.available && t.cuda_version ? `CUDA ${t.cuda_version}` : null
+                t.cuda_available && t.torch_version
+                  ? `PyTorch ${t.torch_version}`
+                  : null
               }
               guidance={t.guidance}
             />

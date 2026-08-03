@@ -1,4 +1,4 @@
-import type { WsLogMessage, WsProgressMessage } from './types'
+import type { WsMessage } from './types'
 
 /** WebSocket 连接状态 */
 export type WsConnectionState =
@@ -8,11 +8,7 @@ export type WsConnectionState =
   | 'reconnecting' // 断线后重连中
   | 'disconnected' // 已断开（不再重连）
 
-/** 后端推送的消息（带 type 判别字段） */
-export type WsMessage =
-  | ({ type: 'log' } & WsLogMessage)
-  | ({ type: 'progress' } & WsProgressMessage)
-  | { type: string; [key: string]: unknown }
+export type { WsMessage } from './types'
 
 type MessageListener = (msg: WsMessage) => void
 type StateListener = (state: WsConnectionState) => void

@@ -1,6 +1,6 @@
 import '@xyflow/react/dist/style.css'
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Background,
   BackgroundVariant,
@@ -17,12 +17,50 @@ import {
   useReactFlow,
 } from '@xyflow/react'
 import type { Connection, Edge, OnSelectionChangeParams } from '@xyflow/react'
-import { Trash2, Waypoints, X } from 'lucide-react'
+import { Link } from 'react-router-dom'
+import {
+  ChevronDown,
+  CircleCheck,
+  Copy,
+  FolderOpen,
+  Loader2,
+  Plus,
+  RefreshCw,
+  Sparkles,
+  Trash2,
+  Waypoints,
+  X,
+} from 'lucide-react'
 import { toast } from 'sonner'
 
+import { api } from '@/api/client'
+import type {
+  ExecutePipelineRequest,
+  PipelineEdgeSpec,
+  PipelineNodeSpec,
+  PipelineSpec,
+  PipelineSummary,
+} from '@/api/types'
 import { wsManager } from '@/api/ws'
 import { cn } from '@/lib/utils'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -44,6 +82,7 @@ import {
   pipelineNodeTypes,
 } from '@/components/shared/pipeline-node'
 import type {
+  BuiltinKind,
   DragPayload,
   NodeParams,
   ParamSpec,
@@ -52,6 +91,7 @@ import type {
   PipelineFlowNode,
   PipelineNodeData,
 } from '@/components/shared/pipeline-node'
+import { confirmDialog } from '@/components/shared/confirm-dialog'
 import { PipelineSidebar } from '@/components/shared/pipeline-sidebar'
 import { PipelineToolbar } from '@/components/shared/pipeline-toolbar'
 
@@ -120,7 +160,7 @@ const DEFAULT_EDGE_OPTIONS = {
 }
 
 // ============================================================
-// 示例管线（首次进入时展示完整编排效果）
+// 示例管线（本地模板：服务端列表为空时可一键载入，不再作为默认画布）
 // ============================================================
 
 function examplePipeline(): { nodes: PipelineFlowNode[]; edges: Edge[] } {
@@ -235,6 +275,394 @@ function edgeLabelFor(
   const { outputs } = getNodePorts(source.data)
   const port = outputs.find((p) => p.id === (sourceHandle ?? 'out')) ?? outputs[0]
   return port ? DATA_TYPE_META[port.dataType].label : undefined
+}
+
+/** 后端错误对象 → 可展示文案 */
+function errMsg(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
+// ============================================================
+// spec ↔ React Flow 互转（纯函数）
+// ============================================================
+
+/** 管线 id 命名规则（与后端 PUT /api/pipelines/:id 校验一致） */
+const PIPELINE_ID_RULE = /^[a-z0-9][a-z0-9-]*$/
+
+interface CanvasMeta {
+  id: string
+  name: string
+  description: string
+}
+
+/** 深度排序对象键后序列化，保证相同内容产生相同指纹（与键插入顺序无关） */
+function canonicalJson(value: unknown): string {
+  const sort = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.map(sort)
+    if (v && typeof v === 'object') {
+      const out: Record<string, unknown> = {}
+      for (const key of Object.keys(v as Record<string, unknown>).sort()) {
+        out[key] = sort((v as Record<string, unknown>)[key])
+      }
+      return out
+    }
+    return v
+  }
+  return JSON.stringify(sort(value))
+}
+
+/**
+ * React Flow 画布 → 服务端 PipelineSpec（toSpec）。
+ *
+ * - 节点保留 id/label/kind/builtin/module_id/capability/params/position；
+ *   params 整体原样输出（含 UI 不展示的字段，往返不丢失）。
+ * - 边以 `{from: [node, port], to: [node, port]}` 输出，sourceHandle/targetHandle
+ *   即节点端口 id（缺省回退 out/in，与现有端口定义一致）。
+ * - 外部 API 节点不在服务端 spec 契约内（后端仅接受 builtin/module），
+ *   调用方需先拦截；此处作为最后防线抛错。
+ */
+function toSpec(
+  nodes: PipelineFlowNode[],
+  edges: Edge[],
+  meta: CanvasMeta,
+): PipelineSpec {
+  const specNodes: PipelineNodeSpec[] = nodes.map((n): PipelineNodeSpec => {
+    const common = {
+      id: n.id,
+      label: n.data.label,
+      params: { ...n.data.params },
+      position: { x: n.position.x, y: n.position.y },
+    }
+    switch (n.data.kind) {
+      case 'builtin':
+        return { ...common, kind: 'builtin', builtin: n.data.builtin }
+      case 'module':
+        return {
+          ...common,
+          kind: 'module',
+          module_id: n.data.moduleId,
+          capability: n.data.capabilityId,
+        }
+      case 'external':
+        throw new Error(`外部 API 节点「${n.data.label}」不支持保存到服务端`)
+    }
+  })
+  const specEdges: PipelineEdgeSpec[] = edges.map((e) => ({
+    from: [e.source, e.sourceHandle ?? 'out'],
+    to: [e.target, e.targetHandle ?? 'in'],
+  }))
+  return {
+    pipeline: { id: meta.id, name: meta.name, description: meta.description },
+    nodes: specNodes,
+    edges: specEdges,
+  }
+}
+
+/** capability → 模块分类（取 `.` 前缀，如 `asr.transcribe` → `asr`） */
+function categoryFromCapability(capability: string | undefined): string {
+  const prefix = (capability ?? '').split('.')[0].trim()
+  return prefix || 'other'
+}
+
+/**
+ * 简单级联布局：按拓扑深度分列（Kahn 求最长路径深度），每列纵向排开。
+ * 仅用于 spec 中缺少 position 的节点；环上节点保持深度 0。
+ */
+function cascadeLayout(spec: PipelineSpec): Map<string, { x: number; y: number }> {
+  const ids = spec.nodes.map((n) => n.id)
+  const depth = new Map<string, number>(ids.map((id) => [id, 0]))
+  const indegree = new Map<string, number>(ids.map((id) => [id, 0]))
+  const children = new Map<string, Set<string>>()
+  for (const e of spec.edges ?? []) {
+    if (!Array.isArray(e.from) || !Array.isArray(e.to)) continue
+    const u = e.from[0]
+    const v = e.to[0]
+    if (!depth.has(u) || !depth.has(v) || u === v) continue
+    const set = children.get(u) ?? new Set<string>()
+    if (!set.has(v)) {
+      set.add(v)
+      children.set(u, set)
+      indegree.set(v, (indegree.get(v) ?? 0) + 1)
+    }
+  }
+  const queue = ids.filter((id) => (indegree.get(id) ?? 0) === 0)
+  while (queue.length > 0) {
+    const u = queue.shift()!
+    for (const v of children.get(u) ?? []) {
+      depth.set(v, Math.max(depth.get(v) ?? 0, (depth.get(u) ?? 0) + 1))
+      indegree.set(v, (indegree.get(v) ?? 0) - 1)
+      if (indegree.get(v) === 0) queue.push(v)
+    }
+  }
+  const columns = new Map<number, string[]>()
+  for (const id of ids) {
+    const col = depth.get(id) ?? 0
+    const list = columns.get(col) ?? []
+    list.push(id)
+    columns.set(col, list)
+  }
+  const positions = new Map<string, { x: number; y: number }>()
+  for (const [col, list] of columns) {
+    list.forEach((id, row) => {
+      positions.set(id, { x: 40 + col * 320, y: 40 + row * 160 })
+    })
+  }
+  return positions
+}
+
+/**
+ * 端口名归一：服务端 spec 的端口名（input/output，ep-core 契约）
+ * ↔ 前端节点 handle id（in/out，BUILTIN_DEFS 定义）。
+ * fallback 为对应方向的默认 handle。
+ */
+function normalizePortName(
+  port: string | undefined,
+  fallback: 'in' | 'out',
+): string {
+  if (!port) return fallback
+  if (port === 'input' || port === 'in') return 'in'
+  if (port === 'output' || port === 'out') return 'out'
+  return port
+}
+
+/**
+ * 服务端 PipelineSpec → React Flow 画布（fromSpec）。
+ *
+ * - builtin 节点：按 builtin 名恢复（未知 builtin 跳过并计数）；
+ * - module 节点：category 由 capability 前缀推导，参数模式随之恢复；
+ * - params 原样保留（含 UI 不展示字段，往返不丢失）；
+ * - position 缺失的节点走级联布局；
+ * - 引用未知节点的边被过滤。
+ */
+function fromSpec(spec: PipelineSpec): {
+  nodes: PipelineFlowNode[]
+  edges: Edge[]
+  skippedNodes: number
+} {
+  const layout = cascadeLayout(spec)
+  const nodes: PipelineFlowNode[] = []
+  const known = new Set<string>()
+  let skippedNodes = 0
+
+  for (const sn of spec.nodes ?? []) {
+    const position = sn.position ?? layout.get(sn.id) ?? { x: 0, y: 0 }
+    // 保留非 UI 展示的参数值：运行时原样存取，toSpec 时整体写回
+    const params = (sn.params ?? {}) as NodeParams
+
+    if (sn.kind === 'builtin') {
+      const builtin = sn.builtin as BuiltinKind | undefined
+      if (builtin && builtin in BUILTIN_DEFS) {
+        nodes.push({
+          id: sn.id,
+          type: 'builtin',
+          position,
+          data: {
+            kind: 'builtin',
+            builtin,
+            label: sn.label || BUILTIN_DEFS[builtin].label,
+            status: 'waiting',
+            params,
+          },
+        })
+        known.add(sn.id)
+        continue
+      }
+      skippedNodes += 1
+      continue
+    }
+
+    if (sn.kind === 'module') {
+      const category = categoryFromCapability(sn.capability)
+      const cap = moduleCapability(category)
+      nodes.push({
+        id: sn.id,
+        type: 'module',
+        position,
+        data: {
+          kind: 'module',
+          label: sn.label || cap.label,
+          moduleId: sn.module_id || 'unknown',
+          // spec 契约不含版本，仅卡片展示用
+          moduleVersion: '1.0.0',
+          category,
+          capabilityId: sn.capability || cap.id,
+          capabilityLabel: cap.label,
+          status: 'waiting',
+          params,
+        },
+      })
+      known.add(sn.id)
+      continue
+    }
+
+    // 未知 kind（如 external_api 不在前端 spec 契约内）
+    skippedNodes += 1
+  }
+
+  const edges: Edge[] = (spec.edges ?? [])
+    .filter(
+      (e) =>
+        Array.isArray(e.from) &&
+        Array.isArray(e.to) &&
+        known.has(e.from[0]) &&
+        known.has(e.to[0]),
+    )
+    .map((e, index) => ({
+      id: `e-${e.from[0]}:${e.from[1]}->${e.to[0]}:${e.to[1]}-${index}`,
+      source: e.from[0],
+      // 服务端 spec 端口名（input/output）归一到前端 handle id（in/out），
+      // 否则内置管线的边会因 handle 不存在被 React Flow 静默丢弃
+      sourceHandle: normalizePortName(e.from[1], 'out'),
+      target: e.to[0],
+      targetHandle: normalizePortName(e.to[1], 'in'),
+      label: edgeLabelFor(e.from[0], e.from[1], nodes),
+    }))
+
+  return { nodes, edges, skippedNodes }
+}
+
+/**
+ * 画布指纹（忽略节点运行状态 status）：用于判断相对上次加载 / 保存
+ * 是否存在未保存更改。meta.id 变化（如另存为）同样视为内容变化的一部分。
+ */
+function canvasFingerprint(
+  nodes: PipelineFlowNode[],
+  edges: Edge[],
+  meta: CanvasMeta,
+): string {
+  return canonicalJson({
+    meta,
+    nodes: nodes.map((n) => ({
+      id: n.id,
+      type: n.type ?? '',
+      position: n.position,
+      data: { ...n.data, status: 'waiting' },
+    })),
+    edges: edges.map((e) => ({
+      source: e.source,
+      sourceHandle: e.sourceHandle ?? null,
+      target: e.target,
+      targetHandle: e.targetHandle ?? null,
+    })),
+  })
+}
+
+/** 新建空白管线最小模板：文件输入 → 文件输出 */
+function blankTemplate(): { nodes: PipelineFlowNode[]; edges: Edge[] } {
+  const input = createPipelineNode(
+    { nodeType: 'builtin', builtin: 'file_input' },
+    { x: 40, y: 100 },
+  )
+  const output = createPipelineNode(
+    { nodeType: 'builtin', builtin: 'file_output' },
+    { x: 420, y: 100 },
+  )
+  const edges: Edge[] = [
+    {
+      id: `e-${input.id}->${output.id}`,
+      source: input.id,
+      target: output.id,
+      sourceHandle: 'out',
+      targetHandle: 'in',
+      label: DATA_TYPE_META.file.label,
+    },
+  ]
+  return { nodes: [input, output], edges }
+}
+
+/** 未保存画布按 spec 执行时的兜底 pipeline.id（后端要求非空） */
+function fallbackPipelineId(name: string): string {
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  return slug || `pipeline-${Date.now().toString(36)}`
+}
+
+// ============================================================
+// 必填参数校验（修复 P1-21：执行前不得放过空的必填参数）
+// ============================================================
+
+interface MissingRequiredParam {
+  nodeId: string
+  nodeLabel: string
+  spec: ParamSpec
+  current: ParamValue | undefined
+}
+
+/** 空值定义：未设置 / 空字符串（含纯空白）。数字 0、布尔 false 不算空。 */
+function isParamEmpty(value: ParamValue | undefined): boolean {
+  return value === undefined || (typeof value === 'string' && value.trim() === '')
+}
+
+/** 遍历所有节点的参数模式，收集 required=true 且当前为空的参数 */
+function collectMissingRequired(nodes: PipelineFlowNode[]): MissingRequiredParam[] {
+  const missing: MissingRequiredParam[] = []
+  for (const n of nodes) {
+    for (const spec of getParamSpecs(n.data)) {
+      if (!spec.required) continue
+      const value = n.data.params[spec.name]
+      if (isParamEmpty(value)) {
+        missing.push({ nodeId: n.id, nodeLabel: n.data.label, spec, current: value })
+      }
+    }
+  }
+  return missing
+}
+
+// ============================================================
+// 执行对话框字段
+// ============================================================
+
+interface ExecField {
+  /** `${nodeId}:${paramName}` */
+  key: string
+  nodeId: string
+  nodeLabel: string
+  spec: ParamSpec
+  current: ParamValue | undefined
+  /** file_input 的 path：每次执行注入的服务器文件路径 */
+  isInputPath: boolean
+}
+
+/**
+ * 构建执行对话框字段：
+ * 1) 每个 file_input 节点的 path 始终收集（预填当前值，可在执行时覆盖）；
+ * 2) 其余为空的必填参数在此补齐。
+ */
+function buildExecFields(nodes: PipelineFlowNode[]): ExecField[] {
+  const fields: ExecField[] = []
+  const seen = new Set<string>()
+  for (const n of nodes) {
+    if (n.data.kind === 'builtin' && n.data.builtin === 'file_input') {
+      const pathSpec = BUILTIN_DEFS.file_input.params.find((p) => p.name === 'path')
+      if (!pathSpec) continue
+      const key = `${n.id}:path`
+      fields.push({
+        key,
+        nodeId: n.id,
+        nodeLabel: n.data.label,
+        spec: pathSpec,
+        current: n.data.params.path,
+        isInputPath: true,
+      })
+      seen.add(key)
+    }
+  }
+  for (const m of collectMissingRequired(nodes)) {
+    const key = `${m.nodeId}:${m.spec.name}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    fields.push({
+      key,
+      nodeId: m.nodeId,
+      nodeLabel: m.nodeLabel,
+      spec: m.spec,
+      current: m.current,
+      isInputPath: false,
+    })
+  }
+  return fields
 }
 
 // ============================================================
@@ -390,23 +818,470 @@ function NodeParamsPanel({
 }
 
 // ============================================================
+// 管线库工具条（服务端持久化入口：库下拉 + 状态 + 新建 / 另存为 / 删除）
+// ============================================================
+
+interface PipelineLibraryBarProps {
+  pipelines: PipelineSummary[] | null
+  error: boolean
+  onRefresh: () => void
+  currentId: string | null
+  currentSource: 'builtin' | 'custom' | null
+  dirty: boolean
+  executing: boolean
+  onSelect: (id: string) => void
+  onNewBlank: () => void
+  onLoadExample: () => void
+  onSaveAs: () => void
+  onDelete: () => void
+}
+
+function SourceBadge({ source }: { source: 'builtin' | 'custom' }) {
+  return (
+    <Badge
+      variant={source === 'builtin' ? 'secondary' : 'outline'}
+      className="h-4 shrink-0 px-1 text-[9px]"
+    >
+      {source === 'builtin' ? '内置' : '自定义'}
+    </Badge>
+  )
+}
+
+function PipelineLibraryBar({
+  pipelines,
+  error,
+  onRefresh,
+  currentId,
+  currentSource,
+  dirty,
+  executing,
+  onSelect,
+  onNewBlank,
+  onLoadExample,
+  onSaveAs,
+  onDelete,
+}: PipelineLibraryBarProps) {
+  return (
+    <div className="flex h-11 shrink-0 items-center gap-2 overflow-x-auto border-b border-border bg-muted/30 px-3">
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button variant="outline" size="sm" className="shrink-0" title="服务端管线库">
+            <FolderOpen className="h-3.5 w-3.5" />
+            管线库
+            {pipelines === null && !error ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              pipelines !== null && (
+                <span className="rounded-full bg-muted px-1.5 font-mono text-[10px] text-muted-foreground">
+                  {pipelines.length}
+                </span>
+              )
+            )}
+            <ChevronDown className="h-3 w-3 text-muted-foreground" />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start" className="max-h-96 w-80 overflow-y-auto">
+          <DropdownMenuLabel>服务端管线</DropdownMenuLabel>
+          {error && (
+            <DropdownMenuItem onSelect={onRefresh}>
+              <span className="text-status-error">列表加载失败，点击重试</span>
+            </DropdownMenuItem>
+          )}
+          {!error && pipelines === null && <DropdownMenuItem disabled>加载中…</DropdownMenuItem>}
+          {!error && pipelines !== null && pipelines.length === 0 && (
+            <DropdownMenuItem onSelect={onLoadExample}>
+              <span>暂无已保存管线，点击载入本地示例</span>
+            </DropdownMenuItem>
+          )}
+          {!error &&
+            pipelines?.map((p) => (
+              <DropdownMenuItem
+                key={p.id}
+                onSelect={() => onSelect(p.id)}
+                className="items-start gap-2"
+                title={`加载管线「${p.name}」`}
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1.5">
+                    <span className="truncate text-[13px]">{p.name}</span>
+                    <SourceBadge source={p.source} />
+                    {p.id === currentId && (
+                      <CircleCheck className="h-3 w-3 shrink-0 text-primary" aria-label="当前管线" />
+                    )}
+                  </div>
+                  {p.description && (
+                    <p className="truncate text-[11px] text-muted-foreground">{p.description}</p>
+                  )}
+                  <p className="truncate font-mono text-[10px] text-muted-foreground">{p.id}</p>
+                </div>
+              </DropdownMenuItem>
+            ))}
+          <DropdownMenuSeparator />
+          <DropdownMenuItem onSelect={onNewBlank}>
+            <Plus className="h-3.5 w-3.5" />
+            新建空白管线
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={onLoadExample}>
+            <Sparkles className="h-3.5 w-3.5" />
+            载入示例管线（本地模板）
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+
+      <div className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+        {currentId ? (
+          <>
+            <span className="max-w-40 truncate font-mono text-[11px]" title={currentId}>
+              {currentId}
+            </span>
+            {currentSource && <SourceBadge source={currentSource} />}
+          </>
+        ) : (
+          <span className="whitespace-nowrap">未保存到服务端</span>
+        )}
+        {dirty && <span className="whitespace-nowrap text-status-starting">● 未保存更改</span>}
+        {executing && (
+          <span className="flex items-center gap-1 whitespace-nowrap text-status-starting">
+            <Loader2 className="h-3 w-3 animate-spin" />
+            执行中
+          </span>
+        )}
+      </div>
+
+      <div className="ml-auto flex shrink-0 items-center gap-1">
+        <Button
+          variant="ghost"
+          size="xs"
+          onClick={onNewBlank}
+          title="新建空白管线（文件输入 → 文件输出）"
+        >
+          <Plus className="h-3.5 w-3.5" />
+          新建
+        </Button>
+        <Button variant="ghost" size="xs" onClick={onSaveAs} title="另存为新的服务端管线">
+          <Copy className="h-3.5 w-3.5" />
+          另存为
+        </Button>
+        {/* 内置管线不显示删除按钮（后端亦会 403 拒绝） */}
+        {currentId && currentSource === 'custom' && (
+          <Button
+            variant="ghost"
+            size="xs"
+            className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+            onClick={onDelete}
+            title="删除当前服务端管线"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+            删除
+          </Button>
+        )}
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          onClick={onRefresh}
+          title="刷新管线列表"
+          aria-label="刷新管线列表"
+        >
+          <RefreshCw className="h-3 w-3" />
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+// ============================================================
+// 另存为对话框
+// ============================================================
+
+interface SaveAsDialogProps {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  defaultName: string
+  pipelines: PipelineSummary[] | null
+  /** 返回是否保存成功（失败时保持打开以便重试） */
+  onConfirm: (name: string, id: string) => Promise<boolean>
+}
+
+function SaveAsDialog({ open, onOpenChange, defaultName, pipelines, onConfirm }: SaveAsDialogProps) {
+  const [name, setName] = useState('')
+  const [id, setId] = useState('')
+  const [attempted, setAttempted] = useState(false)
+  const [pending, setPending] = useState(false)
+
+  useEffect(() => {
+    if (open) {
+      setName(defaultName)
+      setId('')
+      setAttempted(false)
+      setPending(false)
+    }
+  }, [open, defaultName])
+
+  const nameOk = name.trim().length > 0
+  const idValid = PIPELINE_ID_RULE.test(id)
+  const conflict = idValid ? (pipelines?.find((p) => p.id === id) ?? null) : null
+
+  const handleSubmit = async () => {
+    setAttempted(true)
+    if (!nameOk || !idValid || pending) return
+    setPending(true)
+    try {
+      const ok = await onConfirm(name.trim(), id)
+      if (ok) onOpenChange(false)
+    } finally {
+      setPending(false)
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={(next) => !pending && onOpenChange(next)}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>另存为新管线</DialogTitle>
+          <DialogDescription>
+            为当前画布指定新的名称与 ID，保存到服务端管线库。
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-4 py-1">
+          <div className="space-y-1.5">
+            <span className="text-xs font-medium">
+              管线名称
+              <span className="ml-0.5 text-status-error">*</span>
+            </span>
+            <Input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="例如：视频字幕提取"
+              className="h-8 text-sm"
+              autoFocus
+            />
+            {attempted && !nameOk && (
+              <p className="text-[11px] text-status-error">管线名称不能为空</p>
+            )}
+          </div>
+          <div className="space-y-1.5">
+            <span className="text-xs font-medium">
+              管线 ID
+              <span className="ml-0.5 text-status-error">*</span>
+            </span>
+            <Input
+              value={id}
+              onChange={(e) => setId(e.target.value)}
+              placeholder="my-pipeline-1"
+              className="h-8 font-mono text-xs"
+            />
+            <p className="text-[11px] text-muted-foreground">
+              仅允许小写字母、数字、连字符，且以字母或数字开头
+            </p>
+            {attempted && !idValid && (
+              <p className="text-[11px] text-status-error">
+                ID 格式不合法：{id ? `「${id}」不符合规则` : '不能为空'}
+              </p>
+            )}
+            {conflict && (
+              <p className="text-[11px] text-status-starting">
+                已存在同 ID 管线（{conflict.source === 'builtin' ? '内置' : '自定义'}），继续将覆盖
+              </p>
+            )}
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={pending}>
+            取消
+          </Button>
+          <Button onClick={handleSubmit} disabled={pending}>
+            {pending && <Loader2 className="animate-spin" />}
+            保存
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// ============================================================
+// 执行对话框（收集 file_input 路径 + 补齐其他空必填参数）
+// ============================================================
+
+interface ExecuteDialogProps {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  fields: ExecField[]
+  submitting: boolean
+  /** values: key（`${nodeId}:${paramName}`）→ 参数值 */
+  onSubmit: (values: Record<string, ParamValue>) => void
+}
+
+function ExecuteDialog({ open, onOpenChange, fields, submitting, onSubmit }: ExecuteDialogProps) {
+  const [values, setValues] = useState<Record<string, ParamValue>>({})
+  const [attempted, setAttempted] = useState(false)
+
+  useEffect(() => {
+    if (open) {
+      const init: Record<string, ParamValue> = {}
+      for (const f of fields) {
+        if (f.current !== undefined && !isParamEmpty(f.current)) init[f.key] = f.current
+      }
+      setValues(init)
+      setAttempted(false)
+    }
+  }, [open, fields])
+
+  // 按节点分组展示（保持 fields 原顺序）
+  const groups = useMemo(() => {
+    const list: { nodeId: string; label: string; fields: ExecField[] }[] = []
+    for (const f of fields) {
+      const group = list.find((g) => g.nodeId === f.nodeId)
+      if (group) {
+        group.fields.push(f)
+      } else {
+        list.push({ nodeId: f.nodeId, label: f.nodeLabel, fields: [f] })
+      }
+    }
+    return list
+  }, [fields])
+
+  const emptyCount = fields.filter((f) => isParamEmpty(values[f.key])).length
+
+  const handleSubmit = () => {
+    setAttempted(true)
+    if (emptyCount > 0) {
+      toast.error(`仍有 ${emptyCount} 个必填参数未填写`)
+      return
+    }
+    onSubmit(values)
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={(next) => !submitting && onOpenChange(next)}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>执行管线</DialogTitle>
+          <DialogDescription>
+            确认并补齐以下执行参数。文件输入节点的路径为服务器上的文件路径。
+          </DialogDescription>
+        </DialogHeader>
+        <ScrollArea className="max-h-[50vh]">
+          <div className="space-y-5 p-1 pr-3">
+            {groups.map((group) => (
+              <section key={group.nodeId} className="space-y-3">
+                <div className="flex items-baseline gap-2">
+                  <h3 className="text-xs font-semibold">{group.label}</h3>
+                  <span className="truncate font-mono text-[10px] text-muted-foreground">
+                    {group.nodeId}
+                  </span>
+                </div>
+                {group.fields.map((f) => {
+                  const empty = attempted && isParamEmpty(values[f.key])
+                  return (
+                    <div
+                      key={f.key}
+                      className={cn(
+                        'rounded-md p-2',
+                        f.isInputPath && 'border border-border bg-muted/30',
+                      )}
+                    >
+                      {f.isInputPath && (
+                        <p className="mb-1.5 text-[10px] text-muted-foreground">
+                          输入文件路径（服务器路径，每次执行可覆盖）
+                        </p>
+                      )}
+                      <ParamField
+                        spec={f.spec}
+                        value={values[f.key]}
+                        onChange={(v) => setValues((prev) => ({ ...prev, [f.key]: v }))}
+                      />
+                      {empty && (
+                        <p className="mt-1 text-[11px] text-status-error">
+                          必填参数，请填写后再提交
+                        </p>
+                      )}
+                    </div>
+                  )
+                })}
+              </section>
+            ))}
+            {fields.length === 0 && (
+              <p className="text-xs text-muted-foreground">没有需要填写的参数，可直接提交执行。</p>
+            )}
+          </div>
+        </ScrollArea>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={submitting}>
+            取消
+          </Button>
+          <Button onClick={handleSubmit} disabled={submitting}>
+            {submitting && <Loader2 className="animate-spin" />}
+            提交执行
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// ============================================================
 // 管线编辑器
 // ============================================================
 
 function PipelineEditor() {
   const { screenToFlowPosition, fitView } = useReactFlow()
-  const [nodes, setNodes, onNodesChange] = useNodesState<PipelineFlowNode>(EXAMPLE.nodes)
-  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(EXAMPLE.edges)
-  const [name, setName] = useState('示例：音频转写摘要管线')
+  const [nodes, setNodes, onNodesChange] = useNodesState<PipelineFlowNode>([])
+  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([])
+  const [name, setName] = useState('未命名管线')
+  const [description, setDescription] = useState('')
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
   /** 窄屏（<lg）节点库抽屉开关 */
   const [libraryOpen, setLibraryOpen] = useState(false)
   const isDesktop = useMediaQuery('(min-width: 64rem)')
   const canvasRef = useRef<HTMLDivElement>(null)
 
+  // ---- 服务端管线库状态 ----
+  const [pipelines, setPipelines] = useState<PipelineSummary[] | null>(null)
+  const [libraryError, setLibraryError] = useState(false)
+  /** 当前画布对应的服务端管线 id（null = 未保存的本地画布） */
+  const [currentId, setCurrentId] = useState<string | null>(null)
+  const [currentSource, setCurrentSource] = useState<'builtin' | 'custom' | null>(null)
+  /** 上次加载 / 保存时的画布指纹，用于判定未保存更改 */
+  const [baseline, setBaseline] = useState(() =>
+    canvasFingerprint([], [], { id: '', name: '未命名管线', description: '' }),
+  )
+  const [saveAsOpen, setSaveAsOpen] = useState(false)
+
+  // ---- 执行状态 ----
+  // 执行中禁用再次执行（同一画布）。解锁依赖 WS progress：任一节点 failed
+  // 或全部节点到达终态。若后端始终未推送进度（如 daemon 未重启），锁保持到
+  // 页面刷新——宁可保守也不允许重复提交。
+  const [executing, setExecuting] = useState(false)
+  const executingRef = useRef(false)
+  const [execDialogOpen, setExecDialogOpen] = useState(false)
+  const [execFields, setExecFields] = useState<ExecField[]>([])
+  const [execSubmitting, setExecSubmitting] = useState(false)
+
+  const meta = useMemo<CanvasMeta>(
+    () => ({ id: currentId ?? '', name, description }),
+    [currentId, name, description],
+  )
+  const dirty = useMemo(
+    () => canvasFingerprint(nodes, edges, meta) !== baseline,
+    [nodes, edges, meta, baseline],
+  )
+
+  // WS 回调在订阅时闭包固定，用 ref 读取最新画布 / 执行态
+  const nodesRef = useRef<PipelineFlowNode[]>([])
+  useEffect(() => {
+    nodesRef.current = nodes
+  }, [nodes])
+
   const selectedNode = selectedNodeId
     ? (nodes.find((n) => n.id === selectedNodeId) ?? null)
     : null
+
+  const fitSoon = useCallback(() => {
+    requestAnimationFrame(() => {
+      void fitView({ padding: 0.25, duration: 300 })
+    })
+  }, [fitView])
 
   // ---- 连接 ----
 
@@ -522,55 +1397,263 @@ function PipelineEditor() {
     [setNodes, setEdges],
   )
 
-  // ---- WebSocket 管线进度（后端就绪后实时驱动节点状态） ----
+  /**
+   * 删除节点确认（修复 P2-26）。两条路径：
+   * 1) 参数面板「删除节点」按钮 → 本函数确认后调用 deleteNode；
+   * 2) 键盘 Delete/Backspace 等 React Flow 内置删除路径 → 由下方 ReactFlow
+   *    的 onBeforeDelete 内联回调拦截确认。
+   */
+  const requestDeleteNode = useCallback(
+    async (nodeId: string) => {
+      const target = nodes.find((n) => n.id === nodeId)
+      const ok = await confirmDialog({
+        title: '删除节点',
+        description: `确认删除节点「${target?.data.label ?? nodeId}」？其相关连线会一并删除。`,
+        confirmLabel: '删除',
+        variant: 'destructive',
+      })
+      if (ok) deleteNode(nodeId)
+    },
+    [nodes, deleteNode],
+  )
+
+  // ---- WebSocket 管线进度（实时驱动节点状态） ----
 
   useEffect(() => {
     return wsManager.onMessage((msg) => {
       if (msg.type !== 'progress') return
       const nodeId = typeof msg.node_id === 'string' ? msg.node_id : null
       if (!nodeId) return
+      const current = nodesRef.current
+      if (!current.some((n) => n.id === nodeId)) return
       const status = normalizeNodeStatus(typeof msg.status === 'string' ? msg.status : null)
-      setNodes((nds) =>
-        nds.map((n) =>
-          n.id === nodeId ? ({ ...n, data: { ...n.data, status } } as PipelineFlowNode) : n,
-        ),
+      const next = current.map((n) =>
+        n.id === nodeId ? ({ ...n, data: { ...n.data, status } } as PipelineFlowNode) : n,
       )
+      setNodes(next)
+      // 执行结束判定：任一节点失败（管线中止）或全部节点到达终态 → 解锁执行按钮
+      if (
+        executingRef.current &&
+        (status === 'failed' ||
+          next.every((n) => n.data.status === 'done' || n.data.status === 'failed'))
+      ) {
+        executingRef.current = false
+        setExecuting(false)
+      }
     })
   }, [setNodes])
 
-  // ---- 工具栏操作 ----
+  // ---- 服务端管线库 ----
 
-  const handleSave = useCallback(() => {
-    const def: PipelineDefinition = {
-      name,
-      version: 1,
-      nodes: nodes.map((n) => ({
-        id: n.id,
-        type: n.type ?? 'module',
-        position: n.position,
-        data: n.data,
-      })),
-      edges: edges.map((e) => ({
-        id: e.id,
-        source: e.source,
-        target: e.target,
-        sourceHandle: e.sourceHandle,
-        targetHandle: e.targetHandle,
-      })),
-    }
-    // 后端最终以 TOML 持久化；当前阶段先导出 JSON 定义文件
-    const blob = new Blob([JSON.stringify(def, null, 2)], { type: 'application/json' })
-    const url = URL.createObjectURL(blob)
-    const anchor = document.createElement('a')
-    anchor.href = url
-    anchor.download = `${name.trim() || 'pipeline'}.json`
-    anchor.click()
-    URL.revokeObjectURL(url)
-    toast.success('管线已保存', {
-      description: `${def.nodes.length} 个节点 · ${def.edges.length} 条连接`,
+  const refreshPipelines = useCallback(() => {
+    api
+      .listPipelines()
+      .then((list) => {
+        setPipelines(list)
+        setLibraryError(false)
+      })
+      .catch(() => setLibraryError(true))
+  }, [])
+
+  useEffect(() => {
+    refreshPipelines()
+  }, [refreshPipelines])
+
+  /** 有未保存更改时先确认（将丢弃未保存更改） */
+  const confirmDiscardIfDirty = useCallback(async (): Promise<boolean> => {
+    if (!dirty) return true
+    return confirmDialog({
+      title: '丢弃未保存更改？',
+      description: '当前画布有未保存的更改，继续将丢弃这些更改。',
+      confirmLabel: '丢弃并继续',
     })
-  }, [name, nodes, edges])
+  }, [dirty])
 
+  /** 重置为空白画布（未保存到服务端状态） */
+  const resetCanvas = useCallback(
+    (
+      nextNodes: PipelineFlowNode[],
+      nextEdges: Edge[],
+      nextName: string,
+      nextDescription: string,
+    ) => {
+      const nextMeta = { id: '', name: nextName, description: nextDescription }
+      setNodes(nextNodes)
+      setEdges(nextEdges)
+      setName(nextName)
+      setDescription(nextDescription)
+      setCurrentId(null)
+      setCurrentSource(null)
+      setSelectedNodeId(null)
+      setBaseline(canvasFingerprint(nextNodes, nextEdges, nextMeta))
+    },
+    [setNodes, setEdges],
+  )
+
+  /** 选择服务端管线 → 加载 spec 并铺到画布 */
+  const handleSelectPipeline = useCallback(
+    async (id: string) => {
+      if (!(await confirmDiscardIfDirty())) return
+      const toastId = toast.loading('加载管线中…')
+      try {
+        const spec = await api.getPipeline(id)
+        const { nodes: loadedNodes, edges: loadedEdges, skippedNodes } = fromSpec(spec)
+        const loadedMeta = {
+          id,
+          name: spec.pipeline.name,
+          description: spec.pipeline.description,
+        }
+        setNodes(loadedNodes)
+        setEdges(loadedEdges)
+        setName(spec.pipeline.name)
+        setDescription(spec.pipeline.description)
+        setCurrentId(id)
+        setCurrentSource(pipelines?.find((p) => p.id === id)?.source ?? null)
+        setSelectedNodeId(null)
+        setBaseline(canvasFingerprint(loadedNodes, loadedEdges, loadedMeta))
+        fitSoon()
+        if (skippedNodes > 0) {
+          toast.success('管线已加载（部分节点不受支持已跳过）', {
+            id: toastId,
+            description: `${loadedNodes.length} 个节点 · ${loadedEdges.length} 条连接`,
+          })
+        } else {
+          toast.success('管线已加载', {
+            id: toastId,
+            description: `${loadedNodes.length} 个节点 · ${loadedEdges.length} 条连接`,
+          })
+        }
+      } catch (err) {
+        toast.error('加载管线失败', { id: toastId, description: errMsg(err) })
+      }
+    },
+    [confirmDiscardIfDirty, pipelines, setNodes, setEdges, fitSoon],
+  )
+
+  /** 新建空白管线（file_input → file_output 最小模板） */
+  const handleNewBlank = useCallback(async () => {
+    if (!(await confirmDiscardIfDirty())) return
+    const { nodes: n, edges: e } = blankTemplate()
+    resetCanvas(n, e, '未命名管线', '')
+    fitSoon()
+    toast.success('已新建空白管线', { description: '文件输入 → 文件输出 最小模板' })
+  }, [confirmDiscardIfDirty, resetCanvas, fitSoon])
+
+  /** 载入本地示例模板（深拷贝，避免画布编辑污染模板） */
+  const handleLoadExample = useCallback(async () => {
+    if (!(await confirmDiscardIfDirty())) return
+    const cloned = structuredClone(EXAMPLE)
+    resetCanvas(cloned.nodes, cloned.edges, '示例：音频转写摘要管线', '')
+    fitSoon()
+    toast.success('已载入本地示例管线', { description: '可编辑后另存为你的管线' })
+  }, [confirmDiscardIfDirty, resetCanvas, fitSoon])
+
+  /** 删除当前服务端管线（仅 custom；builtin 不显示删除按钮） */
+  const handleDeletePipeline = useCallback(async () => {
+    if (!currentId || currentSource !== 'custom') return
+    const ok = await confirmDialog({
+      title: '删除管线',
+      description: `确认删除管线「${name}」？此操作不可恢复。`,
+      confirmLabel: '删除',
+      variant: 'destructive',
+    })
+    if (!ok) return
+    const toastId = toast.loading('删除中…')
+    try {
+      await api.deletePipeline(currentId)
+      toast.success('管线已删除', { id: toastId })
+      resetCanvas([], [], '未命名管线', '')
+      refreshPipelines()
+    } catch (err) {
+      toast.error('删除失败', { id: toastId, description: errMsg(err) })
+      refreshPipelines()
+    }
+  }, [currentId, currentSource, name, resetCanvas, refreshPipelines])
+
+  // ---- 保存 ----
+
+  /**
+   * 保存到服务端。nameOverride 用于「另存为」对话框（此时 setName 尚未生效）。
+   * 返回是否保存成功。
+   */
+  const savePipelineToServer = useCallback(
+    async (id: string, opts?: { nameOverride?: string }): Promise<boolean> => {
+      const effectiveName = opts?.nameOverride ?? name
+      if (nodes.some((n) => n.data.kind === 'external')) {
+        toast.error('无法保存', {
+          description: '画布包含「外部 API」节点，服务端管线契约暂不支持该类型，请移除后保存。',
+        })
+        return false
+      }
+      if (nodes.length === 0) {
+        toast.error('无法保存', { description: '画布为空，请先添加节点。' })
+        return false
+      }
+      if (!effectiveName.trim()) {
+        toast.error('无法保存', { description: '管线名称不能为空，请先填写名称。' })
+        return false
+      }
+      const badModule = nodes.find(
+        (n) => n.data.kind === 'module' && (!n.data.moduleId || !n.data.capabilityId),
+      )
+      if (badModule) {
+        toast.error('无法保存', {
+          description: `模块节点「${badModule.data.label}」缺少模块或能力信息，请重新添加该节点。`,
+        })
+        return false
+      }
+      const builtinTarget =
+        currentSource === 'builtin' ||
+        pipelines?.some((p) => p.id === id && p.source === 'builtin') === true
+      if (builtinTarget) {
+        const ok = await confirmDialog({
+          title: '覆盖内置管线？',
+          description: '这是内置示例管线，覆盖后不可恢复原样。',
+          confirmLabel: '覆盖',
+          variant: 'destructive',
+        })
+        if (!ok) return false
+      }
+      const spec = toSpec(nodes, edges, { id, name: effectiveName, description })
+      const toastId = toast.loading('保存中…')
+      try {
+        await api.savePipeline(id, spec)
+        setCurrentId(id)
+        setCurrentSource(builtinTarget ? 'builtin' : 'custom')
+        setBaseline(canvasFingerprint(nodes, edges, { id, name: effectiveName, description }))
+        toast.success('管线已保存', {
+          id: toastId,
+          description: `${nodes.length} 个节点 · ${edges.length} 条连接${builtinTarget ? '（已覆盖内置管线）' : ''}`,
+        })
+        refreshPipelines()
+        return true
+      } catch (err) {
+        toast.error('保存失败', { id: toastId, description: errMsg(err) })
+        return false
+      }
+    },
+    [nodes, edges, name, description, currentSource, pipelines, refreshPipelines],
+  )
+
+  /** 保存：已有服务端 id → 直接保存；否则打开「另存为」对话框 */
+  const handleSave = useCallback(() => {
+    if (currentId) {
+      void savePipelineToServer(currentId)
+    } else {
+      setSaveAsOpen(true)
+    }
+  }, [currentId, savePipelineToServer])
+
+  const handleSaveAsConfirm = useCallback(
+    async (newName: string, newId: string): Promise<boolean> => {
+      const ok = await savePipelineToServer(newId, { nameOverride: newName })
+      if (ok) setName(newName)
+      return ok
+    },
+    [savePipelineToServer],
+  )
+
+  /** 本地 JSON 定义文件导入（保留原有交互；导入后视为未保存的本地画布） */
   const handleLoad = useCallback(
     (def: PipelineDefinition) => {
       const validTypes = new Set(['module', 'builtin', 'external'])
@@ -601,10 +1684,22 @@ function PipelineEditor() {
         label: edgeLabelFor(e.source, e.sourceHandle, loadedNodes),
       }))
 
+      const loadedName = def.name
       setNodes(loadedNodes)
       setEdges(loadedEdges as Edge[])
-      setName(def.name)
+      setName(loadedName)
+      setDescription('')
+      // 本地导入不绑定服务端管线
+      setCurrentId(null)
+      setCurrentSource(null)
       setSelectedNodeId(null)
+      setBaseline(
+        canvasFingerprint(loadedNodes, loadedEdges as Edge[], {
+          id: '',
+          name: loadedName,
+          description: '',
+        }),
+      )
       requestAnimationFrame(() => {
         void fitView({ padding: 0.25, duration: 300 })
       })
@@ -612,6 +1707,8 @@ function PipelineEditor() {
     },
     [setNodes, setEdges, fitView],
   )
+
+  // ---- 校验与执行 ----
 
   const validatePipeline = useCallback((): string[] => {
     if (nodes.length === 0) return ['管线为空，请先从左侧节点库添加节点']
@@ -641,15 +1738,119 @@ function PipelineEditor() {
     }
   }, [validatePipeline, nodes.length, edges.length])
 
+  /**
+   * 执行前置校验：连线完整性 + 必填参数校验（P1-21）+ file_input 存在性。
+   * 空的必填参数不在此阻断，而是弹执行对话框补齐。
+   */
   const handleExecute = useCallback(() => {
-    const issues = validatePipeline()
-    if (issues.length > 0) {
-      toast.error('管线验证未通过', { description: issues[0] })
+    if (executing) {
+      toast.info('管线正在执行中', { description: '请等待当前执行结束后再提交。' })
       return
     }
-    // TODO: 后端就绪后改为 POST /api/pipelines/execute
-    toast.info('管线执行功能开发中')
-  }, [validatePipeline])
+    const issues = validatePipeline()
+    if (issues.length > 0) {
+      toast.error('管线验证未通过', {
+        description: issues.slice(0, 4).join('；') + (issues.length > 4 ? '…' : ''),
+      })
+      return
+    }
+    if (nodes.some((n) => n.data.kind === 'external')) {
+      toast.error('无法执行', {
+        description: '画布包含「外部 API」节点，服务端执行暂不支持该类型，请先移除。',
+      })
+      return
+    }
+    if (!nodes.some((n) => n.data.kind === 'builtin' && n.data.builtin === 'file_input')) {
+      toast.error('管线验证未通过', { description: '管线必须包含至少一个「文件输入」节点。' })
+      return
+    }
+    const missing = collectMissingRequired(nodes)
+    if (missing.length > 0) {
+      toast.info(`有 ${missing.length} 个必填参数为空`, {
+        description: '请在执行对话框中补齐后再提交。',
+      })
+    }
+    setExecFields(buildExecFields(nodes))
+    setExecDialogOpen(true)
+  }, [executing, validatePipeline, nodes])
+
+  /** 执行对话框提交：合并参数 → 清空旧状态 → executePipeline → 任务链接 */
+  const handleSubmitExecution = useCallback(
+    async (values: Record<string, ParamValue>) => {
+      setExecSubmitting(true)
+      try {
+        // 1) 对话框值合并进节点 params（补齐的必填参数随画布保留）
+        const patchByNode = new Map<string, NodeParams>()
+        for (const f of execFields) {
+          const v = values[f.key]
+          if (v === undefined) continue
+          const patch = patchByNode.get(f.nodeId) ?? {}
+          patch[f.spec.name] = v
+          patchByNode.set(f.nodeId, patch)
+        }
+        // 新一次执行开始：清空旧的节点运行状态
+        const merged = nodes.map((n) => {
+          const patch = patchByNode.get(n.id)
+          return {
+            ...n,
+            data: {
+              ...n.data,
+              status: 'waiting',
+              params: patch ? { ...n.data.params, ...patch } : n.data.params,
+            },
+          } as PipelineFlowNode
+        })
+        setNodes(merged)
+
+        // 2) inputs：每个 file_input 节点注入本次执行的服务器文件路径
+        const inputs: Record<string, Record<string, unknown>> = {}
+        for (const n of merged) {
+          if (n.data.kind === 'builtin' && n.data.builtin === 'file_input') {
+            const path = n.data.params.path
+            if (typeof path === 'string' && path.trim()) {
+              inputs[n.id] = { path: path.trim() }
+            }
+          }
+        }
+
+        // 3) 画布 == 已加载的未修改服务端管线 → 按 id 执行；否则内联 spec
+        const edited = execFields.some((f) => values[f.key] !== f.current)
+        const sendById = currentId !== null && !dirty && !edited
+        const body: ExecutePipelineRequest = sendById
+          ? { pipeline_id: currentId, inputs }
+          : {
+              spec: toSpec(merged, edges, {
+                id: currentId ?? fallbackPipelineId(name),
+                name,
+                description,
+              }),
+              inputs,
+            }
+
+        const resp = await api.executePipeline(body)
+        executingRef.current = true
+        setExecuting(true)
+        setExecDialogOpen(false)
+        toast.success('管线已提交执行', {
+          description: `任务 ID：${resp.task_id}`,
+          duration: 8000,
+          action: {
+            label: (
+              <Link to="/tasks" className="text-xs font-medium underline-offset-4 hover:underline">
+                任务中心
+              </Link>
+            ),
+            onClick: () => {},
+          },
+        })
+      } catch (err) {
+        toast.error('提交执行失败', { description: errMsg(err) })
+      } finally {
+        setExecSubmitting(false)
+      }
+    },
+    [execFields, nodes, edges, currentId, dirty, name, description, setNodes],
+  )
 
   // ---- 渲染 ----
 
@@ -667,6 +1868,21 @@ function PipelineEditor() {
         onLoad={handleLoad}
         onValidate={handleValidate}
         onExecute={handleExecute}
+      />
+
+      <PipelineLibraryBar
+        pipelines={pipelines}
+        error={libraryError}
+        onRefresh={refreshPipelines}
+        currentId={currentId}
+        currentSource={currentSource}
+        dirty={dirty}
+        executing={executing}
+        onSelect={(id) => void handleSelectPipeline(id)}
+        onNewBlank={() => void handleNewBlank()}
+        onLoadExample={() => void handleLoadExample()}
+        onSaveAs={() => setSaveAsOpen(true)}
+        onDelete={() => void handleDeletePipeline()}
       />
 
       <div className="relative flex min-h-0 flex-1 overflow-hidden">
@@ -699,6 +1915,21 @@ function PipelineEditor() {
             connectionLineType={ConnectionLineType.Bezier}
             connectionRadius={32}
             deleteKeyCode={['Backspace', 'Delete']}
+            onBeforeDelete={async ({ nodes: doomedNodes }) => {
+              // 键盘 Delete/Backspace 及 React Flow 其他内置删除路径统一在此拦截确认；
+              // 参数面板按钮删除走 requestDeleteNode，两者都接入 confirmDialog（P2-26）。
+              if (doomedNodes.length === 0) return true
+              const subject =
+                doomedNodes.length === 1
+                  ? `节点「${doomedNodes[0].data.label}」`
+                  : `${doomedNodes.length} 个节点`
+              return confirmDialog({
+                title: '删除节点',
+                description: `确认删除${subject}？相关连线会一并删除。`,
+                confirmLabel: '删除',
+                variant: 'destructive',
+              })
+            }}
             fitView
             fitViewOptions={{ padding: 0.25 }}
             minZoom={0.2}
@@ -729,8 +1960,17 @@ function PipelineEditor() {
               </span>
               <p className="text-sm font-medium">画布还是空的</p>
               <p className="text-xs text-muted-foreground">
-                从左侧节点库点击或拖入模块 / 内置节点，开始编排你的第一条管线
+                从左侧节点库点击或拖入模块 / 内置节点，或从上方管线库加载已保存的管线
               </p>
+              <Button
+                variant="outline"
+                size="sm"
+                className="pointer-events-auto"
+                onClick={() => void handleLoadExample()}
+              >
+                <Sparkles className="h-3.5 w-3.5" />
+                载入本地示例管线
+              </Button>
             </div>
           )}
         </div>
@@ -740,7 +1980,7 @@ function PipelineEditor() {
           <NodeParamsPanel
             node={selectedNode}
             onParamsChange={(patch) => updateNodeParams(selectedNode.id, patch)}
-            onDelete={() => deleteNode(selectedNode.id)}
+            onDelete={() => void requestDeleteNode(selectedNode.id)}
             onClose={() => setSelectedNodeId(null)}
             className={
               isDesktop ? undefined : 'absolute inset-y-0 right-0 z-30 max-w-[85vw] shadow-lg'
@@ -748,6 +1988,22 @@ function PipelineEditor() {
           />
         )}
       </div>
+
+      <SaveAsDialog
+        open={saveAsOpen}
+        onOpenChange={setSaveAsOpen}
+        defaultName={name}
+        pipelines={pipelines}
+        onConfirm={handleSaveAsConfirm}
+      />
+
+      <ExecuteDialog
+        open={execDialogOpen}
+        onOpenChange={setExecDialogOpen}
+        fields={execFields}
+        submitting={execSubmitting}
+        onSubmit={(values) => void handleSubmitExecution(values)}
+      />
     </div>
   )
 }
