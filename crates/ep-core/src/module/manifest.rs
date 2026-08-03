@@ -78,6 +78,48 @@ pub enum ModelSource {
     Url,
 }
 
+impl ModelSource {
+    /// 来源的字符串形式（用于错误信息、元数据与 API 输出）
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Huggingface => "huggingface",
+            Self::Modelscope => "modelscope",
+            Self::Url => "url",
+        }
+    }
+}
+
+impl std::fmt::Display for ModelSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// 模型的备用下载源（镜像）声明。
+///
+/// TOML 形态为 `[[models.mirrors]]` 嵌套数组，例如：
+///
+/// ```toml
+/// [[models]]
+/// id = "large-v3"
+/// source = "huggingface"
+/// repo_id = "Systran/faster-whisper-large-v3"
+///
+/// [[models.mirrors]]
+/// source = "modelscope"
+/// repo_id = "pengzhendong/faster-whisper-large-v3"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelMirror {
+    /// 镜像来源（必须与主 source 不同，且必须是仓库类来源）
+    pub source: ModelSource,
+    /// 镜像仓库 ID（如 "pengzhendong/faster-whisper-large-v3"）
+    pub repo_id: String,
+    /// 镜像侧的版本/分支（缺省时使用来源默认值）
+    #[serde(default)]
+    pub revision: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelDecl {
     pub id: String,
@@ -90,6 +132,72 @@ pub struct ModelDecl {
     pub size_estimate_mb: Option<u32>,
     #[serde(default)]
     pub default: bool,
+    /// 备用下载源列表（TOML 中为 `[[models.mirrors]]`）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirrors: Vec<ModelMirror>,
+}
+
+impl ModelDecl {
+    /// 解析实际使用的下载源。
+    ///
+    /// - `None` → 使用主 source（声明自身的字段）
+    /// - `Some(s)` 且等于主 source → 使用主字段
+    /// - `Some(s)` 存在于 mirrors → 使用对应 mirror 字段
+    /// - 其余情况 → 报错（中文，列出可用来源）
+    ///
+    /// 返回 `(source, repo_id 或 url, revision)`。
+    pub fn resolve(
+        &self,
+        requested: Option<ModelSource>,
+    ) -> anyhow::Result<(ModelSource, String, Option<String>)> {
+        let target = requested.unwrap_or(self.source);
+
+        if target == self.source {
+            let location = match self.source {
+                ModelSource::Huggingface | ModelSource::Modelscope => {
+                    self.repo_id.clone().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "模型 '{}' 的来源为 '{}'，但未声明 repo_id 字段",
+                            self.id,
+                            self.source
+                        )
+                    })?
+                }
+                ModelSource::Url => self.url.clone().ok_or_else(|| {
+                    anyhow::anyhow!("模型 '{}' 的来源为 'url'，但未声明 url 字段", self.id)
+                })?,
+            };
+            return Ok((self.source, location, self.revision.clone()));
+        }
+
+        if let Some(mirror) = self.mirrors.iter().find(|m| m.source == target) {
+            return Ok((mirror.source, mirror.repo_id.clone(), mirror.revision.clone()));
+        }
+
+        let list = self
+            .available_sources()
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("、");
+        anyhow::bail!(
+            "模型 '{}' 不支持下载源 '{}'，可用来源：{}",
+            self.id,
+            target,
+            list
+        )
+    }
+
+    /// 主 source + 所有 mirrors 的来源列表（去重、保持顺序，主源在前）
+    pub fn available_sources(&self) -> Vec<ModelSource> {
+        let mut sources = vec![self.source];
+        for mirror in &self.mirrors {
+            if !sources.contains(&mirror.source) {
+                sources.push(mirror.source);
+            }
+        }
+        sources
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,6 +323,27 @@ impl ModuleManifest {
                             model.id
                         ));
                     }
+                }
+            }
+
+            for mirror in &model.mirrors {
+                if mirror.source == model.source {
+                    errors.push(format!(
+                        "models[{}]: mirror source \"{}\" duplicates the primary source",
+                        model.id, mirror.source
+                    ));
+                }
+                if mirror.source == ModelSource::Url {
+                    errors.push(format!(
+                        "models[{}]: mirror source must be \"huggingface\" or \"modelscope\" (repo-based)",
+                        model.id
+                    ));
+                }
+                if mirror.repo_id.trim().is_empty() {
+                    errors.push(format!(
+                        "models[{}]: mirror repo_id must not be empty",
+                        model.id
+                    ));
                 }
             }
         }
@@ -386,5 +515,223 @@ type = "cli"
         assert_eq!(manifest.module.id, "faster-whisper");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── mirrors：解析 / resolve / 校验 ─────────────────────────────────
+
+    const MIRROR_TOML: &str = r#"
+[module]
+id = "faster-whisper"
+name = "Faster-Whisper ASR"
+version = "1.1.0"
+description = "High-speed speech recognition"
+category = "asr"
+genre = "whisper"
+
+[runtime]
+type = "python"
+python_version = ">=3.10,<3.13"
+
+[compute]
+backends = ["cpu"]
+
+[[models]]
+id = "large-v3"
+name = "Whisper Large V3"
+source = "huggingface"
+repo_id = "Systran/faster-whisper-large-v3"
+target_dir = "faster-whisper-large-v3"
+size_estimate_mb = 3100
+default = true
+
+[[models.mirrors]]
+source = "modelscope"
+repo_id = "pengzhendong/faster-whisper-large-v3"
+
+[[models.mirrors]]
+source = "url"
+repo_id = "should-not-pass-validation"
+
+[interface]
+type = "http"
+"#;
+
+    #[test]
+    fn test_parse_mirrors() {
+        let manifest: ModuleManifest = toml::from_str(MIRROR_TOML).unwrap();
+        let model = &manifest.models[0];
+        assert_eq!(model.mirrors.len(), 2);
+        assert_eq!(model.mirrors[0].source, ModelSource::Modelscope);
+        assert_eq!(model.mirrors[0].repo_id, "pengzhendong/faster-whisper-large-v3");
+        assert!(model.mirrors[0].revision.is_none());
+    }
+
+    #[test]
+    fn test_no_mirrors_defaults_empty() {
+        let manifest: ModuleManifest = toml::from_str(VALID_TOML).unwrap();
+        assert!(manifest.models[0].mirrors.is_empty());
+        // 校验应通过（无 mirrors）
+        assert!(manifest.validate().is_ok());
+    }
+
+    #[test]
+    fn test_resolve_primary_when_none() {
+        let manifest: ModuleManifest = toml::from_str(MIRROR_TOML).unwrap();
+        let model = &manifest.models[0];
+
+        let (source, location, revision) = model.resolve(None).unwrap();
+        assert_eq!(source, ModelSource::Huggingface);
+        assert_eq!(location, "Systran/faster-whisper-large-v3");
+        assert!(revision.is_none());
+    }
+
+    #[test]
+    fn test_resolve_explicit_primary() {
+        let manifest: ModuleManifest = toml::from_str(MIRROR_TOML).unwrap();
+        let model = &manifest.models[0];
+
+        let (source, location, _) = model.resolve(Some(ModelSource::Huggingface)).unwrap();
+        assert_eq!(source, ModelSource::Huggingface);
+        assert_eq!(location, "Systran/faster-whisper-large-v3");
+    }
+
+    #[test]
+    fn test_resolve_mirror() {
+        let manifest: ModuleManifest = toml::from_str(MIRROR_TOML).unwrap();
+        let model = &manifest.models[0];
+
+        let (source, location, revision) = model.resolve(Some(ModelSource::Modelscope)).unwrap();
+        assert_eq!(source, ModelSource::Modelscope);
+        assert_eq!(location, "pengzhendong/faster-whisper-large-v3");
+        assert!(revision.is_none());
+    }
+
+    #[test]
+    fn test_resolve_unavailable_source_error() {
+        let toml_str = MIRROR_TOML.replace(
+            "[[models.mirrors]]\nsource = \"url\"\nrepo_id = \"should-not-pass-validation\"",
+            "",
+        );
+        let manifest: ModuleManifest = toml::from_str(&toml_str).unwrap();
+        let model = &manifest.models[0];
+
+        let err = model.resolve(Some(ModelSource::Url)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("不支持下载源"), "msg: {msg}");
+        assert!(msg.contains("可用来源"), "msg: {msg}");
+        assert!(msg.contains("huggingface"), "msg: {msg}");
+    }
+
+    #[test]
+    fn test_available_sources_dedup() {
+        let manifest: ModuleManifest = toml::from_str(MIRROR_TOML).unwrap();
+        let model = &manifest.models[0];
+        assert_eq!(
+            model.available_sources(),
+            vec![ModelSource::Huggingface, ModelSource::Modelscope, ModelSource::Url]
+        );
+    }
+
+    #[test]
+    fn test_validate_mirror_duplicate_source() {
+        let toml_str = r#"
+[module]
+id = "m"
+name = "M"
+version = "1.0.0"
+description = "d"
+category = "asr"
+genre = "g"
+
+[runtime]
+type = "python"
+python_version = ">=3.10"
+
+[compute]
+backends = ["cpu"]
+
+[[models]]
+id = "x"
+name = "X"
+source = "huggingface"
+repo_id = "org/x"
+target_dir = "x"
+
+[[models.mirrors]]
+source = "huggingface"
+repo_id = "org2/x"
+
+[interface]
+type = "http"
+"#;
+        let manifest: ModuleManifest = toml::from_str(toml_str).unwrap();
+        let errors = manifest.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("duplicates the primary source")),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_mirror_empty_repo_id() {
+        let toml_str = r#"
+[module]
+id = "m"
+name = "M"
+version = "1.0.0"
+description = "d"
+category = "asr"
+genre = "g"
+
+[runtime]
+type = "python"
+python_version = ">=3.10"
+
+[compute]
+backends = ["cpu"]
+
+[[models]]
+id = "x"
+name = "X"
+source = "huggingface"
+repo_id = "org/x"
+target_dir = "x"
+
+[[models.mirrors]]
+source = "modelscope"
+repo_id = "  "
+
+[interface]
+type = "http"
+"#;
+        let manifest: ModuleManifest = toml::from_str(toml_str).unwrap();
+        let errors = manifest.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("mirror repo_id must not be empty")),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_real_faster_whisper_manifest_mirrors() {
+        // 回归测试：仓库内真实的 faster-whisper 清单必须能解析并通过校验
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../modules/faster-whisper/module.toml");
+        if !path.exists() {
+            return; // 脱离完整仓库布局时跳过
+        }
+        let manifest = ModuleManifest::from_file(&path).unwrap();
+        assert!(manifest.validate().is_ok());
+        assert_eq!(manifest.models.len(), 3);
+        for model in &manifest.models {
+            assert_eq!(model.mirrors.len(), 1, "model {} should have 1 mirror", model.id);
+            assert_eq!(model.mirrors[0].source, ModelSource::Modelscope);
+            assert!(model.mirrors[0].repo_id.starts_with("pengzhendong/faster-whisper-"));
+            // available_sources = 主源 + mirror
+            assert_eq!(
+                model.available_sources(),
+                vec![ModelSource::Huggingface, ModelSource::Modelscope]
+            );
+        }
     }
 }

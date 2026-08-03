@@ -244,6 +244,7 @@ mod tests {
                     revision: Some("main".to_string()),
                     size_estimate_mb: None,
                     default: true,
+                    mirrors: vec![],
                 }]
             } else {
                 vec![]

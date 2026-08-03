@@ -67,6 +67,8 @@ pub struct EnvManager {
     python_path: Option<PathBuf>,
     /// 检测到的 uv 路径
     uv_path: Option<PathBuf>,
+    /// 网络代理环境变量（注入 uv/pip 子进程）
+    network_env: Vec<(String, String)>,
 }
 
 impl EnvManager {
@@ -107,7 +109,21 @@ impl EnvManager {
             root: root.to_path_buf(),
             python_path,
             uv_path,
+            network_env: Vec::new(),
         }
+    }
+
+    /// 设置网络代理配置（链式调用）。
+    ///
+    /// uv venv / uv pip install 子进程将被注入这些环境变量（仅非空值）。
+    pub fn with_network(mut self, network: &crate::config::NetworkConfig) -> Self {
+        self.network_env = network.env_vars();
+        self
+    }
+
+    /// 设置网络代理环境变量
+    pub fn set_network(&mut self, network: &crate::config::NetworkConfig) {
+        self.network_env = network.env_vars();
     }
 
     /// 检测系统 PATH 中的 python（优先 python3，其次 python）
@@ -342,7 +358,7 @@ impl EnvManager {
                 format!("failed to create venv directory: {}", venv_dir.display())
             })?;
 
-            let output = run_command(
+            let output = run_command_with_env(
                 uv.to_str().unwrap_or("uv"),
                 &[
                     "venv",
@@ -350,6 +366,7 @@ impl EnvManager {
                     python_version,
                     venv_dir.to_str().unwrap_or_default(),
                 ],
+                &self.network_env,
             )
             .with_context(|| format!("failed to create venv for module '{module_id}'"))?;
             debug!(module = module_id, output = %output, "venv created");
@@ -382,9 +399,10 @@ impl EnvManager {
             let venv_py_str = venv_python.to_str().unwrap_or_default();
             let req_str = requirements.to_str().unwrap_or_default();
 
-            let output = run_command(
+            let output = run_command_with_env(
                 uv.to_str().unwrap_or("uv"),
                 &["pip", "install", "-r", req_str, "--python", venv_py_str],
+                &self.network_env,
             )
             .with_context(|| format!("failed to install dependencies for module '{module_id}'"))?;
             debug!(module = module_id, output = %output, "dependencies installed");
@@ -539,10 +557,29 @@ fn hash_bytes(data: &[u8]) -> String {
 ///
 /// 成功时返回 stdout 内容，失败时返回错误（含 stderr 信息）。
 pub fn run_command(cmd: &str, args: &[&str]) -> Result<String> {
+    run_command_with_env(cmd, args, &[])
+}
+
+/// 执行外部命令并注入额外环境变量（仅注入非空值），捕获 stdout 输出
+///
+/// 用于给 uv/pip 等联网子进程注入代理环境变量。
+/// 成功时返回 stdout 内容，失败时返回错误（含 stderr 信息）。
+pub fn run_command_with_env(
+    cmd: &str,
+    args: &[&str],
+    extra_env: &[(String, String)],
+) -> Result<String> {
     debug!(cmd = cmd, args = ?args, "executing command");
 
-    let output = Command::new(cmd)
-        .args(args)
+    let mut command = Command::new(cmd);
+    command.args(args);
+    for (key, value) in extra_env {
+        if !value.is_empty() {
+            command.env(key, value);
+        }
+    }
+
+    let output = command
         .output()
         .with_context(|| format!("failed to execute command: {cmd}"))?;
 
@@ -579,6 +616,7 @@ mod tests {
             root,
             python_path: None,
             uv_path: None,
+            network_env: Vec::new(),
         };
 
         let path = mgr.venv_python_path("test-module");
@@ -605,6 +643,7 @@ mod tests {
             root,
             python_path: None,
             uv_path: None,
+            network_env: Vec::new(),
         };
 
         let path = mgr.venv_python_path("faster-whisper");
@@ -628,6 +667,7 @@ mod tests {
             root: root.clone(),
             python_path: None,
             uv_path: None,
+            network_env: Vec::new(),
         };
 
         // venv 不存在时应返回 false
@@ -733,6 +773,7 @@ mod tests {
             root: root.clone(),
             python_path: None,
             uv_path: None,
+            network_env: Vec::new(),
         };
 
         assert_eq!(mgr.get_venv_status("nonexistent"), VenvStatus::NotExist);
@@ -766,6 +807,7 @@ mod tests {
             root: root.clone(),
             python_path: None,
             uv_path: None,
+            network_env: Vec::new(),
         };
 
         assert_eq!(mgr.get_venv_status("test-mod"), VenvStatus::Ready);
@@ -798,6 +840,7 @@ mod tests {
             root: root.clone(),
             python_path: None,
             uv_path: None,
+            network_env: Vec::new(),
         };
 
         assert_eq!(mgr.get_venv_status("test-mod"), VenvStatus::NeedsUpdate);
@@ -928,6 +971,7 @@ mod tests {
             root: root.clone(),
             python_path: None,
             uv_path: None,
+            network_env: Vec::new(),
         };
 
         let result = mgr.check_all_modules_env(&modules);

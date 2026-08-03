@@ -213,6 +213,62 @@ pub struct PythonConfig {
     pub uv_path: String,
 }
 
+/// 网络代理配置 — 统一控制模型下载、依赖安装、模块子进程的出口代理。
+///
+/// 取代此前"子进程隐式继承 daemon 环境变量"的不可控方式：
+/// 所有需要联网的子进程显式注入这里配置的环境变量。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkConfig {
+    /// HTTP 代理（如 "http://127.0.0.1:20171"），空字符串 = 不设置
+    #[serde(default)]
+    pub http_proxy: String,
+    /// HTTPS 代理，空字符串 = 不设置
+    #[serde(default)]
+    pub https_proxy: String,
+    /// 不走代理的地址列表
+    #[serde(default = "default_no_proxy")]
+    pub no_proxy: String,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            http_proxy: String::new(),
+            https_proxy: String::new(),
+            no_proxy: default_no_proxy(),
+        }
+    }
+}
+
+impl NetworkConfig {
+    /// 生成注入子进程的环境变量列表。
+    ///
+    /// 非空的 proxy 字段同时产出大写 + 小写键
+    /// （HTTP_PROXY/http_proxy、HTTPS_PROXY/https_proxy、NO_PROXY/no_proxy）；
+    /// 字段为空则不产出对应键（不覆盖进程继承的环境变量）。
+    pub fn env_vars(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        if !self.http_proxy.is_empty() {
+            out.push(("HTTP_PROXY".to_string(), self.http_proxy.clone()));
+            out.push(("http_proxy".to_string(), self.http_proxy.clone()));
+        }
+        if !self.https_proxy.is_empty() {
+            out.push(("HTTPS_PROXY".to_string(), self.https_proxy.clone()));
+            out.push(("https_proxy".to_string(), self.https_proxy.clone()));
+        }
+        if !self.no_proxy.is_empty() {
+            out.push(("NO_PROXY".to_string(), self.no_proxy.clone()));
+            out.push(("no_proxy".to_string(), self.no_proxy.clone()));
+        }
+        out
+    }
+
+    /// 是否配置了任何出口代理
+    pub fn has_proxy(&self) -> bool {
+        !self.http_proxy.is_empty() || !self.https_proxy.is_empty()
+    }
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineConfig {
@@ -298,6 +354,9 @@ pub struct AppConfig {
     pub pipeline: PipelineConfig,
     #[serde(default)]
     pub ui: UiConfig,
+    /// 网络代理配置（下载 / 依赖安装 / 模块进程出口）
+    #[serde(default)]
+    pub network: NetworkConfig,
 }
 
 
@@ -454,6 +513,9 @@ fn default_font_size() -> f32 {
 fn default_dashboard_refresh() -> u32 {
     2
 }
+fn default_no_proxy() -> String {
+    "localhost,127.0.0.1".into()
+}
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
@@ -497,6 +559,68 @@ mod tests {
         assert!((restored.ui.scale_factor - 1.0).abs() < f32::EPSILON);
         assert!((restored.ui.font_size - 14.0).abs() < f32::EPSILON);
         assert_eq!(restored.ui.dashboard_refresh_secs, 2);
+
+        assert_eq!(restored.network.http_proxy, "");
+        assert_eq!(restored.network.https_proxy, "");
+        assert_eq!(restored.network.no_proxy, "localhost,127.0.0.1");
+    }
+
+    // ── NetworkConfig ──────────────────────────────────────────────────
+
+    #[test]
+    fn network_env_vars_both_proxies() {
+        let net = NetworkConfig {
+            http_proxy: "http://127.0.0.1:20171".into(),
+            https_proxy: "http://127.0.0.1:20171".into(),
+            no_proxy: "localhost,127.0.0.1".into(),
+        };
+        let vars = net.env_vars();
+        // 3 个非空字段 × 大写/小写 = 6 对
+        assert_eq!(vars.len(), 6);
+        assert!(vars.contains(&("HTTP_PROXY".to_string(), "http://127.0.0.1:20171".to_string())));
+        assert!(vars.contains(&("http_proxy".to_string(), "http://127.0.0.1:20171".to_string())));
+        assert!(vars.contains(&("HTTPS_PROXY".to_string(), "http://127.0.0.1:20171".to_string())));
+        assert!(vars.contains(&("https_proxy".to_string(), "http://127.0.0.1:20171".to_string())));
+        assert!(vars.contains(&("NO_PROXY".to_string(), "localhost,127.0.0.1".to_string())));
+        assert!(vars.contains(&("no_proxy".to_string(), "localhost,127.0.0.1".to_string())));
+        assert!(net.has_proxy());
+    }
+
+    #[test]
+    fn network_env_vars_empty_fields_emit_nothing() {
+        // 默认配置：proxy 字段为空 → 只产出 no_proxy 两项
+        let net = NetworkConfig::default();
+        let vars = net.env_vars();
+        assert_eq!(vars.len(), 2);
+        assert!(vars.contains(&("NO_PROXY".to_string(), "localhost,127.0.0.1".to_string())));
+        assert!(vars.contains(&("no_proxy".to_string(), "localhost,127.0.0.1".to_string())));
+        assert!(!net.has_proxy());
+
+        // 全空 → 不产出任何键（不覆盖继承值）
+        let net2 = NetworkConfig {
+            http_proxy: String::new(),
+            https_proxy: String::new(),
+            no_proxy: String::new(),
+        };
+        assert!(net2.env_vars().is_empty());
+    }
+
+    #[test]
+    fn network_config_toml_parse() {
+        let toml_str = r#"
+[network]
+http_proxy = "http://127.0.0.1:20171"
+https_proxy = "http://127.0.0.1:20171"
+no_proxy = "localhost,127.0.0.1,192.168.*"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).expect("parse network section");
+        assert_eq!(config.network.http_proxy, "http://127.0.0.1:20171");
+        assert_eq!(config.network.no_proxy, "localhost,127.0.0.1,192.168.*");
+
+        // 无 [network] 节 → 默认值
+        let config2: AppConfig = toml::from_str("").expect("parse empty");
+        assert_eq!(config2.network.http_proxy, "");
+        assert_eq!(config2.network.no_proxy, "localhost,127.0.0.1");
     }
 
     #[test]
