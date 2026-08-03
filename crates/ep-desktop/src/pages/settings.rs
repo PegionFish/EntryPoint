@@ -1,7 +1,7 @@
 //! 设置页 — 分区卡片布局，保存/重载反馈走 Toast 通知。
 
 use eframe::egui;
-use ep_core::config::{AppConfig, AssignStrategy};
+use ep_core::config::{AppConfig, AssignStrategy, NetworkConfig};
 
 use crate::toast::ToastManager;
 use crate::ui::{card, page_header, primary_button, section_title, subtle_button, Palette};
@@ -111,6 +111,50 @@ pub fn show(ui: &mut egui::Ui, config: &mut AppConfig, toasts: &mut ToastManager
             ui.end_row();
         });
 
+        // ── 网络与代理 ──
+        card(ui, &pal, |ui| {
+            section_title(ui, "网络与代理");
+            ui.add_space(8.0);
+            egui::Grid::new("settings_network")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    field_label(ui, &pal, "HTTP 代理:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut config.network.http_proxy)
+                            .desired_width(f32::INFINITY)
+                            .hint_text(egui::RichText::new("http://127.0.0.1:7890").monospace()),
+                    );
+                    ui.end_row();
+
+                    field_label(ui, &pal, "HTTPS 代理:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut config.network.https_proxy)
+                            .desired_width(f32::INFINITY)
+                            .hint_text(egui::RichText::new("http://127.0.0.1:7890").monospace()),
+                    );
+                    ui.end_row();
+
+                    field_label(ui, &pal, "不走代理:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut config.network.no_proxy)
+                            .desired_width(f32::INFINITY)
+                            .hint_text(
+                                egui::RichText::new("localhost,127.0.0.1").monospace(),
+                            ),
+                    );
+                    ui.end_row();
+                });
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(
+                    "生效范围：模型下载、Python 依赖安装（uv/pip）、模块进程；留空 = 跟随系统环境变量",
+                )
+                .small()
+                .color(pal.text_faint),
+            );
+        });
+
         // ── Python 环境 ──
         section_card(ui, &pal, "Python 环境", "settings_python", |ui, pal| {
             field_label(ui, pal, "Python 路径:");
@@ -186,10 +230,14 @@ pub fn show(ui: &mut egui::Ui, config: &mut AppConfig, toasts: &mut ToastManager
         // ── 底部操作行 ──
         ui.horizontal(|ui| {
             if ui.add(primary_button(&pal, "💾 保存配置")).clicked() {
-                let config_dir = ep_core::config::resolve_root().join("config");
-                match config.save(&config_dir) {
-                    Ok(()) => toasts.success("配置已保存"),
-                    Err(e) => toasts.error(format!("保存失败: {e}")),
+                if let Err(msg) = validate_network(&config.network) {
+                    toasts.error(msg);
+                } else {
+                    let config_dir = ep_core::config::resolve_root().join("config");
+                    match config.save(&config_dir) {
+                        Ok(()) => toasts.success("配置已保存"),
+                        Err(e) => toasts.error(format!("保存失败: {e}")),
+                    }
                 }
             }
 
@@ -231,4 +279,49 @@ fn section_card(
 /// 表单标签列（弱化文本）
 fn field_label(ui: &mut egui::Ui, pal: &Palette, text: &str) {
     ui.label(egui::RichText::new(text).color(pal.text_dim));
+}
+
+/// 校验代理配置：非空的代理地址必须以 http:// 或 https:// 开头。
+///
+/// no_proxy 是地址列表，不做格式校验。
+fn validate_network(network: &NetworkConfig) -> Result<(), String> {
+    for (label, value) in [
+        ("HTTP 代理", &network.http_proxy),
+        ("HTTPS 代理", &network.https_proxy),
+    ] {
+        if !value.is_empty() && !(value.starts_with("http://") || value.starts_with("https://")) {
+            return Err(format!("{label}格式无效，必须以 http:// 或 https:// 开头：{value}"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn net(http: &str, https: &str) -> NetworkConfig {
+        NetworkConfig {
+            http_proxy: http.to_string(),
+            https_proxy: https.to_string(),
+            no_proxy: "localhost,127.0.0.1".to_string(),
+        }
+    }
+
+    #[test]
+    fn validate_network_accepts_empty_and_valid_prefixes() {
+        assert!(validate_network(&net("", "")).is_ok());
+        assert!(validate_network(&net("http://127.0.0.1:7890", "")).is_ok());
+        assert!(validate_network(&net("", "https://proxy.local:8080")).is_ok());
+    }
+
+    #[test]
+    fn validate_network_rejects_bad_prefixes() {
+        assert!(validate_network(&net("socks5://127.0.0.1:1080", "")).is_err());
+        assert!(validate_network(&net("", "127.0.0.1:7890")).is_err());
+        // no_proxy 不参与校验，任意值不影响结果
+        let mut bad = net("ftp://x", "");
+        bad.no_proxy = "随便什么都行".to_string();
+        assert!(validate_network(&bad).is_err());
+    }
 }

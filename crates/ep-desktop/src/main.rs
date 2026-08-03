@@ -117,21 +117,32 @@ async fn background_loop(
     root: std::path::PathBuf,
 ) {
     use ep_desktop::app::{AppCmd, AppMsg};
+    use ep_core::model::DownloadState;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
     let (port_range_start, port_range_end) = config.port_range();
     let mut port_manager = ep_core::port::PortManager::new(port_range_start, port_range_end);
     let mut process_manager = ep_core::process::ProcessManager::new();
-    let mut model_manager = ep_core::model::ModelManager::new(&config.models, &root);
 
     // Initial device detection
     let disabled = &config.compute.disabled_backends;
     let devices = ep_core::compute::detect_all_devices(disabled);
     let _ = tx.send(AppMsg::DevicesRefreshed(devices.clone()));
 
-    // Initial module discovery
+    // Initial module discovery（先于 ModelManager，便于注册 manifests）
     let modules_dir = root.join("modules");
     let mut discovered = ep_core::module::discover_modules(&modules_dir);
     let _ = tx.send(AppMsg::ModulesDiscovered(discovered.clone()));
+
+    // ModelManager：注册模块 manifests（import 解析 target_dir 依赖）+ 网络代理（更新检查依赖）
+    let mut model_manager = ep_core::model::ModelManager::new(&config.models, &root)
+        .with_network(config.network.clone())
+        .with_manifests(manifests_from(&discovered));
+
+    // 进行中的下载句柄（model_id → handle），供取消与进度转发任务清理
+    let download_handles: Arc<Mutex<HashMap<String, ep_core::model::DownloadHandle>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     // 启动时自动检查依赖并刷新模型列表
     let _ = tx.send(AppMsg::DepReportRefreshed(
@@ -217,7 +228,7 @@ async fn background_loop(
                         port_manager.release(&module_id);
                         let _ = tx.send(AppMsg::ModuleStopped(module_id));
                     }
-                    Some(AppCmd::DownloadModel(module_id, model_id)) => {
+                    Some(AppCmd::DownloadModel { module_id, model_id, source }) => {
                         // 在已发现模块中查找 manifest 与对应模型声明
                         let decl = discovered
                             .iter()
@@ -244,49 +255,207 @@ async fn background_loop(
                             };
 
                             if !venv_python.exists() {
-                                let _ = tx.send(AppMsg::ModelDownloadFinished(
-                                    model_id.clone(),
-                                    false,
-                                ));
                                 let _ = tx.send(AppMsg::Error(
                                     "请先启动一次该模块以准备 Python 环境，然后再下载模型"
                                         .to_string(),
                                 ));
+                                let _ = tx.send(AppMsg::ModelDownloadFinished(
+                                    model_id.clone(),
+                                    false,
+                                ));
                             } else {
-                                // 长耗时操作，直接在当前分支 await
-                                let module_dir = root.join("modules").join(&module_id);
-                                match model_manager
-                                    .execute_download(&decl, &module_dir, &venv_python, &config)
-                                    .await
-                                {
-                                    Ok(()) => {
-                                        let _ = tx.send(AppMsg::ModelDownloadFinished(
-                                            model_id.clone(),
-                                            true,
-                                        ));
-                                        let _ = tx.send(AppMsg::ModelsRefreshed(
-                                            model_manager
-                                                .list_all_models(&manifests_from(&discovered)),
-                                        ));
+                                // 任务化下载：立即返回句柄，进度经转发任务回传，绝不阻塞事件循环
+                                match model_manager.execute_download_with_progress(
+                                    &module_id,
+                                    &decl,
+                                    &venv_python,
+                                    &config,
+                                    source,
+                                ) {
+                                    Ok(handle) => {
+                                        let mut progress_rx = handle.subscribe_progress();
+                                        // 保存句柄供取消（UI 发 CancelDownload）
+                                        download_handles
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .insert(model_id.clone(), handle);
+
+                                        let tx2 = tx.clone();
+                                        let mid = model_id.clone();
+                                        let handles2 = Arc::clone(&download_handles);
+                                        tokio::spawn(async move {
+                                            use tokio::sync::broadcast::error::RecvError;
+                                            let mut success = false;
+                                            loop {
+                                                match progress_rx.recv().await {
+                                                    Ok(p) => {
+                                                        let terminal = !matches!(
+                                                            p.state,
+                                                            DownloadState::Downloading
+                                                        );
+                                                        let _ = tx2.send(
+                                                            AppMsg::ModelDownloadProgress {
+                                                                model_id: mid.clone(),
+                                                                percent: p.percent,
+                                                                bytes: p.bytes,
+                                                                state: p.state.clone(),
+                                                            },
+                                                        );
+                                                        if terminal {
+                                                            match &p.state {
+                                                                DownloadState::Completed => {
+                                                                    success = true;
+                                                                }
+                                                                DownloadState::Failed(msg) => {
+                                                                    let _ = tx2.send(
+                                                                        AppMsg::Error(format!(
+                                                                            "模型 {mid} 下载失败：{msg}"
+                                                                        )),
+                                                                    );
+                                                                }
+                                                                DownloadState::Cancelled => {
+                                                                    let _ = tx2.send(
+                                                                        AppMsg::Info(format!(
+                                                                            "模型 {mid} 下载已取消"
+                                                                        )),
+                                                                    );
+                                                                }
+                                                                DownloadState::Downloading => {}
+                                                            }
+                                                            break;
+                                                        }
+                                                    }
+                                                    // 接收滞后：跳过丢失的事件，继续等待后续进度
+                                                    Err(RecvError::Lagged(_)) => continue,
+                                                    // 通道已关闭：按异常结束处理
+                                                    Err(RecvError::Closed) => break,
+                                                }
+                                            }
+                                            // 清理句柄并发出最终消息（UI 据此刷新列表）
+                                            handles2
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner())
+                                                .remove(&mid);
+                                            let _ = tx2.send(AppMsg::ModelDownloadFinished(
+                                                mid, success,
+                                            ));
+                                        });
                                     }
                                     Err(e) => {
+                                        let _ = tx.send(AppMsg::Error(format!(
+                                            "启动模型下载失败: {e}"
+                                        )));
                                         let _ = tx.send(AppMsg::ModelDownloadFinished(
                                             model_id.clone(),
                                             false,
                                         ));
-                                        let _ = tx.send(AppMsg::Error(format!(
-                                            "模型下载失败: {e}"
-                                        )));
                                     }
                                 }
                             }
                         } else {
-                            let _ = tx
-                                .send(AppMsg::ModelDownloadFinished(model_id.clone(), false));
                             let _ = tx.send(AppMsg::Error(format!(
                                 "模块 {module_id} 或模型 {model_id} 未找到"
                             )));
+                            let _ = tx
+                                .send(AppMsg::ModelDownloadFinished(model_id.clone(), false));
                         }
+                    }
+                    Some(AppCmd::CancelDownload(model_id)) => {
+                        // 从句柄映射中取出引用并取消（cancel 幂等；supervise 任务会发 Cancelled）
+                        let mut guard = download_handles.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(handle) = guard.get_mut(&model_id) {
+                            handle.cancel();
+                        }
+                    }
+                    Some(AppCmd::CheckUpdate { module_id, model_id }) => {
+                        let decl = discovered
+                            .iter()
+                            .filter_map(|m| m.manifest.as_ref())
+                            .find(|mf| mf.module.id == module_id)
+                            .and_then(|mf| {
+                                mf.models.iter().find(|d| d.id == model_id).cloned()
+                            });
+                        if let Some(decl) = decl {
+                            // spawn 独立任务，避免阻塞命令循环；用独立 ModelManager（同一配置）
+                            let models_cfg = config.models.clone();
+                            let network = config.network.clone();
+                            let root2 = root.clone();
+                            let tx2 = tx.clone();
+                            tokio::spawn(async move {
+                                let mgr = ep_core::model::ModelManager::new(&models_cfg, &root2)
+                                    .with_network(network);
+                                let result = mgr.check_update_available(&decl).await;
+                                let _ = tx2.send(AppMsg::ModelUpdateChecked {
+                                    model_id,
+                                    result,
+                                    notify: true,
+                                });
+                            });
+                        } else {
+                            let _ = tx.send(AppMsg::Error(format!(
+                                "模块 {module_id} 或模型 {model_id} 未找到，无法检查更新"
+                            )));
+                        }
+                    }
+                    Some(AppCmd::CheckAllUpdates) => {
+                        // 收集所有 Ready 模型的声明，spawn 单任务内并发检查并汇总
+                        let ready_models = model_manager
+                            .list_all_models(&manifests_from(&discovered))
+                            .into_iter()
+                            .filter(|mv| mv.status == ep_core::model::ModelStatus::Ready)
+                            .collect::<Vec<_>>();
+
+                        let decls: Vec<(String, ep_core::module::ModelDecl)> = ready_models
+                            .iter()
+                            .filter_map(|mv| {
+                                discovered
+                                    .iter()
+                                    .filter_map(|m| m.manifest.as_ref())
+                                    .find(|mf| mf.module.id == mv.module_id)
+                                    .and_then(|mf| {
+                                        mf.models
+                                            .iter()
+                                            .find(|d| d.id == mv.model_id)
+                                            .map(|d| (mv.model_id.clone(), d.clone()))
+                                    })
+                            })
+                            .collect();
+
+                        // 各模型各自 spawn 并发检查（JoinSet），完成后汇总
+                        let models_cfg = config.models.clone();
+                        let network = config.network.clone();
+                        let root2 = root.clone();
+                        let tx2 = tx.clone();
+                        tokio::spawn(async move {
+                            let mut set = tokio::task::JoinSet::new();
+                            for (model_id, decl) in decls {
+                                let models_cfg = models_cfg.clone();
+                                let network = network.clone();
+                                let root2 = root2.clone();
+                                set.spawn(async move {
+                                    let mgr =
+                                        ep_core::model::ModelManager::new(&models_cfg, &root2)
+                                            .with_network(network);
+                                    let result = mgr.check_update_available(&decl).await;
+                                    (model_id, result)
+                                });
+                            }
+                            let total = set.len();
+                            let mut available = 0usize;
+                            while let Some(joined) = set.join_next().await {
+                                if let Ok((model_id, result)) = joined {
+                                    if result.available {
+                                        available += 1;
+                                    }
+                                    let _ = tx2.send(AppMsg::ModelUpdateChecked {
+                                        model_id,
+                                        result,
+                                        notify: false,
+                                    });
+                                }
+                            }
+                            let _ = tx2.send(AppMsg::UpdatesCheckSummary { total, available });
+                        });
                     }
                     Some(AppCmd::DeleteModel(target_dir)) => {
                         let dir = model_manager.model_dir(&target_dir);
@@ -321,8 +490,9 @@ async fn background_loop(
                         }
                     }
                     Some(AppCmd::RefreshModels) => {
-                        // 重新扫描模块目录并刷新模型列表
+                        // 重新扫描模块目录并刷新模型列表；同步更新 ModelManager 注册的 manifests
                         discovered = ep_core::module::discover_modules(&modules_dir);
+                        model_manager.set_manifests(manifests_from(&discovered));
                         let _ = tx.send(AppMsg::ModelsRefreshed(
                             model_manager.list_all_models(&manifests_from(&discovered)),
                         ));
