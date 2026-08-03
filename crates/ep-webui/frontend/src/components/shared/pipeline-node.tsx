@@ -34,12 +34,12 @@ interface DataTypeMeta {
 }
 
 export const DATA_TYPE_META: Record<DataType, DataTypeMeta> = {
-  audio: { label: '音频', handle: 'bg-amber-400! border-card!', chip: 'bg-amber-400' },
-  video: { label: '视频', handle: 'bg-violet-400! border-card!', chip: 'bg-violet-400' },
-  image: { label: '图像', handle: 'bg-cyan-400! border-card!', chip: 'bg-cyan-400' },
-  text: { label: '文本', handle: 'bg-sky-400! border-card!', chip: 'bg-sky-400' },
-  file: { label: '文件', handle: 'bg-zinc-400! border-card!', chip: 'bg-zinc-400' },
-  any: { label: '任意', handle: 'bg-teal-400! border-card!', chip: 'bg-teal-400' },
+  audio: { label: '音频', handle: 'bg-dtype-audio! border-card!', chip: 'bg-dtype-audio' },
+  video: { label: '视频', handle: 'bg-dtype-video! border-card!', chip: 'bg-dtype-video' },
+  image: { label: '图像', handle: 'bg-dtype-image! border-card!', chip: 'bg-dtype-image' },
+  text: { label: '文本', handle: 'bg-dtype-text! border-card!', chip: 'bg-dtype-text' },
+  file: { label: '文件', handle: 'bg-dtype-file! border-card!', chip: 'bg-dtype-file' },
+  any: { label: '任意', handle: 'bg-dtype-any! border-card!', chip: 'bg-dtype-any' },
 }
 
 /** 端口数据类型兼容规则：相同、任一为 any、或任一为 file（文件可承载任何媒体类型） */
@@ -162,7 +162,7 @@ export const BUILTIN_DEFS: Record<BuiltinKind, BuiltinDef> = {
     label: '文件输入',
     description: '从磁盘读取输入文件',
     icon: FileInput,
-    accent: 'bg-sky-500/15 text-sky-400',
+    accent: 'bg-node-file-input/15 text-node-file-input',
     inputs: [],
     outputs: [{ id: 'out', label: '输出', dataType: 'file' }],
     params: [
@@ -175,7 +175,7 @@ export const BUILTIN_DEFS: Record<BuiltinKind, BuiltinDef> = {
     label: '文件输出',
     description: '将结果写入磁盘文件',
     icon: FileOutput,
-    accent: 'bg-emerald-500/15 text-emerald-400',
+    accent: 'bg-node-file-output/15 text-node-file-output',
     inputs: [{ id: 'in', label: '输入', dataType: 'file' }],
     outputs: [],
     params: [
@@ -188,7 +188,7 @@ export const BUILTIN_DEFS: Record<BuiltinKind, BuiltinDef> = {
     label: 'FFmpeg 处理',
     description: '音视频转码 / 剪辑 / 混流',
     icon: Film,
-    accent: 'bg-orange-500/15 text-orange-400',
+    accent: 'bg-node-ffmpeg/15 text-node-ffmpeg',
     inputs: [{ id: 'in', label: '输入', dataType: 'file' }],
     outputs: [{ id: 'out', label: '输出', dataType: 'file' }],
     params: [
@@ -375,16 +375,16 @@ const CATEGORY_ICONS: Record<string, LucideIcon> = {
 }
 
 const CATEGORY_ACCENTS: Record<string, string> = {
-  asr: 'bg-amber-500/15 text-amber-400',
-  tts: 'bg-sky-500/15 text-sky-400',
-  denoise: 'bg-teal-500/15 text-teal-400',
-  ocr: 'bg-lime-500/15 text-lime-400',
-  image: 'bg-cyan-500/15 text-cyan-400',
-  video: 'bg-orange-500/15 text-orange-400',
-  audio: 'bg-rose-500/15 text-rose-400',
-  translate: 'bg-emerald-500/15 text-emerald-400',
-  llm: 'bg-violet-500/15 text-violet-400',
-  other: 'bg-zinc-500/15 text-zinc-400',
+  asr: 'bg-cat-asr/15 text-cat-asr',
+  tts: 'bg-cat-tts/15 text-cat-tts',
+  denoise: 'bg-cat-denoise/15 text-cat-denoise',
+  ocr: 'bg-cat-ocr/15 text-cat-ocr',
+  image: 'bg-cat-image/15 text-cat-image',
+  video: 'bg-cat-video/15 text-cat-video',
+  audio: 'bg-cat-audio/15 text-cat-audio',
+  translate: 'bg-cat-translate/15 text-cat-translate',
+  llm: 'bg-cat-llm/15 text-cat-llm',
+  other: 'bg-cat-other/15 text-cat-other',
 }
 
 export function categoryVisual(category: string): { icon: LucideIcon; accent: string } {
@@ -715,9 +715,9 @@ export function BuiltinNode({ data, selected }: NodeProps<BuiltinFlowNode>) {
 }
 
 const METHOD_BADGES: Record<ExternalNodeData['method'], string> = {
-  GET: 'bg-emerald-500/15 text-emerald-400',
-  POST: 'bg-amber-500/15 text-amber-400',
-  PUT: 'bg-sky-500/15 text-sky-400',
+  GET: 'bg-http-get/15 text-http-get',
+  POST: 'bg-http-post/15 text-http-post',
+  PUT: 'bg-http-put/15 text-http-put',
 }
 
 /** 外部 API 节点：展示接口地址与请求方法 */
@@ -729,7 +729,7 @@ export function ExternalApiNode({ data, selected }: NodeProps<ExternalFlowNode>)
   return (
     <NodeCard status={data.status} selected={selected}>
       <div className="flex items-center gap-2 px-3 pb-2 pt-2.5">
-        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-cyan-500/15 text-cyan-400">
+        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-node-external/15 text-node-external">
           <Globe className="h-4 w-4" />
         </span>
         <div className="min-w-0 flex-1">

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { DragEvent } from 'react'
-import { CircleAlert, Globe, GripVertical, RefreshCw, Search, Wrench } from 'lucide-react'
+import type { DragEvent, KeyboardEvent } from 'react'
+import { CircleAlert, Globe, GripVertical, RefreshCw, Search, Wrench, X } from 'lucide-react'
 import { api } from '@/api/client'
 import type { ModuleResponse } from '@/api/types'
 import { categoryLabel, statusMeta } from '@/lib/constants'
@@ -23,14 +23,34 @@ interface PaletteItemProps {
   accent: string
   trailing?: React.ReactNode
   payload: DragPayload
+  onAdd: (payload: DragPayload) => void
 }
 
-function PaletteItem({ icon, title, subtitle, accent, trailing, payload }: PaletteItemProps) {
+function PaletteItem({
+  icon,
+  title,
+  subtitle,
+  accent,
+  trailing,
+  payload,
+  onAdd,
+}: PaletteItemProps) {
+  const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault()
+      onAdd(payload)
+    }
+  }
   return (
     <div
       draggable
+      role="button"
+      tabIndex={0}
+      aria-label={`添加节点：${title}`}
       onDragStart={(e) => startDrag(e, payload)}
-      title="拖拽到右侧画布以添加节点"
+      onClick={() => onAdd(payload)}
+      onKeyDown={handleKeyDown}
+      title="点击或拖拽到画布以添加节点"
       className="group flex cursor-grab items-center gap-2.5 rounded-md border border-transparent px-2 py-1.5 transition-all duration-150 hover:border-border hover:bg-accent active:cursor-grabbing active:scale-[0.98]"
     >
       <span
@@ -67,8 +87,17 @@ function SectionTitle({ children, count }: { children: React.ReactNode; count?: 
   )
 }
 
-/** 管线节点库：内置节点 + 按分类分组的模块（可拖入画布） */
-export function PipelineSidebar() {
+interface PipelineSidebarProps {
+  /** 点击（或键盘确认）节点库项时添加节点到画布 */
+  onAdd: (payload: DragPayload) => void
+  /** 提供时在头部显示关闭按钮（窄屏抽屉模式） */
+  onClose?: () => void
+  /** 附加布局类（窄屏 overlay 定位等） */
+  className?: string
+}
+
+/** 管线节点库：内置节点 + 按分类分组的模块（可点击 / 拖入画布） */
+export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarProps) {
   const [modules, setModules] = useState<ModuleResponse[] | null>(null)
   const [failed, setFailed] = useState(false)
   const [filter, setFilter] = useState('')
@@ -122,19 +151,36 @@ export function PipelineSidebar() {
     !query || '外部 api external http 接口'.includes(query) || 'api'.includes(query)
 
   return (
-    <aside className="flex w-60 shrink-0 flex-col border-r border-border bg-card">
+    <aside
+      className={cn('flex h-full w-60 shrink-0 flex-col border-r border-border bg-card', className)}
+    >
       <div className="shrink-0 space-y-2.5 border-b border-border p-3">
         <div className="flex items-center justify-between">
           <span className="text-sm font-semibold">节点库</span>
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            onClick={load}
-            title="刷新模块列表"
-            aria-label="刷新模块列表"
-          >
-            <RefreshCw className={cn('h-3 w-3', modules === null && !failed && 'animate-spin')} />
-          </Button>
+          <div className="flex items-center gap-1">
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              onClick={load}
+              title="刷新模块列表"
+              aria-label="刷新模块列表"
+            >
+              <RefreshCw
+                className={cn('h-3 w-3', modules === null && !failed && 'animate-spin')}
+              />
+            </Button>
+            {onClose && (
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                onClick={onClose}
+                title="关闭节点库"
+                aria-label="关闭节点库"
+              >
+                <X className="h-3 w-3" />
+              </Button>
+            )}
+          </div>
         </div>
         <div className="relative">
           <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
@@ -160,6 +206,7 @@ export function PipelineSidebar() {
                 subtitle={b.description}
                 accent={b.accent}
                 payload={{ nodeType: 'builtin', builtin: b.kind }}
+                onAdd={onAdd}
               />
             ))}
             {externalVisible && (
@@ -167,8 +214,9 @@ export function PipelineSidebar() {
                 icon={<Globe className="h-4 w-4" />}
                 title="外部 API"
                 subtitle="调用外部 HTTP 接口"
-                accent="bg-cyan-500/15 text-cyan-400"
+                accent="bg-node-external/15 text-node-external"
                 payload={{ nodeType: 'external' }}
+                onAdd={onAdd}
               />
             )}
           </div>
@@ -237,6 +285,7 @@ export function PipelineSidebar() {
                         moduleVersion: m.version,
                         category: m.category,
                       }}
+                      onAdd={onAdd}
                     />
                   )
                 })}
@@ -247,7 +296,7 @@ export function PipelineSidebar() {
       </ScrollArea>
 
       <div className="shrink-0 border-t border-border px-3 py-2.5 text-[11px] text-muted-foreground">
-        拖拽节点到右侧画布以添加
+        点击或拖拽节点到画布以添加
       </div>
     </aside>
   )

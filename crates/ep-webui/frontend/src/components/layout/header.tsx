@@ -1,4 +1,4 @@
-import { LoaderCircle, Moon, Sun, Wifi, WifiOff } from 'lucide-react'
+import { LoaderCircle, Menu, Moon, Sun, Wifi, WifiOff } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { useThemeStore } from '@/store/theme'
 import { useWsState } from '@/hooks/use-ws-state'
@@ -44,12 +44,27 @@ function WsIndicator() {
   )
 }
 
-export function Header() {
+interface HeaderProps {
+  /** 点击汉堡按钮时打开移动端导航抽屉 */
+  onMenuClick: () => void
+}
+
+export function Header({ onMenuClick }: HeaderProps) {
   const theme = useThemeStore((s) => s.theme)
   const toggle = useThemeStore((s) => s.toggle)
   return (
     <header className="flex h-14 shrink-0 items-center justify-between border-b border-border bg-card px-4">
       <div className="flex items-center gap-2">
+        <Button
+          variant="ghost"
+          size="icon"
+          className="lg:hidden"
+          onClick={onMenuClick}
+          aria-label="打开导航菜单"
+          title="打开导航菜单"
+        >
+          <Menu className="h-4 w-4" />
+        </Button>
         <span className="text-base font-semibold tracking-tight">
           EntryPoint
         </span>
