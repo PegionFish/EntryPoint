@@ -1,12 +1,15 @@
 //! 仪表盘 — 统计概览、依赖检测、计算设备、模块状态一览。
 
 use eframe::egui;
+use ep_core::config::AppConfig;
 use ep_core::types::{ComputeDevice, ServiceStatus};
 
 use crate::app::ModuleEntry;
+use crate::i18n::tr;
+use crate::pages::modules::{category_label, service_label};
 use crate::ui::{
     badge, card, card_grid, empty_state, page_header, responsive_columns, section_title,
-    service_status, status_badge, Palette,
+    service_status, Palette,
 };
 
 /// 页面内容四周的留白（px）
@@ -18,10 +21,12 @@ const SECTION_GAP: f32 = 20.0;
 
 pub fn show(
     ui: &mut egui::Ui,
+    config: &AppConfig,
     devices: &[ComputeDevice],
     modules: &[ModuleEntry],
     dep_report: Option<&ep_core::deps::DepReport>,
 ) {
+    let lang = ep_core::i18n::normalize_language(&config.general.language);
     let pal = Palette::new(ui.style().visuals.dark_mode);
 
     egui::ScrollArea::vertical().show(ui, |ui| {
@@ -29,19 +34,19 @@ pub fn show(
         ui.horizontal(|ui| {
             ui.add_space(PAGE_MARGIN);
             ui.vertical(|ui| {
-                page_header(ui, "仪表盘", |_| {});
+                page_header(ui, &tr(lang, "desktopPages.dashboard.title", &[]), |_| {});
                 ui.add_space(12.0);
 
-                stats_section(ui, &pal, devices, modules);
+                stats_section(ui, lang, &pal, devices, modules);
                 ui.add_space(SECTION_GAP);
 
-                dep_section(ui, &pal, dep_report);
+                dep_section(ui, lang, &pal, dep_report);
                 ui.add_space(SECTION_GAP);
 
-                device_section(ui, &pal, devices);
+                device_section(ui, lang, &pal, devices);
                 ui.add_space(SECTION_GAP);
 
-                module_section(ui, &pal, modules);
+                module_section(ui, lang, &pal, modules);
                 ui.add_space(8.0);
             });
             ui.add_space(PAGE_MARGIN);
@@ -53,13 +58,14 @@ pub fn show(
 // ─── 统计卡片 ────────────────────────────────────────────────────────────────
 
 struct StatCard {
-    label: &'static str,
+    label: String,
     value: String,
     color: egui::Color32,
 }
 
 fn stats_section(
     ui: &mut egui::Ui,
+    lang: &str,
     pal: &Palette,
     devices: &[ComputeDevice],
     modules: &[ModuleEntry],
@@ -72,22 +78,22 @@ fn stats_section(
 
     let stats = [
         StatCard {
-            label: "设备",
+            label: tr(lang, "desktopPages.dashboard.stat.devices", &[]),
             value: devices.len().to_string(),
             color: pal.text,
         },
         StatCard {
-            label: "模块",
+            label: tr(lang, "desktopPages.dashboard.stat.modules", &[]),
             value: modules.len().to_string(),
             color: pal.text,
         },
         StatCard {
-            label: "运行中",
+            label: tr(lang, "desktopPages.dashboard.stat.running", &[]),
             value: running.to_string(),
             color: if running > 0 { pal.success } else { pal.text },
         },
         StatCard {
-            label: "错误",
+            label: tr(lang, "desktopPages.dashboard.stat.errors", &[]),
             value: errors.to_string(),
             color: if errors > 0 { pal.danger } else { pal.text },
         },
@@ -105,7 +111,7 @@ fn stats_section(
                         .color(s.color),
                 );
                 ui.add_space(2.0);
-                ui.label(egui::RichText::new(s.label).color(pal.text_dim));
+                ui.label(egui::RichText::new(s.label.as_str()).color(pal.text_dim));
                 ui.add_space(6.0);
             });
         });
@@ -116,14 +122,15 @@ fn stats_section(
 
 fn dep_section(
     ui: &mut egui::Ui,
+    lang: &str,
     pal: &Palette,
     report: Option<&ep_core::deps::DepReport>,
 ) {
-    section_title(ui, "依赖检测");
+    section_title(ui, &tr(lang, "desktopPages.dashboard.deps.title", &[]));
     ui.add_space(8.0);
 
     let Some(report) = report else {
-        ui.label(egui::RichText::new("正在检测…").color(pal.text_dim));
+        ui.label(egui::RichText::new(tr(lang, "desktopPages.dashboard.deps.checking", &[])).color(pal.text_dim));
         return;
     };
 
@@ -138,6 +145,7 @@ fn dep_section(
         }
         dep_row(
             ui,
+            lang,
             pal,
             report.ffmpeg.available,
             &ffmpeg_detail,
@@ -149,9 +157,13 @@ fn dep_section(
             ui.add_space(8.0);
             let detail = match &tc.torch_version {
                 Some(v) => format!("{} · torch {v}", tc.module_id),
-                None => format!("{} · torch 未安装", tc.module_id),
+                None => format!(
+                    "{} · {}",
+                    tc.module_id,
+                    tr(lang, "desktopPages.dashboard.deps.torchNotInstalled", &[])
+                ),
             };
-            dep_row(ui, pal, tc.cuda_available, &detail, tc.guidance.as_deref());
+            dep_row(ui, lang, pal, tc.cuda_available, &detail, tc.guidance.as_deref());
         }
     });
 }
@@ -159,6 +171,7 @@ fn dep_section(
 /// 单行依赖状态：可用/缺失徽章 + mono 详情 + 弱化指引
 fn dep_row(
     ui: &mut egui::Ui,
+    lang: &str,
     pal: &Palette,
     ok: bool,
     detail: &str,
@@ -167,9 +180,9 @@ fn dep_row(
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
         if ok {
-            badge(ui, pal, pal.success, "可用");
+            badge(ui, pal, pal.success, tr(lang, "desktopPages.dashboard.deps.available", &[]));
         } else {
-            badge(ui, pal, pal.danger, "缺失");
+            badge(ui, pal, pal.danger, tr(lang, "common.status.missing", &[]));
         }
         ui.label(
             egui::RichText::new(detail)
@@ -185,8 +198,8 @@ fn dep_row(
 
 // ─── 计算设备 ────────────────────────────────────────────────────────────────
 
-fn device_section(ui: &mut egui::Ui, pal: &Palette, devices: &[ComputeDevice]) {
-    section_title(ui, "计算设备");
+fn device_section(ui: &mut egui::Ui, lang: &str, pal: &Palette, devices: &[ComputeDevice]) {
+    section_title(ui, &tr(lang, "desktopPages.dashboard.devices.title", &[]));
     ui.add_space(8.0);
 
     if devices.is_empty() {
@@ -194,8 +207,8 @@ fn device_section(ui: &mut egui::Ui, pal: &Palette, devices: &[ComputeDevice]) {
             ui,
             pal,
             "🖥️",
-            "未检测到计算设备",
-            "请确认 GPU 驱动已正确安装",
+            &tr(lang, "desktopPages.dashboard.devices.empty.title", &[]),
+            &tr(lang, "desktopPages.dashboard.devices.empty.hint", &[]),
         );
         return;
     }
@@ -235,10 +248,20 @@ fn device_section(ui: &mut egui::Ui, pal: &Palette, devices: &[ComputeDevice]) {
             // 利用率 / 温度
             let mut meta: Vec<String> = Vec::new();
             if let Some(u) = dev.utilization {
-                meta.push(format!("利用率 {u}%"));
+                let value = u.to_string();
+                meta.push(tr(
+                    lang,
+                    "desktopPages.dashboard.devices.utilization",
+                    &[("value", &value)],
+                ));
             }
             if let Some(t) = dev.temperature {
-                meta.push(format!("温度 {t}°C"));
+                let value = t.to_string();
+                meta.push(tr(
+                    lang,
+                    "desktopPages.dashboard.devices.temperature",
+                    &[("value", &value)],
+                ));
             }
             if !meta.is_empty() {
                 ui.add_space(4.0);
@@ -250,8 +273,8 @@ fn device_section(ui: &mut egui::Ui, pal: &Palette, devices: &[ComputeDevice]) {
 
 // ─── 模块状态概览 ────────────────────────────────────────────────────────────
 
-fn module_section(ui: &mut egui::Ui, pal: &Palette, modules: &[ModuleEntry]) {
-    section_title(ui, "模块状态概览");
+fn module_section(ui: &mut egui::Ui, lang: &str, pal: &Palette, modules: &[ModuleEntry]) {
+    section_title(ui, &tr(lang, "desktopPages.dashboard.modules.title", &[]));
     ui.add_space(8.0);
 
     if modules.is_empty() {
@@ -259,11 +282,19 @@ fn module_section(ui: &mut egui::Ui, pal: &Palette, modules: &[ModuleEntry]) {
             ui,
             pal,
             "🧩",
-            "未发现模块",
-            "请检查 modules/ 目录后重新扫描",
+            &tr(lang, "desktopPages.dashboard.modules.empty.title", &[]),
+            &tr(lang, "desktopPages.dashboard.modules.empty.hint", &[]),
         );
         return;
     }
+
+    let headers = [
+        tr(lang, "desktopPages.dashboard.col.name", &[]),
+        tr(lang, "desktopPages.dashboard.col.category", &[]),
+        tr(lang, "desktopPages.dashboard.col.status", &[]),
+        tr(lang, "desktopPages.dashboard.col.device", &[]),
+        tr(lang, "desktopPages.dashboard.col.port", &[]),
+    ];
 
     egui::ScrollArea::horizontal().show(ui, |ui| {
         egui::Grid::new("dashboard_modules")
@@ -271,15 +302,16 @@ fn module_section(ui: &mut egui::Ui, pal: &Palette, modules: &[ModuleEntry]) {
             .min_col_width(64.0)
             .spacing([18.0, 8.0])
             .show(ui, |ui| {
-                for head in ["名称", "类别", "状态", "设备", "端口"] {
-                    ui.strong(head);
+                for head in &headers {
+                    ui.strong(head.as_str());
                 }
                 ui.end_row();
 
                 for m in modules {
                     ui.label(&m.name);
-                    ui.label(m.category.to_string());
-                    status_badge(ui, pal, service_status(&m.status, pal));
+                    ui.label(category_label(lang, &m.category));
+                    let meta = service_status(&m.status, pal);
+                    badge(ui, pal, meta.color, service_label(lang, &m.status));
                     ui.label(
                         egui::RichText::new(m.device.as_deref().unwrap_or("-")).monospace(),
                     );

@@ -1,11 +1,14 @@
 //! 管线编辑器 — 加载 / 校验 / 可视化管线 TOML 的节点画布。
 //!
 //! 配色统一来自 [`crate::ui::Palette`]（节点类型色除外），深浅主题均可用。
+//! 用户可见文案经 [`crate::i18n::tr`] 查找，语言取自 `config.general.language`。
 
 use eframe::egui;
+use ep_core::config::AppConfig;
 use ep_core::pipeline::dag::{NodeKind, Pipeline, ValidationError};
 use std::collections::HashMap;
 
+use crate::i18n::tr;
 use crate::ui::{badge, empty_state, primary_button, subtle_button, Palette};
 
 const NODE_W: f32 = 160.0;
@@ -33,6 +36,8 @@ struct VizState {
     file_path: String,
     pipeline: Option<Pipeline>,
     validation_msg: Option<String>,
+    /// 最近一次验证是否通过（决定状态栏颜色；文案本身已本地化，不能靠前缀匹配）
+    validation_ok: bool,
     positions: HashMap<String, egui::Pos2>,
     selected: Option<String>,
     offset: egui::Vec2,
@@ -45,6 +50,7 @@ impl Default for VizState {
             file_path: String::new(),
             pipeline: None,
             validation_msg: None,
+            validation_ok: false,
             positions: HashMap::new(),
             selected: None,
             offset: egui::Vec2::ZERO,
@@ -59,7 +65,8 @@ fn sid() -> egui::Id {
 
 // ── Page entry ────────────────────────────────────────────────────
 
-pub fn show(ui: &mut egui::Ui) {
+pub fn show(ui: &mut egui::Ui, config: &AppConfig) {
+    let lang = ep_core::i18n::normalize_language(&config.general.language);
     let pal = Palette::new(ui.style().visuals.dark_mode);
     let mut st = ui.data(|d| d.get_temp::<VizState>(sid())).unwrap_or_default();
 
@@ -68,38 +75,60 @@ pub fn show(ui: &mut egui::Ui) {
 
     // Toolbar
     ui.horizontal(|ui| {
-        ui.label("管线文件:");
+        ui.label(format!("{}:", tr(lang, "desktopApp.pipeline.fileLabel", &[])));
         let path_w = (ui.available_width() - 430.0).clamp(140.0, 320.0);
         ui.add(egui::TextEdit::singleline(&mut st.file_path).desired_width(path_w));
-        if ui.add(primary_button(&pal, "加载 TOML")).clicked() {
-            load_pipeline(&mut st);
-        }
-        if ui.add(subtle_button(&pal, "验证")).clicked() {
-            validate_pipeline(&mut st);
-        }
         if ui
-            .add(subtle_button(&pal, "保存 TOML"))
-            .on_hover_text("尚未支持")
+            .add(primary_button(&pal, tr(lang, "desktopApp.pipeline.loadToml", &[])))
             .clicked()
         {
-            st.validation_msg = Some("保存功能尚未实现（缺少 toml 序列化依赖）".into());
+            load_pipeline(&mut st, lang);
+        }
+        if ui
+            .add(subtle_button(&pal, tr(lang, "desktopApp.pipeline.validate", &[])))
+            .clicked()
+        {
+            validate_pipeline(&mut st, lang);
+        }
+        if ui
+            .add(subtle_button(&pal, tr(lang, "desktopApp.pipeline.saveToml", &[])))
+            .on_hover_text(tr(lang, "desktopApp.pipeline.saveTomlTip", &[]))
+            .clicked()
+        {
+            st.validation_msg = Some(tr(lang, "desktopApp.pipeline.saveNotImplemented", &[]));
+            st.validation_ok = false;
         }
         if let Some(ref p) = st.pipeline {
             ui.separator();
-            ui.strong(format!("管线: {}", p.name));
+            ui.strong(tr(
+                lang,
+                "desktopApp.pipeline.pipelineName",
+                &[("name", p.name.as_str())],
+            ));
         }
 
         // 右侧：视图缩放控件
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.add(subtle_button(&pal, "−")).on_hover_text("缩小").clicked() {
+            if ui
+                .add(subtle_button(&pal, "−"))
+                .on_hover_text(tr(lang, "desktopApp.pipeline.zoomOut", &[]))
+                .clicked()
+            {
                 st.zoom = (st.zoom / ZOOM_STEP).clamp(ZOOM_MIN, ZOOM_MAX);
             }
-            if ui.add(subtle_button(&pal, "＋")).on_hover_text("放大").clicked() {
+            if ui
+                .add(subtle_button(&pal, "＋"))
+                .on_hover_text(tr(lang, "desktopApp.pipeline.zoomIn", &[]))
+                .clicked()
+            {
                 st.zoom = (st.zoom * ZOOM_STEP).clamp(ZOOM_MIN, ZOOM_MAX);
             }
             if ui
-                .add(subtle_button(&pal, "⤢ 适配"))
-                .on_hover_text("缩放至完整显示所有节点")
+                .add(subtle_button(
+                    &pal,
+                    format!("⤢ {}", tr(lang, "desktopApp.pipeline.fit", &[])),
+                ))
+                .on_hover_text(tr(lang, "desktopApp.pipeline.fitTip", &[]))
                 .clicked()
             {
                 do_fit = true;
@@ -118,15 +147,15 @@ pub fn show(ui: &mut egui::Ui) {
             ui,
             &pal,
             "🧩",
-            "尚未加载管线",
-            "加载管线 TOML 文件以查看可视化节点图",
+            &tr(lang, "desktopApp.pipeline.emptyTitle", &[]),
+            &tr(lang, "desktopApp.pipeline.emptyHint", &[]),
         );
     } else {
         let pipeline = st.pipeline.clone().unwrap();
         if st.positions.is_empty() && !pipeline.nodes.is_empty() {
             st.positions = compute_layout(&pipeline);
         }
-        let canvas_size = draw_main(ui, &pal, &mut st, &pipeline);
+        let canvas_size = draw_main(ui, lang, &pal, &mut st, &pipeline);
         if do_fit {
             apply_fit(&mut st, canvas_size);
         }
@@ -135,14 +164,14 @@ pub fn show(ui: &mut egui::Ui) {
     // Status bar
     ui.separator();
     match &st.validation_msg {
-        Some(msg) if msg.starts_with("验证通过") => {
+        Some(msg) if st.validation_ok => {
             ui.colored_label(pal.success, msg.as_str());
         }
         Some(msg) => {
             ui.colored_label(pal.danger, msg.as_str());
         }
         None => {
-            ui.colored_label(pal.text_dim, "状态: 就绪");
+            ui.colored_label(pal.text_dim, tr(lang, "desktopApp.pipeline.statusReady", &[]));
         }
     }
 
@@ -155,6 +184,7 @@ pub fn show(ui: &mut egui::Ui) {
 /// 绘制主区域，返回画布实际尺寸（供"适配视图"使用）。
 fn draw_main(
     ui: &mut egui::Ui,
+    lang: &str,
     pal: &Palette,
     st: &mut VizState,
     pipeline: &Pipeline,
@@ -170,7 +200,7 @@ fn draw_main(
     let canvas_size = egui::vec2(canvas_w, canvas_h);
 
     if narrow {
-        draw_canvas(ui, pal, st, pipeline, canvas_size);
+        draw_canvas(ui, lang, pal, st, pipeline, canvas_size);
         return canvas_size;
     }
 
@@ -179,16 +209,16 @@ fn draw_main(
         ui.vertical(|ui| {
             ui.set_width(left_w);
             ui.set_min_height(canvas_h);
-            ui.strong("节点面板");
+            ui.strong(tr(lang, "desktopApp.pipeline.nodePanel", &[]));
             ui.separator();
-            badge(ui, pal, pal.primary, "模块");
+            badge(ui, pal, pal.primary, tr(lang, "common.label.module", &[]));
             ui.add_space(4.0);
-            badge(ui, pal, NODE_COLOR_BUILTIN, "内置");
+            badge(ui, pal, NODE_COLOR_BUILTIN, tr(lang, "desktopApp.pipeline.kindBuiltin", &[]));
             ui.add_space(4.0);
             badge(ui, pal, NODE_COLOR_API, "API");
             ui.add_space(12.0);
             ui.label(
-                egui::RichText::new("点击节点查看详情\n拖拽移动节点\n滚轮缩放画布\n中键拖拽平移")
+                egui::RichText::new(tr(lang, "desktopApp.pipeline.helpText", &[]))
                     .small()
                     .color(pal.text_faint),
             );
@@ -197,7 +227,7 @@ fn draw_main(
         ui.separator();
 
         // Center – node canvas
-        draw_canvas(ui, pal, st, pipeline, canvas_size);
+        draw_canvas(ui, lang, pal, st, pipeline, canvas_size);
 
         ui.separator();
 
@@ -205,9 +235,9 @@ fn draw_main(
         ui.vertical(|ui| {
             ui.set_width(right_w);
             ui.set_min_height(canvas_h);
-            ui.strong("参数面板");
+            ui.strong(tr(lang, "desktopApp.pipeline.paramsPanel", &[]));
             ui.separator();
-            draw_params(ui, pal, pipeline, st.selected.as_deref());
+            draw_params(ui, lang, pal, pipeline, st.selected.as_deref());
         });
     });
 
@@ -218,6 +248,7 @@ fn draw_main(
 
 fn draw_canvas(
     ui: &mut egui::Ui,
+    lang: &str,
     pal: &Palette,
     st: &mut VizState,
     pipeline: &Pipeline,
@@ -271,36 +302,52 @@ fn draw_canvas(
     for node in &pipeline.nodes {
         if let Some(&npos) = st.positions.get(&node.id) {
             let sel = st.selected.as_deref() == Some(node.id.as_str());
-            draw_node(&painter, pal, node, npos, origin, st.offset, st.zoom, sel);
+            draw_node(&painter, lang, pal, node, npos, origin, st.offset, st.zoom, sel);
         }
     }
 }
 
 // ── Right panel: node parameters ──────────────────────────────────
 
-fn draw_params(ui: &mut egui::Ui, pal: &Palette, pipeline: &Pipeline, selected: Option<&str>) {
+fn draw_params(
+    ui: &mut egui::Ui,
+    lang: &str,
+    pal: &Palette,
+    pipeline: &Pipeline,
+    selected: Option<&str>,
+) {
     let Some(node) = selected.and_then(|id| pipeline.nodes.iter().find(|n| n.id == id)) else {
-        ui.label(egui::RichText::new("点击节点查看参数").color(pal.text_faint));
+        ui.label(
+            egui::RichText::new(tr(lang, "desktopApp.pipeline.clickNodeHint", &[]))
+                .color(pal.text_faint),
+        );
         return;
     };
 
     kv_row(ui, pal, "ID", &node.id);
-    let (kind_str, detail) = node_kind_info(&node.kind);
-    kv_row(ui, pal, "类型", kind_str);
+    let (kind_str, detail) = node_kind_info(lang, &node.kind);
+    kv_row(ui, pal, &tr(lang, "common.label.type", &[]), &kind_str);
     if !node.label.is_empty() {
-        kv_row(ui, pal, "标签", &node.label);
+        kv_row(ui, pal, &tr(lang, "desktopApp.pipeline.paramLabel", &[]), &node.label);
     }
-    kv_row(ui, pal, "详情", &detail);
+    kv_row(ui, pal, &tr(lang, "common.label.details", &[]), &detail);
     if let Some(t) = node.timeout_secs {
-        kv_row(ui, pal, "超时", &format!("{t}s"));
+        kv_row(ui, pal, &tr(lang, "desktopApp.pipeline.paramTimeout", &[]), &format!("{t}s"));
     }
     if let Some(r) = node.retry_count {
-        kv_row(ui, pal, "重试", &r.to_string());
+        kv_row(ui, pal, &tr(lang, "desktopApp.pipeline.paramRetry", &[]), &r.to_string());
     }
     if let Some(obj) = node.params.as_object() {
         if !obj.is_empty() {
             ui.add_space(4.0);
-            ui.label(egui::RichText::new("参数:").strong().color(pal.text_dim));
+            ui.label(
+                egui::RichText::new(format!(
+                    "{}:",
+                    tr(lang, "desktopApp.pipeline.params", &[])
+                ))
+                .strong()
+                .color(pal.text_dim),
+            );
             for (k, v) in obj {
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
@@ -479,7 +526,7 @@ fn draw_edges(
             let t = i as f32 / STEPS as f32;
             let u = 1.0 - t;
             let pt = egui::pos2(
-                u * u * u * p0.x + 3.0 * u * u * t * p1.x + 3.0 * u * t * t * p2.x + t * t * t * p3.x,
+                u * u * u * p0.x + 3.0 * u * u * t * p1.x + 3.0 * u * u * t * p2.x + t * t * t * p3.x,
                 u * u * u * p0.y + 3.0 * u * u * t * p1.y + 3.0 * u * t * t * p2.y + t * t * t * p3.y,
             );
             painter.line_segment([prev, pt], stroke);
@@ -495,6 +542,7 @@ fn draw_edges(
 #[allow(clippy::too_many_arguments)]
 fn draw_node(
     painter: &egui::Painter,
+    lang: &str,
     pal: &Palette,
     node: &ep_core::pipeline::dag::PipelineNode,
     canvas_pos: egui::Pos2,
@@ -535,7 +583,7 @@ fn draw_node(
     );
 
     // Kind tag in body
-    let (kind_str, _) = node_kind_info(&node.kind);
+    let (kind_str, _) = node_kind_info(lang, &node.kind);
     painter.text(
         egui::pos2(tl.x + 8.0 * zoom, tl.y + title_h + (h - title_h) * 0.5),
         egui::Align2::LEFT_CENTER,
@@ -562,52 +610,62 @@ fn draw_node(
 
 // ── Actions ───────────────────────────────────────────────────────
 
-fn load_pipeline(st: &mut VizState) {
+fn load_pipeline(st: &mut VizState, lang: &str) {
     let path = std::path::Path::new(&st.file_path);
     match Pipeline::from_toml(path) {
         Ok(pipeline) => {
-            let msg = match pipeline.validate() {
-                Ok(()) => "验证通过".to_string(),
-                Err(errors) => format_errors(&errors),
+            let (msg, ok) = match pipeline.validate() {
+                Ok(()) => (tr(lang, "desktopApp.pipeline.validationPassed", &[]), true),
+                Err(errors) => (format_errors(&errors), false),
             };
             st.positions.clear();
             st.selected = None;
             st.offset = egui::Vec2::ZERO;
             st.zoom = 1.0;
             st.validation_msg = Some(msg);
+            st.validation_ok = ok;
             st.pipeline = Some(pipeline);
         }
         Err(e) => {
-            st.validation_msg = Some(format!("加载失败: {e}"));
+            st.validation_msg = Some(tr(
+                lang,
+                "desktopApp.pipeline.loadFailed",
+                &[("detail", &e.to_string())],
+            ));
+            st.validation_ok = false;
             st.pipeline = None;
         }
     }
 }
 
-fn validate_pipeline(st: &mut VizState) {
+fn validate_pipeline(st: &mut VizState, lang: &str) {
     match &st.pipeline {
         Some(p) => {
-            st.validation_msg = Some(match p.validate() {
-                Ok(()) => "验证通过".to_string(),
-                Err(errors) => format_errors(&errors),
-            });
+            let (msg, ok) = match p.validate() {
+                Ok(()) => (tr(lang, "desktopApp.pipeline.validationPassed", &[]), true),
+                Err(errors) => (format_errors(&errors), false),
+            };
+            st.validation_msg = Some(msg);
+            st.validation_ok = ok;
         }
         None => {
-            st.validation_msg = Some("请先加载管线文件".into());
+            st.validation_msg = Some(tr(lang, "desktopApp.pipeline.loadFileFirst", &[]));
+            st.validation_ok = false;
         }
     }
 }
 
 // ── Helpers (kept from original) ──────────────────────────────────
 
-fn node_kind_info(kind: &NodeKind) -> (&'static str, String) {
+/// 节点类型 → (本地化类型名, 详情)。详情内容为模块/模型 ID 与端点等数据，不翻译。
+fn node_kind_info(lang: &str, kind: &NodeKind) -> (String, String) {
     match kind {
         NodeKind::Module {
             module_id,
             capability,
             model_id,
         } => (
-            "模块",
+            tr(lang, "common.label.module", &[]),
             format!(
                 "{}::{}{}",
                 module_id,
@@ -618,10 +676,12 @@ fn node_kind_info(kind: &NodeKind) -> (&'static str, String) {
                     .unwrap_or_default()
             ),
         ),
-        NodeKind::Builtin { builtin } => ("内置", builtin.clone()),
+        NodeKind::Builtin { builtin } => {
+            (tr(lang, "desktopApp.pipeline.kindBuiltin", &[]), builtin.clone())
+        }
         NodeKind::ExternalApi {
             endpoint, api_type, ..
-        } => ("API", format!("{api_type}: {endpoint}")),
+        } => ("API".to_string(), format!("{api_type}: {endpoint}")),
     }
 }
 

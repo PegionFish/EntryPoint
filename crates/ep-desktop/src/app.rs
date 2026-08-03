@@ -8,6 +8,7 @@ use ep_core::module::{DiscoveredModule, ModelSource};
 use ep_core::pipeline::runner::TaskSummary;
 use ep_core::types::{ComputeDevice, ServiceStatus};
 
+use crate::i18n::tr;
 use crate::pages;
 use crate::theme;
 use crate::toast::ToastManager;
@@ -103,7 +104,8 @@ pub struct ModuleEntry {
 }
 
 impl ModuleEntry {
-    pub fn from_discovered(dm: &DiscoveredModule) -> Self {
+    /// `lang`：清单加载失败的兜底描述按当前界面语言本地化（其余字段为清单数据，不翻译）。
+    pub fn from_discovered(dm: &DiscoveredModule, lang: &str) -> Self {
         match &dm.manifest {
             Some(mf) => Self {
                 id: mf.module.id.clone(),
@@ -127,7 +129,7 @@ impl ModuleEntry {
                     id: id.clone(),
                     name: id.clone(),
                     version: "?".into(),
-                    description: "manifest 加载失败".into(),
+                    description: tr(lang, "desktopApp.module.manifestLoadFailed", &[]),
                     category: ep_core::types::ModuleCategory::Custom,
                     status: ServiceStatus::NotReady,
                     device: None,
@@ -159,13 +161,14 @@ pub enum Page {
     Settings,
 }
 
+/// (页面, 图标, 标题文案的 i18n 键) — 文案渲染时按当前语言查表
 const NAV_ITEMS: &[(Page, &str, &str)] = &[
-    (Page::Dashboard, "📊", "仪表盘"),
-    (Page::Modules, "🧩", "模块"),
-    (Page::Models, "📦", "模型"),
-    (Page::PipelineEditor, "🔗", "管线"),
-    (Page::Tasks, "📋", "任务"),
-    (Page::Settings, "⚙", "设置"),
+    (Page::Dashboard, "📊", "desktopApp.nav.dashboard"),
+    (Page::Modules, "🧩", "desktopApp.nav.modules"),
+    (Page::Models, "📦", "desktopApp.nav.models"),
+    (Page::PipelineEditor, "🔗", "desktopApp.nav.pipeline"),
+    (Page::Tasks, "📋", "desktopApp.nav.tasks"),
+    (Page::Settings, "⚙", "desktopApp.nav.settings"),
 ];
 
 /// 侧栏导航行高
@@ -264,14 +267,24 @@ impl App {
         }
     }
 
+    /// 当前界面语言（归一化）。每帧/每次消息处理从 config 现读，
+    /// 设置页切换语言后下一帧即生效。
+    pub fn lang(&self) -> &'static str {
+        ep_core::i18n::normalize_language(&self.state.config.general.language)
+    }
+
     fn process_messages(&mut self) {
+        let lang = self.lang();
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 AppMsg::DevicesRefreshed(devs) => {
                     self.state.devices = devs;
                 }
                 AppMsg::ModulesDiscovered(dms) => {
-                    self.state.modules = dms.iter().map(ModuleEntry::from_discovered).collect();
+                    self.state.modules = dms
+                        .iter()
+                        .map(|dm| ModuleEntry::from_discovered(dm, lang))
+                        .collect();
                 }
                 AppMsg::ModuleStarted(id, port, device) => {
                     if let Some(m) = self.state.modules.iter_mut().find(|m| m.id == id) {
@@ -280,7 +293,8 @@ impl App {
                         m.device = Some(device);
                         m.started_at = Some(std::time::Instant::now());
                     }
-                    self.toasts.success(format!("模块 {id} 已启动"));
+                    self.toasts
+                        .success(tr(lang, "desktopApp.toast.moduleStarted", &[("id", &id)]));
                 }
                 AppMsg::ModuleStopped(id) => {
                     if let Some(m) = self.state.modules.iter_mut().find(|m| m.id == id) {
@@ -289,7 +303,8 @@ impl App {
                         m.device = None;
                         m.started_at = None;
                     }
-                    self.toasts.info(format!("模块 {id} 已停止"));
+                    self.toasts
+                        .info(tr(lang, "desktopApp.toast.moduleStopped", &[("id", &id)]));
                 }
                 AppMsg::ModuleStatusUpdate(id, status) => {
                     if let Some(m) = self.state.modules.iter_mut().find(|m| m.id == id) {
@@ -329,7 +344,11 @@ impl App {
                     // 清理该模型的下载进度状态
                     self.state.downloads.remove(&model_id);
                     if success {
-                        self.toasts.success(format!("模型 {model_id} 下载完成"));
+                        self.toasts.success(tr(
+                            lang,
+                            "desktopApp.toast.downloadComplete",
+                            &[("id", &model_id)],
+                        ));
                         // 清除旧的更新检查结果（刚下载完成必然最新）
                         self.state.updates.remove(&model_id);
                     }
@@ -343,25 +362,43 @@ impl App {
                     notify,
                 } => {
                     let available = result.available;
+                    // reason 为 ep-core 原始消息，按约定以本地化前缀 + 原文附加
                     let reason = result.reason.clone();
                     self.state.updates.insert(model_id.clone(), result);
                     if notify {
                         if available {
-                            self.toasts
-                                .success(format!("模型 {model_id} 有可用更新，可重新下载"));
+                            self.toasts.success(tr(
+                                lang,
+                                "desktopApp.toast.updateAvailable",
+                                &[("id", &model_id)],
+                            ));
                         } else {
-                            self.toasts.info(format!("模型 {model_id}：{reason}"));
+                            self.toasts.info(tr(
+                                lang,
+                                "desktopApp.toast.updateChecked",
+                                &[("id", &model_id), ("reason", &reason)],
+                            ));
                         }
                     }
                 }
                 AppMsg::UpdatesCheckSummary { total, available } => {
                     if total == 0 {
-                        self.toasts.info("没有可检查更新的已就绪模型");
+                        self.toasts.info(tr(lang, "desktopApp.toast.noReadyModels", &[]));
                     } else if available == 0 {
-                        self.toasts.success(format!("检查完成：{total} 个模型均为最新版本"));
+                        self.toasts.success(tr(
+                            lang,
+                            "desktopApp.toast.allUpToDate",
+                            &[("total", &total.to_string())],
+                        ));
                     } else {
-                        self.toasts
-                            .info(format!("检查完成：{available}/{total} 个模型有可用更新"));
+                        self.toasts.info(tr(
+                            lang,
+                            "desktopApp.toast.updatesFound",
+                            &[
+                                ("available", &available.to_string()),
+                                ("total", &total.to_string()),
+                            ],
+                        ));
                     }
                 }
                 AppMsg::DepReportRefreshed(report) => {
@@ -432,6 +469,7 @@ impl eframe::App for App {
             self.last_repaint = std::time::Instant::now();
         }
 
+        let lang = self.lang();
         let pal = Palette::new(self.dark_theme);
 
         // ── 响应式紧凑模式（窄窗口只显示图标） ──
@@ -474,10 +512,11 @@ impl eframe::App for App {
                 ui.separator();
                 ui.add_space(4.0);
 
-                // 导航项
-                for &(page, icon, label) in NAV_ITEMS {
+                // 导航项（文案按当前语言查表）
+                for &(page, icon, label_key) in NAV_ITEMS {
                     let active = self.current_page == page;
-                    if nav_item(ui, &pal, compact, icon, label, active).clicked() {
+                    let label = tr(lang, label_key, &[]);
+                    if nav_item(ui, &pal, compact, icon, &label, active).clicked() {
                         self.current_page = page;
                     }
                     ui.add_space(2.0);
@@ -493,11 +532,11 @@ impl eframe::App for App {
                     }
                     // 主题切换（持久化到 config/app.toml）
                     let (theme_icon, theme_label) = if self.dark_theme {
-                        ("🌙", "深色")
+                        ("🌙", tr(lang, "common.label.dark", &[]))
                     } else {
-                        ("☀️", "浅色")
+                        ("☀️", tr(lang, "common.label.light", &[]))
                     };
-                    if nav_item(ui, &pal, compact, theme_icon, theme_label, false).clicked() {
+                    if nav_item(ui, &pal, compact, theme_icon, &theme_label, false).clicked() {
                         self.dark_theme = !self.dark_theme;
                         self.state.config.general.theme = if self.dark_theme {
                             "dark".to_string()
@@ -509,7 +548,8 @@ impl eframe::App for App {
                     }
                     ui.add_space(2.0);
                     // 退出
-                    if nav_item(ui, &pal, compact, "⏻", "退出", false).clicked() {
+                    let exit_label = tr(lang, "desktopApp.nav.exit", &[]);
+                    if nav_item(ui, &pal, compact, "⏻", &exit_label, false).clicked() {
                         let _ = self.cmd_tx.send(AppCmd::Shutdown);
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
@@ -517,10 +557,12 @@ impl eframe::App for App {
             });
 
         // ── Central panel — dispatch to page ──
+        // 各页从 config 归一化取 lang（页面内部自行读取），语言切换即时生效。
         egui::CentralPanel::default().show(ctx, |ui| match self.current_page {
             Page::Dashboard => {
                 pages::dashboard::show(
                     ui,
+                    &self.state.config,
                     &self.state.devices,
                     &self.state.modules,
                     self.state.dep_report.as_ref(),
@@ -529,6 +571,7 @@ impl eframe::App for App {
             Page::Modules => {
                 pages::modules::show(
                     ui,
+                    &self.state.config,
                     &mut self.state.modules,
                     &mut self.selected_module,
                     &self.cmd_tx,
@@ -537,6 +580,7 @@ impl eframe::App for App {
             Page::Models => {
                 pages::models::show(
                     ui,
+                    &self.state.config,
                     &self.state.models,
                     &self.state.model_cache_dir,
                     &self.state.downloads,
@@ -546,10 +590,15 @@ impl eframe::App for App {
                 );
             }
             Page::PipelineEditor => {
-                pages::pipeline_editor::show(ui);
+                pages::pipeline_editor::show(ui, &self.state.config);
             }
             Page::Tasks => {
-                pages::tasks::show(ui, &self.state.modules, &self.state.tasks);
+                pages::tasks::show(
+                    ui,
+                    &self.state.config,
+                    &self.state.modules,
+                    &self.state.tasks,
+                );
             }
             Page::Settings => {
                 pages::settings::show(ui, &mut self.state.config, &mut self.toasts);

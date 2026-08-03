@@ -102,11 +102,13 @@ impl Palette {
     }
 }
 
-/// 服务状态显示信息（颜色 + 文案 + 是否过渡态）
+/// 服务状态显示信息（颜色 + 是否过渡态）
+///
+/// 文案不在此处：状态标签走 i18n（见 `pages::modules::service_label`），
+/// 静态 `&'static str` 无法承载按语言切换的翻译结果。
 #[derive(Debug, Clone, Copy)]
 pub struct StatusMeta {
     pub color: egui::Color32,
-    pub label: &'static str,
     /// 过渡态（启动中/准备中），可搭配 spinner / 脉冲提示
     pub transitional: bool,
 }
@@ -117,32 +119,26 @@ pub fn service_status(status: &ep_core::types::ServiceStatus, pal: &Palette) -> 
     match status {
         ServiceStatus::Running => StatusMeta {
             color: pal.success,
-            label: "运行中",
             transitional: false,
         },
         ServiceStatus::Stopped => StatusMeta {
             color: pal.neutral,
-            label: "已停止",
             transitional: false,
         },
         ServiceStatus::Starting => StatusMeta {
             color: pal.info,
-            label: "启动中",
             transitional: true,
         },
         ServiceStatus::Preparing => StatusMeta {
             color: pal.warning,
-            label: "准备中",
             transitional: true,
         },
         ServiceStatus::Error(_) => StatusMeta {
             color: pal.danger,
-            label: "错误",
             transitional: false,
         },
         ServiceStatus::NotReady => StatusMeta {
             color: pal.notready,
-            label: "未就绪",
             transitional: false,
         },
     }

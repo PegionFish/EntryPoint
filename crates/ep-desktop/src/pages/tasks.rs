@@ -1,23 +1,33 @@
 //! 任务中心页 — 管线任务进度 + 运行中的服务 + 全部模块状态。
+//!
+//! 用户可见文案经 [`crate::i18n::tr`] 查找；状态/类别文案复用
+//! [`crate::pages::modules`] 的本地化 helper，颜色一律取自当前主题色板。
 
 use eframe::egui;
+use ep_core::config::AppConfig;
 use ep_core::pipeline::runner::TaskSummary;
 use ep_core::types::{ServiceStatus, TaskStatus};
 
 use crate::app::ModuleEntry;
-use crate::ui::{
-    badge, card, empty_state, page_header, section_title, service_status, status_badge, Palette,
-};
+use crate::i18n::tr;
+use crate::pages::modules::{category_label, service_label};
+use crate::ui::{badge, card, empty_state, page_header, section_title, service_status, Palette};
 
-pub fn show(ui: &mut egui::Ui, modules: &[ModuleEntry], tasks: &[TaskSummary]) {
+pub fn show(
+    ui: &mut egui::Ui,
+    config: &AppConfig,
+    modules: &[ModuleEntry],
+    tasks: &[TaskSummary],
+) {
+    let lang = ep_core::i18n::normalize_language(&config.general.language);
     let pal = Palette::new(ui.style().visuals.dark_mode);
 
-    page_header(ui, "任务中心", |_| {});
+    page_header(ui, &tr(lang, "tasks.page.title", &[]), |_| {});
     ui.add_space(8.0);
 
     egui::ScrollArea::vertical().show(ui, |ui| {
         // ── 管线任务 ──
-        section_title(ui, "管线任务");
+        section_title(ui, &tr(lang, "tasks.stats.pipelineTasks", &[]));
         ui.add_space(6.0);
 
         if tasks.is_empty() {
@@ -25,12 +35,12 @@ pub fn show(ui: &mut egui::Ui, modules: &[ModuleEntry], tasks: &[TaskSummary]) {
                 ui,
                 &pal,
                 "📋",
-                "暂无管线任务",
-                "在管线编辑器中加载并运行管线后，任务会显示在这里",
+                &tr(lang, "tasks.tasks.emptyTitle", &[]),
+                &tr(lang, "desktopApp.tasks.emptyHint", &[]),
             );
         } else {
             for task in tasks {
-                task_card(ui, &pal, task);
+                task_card(ui, lang, &pal, task);
                 ui.add_space(8.0);
             }
         }
@@ -38,7 +48,7 @@ pub fn show(ui: &mut egui::Ui, modules: &[ModuleEntry], tasks: &[TaskSummary]) {
         ui.add_space(12.0);
 
         // ── 运行中的服务 ──
-        section_title(ui, "运行中的服务");
+        section_title(ui, &tr(lang, "tasks.stats.runningServices", &[]));
         ui.add_space(6.0);
 
         let running: Vec<&ModuleEntry> = modules
@@ -47,11 +57,14 @@ pub fn show(ui: &mut egui::Ui, modules: &[ModuleEntry], tasks: &[TaskSummary]) {
             .collect();
 
         if running.is_empty() {
-            ui.label(egui::RichText::new("当前没有运行中的服务").color(pal.text_dim));
+            ui.label(
+                egui::RichText::new(tr(lang, "tasks.services.emptyTitle", &[]))
+                    .color(pal.text_dim),
+            );
         } else {
             card(ui, &pal, |ui| {
                 egui::ScrollArea::horizontal().show(ui, |ui| {
-                    module_grid(ui, &pal, "tasks_running_grid", &running, true);
+                    module_grid(ui, lang, &pal, "tasks_running_grid", &running, true);
                 });
             });
         }
@@ -59,16 +72,16 @@ pub fn show(ui: &mut egui::Ui, modules: &[ModuleEntry], tasks: &[TaskSummary]) {
         ui.add_space(16.0);
 
         // ── 全部模块状态 ──
-        section_title(ui, "全部模块状态");
+        section_title(ui, &tr(lang, "tasks.stats.totalModules", &[]));
         ui.add_space(6.0);
 
         if modules.is_empty() {
-            ui.label(egui::RichText::new("未发现模块").color(pal.text_dim));
+            ui.label(egui::RichText::new(tr(lang, "desktopApp.tasks.noModules", &[])).color(pal.text_dim));
         } else {
             let all: Vec<&ModuleEntry> = modules.iter().collect();
             card(ui, &pal, |ui| {
                 egui::ScrollArea::horizontal().show(ui, |ui| {
-                    module_grid(ui, &pal, "tasks_all_grid", &all, false);
+                    module_grid(ui, lang, &pal, "tasks_all_grid", &all, false);
                 });
             });
         }
@@ -79,8 +92,8 @@ pub fn show(ui: &mut egui::Ui, modules: &[ModuleEntry], tasks: &[TaskSummary]) {
 
 // ─── 管线任务卡片 ────────────────────────────────────────────────────────────
 
-fn task_card(ui: &mut egui::Ui, pal: &Palette, task: &TaskSummary) {
-    let (color, label) = task_status_meta(&task.status, pal);
+fn task_card(ui: &mut egui::Ui, lang: &str, pal: &Palette, task: &TaskSummary) {
+    let (color, label) = task_status_meta(lang, &task.status, pal);
 
     card(ui, pal, |ui| {
         // 行1：管线名 + 状态徽章 + 任务 ID（右对齐 mono）
@@ -115,23 +128,40 @@ fn task_card(ui: &mut egui::Ui, pal: &Palette, task: &TaskSummary) {
         let mut info = String::new();
         if let Some(started) = &task.started_at {
             if let Some(finished) = &task.finished_at {
-                info.push_str(&format!(
-                    "开始 {} · 完成 {}",
-                    iso_to_secs(started),
-                    iso_to_secs(finished)
+                info.push_str(&tr(
+                    lang,
+                    "desktopApp.tasks.startedFinished",
+                    &[
+                        ("start", iso_to_secs(started)),
+                        ("end", iso_to_secs(finished)),
+                    ],
                 ));
             } else {
-                info.push_str(&format!("开始 {} · 进行中", iso_to_secs(started)));
+                info.push_str(&tr(
+                    lang,
+                    "desktopApp.tasks.startedRunning",
+                    &[("start", iso_to_secs(started))],
+                ));
             }
             info.push_str("    ");
         }
-        info.push_str(&format!("{}/{} 节点", task.completed_nodes, task.node_count));
+        let completed = task.completed_nodes.to_string();
+        let total = task.node_count.to_string();
+        info.push_str(&tr(
+            lang,
+            "tasks.task.nodeProgress",
+            &[("completed", &completed), ("total", &total)],
+        ));
         ui.label(egui::RichText::new(info).small().color(pal.text_dim));
 
-        // 失败原因
+        // 失败原因（ep-core 原始消息以本地化前缀附加原文）
         if let TaskStatus::Failed(err) = &task.status {
             ui.add_space(4.0);
-            ui.label(egui::RichText::new(format!("错误：{err}")).small().color(pal.danger));
+            ui.label(
+                egui::RichText::new(tr(lang, "desktopApp.tasks.error", &[("detail", err)]))
+                    .small()
+                    .color(pal.danger),
+            );
         }
     });
 }
@@ -140,6 +170,7 @@ fn task_card(ui: &mut egui::Ui, pal: &Palette, task: &TaskSummary) {
 
 fn module_grid(
     ui: &mut egui::Ui,
+    lang: &str,
     pal: &Palette,
     id: &str,
     rows: &[&ModuleEntry],
@@ -150,18 +181,26 @@ fn module_grid(
         .spacing([28.0, 10.0])
         .show(ui, |ui| {
             // 表头
-            for col in ["模块", "类别", "状态", "端口"] {
-                ui.label(egui::RichText::new(col).small().color(pal.text_faint));
-            }
+            let mut headers = vec![
+                tr(lang, "common.label.module", &[]),
+                tr(lang, "tasks.moduleTable.category", &[]),
+                tr(lang, "common.label.status", &[]),
+                tr(lang, "desktopPages.dashboard.col.port", &[]),
+            ];
             if with_uptime {
-                ui.label(egui::RichText::new("运行时间").small().color(pal.text_faint));
+                headers.push(tr(lang, "desktopPages.modules.info.uptime", &[]));
+            }
+            for col in headers {
+                ui.label(egui::RichText::new(col).small().color(pal.text_faint));
             }
             ui.end_row();
 
             for m in rows {
                 ui.label(&m.name);
-                ui.label(egui::RichText::new(m.category.to_string()).color(pal.text_dim));
-                status_badge(ui, pal, service_status(&m.status, pal));
+                ui.label(egui::RichText::new(category_label(lang, &m.category)).color(pal.text_dim));
+                // 颜色取自主题色板，文案走 i18n（StatusMeta.label 为静态串，不能承载翻译结果）
+                let meta = service_status(&m.status, pal);
+                badge(ui, pal, meta.color, service_label(lang, &m.status));
                 ui.label(
                     egui::RichText::new(
                         m.port
@@ -175,7 +214,7 @@ fn module_grid(
                     ui.label(
                         egui::RichText::new(
                             m.started_at
-                                .map(|t| format_uptime(t.elapsed()))
+                                .map(|t| format_uptime(lang, t.elapsed()))
                                 .unwrap_or_else(|| "-".into()),
                         )
                         .color(pal.text_dim),
@@ -188,14 +227,14 @@ fn module_grid(
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/// 任务状态 → (颜色, 文案)。颜色一律取自当前主题色板，禁止硬编码 RGB。
-fn task_status_meta(status: &TaskStatus, pal: &Palette) -> (egui::Color32, &'static str) {
+/// 任务状态 → (颜色, 本地化文案)。颜色一律取自当前主题色板，禁止硬编码 RGB。
+fn task_status_meta(lang: &str, status: &TaskStatus, pal: &Palette) -> (egui::Color32, String) {
     match status {
-        TaskStatus::Completed => (pal.success, "完成"),
-        TaskStatus::Running => (pal.info, "运行中"),
-        TaskStatus::Pending => (pal.neutral, "等待"),
-        TaskStatus::Failed(_) => (pal.danger, "失败"),
-        TaskStatus::Cancelled => (pal.warning, "已取消"),
+        TaskStatus::Completed => (pal.success, tr(lang, "common.status.completed", &[])),
+        TaskStatus::Running => (pal.info, tr(lang, "common.status.running", &[])),
+        TaskStatus::Pending => (pal.neutral, tr(lang, "common.status.pending", &[])),
+        TaskStatus::Failed(_) => (pal.danger, tr(lang, "common.status.failed", &[])),
+        TaskStatus::Cancelled => (pal.warning, tr(lang, "common.status.cancelled", &[])),
     }
 }
 
@@ -204,13 +243,28 @@ fn iso_to_secs(iso: &str) -> &str {
     iso.get(..19).unwrap_or(iso)
 }
 
-fn format_uptime(d: std::time::Duration) -> String {
+/// 运行时长（与模块页同一套键，保证两页文案一致）
+fn format_uptime(lang: &str, d: std::time::Duration) -> String {
     let secs = d.as_secs();
     if secs < 60 {
-        format!("{secs} 秒")
+        let s = secs.to_string();
+        tr(lang, "desktopPages.modules.uptime.seconds", &[("s", &s)])
     } else if secs < 3600 {
-        format!("{} 分 {} 秒", secs / 60, secs % 60)
+        let m = (secs / 60).to_string();
+        let s = (secs % 60).to_string();
+        tr(
+            lang,
+            "desktopPages.modules.uptime.minutes",
+            &[("m", &m), ("s", &s)],
+        )
     } else {
-        format!("{} 时 {} 分 {} 秒", secs / 3600, (secs % 3600) / 60, secs % 60)
+        let h = (secs / 3600).to_string();
+        let m = ((secs % 3600) / 60).to_string();
+        let s = (secs % 60).to_string();
+        tr(
+            lang,
+            "desktopPages.modules.uptime.hours",
+            &[("h", &h), ("m", &m), ("s", &s)],
+        )
     }
 }
