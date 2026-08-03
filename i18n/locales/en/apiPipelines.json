@@ -1,0 +1,22 @@
+{
+  "execute.eitherRequired": "Either pipeline_id or spec must be provided",
+  "execute.mutuallyExclusive": "pipeline_id and spec cannot be provided at the same time",
+  "execute.pipelineNotFound": "Pipeline not found: {{id}}",
+  "execute.inputsUnknownNode": "inputs reference a node that does not exist: {{nodeId}}",
+  "execute.inputsNotObject": "inputs[\"{{nodeId}}\"] must be a parameter object",
+  "execute.cycleDetected": "Pipeline `{{id}}` contains a cycle and cannot be executed",
+  "execute.internalError": "Failed to submit pipeline execution: {{detail}}",
+  "specInvalid": "Pipeline spec is invalid: {{detail}}",
+  "pipelines.notFound": "Pipeline not found",
+  "pipelines.invalidId": "Pipeline id format is invalid (only lowercase letters, digits and hyphens are allowed, and it must start with a letter or digit)",
+  "pipelines.specNotJson": "Pipeline spec is not valid JSON: {{detail}}",
+  "pipelines.specMalformed": "Pipeline spec structure is malformed: {{detail}}",
+  "pipelines.idMismatch": "pipeline.id in the spec ({{specId}}) does not match the path id ({{pathId}})",
+  "pipelines.saveFailed": "Failed to save pipeline: {{detail}}",
+  "pipelines.builtinReadOnly": "Built-in pipelines cannot be deleted",
+  "pipelines.deleteFailed": "Failed to delete pipeline file: {{detail}}",
+  "tasks.taskNotFound": "Task not found: {{taskId}}",
+  "tasks.nodeNotFound": "Node not found in task: {{nodeId}}",
+  "tasks.noArtifact": "Node `{{nodeId}}` has no downloadable artifact",
+  "tasks.artifactPathInvalid": "Artifact path of node `{{nodeId}}` is invalid"
+}

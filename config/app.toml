@@ -4,7 +4,7 @@ port = 9800
 allow_public = false
 
 [general]
-language = "zh"
+language = "zh-CN"
 theme = "dark"
 log_level = "info"
 check_updates = true
