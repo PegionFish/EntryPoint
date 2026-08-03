@@ -37,21 +37,20 @@ sudo dnf install ffmpeg
 
 ## 2. 构建
 
-使用统一构建脚本：
+使用统一构建脚本（服务器包）：
 
 ```bash
 cd /server/EntryPoint
-./scripts/build.sh
+./build.sh server
 ```
 
-该脚本依次执行：
+脚本依次执行：
 
-1. **Rust 后端**：`cargo build --release`
+1. **Rust 后端**：`cargo build --release -p ep-daemon`
    - 产物：`target/release/ep-daemon`
-2. **WebUI 前端**：`npm ci && npm run build`
-   - 产物：`crates/ep-webui/static/`（HTML/CSS/JS 静态资源）
+2. **打包**：tar.gz 兜底包（含 systemd 服务 + install.sh）+ 自动探测 deb/rpm/PKGBUILD
 
-构建完成后，`ep-daemon` 二进制内嵌前端静态资源，单文件即可运行。
+构建完成后，解压 tar.gz 运行 `install.sh` 即可部署到 `/opt/entrypoint`。
 
 ---
 
@@ -315,10 +314,10 @@ cd /server/EntryPoint
 # 拉取最新代码
 git pull
 
-# 重新构建
-./scripts/build.sh
+# 重新构建服务器包
+./build.sh server
 
-# 重启服务
+# 解压 tar.gz 后运行 install.sh 完成安装（或直接用源码树安装）
 sudo systemctl restart entrypoint
 
 # 确认启动成功

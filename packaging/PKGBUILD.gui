@@ -1,14 +1,14 @@
 # Maintainer: EntryPoint Community
-pkgname=entrypoint-server
+pkgname=entrypoint-gui
 pkgver=0.1.0
 pkgrel=1
-pkgdesc="EntryPoint 服务器 — AI 模块编排平台 daemon + WebUI"
+pkgdesc="EntryPoint 桌面 GUI 客户端 — AI 模块编排平台"
 arch=('x86_64')
 url="https://github.com/PegionFish/EntryPoint"
 license=('MIT')
 
-depends=('gcc-libs' 'fontconfig')
-makedepends=('rust' 'npm')
+depends=('gcc-libs' 'libxkbcommon' 'wayland' 'fontconfig')
+makedepends=('rust')
 optdepends=(
     'nvidia-utils: CUDA GPU 支持'
     'ffmpeg: 视频/音频处理'
@@ -20,14 +20,7 @@ sha256sums=('SKIP')
 
 build() {
     cd "$srcdir/$pkgname-$pkgver"
-
-    # Rust daemon
-    cargo build --release --locked -p ep-daemon
-
-    # WebUI 前端
-    cd crates/ep-webui/frontend
-    npm ci
-    npm run build
+    cargo build --release --locked -p ep-desktop
 }
 
 package() {
@@ -37,10 +30,9 @@ package() {
     install -dm755 "$pkgdir/opt/entrypoint/bin" \
         "$pkgdir/opt/entrypoint/config/pipelines" \
         "$pkgdir/opt/entrypoint/modules" \
-        "$pkgdir/opt/entrypoint/workspace" \
-        "$pkgdir/opt/entrypoint/webui"
+        "$pkgdir/opt/entrypoint/workspace"
 
-    install -Dm755 target/release/ep-daemon "$pkgdir/opt/entrypoint/bin/ep-daemon"
+    install -Dm755 target/release/entrypoint "$pkgdir/opt/entrypoint/bin/entrypoint"
 
     # 配置与模块
     install -Dm644 config/*.toml "$pkgdir/opt/entrypoint/config/" 2>/dev/null || true
@@ -48,19 +40,16 @@ package() {
     cp -r modules/* "$pkgdir/opt/entrypoint/modules/" 2>/dev/null || true
     find "$pkgdir/opt/entrypoint/modules" -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true
 
-    # WebUI 静态文件
-    cp -r crates/ep-webui/static/* "$pkgdir/opt/entrypoint/webui/" 2>/dev/null || true
-
-    # systemd 服务（EP_ROOT 指向 /opt/entrypoint）
-    install -Dm644 packaging/entrypoint.service "$pkgdir/usr/lib/systemd/system/entrypoint.service"
-
     # /usr/bin 包装器（注入 EP_ROOT）
-    cat > "$pkgdir/usr/bin/ep-daemon" <<'EOF'
+    cat > "$pkgdir/usr/bin/entrypoint" <<'EOF'
 #!/bin/sh
 export EP_ROOT=/opt/entrypoint
-exec /opt/entrypoint/bin/ep-daemon "$@"
+exec /opt/entrypoint/bin/entrypoint "$@"
 EOF
-    chmod 755 "$pkgdir/usr/bin/ep-daemon"
+    chmod 755 "$pkgdir/usr/bin/entrypoint"
+
+    # 桌面启动器
+    install -Dm644 packaging/entrypoint.desktop "$pkgdir/usr/share/applications/entrypoint.desktop"
 
     # License
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE" 2>/dev/null || true

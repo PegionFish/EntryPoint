@@ -55,28 +55,40 @@ npm run dev
 
 技术栈：React 19 + TypeScript + Vite + TailwindCSS 4 + shadcn/ui + React Flow + Zustand
 
-## 构建
+## 构建与打包
 
-使用统一构建脚本：
+使用统一构建脚本（GUI 客户端与服务器分开打包）：
 
-```bash
-./scripts/build.sh
+### Windows
+
+```powershell
+.\build.ps1 gui        # 桌面 GUI 客户端 zip（解压即用）
+.\build.ps1 server     # 服务器 zip（ep-daemon + WebUI）
 ```
 
-该脚本执行：
-1. `cargo build --release` — 编译 Rust 后端（ep-daemon 二进制）
-2. `npm ci && npm run build` — 构建前端静态资源到 `crates/ep-webui/static/`
+可选参数：`-Target debug|release`（默认 release）、`-SkipTest`、`-SkipClippy`、`-Clean`、`-OutputDir <dir>`（默认 dist）。
+
+### Linux / macOS
+
+```bash
+./build.sh gui         # GUI 客户端包
+./build.sh server      # 服务器包（仅 Linux；macOS 不支持）
+```
+
+- Linux GUI/server：tar.gz 兜底包 + 自动探测 deb（dpkg-deb）/ rpm（rpmbuild）/ Arch PKGBUILD（dist/arch-<mode>/）
+- macOS：仅 GUI，产出 EntryPoint.app 并压缩为 zip
+- 可选参数：`-t debug|release`、`--skip-test`、`--skip-clippy`、`--clean`、`-o <dir>`
 
 构建产物：
-- 后端二进制：`target/release/ep-daemon`
-- 前端静态文件：`crates/ep-webui/static/`
+- 二进制：`target/release/entrypoint`（GUI）、`target/release/ep-daemon`（服务器）
+- 打包产物：`dist/` 下的 zip / tar.gz / deb / rpm
 
 ## Linux 部署指南
 
 ### 1. 构建
 
 ```bash
-./scripts/build.sh
+./build.sh server
 ```
 
 ### 2. 安装 systemd 服务

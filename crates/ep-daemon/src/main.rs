@@ -208,7 +208,12 @@ async fn run_server() -> anyhow::Result<()> {
     }
 
     // 8. Build router with SPA fallback (absolute path)
-    let static_dir = root.join("crates").join("ep-webui").join("static");
+    // Packaged layout: <root>/webui; dev layout: <root>/crates/ep-webui/static
+    let static_dir = if root.join("webui").is_dir() {
+        root.join("webui")
+    } else {
+        root.join("crates").join("ep-webui").join("static")
+    };
     let static_dir_str = static_dir.to_string_lossy().to_string();
     let index_path = static_dir.join("index.html");
     let index_path_str = index_path.to_string_lossy().to_string();
