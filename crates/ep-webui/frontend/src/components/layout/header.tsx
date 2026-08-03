@@ -1,26 +1,20 @@
 import { LoaderCircle, Menu, Moon, Sun, Wifi, WifiOff } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import { Button } from '@/components/ui/button'
 import { useThemeStore } from '@/store/theme'
 import { useWsState } from '@/hooks/use-ws-state'
-import type { WsConnectionState } from '@/api/ws'
 import { cn } from '@/lib/utils'
 
-const WS_LABEL: Record<WsConnectionState, string> = {
-  idle: '未连接',
-  connecting: '连接中',
-  connected: '已连接',
-  reconnecting: '重连中',
-  disconnected: '已断开',
-}
-
 function WsIndicator() {
+  const { t } = useTranslation('components')
   const state = useWsState()
+  const label = t(`header.ws.${state}`)
   const connected = state === 'connected'
   const pending = state === 'connecting' || state === 'reconnecting'
   return (
     <div
       className="flex items-center gap-2 text-xs text-muted-foreground"
-      title={`WebSocket ${WS_LABEL[state]}`}
+      title={t('header.wsTitle', { state: label })}
     >
       <span
         className={cn(
@@ -39,7 +33,7 @@ function WsIndicator() {
       ) : (
         <WifiOff className="h-3.5 w-3.5" />
       )}
-      <span className="hidden sm:inline">{WS_LABEL[state]}</span>
+      <span className="hidden sm:inline">{label}</span>
     </div>
   )
 }
@@ -50,6 +44,7 @@ interface HeaderProps {
 }
 
 export function Header({ onMenuClick }: HeaderProps) {
+  const { t } = useTranslation('components')
   const theme = useThemeStore((s) => s.theme)
   const toggle = useThemeStore((s) => s.toggle)
   return (
@@ -60,8 +55,8 @@ export function Header({ onMenuClick }: HeaderProps) {
           size="icon"
           className="lg:hidden"
           onClick={onMenuClick}
-          aria-label="打开导航菜单"
-          title="打开导航菜单"
+          aria-label={t('header.openNav')}
+          title={t('header.openNav')}
         >
           <Menu className="h-4 w-4" />
         </Button>
@@ -75,8 +70,8 @@ export function Header({ onMenuClick }: HeaderProps) {
           variant="ghost"
           size="icon"
           onClick={toggle}
-          aria-label="切换主题"
-          title={theme === 'dark' ? '切换到浅色主题' : '切换到深色主题'}
+          aria-label={t('header.toggleTheme')}
+          title={theme === 'dark' ? t('header.switchToLight') : t('header.switchToDark')}
         >
           {theme === 'dark' ? (
             <Sun className="h-4 w-4" />

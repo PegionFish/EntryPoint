@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { toast } from 'sonner'
 import {
@@ -79,12 +80,13 @@ function DetailSkeleton() {
 
 /** 长路径旁的复制按钮：写入剪贴板并给出 toast 反馈 */
 function CopyPathButton({ value, label }: { value: string; label: string }) {
+  const { t } = useTranslation('modules')
   const handleCopy = async () => {
     try {
       await navigator.clipboard.writeText(value)
-      toast.success(`${label}已复制`)
+      toast.success(t('detail.copied', { label }))
     } catch {
-      toast.error('复制失败，请手动选择文本复制')
+      toast.error(t('detail.copyFailed'))
     }
   }
   return (
@@ -93,8 +95,8 @@ function CopyPathButton({ value, label }: { value: string; label: string }) {
       size="xs"
       className="shrink-0 text-muted-foreground/70 hover:text-foreground"
       onClick={() => void handleCopy()}
-      title={`复制${label}`}
-      aria-label={`复制${label}`}
+      title={t('detail.copyTitle', { label })}
+      aria-label={t('detail.copyTitle', { label })}
     >
       <Copy />
     </Button>
@@ -102,6 +104,7 @@ function CopyPathButton({ value, label }: { value: string; label: string }) {
 }
 
 export default function ModuleDetailPage() {
+  const { t } = useTranslation('modules')
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const wsState = useWsState()
@@ -124,7 +127,7 @@ export default function ModuleDetailPage() {
   const rawStatus = status?.status ?? mod?.service_status ?? 'stopped'
   const statusKey = normalizeStatus(rawStatus)
   const meta = statusMeta(rawStatus)
-  const name = mod?.name ?? id ?? '未知模块'
+  const name = mod?.name ?? id ?? t('detail.unknownModule')
 
   const failMsg = (e: unknown) =>
     e instanceof Error ? e.message : String(e)
@@ -132,9 +135,9 @@ export default function ModuleDetailPage() {
   const handleStart = async () => {
     try {
       await startModule()
-      toast.success(`「${name}」已开始启动`)
+      toast.success(t('toast.startStarted', { name }))
     } catch (e) {
-      toast.error('启动失败', { description: failMsg(e) })
+      toast.error(t('toast.startFailed'), { description: failMsg(e) })
     }
   }
 
@@ -142,9 +145,9 @@ export default function ModuleDetailPage() {
   const handleStopConfirmed = async () => {
     try {
       await stopModule()
-      toast.success(`「${name}」已停止`)
+      toast.success(t('toast.stopSucceeded', { name }))
     } catch (e) {
-      toast.error('停止失败', { description: failMsg(e) })
+      toast.error(t('toast.stopFailed'), { description: failMsg(e) })
       throw e
     }
   }
@@ -154,9 +157,9 @@ export default function ModuleDetailPage() {
       // 先停止再启动；停止失败（如进程已退出）不阻断启动
       await stopModule().catch(() => undefined)
       await startModule()
-      toast.success(`「${name}」已开始重启`)
+      toast.success(t('toast.restartStarted', { name }))
     } catch (e) {
-      toast.error('重启失败', { description: failMsg(e) })
+      toast.error(t('toast.restartFailed'), { description: failMsg(e) })
     }
   }
 
@@ -166,7 +169,7 @@ export default function ModuleDetailPage() {
       return (
         <Button size="sm" disabled>
           <Loader2 className="animate-spin" />
-          处理中…
+          {t('detail.processing')}
         </Button>
       )
     }
@@ -180,7 +183,7 @@ export default function ModuleDetailPage() {
             className="border-status-running/50 text-status-running hover:bg-status-running/10 hover:text-status-running dark:bg-transparent dark:hover:bg-status-running/10"
           >
             <Play />
-            启动
+            {t('common:action.start')}
           </Button>
         )
       case 'running':
@@ -193,14 +196,14 @@ export default function ModuleDetailPage() {
             onClick={() => setStopConfirmOpen(true)}
           >
             <Square />
-            停止
+            {t('common:action.stop')}
           </Button>
         )
       case 'error':
         return (
           <Button size="sm" onClick={() => void handleRestart()}>
             <RotateCw />
-            重启
+            {t('common:action.restart')}
           </Button>
         )
       default:
@@ -212,8 +215,8 @@ export default function ModuleDetailPage() {
   return (
     <>
       <PageContainer
-        title="模块详情"
-        description="模块运行状态、操作与实时日志"
+        title={t('detail.pageTitle')}
+        description={t('detail.pageDescription')}
         actions={
           <>
             <Button
@@ -222,7 +225,7 @@ export default function ModuleDetailPage() {
               onClick={() => navigate('/modules')}
             >
               <ChevronLeft />
-              返回
+              {t('common:action.back')}
             </Button>
             {!loading && renderAction()}
           </>
@@ -235,7 +238,7 @@ export default function ModuleDetailPage() {
         ) : !mod && error ? (
           <div className="flex flex-col items-center justify-center rounded-lg border border-dashed py-16 text-center">
             <CircleAlert className="size-8 text-status-error" />
-            <p className="mt-3 text-sm font-medium">模块不存在或加载失败</p>
+            <p className="mt-3 text-sm font-medium">{t('detail.notFound')}</p>
             <p className="mt-1 max-w-sm break-all px-6 text-xs text-muted-foreground">
               {error}
             </p>
@@ -246,7 +249,7 @@ export default function ModuleDetailPage() {
               onClick={() => navigate('/modules')}
             >
               <ChevronLeft />
-              返回模块列表
+              {t('detail.backToList')}
             </Button>
           </div>
         ) : (
@@ -291,7 +294,10 @@ export default function ModuleDetailPage() {
               {mod?.path && (
                 <p className="mt-1.5 flex items-center gap-1 font-mono text-xs text-muted-foreground/60">
                   <span className="min-w-0 break-all">{mod.path}</span>
-                  <CopyPathButton value={mod.path} label="模块路径" />
+                  <CopyPathButton
+                    value={mod.path}
+                    label={t('detail.modulePath')}
+                  />
                 </p>
               )}
             </header>
@@ -305,11 +311,10 @@ export default function ModuleDetailPage() {
                 <TriangleAlert className="mt-0.5 size-4 shrink-0 text-status-preparing" />
                 <div className="min-w-0 flex-1 text-sm">
                   <p className="font-medium text-status-preparing">
-                    模块未就绪：缺少模型或依赖
+                    {t('detail.notReadyTitle')}
                   </p>
                   <p className="mt-0.5 leading-relaxed text-status-preparing/75">
-                    该模块尚不满足启动条件——所需的模型文件可能未下载，或系统依赖（如
-                    FFmpeg、PyTorch CUDA）缺失。请确认以下两处就绪后再尝试启动。
+                    {t('detail.notReadyDescription')}
                   </p>
                   <div className="mt-2.5 flex flex-wrap gap-2">
                     <Button
@@ -320,7 +325,7 @@ export default function ModuleDetailPage() {
                     >
                       <Link to="/models">
                         <Database />
-                        前往模型管理
+                        {t('detail.goToModels')}
                       </Link>
                     </Button>
                     <Button
@@ -331,7 +336,7 @@ export default function ModuleDetailPage() {
                     >
                       <Link to="/">
                         <HardDrive />
-                        查看依赖报告
+                        {t('detail.viewDepReport')}
                       </Link>
                     </Button>
                   </div>
@@ -342,24 +347,26 @@ export default function ModuleDetailPage() {
             {/* 运行信息 */}
             <Card className="animate-[ep-fade-up_0.35s_ease_both] [animation-delay:60ms]">
               <CardHeader>
-                <CardTitle>运行信息</CardTitle>
+                <CardTitle>{t('detail.runtimeTitle')}</CardTitle>
               </CardHeader>
               <CardContent>
                 <dl className="grid grid-cols-2 gap-x-6 gap-y-5 md:grid-cols-4">
                   <InfoItem label="ID" value={mod?.id ?? id ?? '—'} mono />
                   <InfoItem
-                    label="版本"
+                    label={t('detail.version')}
                     value={mod?.version ? `v${mod.version}` : '—'}
                     mono={Boolean(mod?.version)}
                   />
                   <InfoItem
-                    label="类别"
+                    label={t('detail.category')}
                     value={
                       mod?.category ? categoryLabel(mod.category) : '—'
                     }
                   />
                   <div className="min-w-0">
-                    <dt className="text-xs text-muted-foreground">状态</dt>
+                    <dt className="text-xs text-muted-foreground">
+                      {t('common:label.status')}
+                    </dt>
                     <dd className="mt-1">
                       <Badge
                         variant="outline"
@@ -379,14 +386,17 @@ export default function ModuleDetailPage() {
                     </dd>
                   </div>
                   {/* API 无模块 → 设备映射，明示「暂不支持」而非占位符（与仪表盘一致） */}
-                  <InfoItem label="设备" value="暂不支持" />
                   <InfoItem
-                    label="端口"
+                    label={t('detail.device')}
+                    value={t('detail.deviceUnsupported')}
+                  />
+                  <InfoItem
+                    label={t('detail.port')}
                     value={status?.port != null ? String(status.port) : '—'}
                     mono={status?.port != null}
                   />
                   <InfoItem
-                    label="运行时长"
+                    label={t('detail.uptime')}
                     value={
                       status && status.uptime_secs > 0
                         ? formatUptime(status.uptime_secs)
@@ -403,7 +413,7 @@ export default function ModuleDetailPage() {
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
                   <TerminalSquare className="size-4 text-muted-foreground" />
-                  实时日志
+                  {t('detail.logsTitle')}
                 </CardTitle>
                 <CardAction>
                   <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -420,10 +430,10 @@ export default function ModuleDetailPage() {
                       aria-hidden
                     />
                     {wsState === 'connected'
-                      ? '实时推送中'
+                      ? t('detail.logsStreaming')
                       : wsState === 'disconnected'
-                        ? '推送已断开'
-                        : '连接中…'}
+                        ? t('detail.logsDisconnected')
+                        : t('detail.logsConnecting')}
                   </span>
                 </CardAction>
               </CardHeader>
@@ -435,7 +445,7 @@ export default function ModuleDetailPage() {
                 />
                 {/* 后端日志缓冲上限 500 行，明示截断行为避免误解（P2-19） */}
                 <p className="mt-2 text-xs text-muted-foreground/60">
-                  仅保留最近 500 行，实时推送需保持页面连接
+                  {t('detail.logsRetention')}
                 </p>
               </CardContent>
             </Card>
@@ -445,7 +455,7 @@ export default function ModuleDetailPage() {
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
                   <Database className="size-4 text-muted-foreground" />
-                  模型状态
+                  {t('detail.modelsTitle')}
                 </CardTitle>
               </CardHeader>
               <CardContent>
@@ -456,7 +466,7 @@ export default function ModuleDetailPage() {
                   </div>
                 ) : !models || models.models.length === 0 ? (
                   <p className="py-4 text-center text-sm text-muted-foreground">
-                    该模块暂无关联模型
+                    {t('detail.modelsEmpty')}
                   </p>
                 ) : (
                   <div className="space-y-2">
@@ -477,7 +487,7 @@ export default function ModuleDetailPage() {
                               </span>
                               <CopyPathButton
                                 value={m.target_dir}
-                                label="模型路径"
+                                label={t('detail.modelPath')}
                               />
                             </p>
                           </div>
@@ -487,7 +497,9 @@ export default function ModuleDetailPage() {
                             </span>
                             <span className="hidden font-mono text-xs text-muted-foreground sm:inline">
                               {m.file_count != null
-                                ? `${m.file_count} 文件`
+                                ? t('detail.fileCount', {
+                                    count: m.file_count,
+                                  })
                                 : '—'}
                             </span>
                             <Badge
@@ -519,9 +531,9 @@ export default function ModuleDetailPage() {
       <ConfirmDialog
         open={stopConfirmOpen}
         onOpenChange={setStopConfirmOpen}
-        title={`停止「${name}」`}
-        description="停止后该模块的服务进程将被终止，正在处理的请求会中断，确定要停止吗？"
-        confirmLabel="停止模块"
+        title={t('stopDialog.title', { name })}
+        description={t('stopDialog.description')}
+        confirmLabel={t('stopDialog.confirm')}
         variant="destructive"
         onConfirm={() => handleStopConfirmed()}
       />

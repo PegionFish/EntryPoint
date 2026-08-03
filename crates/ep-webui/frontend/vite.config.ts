@@ -8,6 +8,8 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
+      // 仓库级 i18n 目录（frontend 的上三级），翻译 JSON 由桌面端/后端共享
+      '@i18n': path.resolve(__dirname, '../../../i18n'),
     },
   },
   build: {
@@ -16,6 +18,10 @@ export default defineConfig({
   },
   server: {
     port: 5173,
+    fs: {
+      // 允许 dev server 读取 frontend/ 之外的仓库级 i18n JSON
+      allow: [path.resolve(__dirname, '../../..')],
+    },
     proxy: {
       '/api': 'http://localhost:9800',
       '/ws': {

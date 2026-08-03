@@ -19,6 +19,7 @@ import {
   Upload,
   X,
 } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { api } from '@/api/client'
 import type { ModelInfo, ModelSource } from '@/api/types'
@@ -65,16 +66,23 @@ import { cn, formatBytes, formatMB } from '@/lib/utils'
 
 // ─── 常量与工具 ──────────────────────────────────────────────────────────────
 
-/** 模型来源 → 展示标签（中文语境下保留平台名） */
-const SOURCE_LABELS: Record<string, string> = {
-  huggingface: 'HuggingFace',
-  modelscope: 'ModelScope',
-  url: 'URL 直链',
-  local_import: '本地导入',
-}
+/** 翻译函数签名（与 react-i18next useTranslation 返回的 t 兼容） */
+type TranslateFn = (key: string, options?: Record<string, unknown>) => string
 
-function sourceLabel(source: string): string {
-  return SOURCE_LABELS[source.toLowerCase()] ?? source
+/** 模型来源 → 展示标签（品牌名 HuggingFace / ModelScope 保持原文，其余走翻译） */
+function sourceLabel(t: TranslateFn, source: string): string {
+  switch (source.toLowerCase()) {
+    case 'huggingface':
+      return 'HuggingFace'
+    case 'modelscope':
+      return 'ModelScope'
+    case 'url':
+      return t('source.url')
+    case 'local_import':
+      return t('source.localImport')
+    default:
+      return source
+  }
 }
 
 /** 收窄字符串来源为 ModelSource（后端 source 字段可能为 local_import 等） */
@@ -226,6 +234,9 @@ export interface UploadProgress {
   total: number
 }
 
+/** 上传取消的内部错误标识（与语言无关，仅用于分支判断，不直接展示） */
+const UPLOAD_ABORTED = '__ep_upload_aborted__'
+
 /**
  * 以 XMLHttpRequest 上传模型文件，换取真实的上传进度事件
  * （fetch 无法获取上传进度；模型动辄数 GB，进度反馈是必需的）。
@@ -238,6 +249,7 @@ function uploadModelWithProgress(
   files: File[],
   paths: string[],
   onProgress: (p: UploadProgress) => void,
+  t: TranslateFn,
 ): { promise: Promise<ModelInfo>; abort: () => void } {
   const form = new FormData()
   form.append('model_id', modelId)
@@ -275,12 +287,12 @@ function uploadModelWithProgress(
         new Error(
           typeof msg === 'string' && msg.trim()
             ? msg
-            : `API ${xhr.status}: 上传失败`,
+            : t('upload.errorHttp', { status: xhr.status }),
         ),
       )
     })
-    xhr.addEventListener('error', () => reject(new Error('网络错误，上传失败')))
-    xhr.addEventListener('abort', () => reject(new Error('上传已取消')))
+    xhr.addEventListener('error', () => reject(new Error(t('upload.errorNetwork'))))
+    xhr.addEventListener('abort', () => reject(new Error(UPLOAD_ABORTED)))
     xhr.send(form)
   })
   return { promise, abort: () => xhr.abort() }
@@ -289,7 +301,8 @@ function uploadModelWithProgress(
 // ─── 状态徽章 ────────────────────────────────────────────────────────────────
 
 interface ModelStatusMeta {
-  label: string
+  /** 状态文案翻译键（复用 common:status.*）；null 表示原样展示后端状态值 */
+  labelKey: string | null
   dot: string
   badge: string
   transitional: boolean
@@ -300,21 +313,21 @@ function modelStatusMeta(status: string): ModelStatusMeta {
   switch (status.trim().toLowerCase()) {
     case 'ready':
       return {
-        label: '就绪',
+        labelKey: 'common:status.ready',
         dot: 'bg-status-running',
         badge: 'bg-status-running/15 text-status-running border-status-running/30',
         transitional: false,
       }
     case 'missing':
       return {
-        label: '缺失',
+        labelKey: 'common:status.missing',
         dot: 'bg-status-error',
         badge: 'bg-status-error/15 text-status-error border-status-error/30',
         transitional: false,
       }
     case 'incomplete':
       return {
-        label: '不完整',
+        labelKey: 'common:status.incomplete',
         dot: 'bg-status-preparing',
         badge:
           'bg-status-preparing/15 text-status-preparing border-status-preparing/30',
@@ -322,7 +335,7 @@ function modelStatusMeta(status: string): ModelStatusMeta {
       }
     case 'downloading':
       return {
-        label: '下载中',
+        labelKey: 'common:status.downloading',
         dot: 'bg-status-starting',
         badge:
           'bg-status-starting/15 text-status-starting border-status-starting/30',
@@ -330,7 +343,7 @@ function modelStatusMeta(status: string): ModelStatusMeta {
       }
     default:
       return {
-        label: status,
+        labelKey: null,
         dot: 'bg-muted-foreground',
         badge: 'bg-muted text-muted-foreground border-border',
         transitional: false,
@@ -339,6 +352,7 @@ function modelStatusMeta(status: string): ModelStatusMeta {
 }
 
 function ModelStatusBadge({ status }: { status: string }) {
+  const { t } = useTranslation('models')
   const meta = modelStatusMeta(status)
   return (
     <Badge variant="outline" className={meta.badge}>
@@ -349,12 +363,13 @@ function ModelStatusBadge({ status }: { status: string }) {
           meta.transitional && 'animate-pulse',
         )}
       />
-      {meta.label}
+      {meta.labelKey ? t(meta.labelKey) : status}
     </Badge>
   )
 }
 
 function SourceBadges({ model }: { model: ModelInfo }) {
+  const { t } = useTranslation('models')
   // 多源时展示全部可用源；否则回退 source 字段（未知来源原样显示）
   const sources: string[] =
     model.available_sources && model.available_sources.length > 0
@@ -371,7 +386,7 @@ function SourceBadges({ model }: { model: ModelInfo }) {
           variant="outline"
           className="border-border/60 px-1.5 text-[10px] font-normal text-muted-foreground"
         >
-          {sourceLabel(s)}
+          {sourceLabel(t, s)}
         </Badge>
       ))}
     </>
@@ -398,6 +413,7 @@ interface UpdateCheckResult {
 // ─── 页面 ────────────────────────────────────────────────────────────────────
 
 export function ModelsPage() {
+  const { t } = useTranslation('models')
   const {
     models,
     details,
@@ -471,13 +487,13 @@ export function ModelsPage() {
       group?.models.find((m) => m.model_id === entry.model_id)?.name ??
       entry.model_id
     if (entry.state === 'completed') {
-      toast.success('模型下载完成', { description: name })
+      toast.success(t('download.completed'), { description: name })
     } else if (entry.state === 'failed') {
-      toast.error('模型下载失败', {
-        description: `${name}，可重试或更换下载源`,
+      toast.error(t('download.failed'), {
+        description: t('download.failedDesc', { name }),
       })
     } else {
-      toast.info('模型下载已取消', { description: name })
+      toast.info(t('download.cancelled'), { description: name })
     }
   }
 
@@ -496,13 +512,15 @@ export function ModelsPage() {
         model_id: model.model_id,
         source: chosen,
       })
-      toast.success('已开始下载', {
-        description: `${model.name}${chosen ? ` · ${sourceLabel(chosen)}` : ''}`,
+      toast.success(t('download.started'), {
+        description: chosen
+          ? `${model.name} · ${sourceLabel(t, chosen)}`
+          : model.name,
       })
       // 立即拉一次下载列表，保证进度条尽快出现（WS 初始推送可能稍晚）
       void refreshDownloads()
     } catch (e) {
-      toast.error('下载启动失败', { description: errMsg(e) })
+      toast.error(t('download.startFailed'), { description: errMsg(e) })
     }
   }
 
@@ -511,7 +529,7 @@ export function ModelsPage() {
     if (!deleteTarget) return
     try {
       await deleteModel(deleteTarget.moduleId, deleteTarget.model.model_id)
-      toast.success('模型已删除', { description: deleteTarget.model.name })
+      toast.success(t('delete.success'), { description: deleteTarget.model.name })
       const key = `${deleteTarget.moduleId}/${deleteTarget.model.model_id}`
       setUpdateInfo((prev) => {
         if (!(key in prev)) return prev
@@ -520,7 +538,7 @@ export function ModelsPage() {
         return next
       })
     } catch (e) {
-      toast.error('删除模型失败', { description: errMsg(e) })
+      toast.error(t('delete.failed'), { description: errMsg(e) })
       throw e // 保持确认框打开，便于重试
     }
   }
@@ -533,14 +551,16 @@ export function ModelsPage() {
       const result = await api.checkModelUpdate(moduleId, model.model_id)
       setUpdateInfo((prev) => ({ ...prev, [key]: result }))
       if (result.available) {
-        toast.info(`「${model.name}」有可用更新`, { description: result.reason })
+        toast.info(t('update.availableToast', { name: model.name }), {
+          description: result.reason,
+        })
       } else {
-        toast.success(`「${model.name}」已是最新版本`, {
+        toast.success(t('update.upToDateToast', { name: model.name }), {
           description: result.reason,
         })
       }
     } catch (e) {
-      toast.error('检查更新失败', { description: errMsg(e) })
+      toast.error(t('update.checkFailed'), { description: errMsg(e) })
     } finally {
       setChecking((prev) => {
         const next = new Set(prev)
@@ -560,36 +580,40 @@ export function ModelsPage() {
       }
     }
     if (targets.length === 0) {
-      toast.info('没有可检查的模型', { description: '仅就绪状态的模型支持检查更新' })
+      toast.info(t('update.noneToCheck'), {
+        description: t('update.onlyReadyCheckable'),
+      })
       return
     }
     setCheckingAll(true)
     try {
       const results = await Promise.allSettled(
-        targets.map((t) => api.checkModelUpdate(t.moduleId, t.model.model_id)),
+        targets.map((target) =>
+          api.checkModelUpdate(target.moduleId, target.model.model_id),
+        ),
       )
       const patch: Record<string, UpdateCheckResult> = {}
       const updatable: string[] = []
       let failed = 0
       results.forEach((r, i) => {
-        const t = targets[i]
-        const key = `${t.moduleId}/${t.model.model_id}`
+        const target = targets[i]
+        const key = `${target.moduleId}/${target.model.model_id}`
         if (r.status === 'fulfilled') {
           patch[key] = r.value
-          if (r.value.available) updatable.push(t.model.name)
+          if (r.value.available) updatable.push(target.model.name)
         } else {
           failed++
         }
       })
       setUpdateInfo((prev) => ({ ...prev, ...patch }))
       if (updatable.length > 0) {
-        toast.warning(`${updatable.length} 个模型有可用更新`, {
-          description: updatable.join('、'),
+        toast.warning(t('update.updatableCount', { count: updatable.length }), {
+          description: updatable.join(t('update.listSeparator')),
         })
       } else if (failed > 0) {
-        toast.error(`${failed} 个模型检查失败，其余模型均为最新`)
+        toast.error(t('update.someCheckFailed', { count: failed }))
       } else {
-        toast.success('全部模型均为最新版本')
+        toast.success(t('update.allUpToDate'))
       }
     } finally {
       setCheckingAll(false)
@@ -600,24 +624,27 @@ export function ModelsPage() {
   async function handleImport() {
     if (!importModule || !importModelId || !sourcePath.trim()) return
     setImporting(true)
-    const toastId = toast.loading('正在导入模型…')
+    const toastId = toast.loading(t('import.importingToast'))
     try {
       const resp = await importModel(importModule, {
         model_id: importModelId,
         source_path: sourcePath.trim(),
       })
       if (resp.error) {
-        toast.error('导入失败', { id: toastId, description: resp.error })
+        toast.error(t('import.failed'), { id: toastId, description: resp.error })
       } else {
-        toast.success('模型导入成功', {
+        toast.success(t('import.success'), {
           id: toastId,
-          description: `${resp.file_count ?? '–'} 个文件 · ${formatBytes(resp.total_bytes)}`,
+          description: t('add.filesAndSize', {
+            count: resp.file_count ?? '–',
+            size: formatBytes(resp.total_bytes),
+          }),
         })
         setImportModelId('')
         setSourcePath('')
       }
     } catch (e) {
-      toast.error('导入失败', {
+      toast.error(t('import.failed'), {
         id: toastId,
         description: e instanceof Error ? e.message : String(e),
       })
@@ -655,7 +682,7 @@ export function ModelsPage() {
     try {
       const collected = await collectDataTransferItems(items)
       if (collected.length === 0) {
-        toast.error('未从拖拽内容中读取到文件')
+        toast.error(t('upload.dropEmpty'))
         return
       }
       const isSingleArchive =
@@ -679,7 +706,7 @@ export function ModelsPage() {
         })
       }
     } catch (err) {
-      toast.error('读取拖拽内容失败', { description: errMsg(err) })
+      toast.error(t('upload.dropReadFailed'), { description: errMsg(err) })
     } finally {
       setCollecting(false)
     }
@@ -693,20 +720,24 @@ export function ModelsPage() {
     const { files, paths, totalBytes } = picked
     const moduleId = uploadModule
     setUploading({ percent: 0, loaded: 0, total: totalBytes })
-    const toastId = toast.loading('正在上传模型文件…')
+    const toastId = toast.loading(t('upload.uploadingToast'))
     const { promise, abort } = uploadModelWithProgress(
       moduleId,
       uploadModelId,
       files,
       paths,
       setUploading,
+      t,
     )
     abortUploadRef.current = abort
     try {
       await promise
-      toast.success('模型上传成功', {
+      toast.success(t('upload.success'), {
         id: toastId,
-        description: `${files.length} 个文件 · ${formatBytes(totalBytes)}`,
+        description: t('add.filesAndSize', {
+          count: files.length,
+          size: formatBytes(totalBytes),
+        }),
       })
       setPicked(null)
       setUploadModelId('')
@@ -716,10 +747,10 @@ export function ModelsPage() {
         details[moduleId] ? moduleModels(moduleId) : Promise.resolve(),
       ])
     } catch (e) {
-      if (e instanceof Error && e.message === '上传已取消') {
-        toast.info('上传已取消', { id: toastId })
+      if (e instanceof Error && e.message === UPLOAD_ABORTED) {
+        toast.info(t('upload.cancelled'), { id: toastId })
       } else {
-        toast.error('模型上传失败', { id: toastId, description: errMsg(e) })
+        toast.error(t('upload.failed'), { id: toastId, description: errMsg(e) })
       }
     } finally {
       abortUploadRef.current = null
@@ -741,7 +772,9 @@ export function ModelsPage() {
           void moduleModels(moduleId)
             .catch((e: unknown) => {
               toast.error(
-                `获取模型详情失败：${e instanceof Error ? e.message : String(e)}`,
+                t('detail.loadFailed', {
+                  error: e instanceof Error ? e.message : String(e),
+                }),
               )
             })
             .finally(() => {
@@ -761,8 +794,8 @@ export function ModelsPage() {
 
   return (
     <PageContainer
-      title="模型管理"
-      description="按模块查看模型状态，支持在线下载、从本机上传与服务器本地路径导入"
+      title={t('page.title')}
+      description={t('page.description')}
       actions={
         <>
           <Button
@@ -776,11 +809,11 @@ export function ModelsPage() {
             ) : (
               <ListRestart className="size-3.5" />
             )}
-            检查全部更新
+            {t('page.checkAllUpdates')}
           </Button>
           <Button variant="outline" size="sm" onClick={() => void refresh()}>
             <RefreshCw className="size-3.5" />
-            刷新
+            {t('common:action.refresh')}
           </Button>
         </>
       }
@@ -789,9 +822,11 @@ export function ModelsPage() {
         {error && (
           <div className="flex items-center gap-2 rounded-lg border border-status-error/30 bg-status-error/10 px-4 py-3 text-sm text-status-error">
             <TriangleAlert className="size-4 shrink-0" />
-            <span className="min-w-0 flex-1 truncate">加载失败：{error}</span>
+            <span className="min-w-0 flex-1 truncate">
+              {t('page.loadFailed', { error })}
+            </span>
             <Button variant="ghost" size="xs" onClick={() => void refresh()}>
-              重试
+              {t('common:action.retry')}
             </Button>
           </div>
         )}
@@ -801,10 +836,7 @@ export function ModelsPage() {
           <div className="flex items-start gap-2.5 rounded-lg border border-status-preparing/30 bg-status-preparing/10 px-4 py-3">
             <CircleAlert className="mt-0.5 size-4 shrink-0 text-status-preparing" />
             <p className="text-xs leading-relaxed text-foreground/80">
-              有 {modelStats.missing}{' '}
-              个模型缺失或不完整，可通过三种途径获取：① 点击列表中的「下载」在线获取；②
-              使用下方「从本机上传」上传浏览器中的模型文件；③
-              手动将文件复制到服务器后，用「服务器本地路径导入」添加。
+              {t('guide.missingModels', { count: modelStats.missing })}
             </p>
           </div>
         )}
@@ -819,9 +851,12 @@ export function ModelsPage() {
           <Card>
             <EmptyState
               icon={Database}
-              title="暂无模型信息"
-              description="安装模块后，其所需模型将在此处显示。获取模型有三种途径：① 在线下载——在模型列表中点击「下载」；② 从本机上传——把浏览器中的模型文件夹或压缩包上传到服务器；③ 手动将模型文件复制到服务器，再用下方「服务器本地路径导入」添加。"
-              action={{ label: '刷新', onClick: () => void refresh() }}
+              title={t('empty.title')}
+              description={t('empty.description')}
+              action={{
+                label: t('common:action.refresh'),
+                onClick: () => void refresh(),
+              }}
             />
           </Card>
         ) : (
@@ -847,7 +882,7 @@ export function ModelsPage() {
               <CardContent className="p-0">
                 {group.models.length === 0 ? (
                   <p className="px-6 pb-5 text-sm text-muted-foreground">
-                    该模块暂无关联模型
+                    {t('group.noModels')}
                   </p>
                 ) : (
                   <div className="divide-y divide-border">
@@ -901,7 +936,7 @@ export function ModelsPage() {
                                     className="border-status-preparing/30 bg-status-preparing/15 px-1.5 text-[10px] text-status-preparing"
                                   >
                                     <Sparkles className="size-2.5" />
-                                    有更新
+                                    {t('update.badge')}
                                   </Badge>
                                 )}
                               </div>
@@ -951,7 +986,7 @@ export function ModelsPage() {
                                         onClick={(e) => e.stopPropagation()}
                                       >
                                         <Download className="size-3" />
-                                        下载
+                                        {t('common:action.download')}
                                         <ChevronDown className="size-3" />
                                       </Button>
                                     </DropdownMenuTrigger>
@@ -968,7 +1003,7 @@ export function ModelsPage() {
                                           }
                                         >
                                           <Download className="size-3.5" />
-                                          {sourceLabel(s)}
+                                          {sourceLabel(t, s)}
                                         </DropdownMenuItem>
                                       ))}
                                     </DropdownMenuContent>
@@ -986,7 +1021,7 @@ export function ModelsPage() {
                                     }}
                                   >
                                     <Download className="size-3" />
-                                    下载
+                                    {t('common:action.download')}
                                   </Button>
                                 ))}
 
@@ -1005,7 +1040,7 @@ export function ModelsPage() {
                                   }}
                                 >
                                   <Download className="size-3" />
-                                  重新下载
+                                  {t('download.redownload')}
                                 </Button>
                               )}
 
@@ -1026,7 +1061,7 @@ export function ModelsPage() {
                                     ) : (
                                       <Sparkles className="size-3" />
                                     )}
-                                    检查更新
+                                    {t('update.check')}
                                   </Button>
                                   <Button
                                     size="xs"
@@ -1041,7 +1076,7 @@ export function ModelsPage() {
                                     }}
                                   >
                                     <Trash2 className="size-3" />
-                                    删除
+                                    {t('common:action.delete')}
                                   </Button>
                                 </>
                               )}
@@ -1059,7 +1094,7 @@ export function ModelsPage() {
                                   <div>
                                     <dt className="flex items-center gap-1.5 text-xs text-muted-foreground">
                                       <FileBox className="size-3.5" />
-                                      文件数
+                                      {t('detail.fileCount')}
                                     </dt>
                                     <dd className="mt-1 font-mono">
                                       {detail.file_count ?? '–'}
@@ -1068,7 +1103,7 @@ export function ModelsPage() {
                                   <div>
                                     <dt className="flex items-center gap-1.5 text-xs text-muted-foreground">
                                       <HardDrive className="size-3.5" />
-                                      实际大小
+                                      {t('detail.actualSize')}
                                     </dt>
                                     <dd className="mt-1 font-mono">
                                       {formatBytes(detail.size_bytes)}
@@ -1077,7 +1112,7 @@ export function ModelsPage() {
                                   <div className="min-w-0">
                                     <dt className="flex items-center gap-1.5 text-xs text-muted-foreground">
                                       <FolderOpen className="size-3.5" />
-                                      本地缓存路径
+                                      {t('detail.cachePath')}
                                     </dt>
                                     <dd className="mt-1 break-all font-mono text-xs leading-relaxed">
                                       {detail.local_cache_path ??
@@ -1087,7 +1122,7 @@ export function ModelsPage() {
                                 </dl>
                               ) : (
                                 <p className="text-xs text-muted-foreground">
-                                  暂无详情数据
+                                  {t('detail.noData')}
                                 </p>
                               )}
                             </div>
@@ -1107,34 +1142,33 @@ export function ModelsPage() {
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base font-semibold">
               <Upload className="size-4 text-primary" />
-              添加模型
+              {t('add.title')}
             </CardTitle>
-            <CardDescription>
-              在线下载请直接使用上方列表中的「下载」按钮；此处提供另外两种途径
-            </CardDescription>
+            <CardDescription>{t('add.description')}</CardDescription>
           </CardHeader>
           <CardContent>
             <Tabs defaultValue="upload">
               <TabsList>
                 <TabsTrigger value="upload">
                   <Upload className="size-3.5" />
-                  从本机上传
+                  {t('upload.tab')}
                 </TabsTrigger>
                 <TabsTrigger value="import">
                   <HardDrive className="size-3.5" />
-                  服务器本地路径导入
+                  {t('import.tab')}
                 </TabsTrigger>
               </TabsList>
 
               {/* ── 从本机上传 ── */}
               <TabsContent value="upload" className="mt-4 space-y-4">
                 <p className="text-xs text-muted-foreground">
-                  将你自己电脑上的模型文件（浏览器端文件）上传到服务器：支持整个文件夹，或单个
-                  .zip / .tar.gz / .tgz 压缩包（由服务端解包）。
+                  {t('upload.description')}
                 </p>
                 <div className="grid gap-4 sm:grid-cols-2">
                   <div className="space-y-2">
-                    <label className="text-sm font-medium">目标模块</label>
+                    <label className="text-sm font-medium">
+                      {t('add.targetModule')}
+                    </label>
                     <Select
                       value={uploadModule || undefined}
                       onValueChange={(v) => {
@@ -1144,7 +1178,7 @@ export function ModelsPage() {
                       disabled={!!uploading}
                     >
                       <SelectTrigger className="w-full">
-                        <SelectValue placeholder="选择模块" />
+                        <SelectValue placeholder={t('add.selectModule')} />
                       </SelectTrigger>
                       <SelectContent>
                         {moduleOptions.map((m) => (
@@ -1156,14 +1190,16 @@ export function ModelsPage() {
                     </Select>
                   </div>
                   <div className="space-y-2">
-                    <label className="text-sm font-medium">模型</label>
+                    <label className="text-sm font-medium">
+                      {t('common:label.model')}
+                    </label>
                     <Select
                       value={uploadModelId || undefined}
                       onValueChange={setUploadModelId}
                       disabled={!uploadModule || !!uploading}
                     >
                       <SelectTrigger className="w-full">
-                        <SelectValue placeholder="选择模型" />
+                        <SelectValue placeholder={t('add.selectModel')} />
                       </SelectTrigger>
                       <SelectContent>
                         {uploadModelOptions.map((m) => (
@@ -1201,8 +1237,10 @@ export function ModelsPage() {
                       <div className="flex items-center justify-between font-mono text-xs text-muted-foreground">
                         <span>
                           {uploading.percent >= 100
-                            ? '传输完成，服务器处理中…'
-                            : `正在上传 ${Math.floor(uploading.percent)}%`}
+                            ? t('upload.transferDoneProcessing')
+                            : t('upload.uploadingPercent', {
+                                percent: Math.floor(uploading.percent),
+                              })}
                         </span>
                         <span>
                           {formatBytes(uploading.loaded)} /{' '}
@@ -1216,14 +1254,14 @@ export function ModelsPage() {
                         onClick={() => abortUploadRef.current?.()}
                       >
                         <X className="size-3" />
-                        取消上传
+                        {t('upload.cancelUpload')}
                       </Button>
                     </div>
                   ) : collecting ? (
                     <div className="flex flex-col items-center gap-2">
                       <Loader2 className="size-6 animate-spin text-muted-foreground" />
                       <p className="text-sm text-muted-foreground">
-                        正在读取文件…
+                        {t('upload.readingFiles')}
                       </p>
                     </div>
                   ) : picked ? (
@@ -1239,25 +1277,28 @@ export function ModelsPage() {
                             <span className="truncate text-sm font-medium">
                               {picked.mode === 'archive'
                                 ? picked.files[0].name
-                                : '文件夹上传'}
+                                : t('upload.folderUpload')}
                             </span>
                             <Badge
                               variant="secondary"
                               className="font-mono text-[10px] text-muted-foreground"
                             >
-                              {picked.files.length} 个文件
+                              {t('upload.fileCount', {
+                                count: picked.files.length,
+                              })}
                             </Badge>
                           </div>
                           <div className="font-mono text-xs text-muted-foreground">
                             {formatBytes(picked.totalBytes)}
-                            {picked.mode === 'archive' && ' · 服务端解包'}
+                            {picked.mode === 'archive' &&
+                              ` · ${t('upload.extractedOnServer')}`}
                           </div>
                         </div>
                       </div>
                       <Button
                         variant="ghost"
                         size="icon-xs"
-                        title="清除已选文件"
+                        title={t('upload.clearSelection')}
                         onClick={() => setPicked(null)}
                       >
                         <X className="size-3.5" />
@@ -1266,11 +1307,9 @@ export function ModelsPage() {
                   ) : (
                     <div className="flex flex-col items-center gap-2">
                       <Upload className="size-6 text-muted-foreground/60" />
-                      <p className="text-sm">
-                        拖拽模型文件夹或 .zip / .tar.gz / .tgz 压缩包到此处
-                      </p>
+                      <p className="text-sm">{t('upload.dropHint')}</p>
                       <p className="text-xs text-muted-foreground">
-                        文件夹按相对路径保留目录结构；压缩包由服务端自动解包
+                        {t('upload.dropHintSub')}
                       </p>
                       <div className="mt-2 flex flex-wrap justify-center gap-2">
                         <Button
@@ -1280,7 +1319,7 @@ export function ModelsPage() {
                           onClick={() => folderInputRef.current?.click()}
                         >
                           <FolderUp className="size-3.5" />
-                          选择文件夹
+                          {t('upload.pickFolder')}
                         </Button>
                         <Button
                           variant="outline"
@@ -1289,7 +1328,7 @@ export function ModelsPage() {
                           onClick={() => archiveInputRef.current?.click()}
                         >
                           <FileArchive className="size-3.5" />
-                          选择压缩包
+                          {t('upload.pickArchive')}
                         </Button>
                       </div>
                     </div>
@@ -1325,8 +1364,11 @@ export function ModelsPage() {
                 <div className="flex items-center justify-between gap-3">
                   <p className="text-xs text-muted-foreground">
                     {picked
-                      ? `将上传 ${picked.files.length} 个文件（${formatBytes(picked.totalBytes)}），大文件耗时较长，请保持页面打开`
-                      : '目标模型已存在时上传会被拒绝，需先删除旧模型'}
+                      ? t('upload.pickedHint', {
+                          count: picked.files.length,
+                          size: formatBytes(picked.totalBytes),
+                        })
+                      : t('upload.existsHint')}
                   </p>
                   <Button
                     disabled={
@@ -1343,7 +1385,7 @@ export function ModelsPage() {
                     ) : (
                       <Upload className="size-4" />
                     )}
-                    开始上传
+                    {t('upload.start')}
                   </Button>
                 </div>
               </TabsContent>
@@ -1351,11 +1393,13 @@ export function ModelsPage() {
               {/* ── 服务器本地路径导入 ── */}
               <TabsContent value="import" className="mt-4 space-y-4">
                 <p className="text-xs text-muted-foreground">
-                  模型文件已在服务器上时使用：填写包含模型文件的目录路径，后端将其复制到模块模型缓存目录，跳过网络下载。
+                  {t('import.description')}
                 </p>
                 <div className="grid items-end gap-4 sm:grid-cols-2 lg:grid-cols-[1fr_1fr_1.6fr_auto]">
                   <div className="space-y-2">
-                    <label className="text-sm font-medium">目标模块</label>
+                    <label className="text-sm font-medium">
+                      {t('add.targetModule')}
+                    </label>
                     <Select
                       value={importModule || undefined}
                       onValueChange={(v) => {
@@ -1364,7 +1408,7 @@ export function ModelsPage() {
                       }}
                     >
                       <SelectTrigger className="w-full">
-                        <SelectValue placeholder="选择模块" />
+                        <SelectValue placeholder={t('add.selectModule')} />
                       </SelectTrigger>
                       <SelectContent>
                         {moduleOptions.map((m) => (
@@ -1376,14 +1420,16 @@ export function ModelsPage() {
                     </Select>
                   </div>
                   <div className="space-y-2">
-                    <label className="text-sm font-medium">模型</label>
+                    <label className="text-sm font-medium">
+                      {t('common:label.model')}
+                    </label>
                     <Select
                       value={importModelId || undefined}
                       onValueChange={setImportModelId}
                       disabled={!importModule}
                     >
                       <SelectTrigger className="w-full">
-                        <SelectValue placeholder="选择模型" />
+                        <SelectValue placeholder={t('add.selectModel')} />
                       </SelectTrigger>
                       <SelectContent>
                         {importModelOptions.map((m) => (
@@ -1395,7 +1441,9 @@ export function ModelsPage() {
                     </Select>
                   </div>
                   <div className="space-y-2">
-                    <label className="text-sm font-medium">源路径</label>
+                    <label className="text-sm font-medium">
+                      {t('import.sourcePath')}
+                    </label>
                     <Input
                       value={sourcePath}
                       onChange={(e) => setSourcePath(e.target.value)}
@@ -1417,7 +1465,7 @@ export function ModelsPage() {
                     ) : (
                       <Download className="size-4" />
                     )}
-                    导入
+                    {t('common:action.import')}
                   </Button>
                 </div>
               </TabsContent>
@@ -1433,9 +1481,11 @@ export function ModelsPage() {
           if (!open) setDeleteTarget(null)
         }}
         variant="destructive"
-        title={`删除模型「${deleteTarget?.model.name ?? ''}」？`}
-        description="将删除服务器上的模型文件（整个模型目录及元数据）。此操作不可撤销，之后需要重新下载或上传才能恢复。"
-        confirmLabel="删除"
+        title={t('delete.confirmTitle', {
+          name: deleteTarget?.model.name ?? '',
+        })}
+        description={t('delete.confirmDescription')}
+        confirmLabel={t('common:action.delete')}
         onConfirm={() => confirmDelete()}
       />
     </PageContainer>

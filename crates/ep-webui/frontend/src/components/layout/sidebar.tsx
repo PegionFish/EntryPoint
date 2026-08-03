@@ -1,4 +1,5 @@
 import { NavLink } from 'react-router-dom'
+import { useTranslation } from 'react-i18next'
 import {
   Database,
   GitBranch,
@@ -12,18 +13,19 @@ import { cn } from '@/lib/utils'
 
 interface NavItem {
   to: string
-  label: string
+  /** components 命名空间下的标签键 */
+  labelKey: string
   icon: LucideIcon
   end?: boolean
 }
 
 const NAV_ITEMS: NavItem[] = [
-  { to: '/', label: '仪表盘', icon: LayoutDashboard, end: true },
-  { to: '/modules', label: '模块', icon: Puzzle },
-  { to: '/pipeline', label: '管线', icon: GitBranch },
-  { to: '/tasks', label: '任务', icon: ListTodo },
-  { to: '/models', label: '模型', icon: Database },
-  { to: '/settings', label: '设置', icon: Settings },
+  { to: '/', labelKey: 'sidebar.nav.dashboard', icon: LayoutDashboard, end: true },
+  { to: '/modules', labelKey: 'sidebar.nav.modules', icon: Puzzle },
+  { to: '/pipeline', labelKey: 'sidebar.nav.pipeline', icon: GitBranch },
+  { to: '/tasks', labelKey: 'sidebar.nav.tasks', icon: ListTodo },
+  { to: '/models', labelKey: 'sidebar.nav.models', icon: Database },
+  { to: '/settings', labelKey: 'sidebar.nav.settings', icon: Settings },
 ]
 
 interface SidebarNavProps {
@@ -34,6 +36,7 @@ interface SidebarNavProps {
 
 /** 导航列表：桌面侧栏与移动端抽屉共用，保证导航数据源与样式单一 */
 export function SidebarNav({ onNavigate, className }: SidebarNavProps) {
+  const { t } = useTranslation('components')
   return (
     <nav className={cn('flex flex-col gap-1 p-3', className)}>
       {NAV_ITEMS.map((item) => (
@@ -52,7 +55,7 @@ export function SidebarNav({ onNavigate, className }: SidebarNavProps) {
           }
         >
           <item.icon className="h-4 w-4 shrink-0" />
-          <span>{item.label}</span>
+          <span>{t(item.labelKey)}</span>
         </NavLink>
       ))}
     </nav>

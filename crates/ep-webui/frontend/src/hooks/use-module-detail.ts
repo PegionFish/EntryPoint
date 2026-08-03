@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import { api } from '@/api/client'
 import { wsManager } from '@/api/ws'
 import type {
@@ -54,6 +55,7 @@ function appendLine(prev: string[], line: string): string[] {
  * - 启动 / 停止采用乐观更新：先切换为过渡态，请求完成后以服务端结果校正。
  */
 export function useModuleDetail(moduleId: string | undefined): UseModuleDetailResult {
+  const { t } = useTranslation('modules')
   const id = moduleId ?? ''
   const [module, setModule] = useState<ModuleResponse | null>(null)
   const [status, setStatus] = useState<ModuleStatusResponse | null>(null)
@@ -90,7 +92,7 @@ export function useModuleDetail(moduleId: string | undefined): UseModuleDetailRe
         if (cancelled) return
         const found = list.find((m) => m.id === id) ?? null
         setModule(found)
-        if (!found) setError(`未找到模块「${id}」`)
+        if (!found) setError(t('error.moduleNotFound', { id }))
       })
       .catch(() => {
         /* 元信息加载失败不阻塞页面，状态轮询仍可进行 */
@@ -98,7 +100,7 @@ export function useModuleDetail(moduleId: string | undefined): UseModuleDetailRe
     return () => {
       cancelled = true
     }
-  }, [id])
+  }, [id, t])
 
   // 历史日志 + 关联模型：挂载时拉取一次
   useEffect(() => {
@@ -179,7 +181,7 @@ export function useModuleDetail(moduleId: string | undefined): UseModuleDetailRe
   }, [id])
 
   const startModule = useCallback(async () => {
-    if (!id) throw new Error('缺少模块 ID')
+    if (!id) throw new Error(t('error.missingModuleId'))
     setActing(true)
     // 乐观更新为过渡态
     setStatus((prev) => (prev ? { ...prev, status: 'starting' } : prev))
@@ -194,10 +196,10 @@ export function useModuleDetail(moduleId: string | undefined): UseModuleDetailRe
     } finally {
       if (mounted.current) setActing(false)
     }
-  }, [id, refreshStatus])
+  }, [id, refreshStatus, t])
 
   const stopModule = useCallback(async () => {
-    if (!id) throw new Error('缺少模块 ID')
+    if (!id) throw new Error(t('error.missingModuleId'))
     setActing(true)
     setStatus((prev) =>
       prev ? { ...prev, status: 'stopped', port: null, uptime_secs: 0 } : prev,
@@ -213,7 +215,7 @@ export function useModuleDetail(moduleId: string | undefined): UseModuleDetailRe
     } finally {
       if (mounted.current) setActing(false)
     }
-  }, [id, refreshStatus])
+  }, [id, refreshStatus, t])
 
   const clearLogs = useCallback(() => setLogs([]), [])
 

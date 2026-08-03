@@ -13,8 +13,10 @@ import {
   TerminalSquare,
   TriangleAlert,
 } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import type { AppConfig } from '@/api/types'
+import { normalizeLanguage, setAppLanguage } from '@/i18n'
 import { useThemeStore } from '@/store/theme'
 import { PageContainer } from '@/components/layout/page-container'
 import { Button } from '@/components/ui/button'
@@ -197,41 +199,40 @@ interface ValidationErrors {
   https_proxy?: string
 }
 
+/** 翻译函数最小签名：供模块级校验函数使用，与 react-i18next 的 t 类型解耦 */
+type TranslateFn = (key: string) => string
+
 /** 端口必须为 1–65535 的整数 */
-function portError(value: number): string | undefined {
-  return Number.isInteger(value) && value >= 1 && value <= 65535
-    ? undefined
-    : '端口必须为 1–65535 的整数'
+function portInvalid(value: number): boolean {
+  return !(Number.isInteger(value) && value >= 1 && value <= 65535)
 }
 
 /** 代理地址非空时必须以 http:// 或 https:// 开头 */
-function proxyError(value: string): string | undefined {
+function proxyInvalid(value: string): boolean {
   const v = value.trim()
-  return v === '' || /^https?:\/\//.test(v)
-    ? undefined
-    : '必须以 http:// 或 https:// 开头'
+  return v !== '' && !/^https?:\/\//.test(v)
 }
 
-/** 对当前表单做整体校验，返回全部错误 */
-function validateConfig(config: AppConfig): ValidationErrors {
+/** 对当前表单做整体校验，返回全部错误（错误文案经 i18n 翻译） */
+function validateConfig(config: AppConfig, t: TranslateFn): ValidationErrors {
   const errors: ValidationErrors = {}
-  const serverPort = portError(config.server.port)
-  if (serverPort) errors.server_port = serverPort
-  const rangeStart = portError(config.ports.range_start)
-  if (rangeStart) errors.range_start = rangeStart
-  const rangeEnd = portError(config.ports.range_end)
-  if (rangeEnd) errors.range_end = rangeEnd
+  if (portInvalid(config.server.port))
+    errors.server_port = t('validation.port')
+  if (portInvalid(config.ports.range_start))
+    errors.range_start = t('validation.port')
+  if (portInvalid(config.ports.range_end))
+    errors.range_end = t('validation.port')
   if (
-    !rangeStart &&
-    !rangeEnd &&
+    !errors.range_start &&
+    !errors.range_end &&
     config.ports.range_start >= config.ports.range_end
   ) {
-    errors.ports_range = '起始端口必须小于结束端口'
+    errors.ports_range = t('validation.portRange')
   }
-  const httpProxy = proxyError(config.network?.http_proxy ?? '')
-  if (httpProxy) errors.http_proxy = httpProxy
-  const httpsProxy = proxyError(config.network?.https_proxy ?? '')
-  if (httpsProxy) errors.https_proxy = httpsProxy
+  if (proxyInvalid(config.network?.http_proxy ?? ''))
+    errors.http_proxy = t('validation.proxy')
+  if (proxyInvalid(config.network?.https_proxy ?? ''))
+    errors.https_proxy = t('validation.proxy')
   return errors
 }
 
@@ -256,12 +257,24 @@ function scrollToFirstError(errors: ValidationErrors) {
 /* ── 设置页 ──────────────────────────────────────────────────── */
 
 export function SettingsPage() {
-  const { config, setConfig, save, reload, loading, saving, error, dirty } =
-    useConfig()
+  const { t } = useTranslation('settings')
+  /** t 的轻量包装：供模块级校验函数使用（隔离 react-i18next 类型） */
+  const tr: TranslateFn = (key) => t(key)
+  const {
+    config,
+    setConfig,
+    save,
+    persistPartial,
+    reload,
+    loading,
+    saving,
+    error,
+    dirty,
+  } = useConfig()
   /** 开启「允许公网访问」前的安全确认对话框 */
   const [publicDialogOpen, setPublicDialogOpen] = useState(false)
   /** 实时字段校验错误（由当前表单内容派生） */
-  const errors: ValidationErrors = config ? validateConfig(config) : {}
+  const errors: ValidationErrors = config ? validateConfig(config, tr) : {}
 
   /** 局部更新某个配置分区 */
   function patchSection<K extends keyof AppConfig>(
@@ -273,41 +286,66 @@ export function SettingsPage() {
     )
   }
 
+  /**
+   * 界面语言切换：即时生效 + 立即持久化（不等保存按钮）。
+   * 持久化以服务器最新配置为 PUT 基线、只覆盖 language 字段，
+   * 不会把页面上其他未保存的 draft 改动一起提交。
+   */
+  async function handleLanguageChange(value: string) {
+    const lang = normalizeLanguage(value)
+    // 1) 同步 draft，Select 选中态立即可见
+    patchSection('general', { language: lang })
+    // 2) i18n 立即生效（changeLanguage + localStorage + <html lang> + 标题）
+    setAppLanguage(lang)
+    // 3) 立即持久化到服务器（全局唯一真源）
+    const ok = await persistPartial((cfg) => ({
+      ...cfg,
+      general: { ...cfg.general, language: lang },
+    }))
+    if (ok) {
+      toast.success(t('toast.languageSaved'))
+    } else {
+      toast.error(t('toast.languageSaveFailed'), {
+        description: t('toast.languageSaveFailedDescription'),
+      })
+    }
+  }
+
   async function handleSave() {
     if (!config) return
     // 校验未通过：阻止保存、汇总报错并滚动到首个出错字段
-    const validationErrors = validateConfig(config)
+    const validationErrors = validateConfig(config, tr)
     const messages = [
       ...new Set(
         Object.values(validationErrors).filter((m): m is string => Boolean(m)),
       ),
     ]
     if (messages.length > 0) {
-      toast.error('配置校验未通过，请修正后再保存', {
-        description: messages.join('；'),
+      toast.error(t('toast.validationFailed'), {
+        description: messages.join('; '),
       })
       scrollToFirstError(validationErrors)
       return
     }
-    const toastId = toast.loading('正在保存配置…')
+    const toastId = toast.loading(t('toast.saving'))
     const ok = await save()
     if (ok) {
-      toast.success('配置已保存', {
+      toast.success(t('toast.saved'), {
         id: toastId,
         // P2-51：server.host / port 等改动需重启 daemon 才生效
-        description: '服务器地址/端口等改动需重启服务后生效',
+        description: t('toast.savedRestartNote'),
       })
     } else {
-      toast.error('配置保存失败', {
+      toast.error(t('toast.saveFailed'), {
         id: toastId,
-        description: '请检查服务状态后重试',
+        description: t('toast.saveFailedHint'),
       })
     }
   }
 
   async function handleReset() {
     await reload()
-    toast.info('已恢复为上次保存的配置')
+    toast.info(t('toast.reset'))
   }
 
   function handleAllowPublic(checked: boolean) {
@@ -321,14 +359,14 @@ export function SettingsPage() {
 
   return (
     <PageContainer
-      title="设置"
-      description="服务器、计算、模型与环境配置"
+      title={t('title')}
+      description={t('description')}
       actions={
         <>
           {dirty && (
             <span className="flex items-center gap-1.5 text-xs text-status-preparing">
               <span className="size-1.5 animate-pulse rounded-full bg-status-preparing" />
-              未保存的更改
+              {t('common:tip.unsavedChanges')}
             </span>
           )}
           <Button
@@ -338,7 +376,7 @@ export function SettingsPage() {
             disabled={loading || saving || !dirty}
           >
             <RotateCcw className="size-3.5" />
-            重置
+            {t('action.reset')}
           </Button>
           <Button
             size="sm"
@@ -350,7 +388,7 @@ export function SettingsPage() {
             ) : (
               <Save className="size-3.5" />
             )}
-            保存
+            {t('common:action.save')}
           </Button>
         </>
       }
@@ -373,10 +411,13 @@ export function SettingsPage() {
           {/* ── 服务器 ── */}
           <Section
             icon={Server}
-            title="服务器"
-            description="EntryPoint 服务的监听地址与访问控制"
+            title={t('server.title')}
+            description={t('server.description')}
           >
-            <Field label="监听地址" description="0.0.0.0 表示监听所有网卡">
+            <Field
+              label={t('server.host')}
+              description={t('server.hostDescription')}
+            >
               <Input
                 value={config.server.host}
                 onChange={(e) =>
@@ -387,8 +428,8 @@ export function SettingsPage() {
               />
             </Field>
             <Field
-              label="端口"
-              description="WebUI 与 API 服务端口"
+              label={t('server.port')}
+              description={t('server.portDescription')}
               field="server-port"
               error={errors.server_port}
             >
@@ -402,8 +443,8 @@ export function SettingsPage() {
             </Field>
             <SwitchRow
               className="sm:col-span-2"
-              label="允许公网访问"
-              description="关闭时仅允许私有网段与回环地址访问"
+              label={t('server.allowPublic')}
+              description={t('server.allowPublicDescription')}
               checked={config.server.allow_public}
               onCheckedChange={handleAllowPublic}
             />
@@ -412,24 +453,24 @@ export function SettingsPage() {
           {/* ── 通用 ── */}
           <Section
             icon={Settings2}
-            title="通用"
-            description="界面语言、主题与日志级别"
+            title={t('general.title')}
+            description={t('general.description')}
           >
-            <Field label="界面语言">
-              {/* P1-43：后端暂无 i18n，English 等选项实际无效，已移除；i18n 接入后再开放 */}
+            <Field label={t('general.language')}>
               <Select
-                value={config.general.language}
-                onValueChange={(v) => patchSection('general', { language: v })}
+                value={normalizeLanguage(config.general.language)}
+                onValueChange={(v) => void handleLanguageChange(v)}
               >
                 <SelectTrigger className="w-full">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="zh">简体中文</SelectItem>
+                  <SelectItem value="zh-CN">简体中文</SelectItem> {/* i18n-exempt: native label（语言选项固定以本族语显示，i18n 惯例，不进翻译文件） */}
+                  <SelectItem value="en">English</SelectItem> {/* i18n-exempt: native label（同上） */}
                 </SelectContent>
               </Select>
             </Field>
-            <Field label="主题">
+            <Field label={t('common:label.theme')}>
               <Select
                 value={config.general.theme}
                 onValueChange={(v) => {
@@ -444,13 +485,17 @@ export function SettingsPage() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="dark">深色</SelectItem>
-                  <SelectItem value="light">浅色</SelectItem>
+                  <SelectItem value="dark">
+                    {t('common:label.dark')}
+                  </SelectItem>
+                  <SelectItem value="light">
+                    {t('common:label.light')}
+                  </SelectItem>
                   {/* P2-46：「跟随系统」已移除，theme store 仅实现 dark/light */}
                 </SelectContent>
               </Select>
             </Field>
-            <Field label="日志级别">
+            <Field label={t('general.logLevel')}>
               <Select
                 value={config.general.log_level}
                 onValueChange={(v) =>
@@ -470,8 +515,8 @@ export function SettingsPage() {
               </Select>
             </Field>
             <SwitchRow
-              label="启动时检查更新"
-              description="自动检测新版本并发出提示"
+              label={t('general.checkUpdates')}
+              description={t('general.checkUpdatesDescription')}
               checked={config.general.check_updates}
               onCheckedChange={(v) =>
                 patchSection('general', { check_updates: v })
@@ -482,10 +527,13 @@ export function SettingsPage() {
           {/* ── 计算 ── */}
           <Section
             icon={Cpu}
-            title="计算"
-            description="计算设备分配策略与资源监控"
+            title={t('compute.title')}
+            description={t('compute.description')}
           >
-            <Field label="分配策略" description="模块启动时选择计算设备的策略">
+            <Field
+              label={t('compute.strategy')}
+              description={t('compute.strategyDescription')}
+            >
               <Select
                 value={config.compute.strategy}
                 onValueChange={(v) => patchSection('compute', { strategy: v })}
@@ -494,13 +542,22 @@ export function SettingsPage() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="least_memory">最小显存优先</SelectItem>
-                  <SelectItem value="round_robin">轮询</SelectItem>
-                  <SelectItem value="manual">手动</SelectItem>
+                  <SelectItem value="least_memory">
+                    {t('strategy.leastMemory')}
+                  </SelectItem>
+                  <SelectItem value="round_robin">
+                    {t('strategy.roundRobin')}
+                  </SelectItem>
+                  <SelectItem value="manual">
+                    {t('strategy.manual')}
+                  </SelectItem>
                 </SelectContent>
               </Select>
             </Field>
-            <Field label="刷新间隔（秒）" description="设备状态轮询周期">
+            <Field
+              label={t('compute.refreshInterval')}
+              description={t('compute.refreshIntervalDescription')}
+            >
               <NumberField
                 value={config.compute.refresh_interval_secs}
                 onValueChange={(v) =>
@@ -512,8 +569,8 @@ export function SettingsPage() {
             </Field>
             <SwitchRow
               className="sm:col-span-2"
-              label="允许显存超额"
-              description="允许模块分配到显存不足的设备（可能导致加载失败）"
+              label={t('compute.allowOvercommit')}
+              description={t('compute.allowOvercommitDescription')}
               checked={config.compute.allow_overcommit}
               onCheckedChange={(v) =>
                 patchSection('compute', { allow_overcommit: v })
@@ -524,11 +581,11 @@ export function SettingsPage() {
           {/* ── 端口 ── */}
           <Section
             icon={Network}
-            title="端口"
-            description="模块服务自动分配端口的可用范围"
+            title={t('ports.title')}
+            description={t('ports.description')}
           >
             <Field
-              label="起始端口"
+              label={t('ports.rangeStart')}
               field="range-start"
               error={errors.range_start}
             >
@@ -543,7 +600,7 @@ export function SettingsPage() {
               />
             </Field>
             <Field
-              label="结束端口"
+              label={t('ports.rangeEnd')}
               field="range-end"
               error={errors.range_end ?? errors.ports_range}
             >
@@ -560,10 +617,13 @@ export function SettingsPage() {
           {/* ── 模型 ── */}
           <Section
             icon={Database}
-            title="模型"
-            description="模型缓存目录、下载源与本地搜索路径"
+            title={t('models.title')}
+            description={t('models.description')}
           >
-            <Field label="缓存目录" description="模型文件的统一存放位置">
+            <Field
+              label={t('models.cacheDir')}
+              description={t('models.cacheDirDescription')}
+            >
               <Input
                 value={config.models.cache_dir}
                 onChange={(e) =>
@@ -573,7 +633,10 @@ export function SettingsPage() {
                 className="font-mono text-xs"
               />
             </Field>
-            <Field label="Hugging Face 镜像" description="下载 HF 模型时使用的镜像端点">
+            <Field
+              label={t('models.hfEndpoint')}
+              description={t('models.hfEndpointDescription')}
+            >
               <Input
                 value={config.models.hf_endpoint}
                 onChange={(e) =>
@@ -583,7 +646,7 @@ export function SettingsPage() {
                 className="font-mono text-xs"
               />
             </Field>
-            <Field label="默认下载源">
+            <Field label={t('models.defaultSource')}>
               <Select
                 value={config.models.default_source}
                 onValueChange={(v) =>
@@ -599,7 +662,7 @@ export function SettingsPage() {
                 </SelectContent>
               </Select>
             </Field>
-            <Field label="最大并发下载数">
+            <Field label={t('models.maxConcurrentDownloads')}>
               <NumberField
                 value={config.models.max_concurrent_downloads}
                 onValueChange={(v) =>
@@ -610,8 +673,8 @@ export function SettingsPage() {
               />
             </Field>
             <Field
-              label="本地缓存搜索路径"
-              description="多个路径用英文逗号分隔，按优先级排序"
+              label={t('models.cachePaths')}
+              description={t('models.cachePathsDescription')}
               className="sm:col-span-2"
             >
               <Input
@@ -633,11 +696,11 @@ export function SettingsPage() {
           {/* ── 网络与代理 ── */}
           <Section
             icon={Globe}
-            title="网络与代理"
-            description="示例：http://127.0.0.1:7890；留空 = 跟随系统环境变量；生效范围：模型下载、Python 依赖安装、模块进程"
+            title={t('network.title')}
+            description={t('network.description')}
           >
             <Field
-              label="HTTP 代理（http_proxy）"
+              label={t('network.httpProxy')}
               field="http-proxy"
               error={errors.http_proxy}
             >
@@ -652,7 +715,7 @@ export function SettingsPage() {
               />
             </Field>
             <Field
-              label="HTTPS 代理（https_proxy）"
+              label={t('network.httpsProxy')}
               field="https-proxy"
               error={errors.https_proxy}
             >
@@ -667,8 +730,8 @@ export function SettingsPage() {
               />
             </Field>
             <Field
-              label="代理排除列表（no_proxy）"
-              description="不走代理的地址列表，默认 localhost,127.0.0.1"
+              label={t('network.noProxy')}
+              description={t('network.noProxyDescription')}
               className="sm:col-span-2"
             >
               <Input
@@ -685,10 +748,10 @@ export function SettingsPage() {
           {/* ── Python ── */}
           <Section
             icon={TerminalSquare}
-            title="Python"
-            description="模块运行所依赖 Python 与 uv 可执行文件路径"
+            title={t('python.title')}
+            description={t('python.description')}
           >
-            <Field label="Python 路径">
+            <Field label={t('python.path')}>
               <Input
                 value={config.python.path}
                 onChange={(e) =>
@@ -698,7 +761,10 @@ export function SettingsPage() {
                 className="font-mono text-xs"
               />
             </Field>
-            <Field label="uv 路径" description="用于模块依赖安装与虚拟环境管理">
+            <Field
+              label={t('python.uvPath')}
+              description={t('python.uvPathDescription')}
+            >
               <Input
                 value={config.python.uv_path}
                 onChange={(e) =>
@@ -713,10 +779,13 @@ export function SettingsPage() {
           {/* ── 管线 ── */}
           <Section
             icon={GitBranch}
-            title="管线"
-            description="管线执行的并发、超时与工作区配置"
+            title={t('pipeline.title')}
+            description={t('pipeline.description')}
           >
-            <Field label="最大并行数" description="同时运行的管线任务上限">
+            <Field
+              label={t('pipeline.maxParallel')}
+              description={t('pipeline.maxParallelDescription')}
+            >
               <NumberField
                 value={config.pipeline.max_parallel}
                 onValueChange={(v) =>
@@ -726,7 +795,10 @@ export function SettingsPage() {
                 max={64}
               />
             </Field>
-            <Field label="默认超时（秒）" description="单个管线任务的最长运行时间">
+            <Field
+              label={t('pipeline.defaultTimeout')}
+              description={t('pipeline.defaultTimeoutDescription')}
+            >
               <NumberField
                 value={config.pipeline.default_timeout_secs}
                 onValueChange={(v) =>
@@ -735,7 +807,10 @@ export function SettingsPage() {
                 min={1}
               />
             </Field>
-            <Field label="工作区目录" description="管线运行时的中间文件存放位置">
+            <Field
+              label={t('pipeline.workspaceDir')}
+              description={t('pipeline.workspaceDirDescription')}
+            >
               <Input
                 value={config.pipeline.workspace_dir}
                 onChange={(e) =>
@@ -746,8 +821,8 @@ export function SettingsPage() {
               />
             </Field>
             <SwitchRow
-              label="保留工作区"
-              description="任务结束后保留中间文件，便于排查问题"
+              label={t('pipeline.keepWorkspace')}
+              description={t('pipeline.keepWorkspaceDescription')}
               checked={config.pipeline.keep_workspace}
               onCheckedChange={(v) =>
                 patchSection('pipeline', { keep_workspace: v })
@@ -768,18 +843,14 @@ export function SettingsPage() {
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2 text-status-preparing">
               <TriangleAlert className="size-4" />
-              ⚠️ 安全风险警告
+              {t('publicDialog.title')}
             </DialogTitle>
             <DialogDescription asChild>
               <div className="space-y-2 pt-1 text-sm leading-relaxed">
-                <p>
-                  开启后，任何能访问此服务器 IP
-                  的设备均可操作 EntryPoint，包括启停模块、修改配置。
-                </p>
-                <p>本项目不内置用户认证和传输加密。</p>
+                <p>{t('publicDialog.risk')}</p>
+                <p>{t('publicDialog.noAuth')}</p>
                 <p className="font-medium text-foreground">
-                  仅在您了解风险并有外部安全措施（如
-                  VPN、防火墙规则）时开启。
+                  {t('publicDialog.warning')}
                 </p>
               </div>
             </DialogDescription>
@@ -789,7 +860,7 @@ export function SettingsPage() {
               variant="outline"
               onClick={() => setPublicDialogOpen(false)}
             >
-              取消
+              {t('common:action.cancel')}
             </Button>
             <Button
               variant="destructive"
@@ -798,7 +869,7 @@ export function SettingsPage() {
                 setPublicDialogOpen(false)
               }}
             >
-              确认开启
+              {t('publicDialog.confirm')}
             </Button>
           </DialogFooter>
         </DialogContent>

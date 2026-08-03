@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next'
 import {
   Sheet,
   SheetContent,
@@ -19,6 +20,7 @@ interface MobileNavProps {
  * 点击遮罩 / 按 ESC / 点击导航项后自动关闭。
  */
 export function MobileNav({ open, onOpenChange }: MobileNavProps) {
+  const { t } = useTranslation('components')
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent side="left" className="w-64 gap-0 bg-card sm:max-w-64">
@@ -27,7 +29,7 @@ export function MobileNav({ open, onOpenChange }: MobileNavProps) {
             EntryPoint
           </SheetTitle>
           <SheetDescription className="sr-only">
-            应用主导航菜单
+            {t('mobileNav.description')}
           </SheetDescription>
         </SheetHeader>
         <SidebarNav

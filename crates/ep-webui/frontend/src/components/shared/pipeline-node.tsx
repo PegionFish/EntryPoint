@@ -18,6 +18,16 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { categoryLabel } from '@/lib/constants'
+import i18n from '@/i18n'
+
+/**
+ * 模块级翻译助手：静态元数据（常量/工厂函数）无法使用 React Hook，
+ * 在读取时按当前语言即时解析，保证语言切换后重渲染即可生效。
+ * 键位于 components 命名空间，跨命名空间用 "common:xxx" 全限定键。
+ */
+function t(key: string, options?: Record<string, unknown>): string {
+  return i18n.t(key, options) as string
+}
 
 // ============================================================
 // 数据类型（端口）
@@ -34,12 +44,12 @@ interface DataTypeMeta {
 }
 
 export const DATA_TYPE_META: Record<DataType, DataTypeMeta> = {
-  audio: { label: '音频', handle: 'bg-dtype-audio! border-card!', chip: 'bg-dtype-audio' },
-  video: { label: '视频', handle: 'bg-dtype-video! border-card!', chip: 'bg-dtype-video' },
-  image: { label: '图像', handle: 'bg-dtype-image! border-card!', chip: 'bg-dtype-image' },
-  text: { label: '文本', handle: 'bg-dtype-text! border-card!', chip: 'bg-dtype-text' },
-  file: { label: '文件', handle: 'bg-dtype-file! border-card!', chip: 'bg-dtype-file' },
-  any: { label: '任意', handle: 'bg-dtype-any! border-card!', chip: 'bg-dtype-any' },
+  audio: { get label() { return t('components:pipeline.dataType.audio') }, handle: 'bg-dtype-audio! border-card!', chip: 'bg-dtype-audio' },
+  video: { get label() { return t('components:pipeline.dataType.video') }, handle: 'bg-dtype-video! border-card!', chip: 'bg-dtype-video' },
+  image: { get label() { return t('components:pipeline.dataType.image') }, handle: 'bg-dtype-image! border-card!', chip: 'bg-dtype-image' },
+  text: { get label() { return t('components:pipeline.dataType.text') }, handle: 'bg-dtype-text! border-card!', chip: 'bg-dtype-text' },
+  file: { get label() { return t('components:pipeline.dataType.file') }, handle: 'bg-dtype-file! border-card!', chip: 'bg-dtype-file' },
+  any: { get label() { return t('components:pipeline.dataType.any') }, handle: 'bg-dtype-any! border-card!', chip: 'bg-dtype-any' },
 }
 
 /** 端口数据类型兼容规则：相同、任一为 any、或任一为 file（文件可承载任何媒体类型） */
@@ -70,21 +80,26 @@ interface NodeStatusMeta {
 }
 
 export const NODE_STATUS_META: Record<NodeStatus, NodeStatusMeta> = {
-  waiting: { label: '等待', border: 'border-border', dot: 'bg-status-stopped', glow: '' },
+  waiting: {
+    get label() { return t('components:pipeline.nodeStatus.waiting') },
+    border: 'border-border',
+    dot: 'bg-status-stopped',
+    glow: '',
+  },
   running: {
-    label: '运行中',
+    get label() { return t('components:pipeline.nodeStatus.running') },
     border: 'border-status-starting',
     dot: 'bg-status-starting animate-pulse',
     glow: 'shadow-md shadow-status-starting/30',
   },
   done: {
-    label: '完成',
+    get label() { return t('components:pipeline.nodeStatus.done') },
     border: 'border-status-running',
     dot: 'bg-status-running',
     glow: 'shadow-md shadow-status-running/25',
   },
   failed: {
-    label: '失败',
+    get label() { return t('components:pipeline.nodeStatus.failed') },
     border: 'border-status-error',
     dot: 'bg-status-error',
     glow: 'shadow-md shadow-status-error/30',
@@ -159,47 +174,47 @@ export interface BuiltinDef {
 export const BUILTIN_DEFS: Record<BuiltinKind, BuiltinDef> = {
   file_input: {
     kind: 'file_input',
-    label: '文件输入',
-    description: '从磁盘读取输入文件',
+    get label() { return t('components:pipeline.builtin.fileInput.label') },
+    get description() { return t('components:pipeline.builtin.fileInput.description') },
     icon: FileInput,
     accent: 'bg-node-file-input/15 text-node-file-input',
     inputs: [],
-    outputs: [{ id: 'out', label: '输出', dataType: 'file' }],
+    outputs: [{ id: 'out', get label() { return t('components:pipeline.port.output') }, dataType: 'file' }],
     params: [
-      { name: 'path', label: '文件路径', type: 'string', required: true, placeholder: '/workspace/input/audio.wav' },
-      { name: 'pattern', label: '匹配模式', type: 'string', placeholder: '*.wav（批量时生效）' },
+      { name: 'path', get label() { return t('components:pipeline.param.filePath') }, type: 'string', required: true, placeholder: '/workspace/input/audio.wav' },
+      { name: 'pattern', get label() { return t('components:pipeline.param.pattern') }, type: 'string', get placeholder() { return t('components:pipeline.param.pattern.placeholder') } },
     ],
   },
   file_output: {
     kind: 'file_output',
-    label: '文件输出',
-    description: '将结果写入磁盘文件',
+    get label() { return t('components:pipeline.builtin.fileOutput.label') },
+    get description() { return t('components:pipeline.builtin.fileOutput.description') },
     icon: FileOutput,
     accent: 'bg-node-file-output/15 text-node-file-output',
-    inputs: [{ id: 'in', label: '输入', dataType: 'file' }],
+    inputs: [{ id: 'in', get label() { return t('components:pipeline.port.input') }, dataType: 'file' }],
     outputs: [],
     params: [
-      { name: 'path', label: '输出路径', type: 'string', required: true, placeholder: '/workspace/output/result.txt' },
-      { name: 'overwrite', label: '覆盖已有文件', type: 'boolean', defaultValue: true },
+      { name: 'path', get label() { return t('components:pipeline.param.outputPath') }, type: 'string', required: true, placeholder: '/workspace/output/result.txt' },
+      { name: 'overwrite', get label() { return t('components:pipeline.param.overwrite') }, type: 'boolean', defaultValue: true },
     ],
   },
   ffmpeg: {
     kind: 'ffmpeg',
-    label: 'FFmpeg 处理',
-    description: '音视频转码 / 剪辑 / 混流',
+    get label() { return t('components:pipeline.builtin.ffmpeg.label') },
+    get description() { return t('components:pipeline.builtin.ffmpeg.description') },
     icon: Film,
     accent: 'bg-node-ffmpeg/15 text-node-ffmpeg',
-    inputs: [{ id: 'in', label: '输入', dataType: 'file' }],
-    outputs: [{ id: 'out', label: '输出', dataType: 'file' }],
+    inputs: [{ id: 'in', get label() { return t('components:pipeline.port.input') }, dataType: 'file' }],
+    outputs: [{ id: 'out', get label() { return t('components:pipeline.port.output') }, dataType: 'file' }],
     params: [
       {
         name: 'args',
-        label: '命令参数',
+        get label() { return t('components:pipeline.param.args') },
         type: 'string',
         placeholder: '-i {input} -c:v libx264 {output}',
-        hint: '{input}/{output} 为占位符',
+        get hint() { return t('components:pipeline.param.args.hint') },
       },
-      { name: 'timeout_secs', label: '超时（秒）', type: 'number', defaultValue: 600 },
+      { name: 'timeout_secs', get label() { return t('components:pipeline.param.timeoutSecs') }, type: 'number', defaultValue: 600 },
     ],
   },
 }
@@ -215,10 +230,10 @@ export const BUILTIN_LIST: BuiltinDef[] = [
 // ============================================================
 
 export const EXTERNAL_PARAMS: ParamSpec[] = [
-  { name: 'endpoint', label: '接口地址', type: 'string', required: true, placeholder: 'https://api.example.com/v1/process' },
-  { name: 'method', label: '请求方法', type: 'select', options: ['GET', 'POST', 'PUT'], defaultValue: 'POST' },
-  { name: 'api_key', label: 'API Key', type: 'string', placeholder: 'sk-…（可选）' },
-  { name: 'timeout_secs', label: '超时（秒）', type: 'number', defaultValue: 60 },
+  { name: 'endpoint', get label() { return t('components:pipeline.param.endpoint') }, type: 'string', required: true, placeholder: 'https://api.example.com/v1/process' },
+  { name: 'method', get label() { return t('components:pipeline.param.method') }, type: 'select', options: ['GET', 'POST', 'PUT'], defaultValue: 'POST' },
+  { name: 'api_key', label: 'API Key', type: 'string', get placeholder() { return t('components:pipeline.param.apiKey.placeholder') } },
+  { name: 'timeout_secs', get label() { return t('components:pipeline.param.timeoutSecs') }, type: 'number', defaultValue: 60 },
 ]
 
 // ============================================================
@@ -235,123 +250,124 @@ export interface CapabilityDef {
 
 const DEVICE_PARAM: ParamSpec = {
   name: 'device',
-  label: '计算设备',
+  get label() { return t('components:pipeline.param.device') },
   type: 'select',
   options: ['auto', 'cuda', 'cpu'],
   defaultValue: 'auto',
 }
 
+/** 工厂函数在渲染期调用，标签直接按当前语言解析 */
 export function moduleCapability(category: string): CapabilityDef {
   const io = (input: DataType, output: DataType): Pick<CapabilityDef, 'inputs' | 'outputs'> => ({
-    inputs: [{ id: 'in', label: '输入', dataType: input }],
-    outputs: [{ id: 'out', label: '输出', dataType: output }],
+    inputs: [{ id: 'in', label: t('components:pipeline.port.input'), dataType: input }],
+    outputs: [{ id: 'out', label: t('components:pipeline.port.output'), dataType: output }],
   })
 
   switch (category.toLowerCase()) {
     case 'asr':
       return {
         id: 'asr.transcribe',
-        label: '语音转写',
+        label: t('components:pipeline.capability.asr'),
         ...io('audio', 'text'),
         params: [
-          { name: 'language', label: '语言', type: 'select', options: ['zh', 'en', 'ja', 'yue'], defaultValue: 'zh' },
-          { name: 'model', label: '模型', type: 'string', defaultValue: 'paraformer-v2', hint: '模型 ID' },
+          { name: 'language', label: t('common:label.language'), type: 'select', options: ['zh', 'en', 'ja', 'yue'], defaultValue: 'zh' },
+          { name: 'model', label: t('common:label.model'), type: 'string', defaultValue: 'paraformer-v2', hint: t('components:pipeline.param.modelId.hint') },
           DEVICE_PARAM,
         ],
       }
     case 'tts':
       return {
         id: 'tts.synthesize',
-        label: '语音合成',
+        label: t('components:pipeline.capability.tts'),
         ...io('text', 'audio'),
         params: [
-          { name: 'voice', label: '音色', type: 'select', options: ['xiaoyun', 'xiaoxiao', 'alex'], defaultValue: 'xiaoyun' },
-          { name: 'speed', label: '语速', type: 'number', defaultValue: 1.0, hint: '0.5 – 2.0' },
-          { name: 'format', label: '输出格式', type: 'select', options: ['wav', 'mp3', 'flac'], defaultValue: 'wav' },
+          { name: 'voice', label: t('components:pipeline.param.voice'), type: 'select', options: ['xiaoyun', 'xiaoxiao', 'alex'], defaultValue: 'xiaoyun' },
+          { name: 'speed', label: t('components:pipeline.param.speed'), type: 'number', defaultValue: 1.0, hint: '0.5 – 2.0' },
+          { name: 'format', label: t('components:pipeline.param.format'), type: 'select', options: ['wav', 'mp3', 'flac'], defaultValue: 'wav' },
         ],
       }
     case 'denoise':
       return {
         id: 'denoise.enhance',
-        label: '音频降噪',
+        label: t('components:pipeline.capability.denoise'),
         ...io('audio', 'audio'),
         params: [
-          { name: 'strength', label: '降噪强度', type: 'number', defaultValue: 0.7, hint: '0 – 1' },
-          { name: 'model', label: '模型', type: 'string', defaultValue: 'deepfilternet3' },
+          { name: 'strength', label: t('components:pipeline.param.strength'), type: 'number', defaultValue: 0.7, hint: '0 – 1' },
+          { name: 'model', label: t('common:label.model'), type: 'string', defaultValue: 'deepfilternet3' },
         ],
       }
     case 'ocr':
       return {
         id: 'ocr.recognize',
-        label: '文字识别',
+        label: t('components:pipeline.capability.ocr'),
         ...io('image', 'text'),
         params: [
-          { name: 'language', label: '语言', type: 'select', options: ['zh', 'en', 'multi'], defaultValue: 'zh' },
-          { name: 'threshold', label: '置信度阈值', type: 'number', defaultValue: 0.5, hint: '0 – 1' },
+          { name: 'language', label: t('common:label.language'), type: 'select', options: ['zh', 'en', 'multi'], defaultValue: 'zh' },
+          { name: 'threshold', label: t('components:pipeline.param.threshold'), type: 'number', defaultValue: 0.5, hint: '0 – 1' },
         ],
       }
     case 'image':
       return {
         id: 'image.process',
-        label: '图像处理',
+        label: t('components:pipeline.capability.image'),
         ...io('image', 'image'),
         params: [
-          { name: 'operation', label: '操作', type: 'select', options: ['resize', 'crop', 'rotate', 'watermark'], defaultValue: 'resize' },
-          { name: 'quality', label: '输出质量', type: 'number', defaultValue: 90, hint: '1 – 100' },
+          { name: 'operation', label: t('components:pipeline.param.operation'), type: 'select', options: ['resize', 'crop', 'rotate', 'watermark'], defaultValue: 'resize' },
+          { name: 'quality', label: t('components:pipeline.param.quality'), type: 'number', defaultValue: 90, hint: '1 – 100' },
         ],
       }
     case 'video':
       return {
         id: 'video.transcode',
-        label: '视频转码',
+        label: t('components:pipeline.capability.video'),
         ...io('video', 'video'),
         params: [
-          { name: 'codec', label: '编码器', type: 'select', options: ['libx264', 'libx265', 'copy'], defaultValue: 'libx264' },
-          { name: 'fps', label: '帧率', type: 'number', defaultValue: 30 },
-          { name: 'resolution', label: '分辨率', type: 'string', placeholder: '1920x1080（留空保持原始）' },
+          { name: 'codec', label: t('components:pipeline.param.codec'), type: 'select', options: ['libx264', 'libx265', 'copy'], defaultValue: 'libx264' },
+          { name: 'fps', label: t('components:pipeline.param.fps'), type: 'number', defaultValue: 30 },
+          { name: 'resolution', label: t('components:pipeline.param.resolution'), type: 'string', placeholder: t('components:pipeline.param.resolution.placeholder') },
         ],
       }
     case 'audio':
       return {
         id: 'audio.convert',
-        label: '音频转换',
+        label: t('components:pipeline.capability.audio'),
         ...io('audio', 'audio'),
         params: [
-          { name: 'sample_rate', label: '采样率', type: 'select', options: ['8000', '16000', '44100', '48000'], defaultValue: '16000' },
-          { name: 'channels', label: '声道', type: 'select', options: ['1', '2'], defaultValue: '1' },
+          { name: 'sample_rate', label: t('components:pipeline.param.sampleRate'), type: 'select', options: ['8000', '16000', '44100', '48000'], defaultValue: '16000' },
+          { name: 'channels', label: t('components:pipeline.param.channels'), type: 'select', options: ['1', '2'], defaultValue: '1' },
         ],
       }
     case 'translate':
       return {
         id: 'translate.translate',
-        label: '机器翻译',
+        label: t('components:pipeline.capability.translate'),
         ...io('text', 'text'),
         params: [
-          { name: 'source_lang', label: '源语言', type: 'select', options: ['auto', 'zh', 'en', 'ja'], defaultValue: 'auto' },
-          { name: 'target_lang', label: '目标语言', type: 'select', options: ['zh', 'en', 'ja'], defaultValue: 'en' },
-          { name: 'model', label: '模型', type: 'string', defaultValue: 'nllb-200' },
+          { name: 'source_lang', label: t('components:pipeline.param.sourceLang'), type: 'select', options: ['auto', 'zh', 'en', 'ja'], defaultValue: 'auto' },
+          { name: 'target_lang', label: t('components:pipeline.param.targetLang'), type: 'select', options: ['zh', 'en', 'ja'], defaultValue: 'en' },
+          { name: 'model', label: t('common:label.model'), type: 'string', defaultValue: 'nllb-200' },
         ],
       }
     case 'llm':
       return {
         id: 'llm.generate',
-        label: '文本生成',
+        label: t('components:pipeline.capability.llm'),
         ...io('text', 'text'),
         params: [
-          { name: 'model', label: '模型', type: 'string', defaultValue: 'qwen2.5-7b-instruct' },
+          { name: 'model', label: t('common:label.model'), type: 'string', defaultValue: 'qwen2.5-7b-instruct' },
           { name: 'temperature', label: 'Temperature', type: 'number', defaultValue: 0.7, hint: '0 – 2' },
-          { name: 'max_tokens', label: '最大 Token 数', type: 'number', defaultValue: 2048 },
+          { name: 'max_tokens', label: t('components:pipeline.param.maxTokens'), type: 'number', defaultValue: 2048 },
         ],
       }
     default:
       return {
         id: 'other.process',
-        label: '通用处理',
+        label: t('components:pipeline.capability.other'),
         ...io('file', 'file'),
         params: [
-          { name: 'input_path', label: '输入路径', type: 'string', placeholder: '/workspace/input' },
-          { name: 'output_path', label: '输出路径', type: 'string', placeholder: '/workspace/output' },
-          { name: 'extra_args', label: '附加参数', type: 'string', placeholder: '--flag value' },
+          { name: 'input_path', label: t('components:pipeline.param.inputPath'), type: 'string', placeholder: '/workspace/input' },
+          { name: 'output_path', label: t('components:pipeline.param.outputPath'), type: 'string', placeholder: '/workspace/output' },
+          { name: 'extra_args', label: t('components:pipeline.param.extraArgs'), type: 'string', placeholder: '--flag value' },
         ],
       }
   }
@@ -444,8 +460,8 @@ export function getNodePorts(data: PipelineNodeData): { inputs: Port[]; outputs:
     }
     case 'external':
       return {
-        inputs: [{ id: 'in', label: '输入', dataType: 'any' }],
-        outputs: [{ id: 'out', label: '输出', dataType: 'any' }],
+        inputs: [{ id: 'in', label: t('components:pipeline.port.input'), dataType: 'any' }],
+        outputs: [{ id: 'out', label: t('components:pipeline.port.output'), dataType: 'any' }],
       }
   }
 }
@@ -464,11 +480,11 @@ export function getParamSpecs(data: PipelineNodeData): ParamSpec[] {
 export function nodeKindLabel(data: PipelineNodeData): string {
   switch (data.kind) {
     case 'module':
-      return `模块节点 · ${data.capabilityLabel}`
+      return t('components:pipeline.nodeKind.module', { label: data.capabilityLabel })
     case 'builtin':
-      return `内置节点 · ${BUILTIN_DEFS[data.builtin].label}`
+      return t('components:pipeline.nodeKind.builtin', { label: BUILTIN_DEFS[data.builtin].label })
     case 'external':
-      return `外部 API · ${data.method}`
+      return t('components:pipeline.nodeKind.external', { method: data.method })
   }
 }
 
@@ -519,7 +535,7 @@ export function createPipelineNode(
     const cap = moduleCapability(category)
     const data: ModuleNodeData = {
       kind: 'module',
-      label: payload.moduleName ?? payload.moduleId ?? '未命名模块',
+      label: payload.moduleName ?? payload.moduleId ?? t('components:pipeline.unnamedModule'),
       moduleId: payload.moduleId ?? 'unknown',
       moduleVersion: payload.moduleVersion ?? '0.1.0',
       category,
@@ -545,7 +561,7 @@ export function createPipelineNode(
 
   const data: ExternalNodeData = {
     kind: 'external',
-    label: '外部 API',
+    label: t('components:pipeline.external.title'),
     endpoint: 'https://api.example.com/v1/process',
     method: 'POST',
     status: 'waiting',
@@ -588,7 +604,7 @@ function StatusDot({ status }: { status: NodeStatus }) {
   const meta = NODE_STATUS_META[status]
   return (
     <span
-      title={`状态：${meta.label}`}
+      title={t('components:pipeline.nodeStatusTitle', { status: meta.label })}
       className={cn('h-2 w-2 shrink-0 rounded-full transition-colors', meta.dot)}
     />
   )
@@ -620,7 +636,7 @@ function PortLabel({ port, side }: { port: Port; side: 'in' | 'out' }) {
         type={side === 'in' ? 'target' : 'source'}
         position={side === 'in' ? Position.Left : Position.Right}
         id={port.id}
-        title={`${meta.label}端口`}
+        title={t('components:pipeline.portTitle', { type: meta.label })}
         className={cn(
           'h-3! w-3! rounded-full! border-2! transition-transform!',
           'hover:scale-125!',
@@ -700,7 +716,7 @@ export function BuiltinNode({ data, selected }: NodeProps<BuiltinFlowNode>) {
           <p className="truncate text-[10px] text-muted-foreground">{def.description}</p>
         </div>
         <span className="shrink-0 rounded bg-muted px-1 py-px text-[9px] text-muted-foreground">
-          内置
+          {t('components:pipeline.builtin.badge')}
         </span>
         <StatusDot status={data.status} />
       </div>
@@ -734,7 +750,9 @@ export function ExternalApiNode({ data, selected }: NodeProps<ExternalFlowNode>)
         </span>
         <div className="min-w-0 flex-1">
           <p className="truncate text-[13px] font-semibold leading-tight">{data.label}</p>
-          <p className="truncate text-[10px] text-muted-foreground">调用外部 HTTP 接口</p>
+          <p className="truncate text-[10px] text-muted-foreground">
+            {t('components:pipeline.external.description')}
+          </p>
         </div>
         <span
           className={cn(
@@ -750,8 +768,8 @@ export function ExternalApiNode({ data, selected }: NodeProps<ExternalFlowNode>)
         {endpoint}
       </div>
       <PortRow
-        inputs={[{ id: 'in', label: '输入', dataType: 'any' }]}
-        outputs={[{ id: 'out', label: '输出', dataType: 'any' }]}
+        inputs={[{ id: 'in', label: t('components:pipeline.port.input'), dataType: 'any' }]}
+        outputs={[{ id: 'out', label: t('components:pipeline.port.output'), dataType: 'any' }]}
       />
     </NodeCard>
   )

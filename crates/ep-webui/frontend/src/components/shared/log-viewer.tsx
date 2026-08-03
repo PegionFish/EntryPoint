@@ -14,6 +14,7 @@ import {
   Search,
   Trash2,
 } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
@@ -134,6 +135,7 @@ export function LogViewer({
   exportName,
   className,
 }: LogViewerProps) {
+  const { t } = useTranslation('components')
   const scrollRef = useRef<HTMLDivElement>(null)
   const [locked, setLocked] = useState(true)
   const [query, setQuery] = useState('')
@@ -193,9 +195,12 @@ export function LogViewer({
     <div className={cn('space-y-2', className)}>
       <div className="flex flex-wrap items-center gap-2">
         <span className="font-mono text-xs text-muted-foreground">
-          共 {lines.length} 行
+          {t('logViewer.lineCount', { count: lines.length })}
           {trimmedQuery && (
-            <span className="text-primary"> · 命中 {rows.length} 行</span>
+            <span className="text-primary">
+              {' '}
+              · {t('logViewer.matchCount', { count: rows.length })}
+            </span>
           )}
         </span>
         <div className="ml-auto flex flex-wrap items-center gap-1.5">
@@ -207,8 +212,8 @@ export function LogViewer({
             <Input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="搜索日志…"
-              aria-label="搜索日志"
+              placeholder={t('logViewer.searchPlaceholder')}
+              aria-label={t('logViewer.searchLabel')}
               className="h-6 w-44 rounded-md pl-7 text-xs"
             />
           </div>
@@ -218,13 +223,13 @@ export function LogViewer({
           >
             <SelectTrigger
               size="sm"
-              aria-label="按级别过滤"
+              aria-label={t('logViewer.levelFilterLabel')}
               className="h-6 gap-1 rounded-md px-2 text-xs data-[size=sm]:h-6"
             >
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">全部级别</SelectItem>
+              <SelectItem value="all">{t('logViewer.allLevels')}</SelectItem>
               <SelectItem value="error">ERROR</SelectItem>
               <SelectItem value="warn">WARN</SelectItem>
               <SelectItem value="info">INFO</SelectItem>
@@ -235,10 +240,10 @@ export function LogViewer({
               variant="secondary"
               size="xs"
               onClick={followBottom}
-              title="已锁定底部滚动"
+              title={t('logViewer.lockedTitle')}
             >
               <Lock />
-              已跟随
+              {t('logViewer.following')}
             </Button>
           ) : (
             <Button
@@ -246,10 +251,10 @@ export function LogViewer({
               size="xs"
               onClick={followBottom}
               className="border-primary/50 text-primary"
-              title="有新日志，点击回到底部"
+              title={t('logViewer.newLogsTitle')}
             >
               <ArrowDownToLine />
-              回到底部
+              {t('logViewer.backToBottom')}
             </Button>
           )}
           <Button
@@ -257,10 +262,10 @@ export function LogViewer({
             size="xs"
             onClick={handleExport}
             disabled={lines.length === 0}
-            title="导出当前缓冲为 .txt"
+            title={t('logViewer.exportTitle')}
           >
             <Download />
-            导出
+            {t('common:action.export')}
           </Button>
           {onClear && (
             <Button
@@ -268,10 +273,10 @@ export function LogViewer({
               size="xs"
               onClick={onClear}
               disabled={lines.length === 0}
-              title="清空前端显示"
+              title={t('logViewer.clearTitle')}
             >
               <Trash2 />
-              清空
+              {t('logViewer.clear')}
             </Button>
           )}
         </div>
@@ -286,8 +291,8 @@ export function LogViewer({
         {rows.length === 0 ? (
           <div className="flex h-24 items-center justify-center text-muted-foreground/60">
             {lines.length === 0
-              ? '暂无日志'
-              : '没有匹配当前搜索 / 级别过滤的日志'}
+              ? t('logViewer.noLogs')
+              : t('logViewer.noMatches')}
           </div>
         ) : (
           <div className="py-2">
