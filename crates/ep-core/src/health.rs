@@ -28,8 +28,11 @@ pub async fn check_health(
     timeout: Duration,
 ) -> HealthStatus {
     let url = format!("http://localhost:{}{}", port, endpoint);
+    // 健康检查永远只打本机地址：显式禁用代理，避免配置的出口代理
+    // （HTTP_PROXY 等）拦截 localhost 流量
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
+        .no_proxy()
         .build();
 
     let client = match client {

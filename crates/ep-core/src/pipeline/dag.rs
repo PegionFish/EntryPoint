@@ -26,6 +26,15 @@ pub enum ValidationError {
 
 // ─── 节点类型 ────────────────────────────────────────────────────────────────
 
+/// 节点在编辑器画布上的坐标（React Flow / 桌面管线编辑器布局用）。
+///
+/// 纯展示数据：执行器忽略此字段，缺省不影响任何执行语义。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct NodePosition {
+    pub x: f64,
+    pub y: f64,
+}
+
 /// 节点种类
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -34,6 +43,8 @@ pub enum NodeKind {
     Module {
         module_id: String,
         capability: String,
+        /// `skip_serializing_if`：TOML 无 null，None 时不写出该键（反序列化行为不变）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         model_id: Option<String>,
     },
     /// 内置工具节点
@@ -43,12 +54,13 @@ pub enum NodeKind {
         endpoint: String,
         #[serde(default = "default_api_type")]
         api_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         api_key_env: Option<String>,
     },
 }
 
 /// 管线节点
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PipelineNode {
     pub id: String,
     #[serde(flatten)]
@@ -57,8 +69,13 @@ pub struct PipelineNode {
     pub label: String,
     #[serde(default = "default_params")]
     pub params: serde_json::Value,
-    pub position: Option<[f32; 2]>,
+    /// 编辑器画布坐标（可选）。`serde(default)`：旧 TOML 无此字段仍可加载；
+    /// `skip_serializing_if`：避免向 TOML 写入 null（TOML 无 null 值）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<NodePosition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_count: Option<u32>,
 }
 
@@ -82,7 +99,7 @@ pub struct Edge {
 // ─── Pipeline ────────────────────────────────────────────────────────────────
 
 /// 管线定义（DAG）
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Pipeline {
     pub id: String,
     pub name: String,
@@ -604,5 +621,75 @@ to = ["translate", "input"]
             }
         );
         assert!(pipeline.validate().is_ok());
+    }
+
+    // ─── position 字段与 TOML 序列化（WebUI 桥接依赖） ─────────────────────
+
+    #[test]
+    fn test_node_position_parses_and_defaults_to_none() {
+        let toml_str = r#"
+[pipeline]
+id = "pos-test"
+name = "坐标测试"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+
+[[nodes]]
+id = "output"
+kind = "builtin"
+builtin = "file_output"
+position = { x = 240.5, y = -80.0 }
+"#;
+        let pipeline = Pipeline::from_toml_str(toml_str).unwrap();
+        // 旧格式（无 position）向后兼容
+        assert_eq!(pipeline.nodes[0].position, None);
+        // 新格式 {x, y} 解析
+        assert_eq!(
+            pipeline.nodes[1].position,
+            Some(NodePosition { x: 240.5, y: -80.0 })
+        );
+    }
+
+    #[test]
+    fn test_toml_pretty_serialization_outputs() {
+        // 要求：Pipeline/Node/Edge 均可经 toml::to_string_pretty 序列化输出
+        let pipeline = Pipeline::from_toml_str(sample_toml()).unwrap();
+        let pretty = toml::to_string_pretty(&pipeline)
+            .expect("Pipeline 应可用 toml::to_string_pretty 序列化");
+        assert!(pretty.contains("test-pipeline"));
+        assert!(pretty.contains("[[nodes]]"));
+        assert!(pretty.contains("[[edges]]"));
+
+        // 带 position 的节点也能序列化，且 position 形状为 {x, y}
+        let mut p2 = pipeline.clone();
+        p2.nodes[0].position = Some(NodePosition { x: 1.0, y: 2.0 });
+        let pretty2 = toml::to_string_pretty(&p2).expect("带 position 的序列化");
+        assert!(pretty2.contains("x = 1.0"));
+        assert!(pretty2.contains("y = 2.0"));
+
+        // position 缺失时不写出该键（TOML 无 null）
+        assert!(!pretty.contains("position"));
+    }
+
+    #[test]
+    fn test_node_json_position_shape() {
+        // 前端契约：position 为 {"x": ..., "y": ...}
+        let node = PipelineNode {
+            id: "n1".to_string(),
+            kind: NodeKind::Builtin {
+                builtin: "file_input".to_string(),
+            },
+            label: String::new(),
+            params: default_params(),
+            position: Some(NodePosition { x: 12.5, y: 34.0 }),
+            timeout_secs: None,
+            retry_count: None,
+        };
+        let v = serde_json::to_value(&node).unwrap();
+        assert_eq!(v["position"]["x"], 12.5);
+        assert_eq!(v["position"]["y"], 34.0);
     }
 }

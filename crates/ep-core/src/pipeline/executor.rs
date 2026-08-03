@@ -205,6 +205,8 @@ impl PipelineTask {
 mod tests {
     use super::*;
     use crate::pipeline::dag::Pipeline;
+    use crate::pipeline::runner::PipelineRunnerImpl;
+    use crate::types::{PipelineRunner, TaskStatus};
 
     fn test_pipeline() -> Pipeline {
         let toml_str = r#"
@@ -324,6 +326,356 @@ to = ["save", "input"]
         assert!(task.is_complete());
         assert!(matches!(task.status, TaskStatus::Failed(_)));
     }
+
+    // ─── ffmpeg args 占位符替换（P0：shipped 管线依赖 {input}/{output}） ────
+
+    /// 探测 ffmpeg 二进制是否可用（与执行器同款解析逻辑）
+    fn ffmpeg_available() -> bool {
+        std::process::Command::new(resolve_ffmpeg_path())
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// 创建临时工作目录
+    fn ffmpeg_temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ep_ffmpeg_ph_{label}_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 清理临时目录
+    fn cleanup_ffmpeg_dir(dir: &Path) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 用 ffmpeg lavfi 生成真实小音频文件（1s 正弦波）
+    fn generate_audio_file(path: &Path, codec_args: &[&str]) -> bool {
+        let status = std::process::Command::new(resolve_ffmpeg_path())
+            .args(["-y", "-hide_banner", "-loglevel", "error"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=1"])
+            .args(codec_args)
+            .arg(path)
+            .status();
+        matches!(status, Ok(s) if s.success())
+    }
+
+    /// 构造 ffmpeg builtin 节点
+    fn ffmpeg_node(id: &str, params: serde_json::Value) -> PipelineNode {
+        PipelineNode {
+            id: id.to_string(),
+            kind: NodeKind::Builtin {
+                builtin: "ffmpeg".to_string(),
+            },
+            label: String::new(),
+            params,
+            position: None,
+            timeout_secs: None,
+            retry_count: None,
+        }
+    }
+
+    // ── 纯函数级：substitute_ffmpeg_placeholders ─────────────────────────────
+
+    #[test]
+    fn test_substitute_placeholders_input_and_output() {
+        let args: Vec<String> = ["-i", "{input}", "-vn", "-acodec", "copy", "{output}"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let input = PathBuf::from("/tmp/media/video.mp4");
+        let output = PathBuf::from("/tmp/work/extract_output.m4a");
+
+        let (replaced, output_substituted) =
+            substitute_ffmpeg_placeholders(&args, "extract", Some(&input), &output).unwrap();
+
+        assert_eq!(
+            replaced,
+            vec![
+                "-i",
+                "/tmp/media/video.mp4",
+                "-vn",
+                "-acodec",
+                "copy",
+                "/tmp/work/extract_output.m4a",
+            ]
+        );
+        assert!(
+            output_substituted,
+            "{{output}} 被替换后不得再追加输出参数"
+        );
+        // 无残留占位符字面量进入命令行
+        assert!(replaced
+            .iter()
+            .all(|a| !a.contains("{input}") && !a.contains("{output}")));
+    }
+
+    #[test]
+    fn test_substitute_placeholders_absent_is_identity() {
+        // lavfi 风格自包含 args（既有 shipped 测试同款）：无占位符 → 原样透传
+        let args: Vec<String> = [
+            "-f", "lavfi", "-i", "testsrc=duration=1:size=32x32:rate=1", "-frames:v", "1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let (replaced, output_substituted) =
+            substitute_ffmpeg_placeholders(&args, "encode", None, Path::new("/tmp/o")).unwrap();
+
+        assert_eq!(replaced, args);
+        assert!(!output_substituted, "无 {{output}} 占位符 → 保持末尾追加行为");
+    }
+
+    #[test]
+    fn test_substitute_placeholders_missing_upstream_chinese_error() {
+        let args = vec!["-i".to_string(), "{input}".to_string(), "{output}".to_string()];
+
+        let err =
+            substitute_ffmpeg_placeholders(&args, "extract-audio", None, Path::new("/tmp/o"))
+                .expect_err("含 {input} 但无上游文件必须报错");
+        let msg = err.to_string();
+
+        assert!(msg.contains("extract-audio"), "错误应指出节点 id: {msg}");
+        assert!(
+            msg.contains("占位符") && msg.contains("上游"),
+            "错误信息应为中文: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_substitute_placeholders_multiple_and_inline_occurrences() {
+        let args = vec![
+            "{input}".to_string(),
+            "{input}".to_string(),
+            "concat:{output}".to_string(),
+        ];
+
+        let (replaced, output_substituted) = substitute_ffmpeg_placeholders(
+            &args,
+            "n",
+            Some(Path::new("a.mp4")),
+            Path::new("o.wav"),
+        )
+        .unwrap();
+
+        assert_eq!(replaced, vec!["a.mp4", "a.mp4", "concat:o.wav"]);
+        assert!(output_substituted);
+    }
+
+    #[test]
+    fn test_resolve_output_path_honors_output_extension() {
+        let node = ffmpeg_node(
+            "extract-audio",
+            serde_json::json!({ "output_extension": "wav" }),
+        );
+        let path = resolve_ffmpeg_output_path(&node, Path::new("/work"));
+        assert_eq!(path, PathBuf::from("/work/extract-audio_output.wav"));
+
+        // 显式 output 参数优先，且不叠加扩展名
+        let node = ffmpeg_node(
+            "x",
+            serde_json::json!({ "output": "/out/custom.bin", "output_extension": "wav" }),
+        );
+        assert_eq!(
+            resolve_ffmpeg_output_path(&node, Path::new("/work")),
+            PathBuf::from("/out/custom.bin")
+        );
+
+        // 无 output_extension → 保持旧路径形状（向后兼容）
+        let node = ffmpeg_node("y", serde_json::json!({}));
+        assert_eq!(
+            resolve_ffmpeg_output_path(&node, Path::new("/work")),
+            PathBuf::from("/work/y_output")
+        );
+    }
+
+    // ── e2e：真实 ffmpeg 二进制 + tempdir 小文件 ─────────────────────────────
+
+    /// shipped video_to_srt.toml extract-audio 节点同款 args：
+    /// {input}/{output} 均被替换、输出落盘、无 `{input}` 字面量残留
+    /// （字面量残留时 ffmpeg 会报 "No such file or directory"，测试即失败）
+    #[tokio::test]
+    async fn test_ffmpeg_placeholder_e2e_video_to_srt_shape() {
+        if !ffmpeg_available() {
+            eprintln!("SKIP: ffmpeg not available");
+            return;
+        }
+
+        let work_dir = ffmpeg_temp_dir("v2s");
+        let input_file = work_dir.join("source.wav");
+        if !generate_audio_file(&input_file, &["-ar", "16000", "-ac", "1"]) {
+            eprintln!("SKIP: failed to generate test audio");
+            cleanup_ffmpeg_dir(&work_dir);
+            return;
+        }
+
+        let node = ffmpeg_node(
+            "extract-audio",
+            serde_json::json!({
+                "args": ["-i", "{input}", "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "{output}"],
+                "output_extension": "wav",
+            }),
+        );
+
+        let artifact =
+            execute_builtin_ffmpeg(&node, &[Artifact::File(input_file)], &work_dir)
+                .await
+                .expect("占位符替换后 ffmpeg 应成功");
+
+        let output = match artifact {
+            Artifact::File(p) => p,
+            other => panic!("expected file artifact, got {other:?}"),
+        };
+        assert_eq!(output, work_dir.join("extract-audio_output.wav"));
+        assert!(output.exists(), "输出文件应生成");
+        assert!(std::fs::metadata(&output).unwrap().len() > 0);
+
+        cleanup_ffmpeg_dir(&work_dir);
+    }
+
+    /// args 无占位符且无 -i：保持旧行为（前置上游输入 + 末尾追加输出）
+    #[tokio::test]
+    async fn test_ffmpeg_legacy_args_backward_compat() {
+        if !ffmpeg_available() {
+            eprintln!("SKIP: ffmpeg not available");
+            return;
+        }
+
+        let work_dir = ffmpeg_temp_dir("legacy");
+        let input_file = work_dir.join("in.wav");
+        if !generate_audio_file(&input_file, &["-ar", "16000", "-ac", "1"]) {
+            eprintln!("SKIP: failed to generate test audio");
+            cleanup_ffmpeg_dir(&work_dir);
+            return;
+        }
+
+        let node = ffmpeg_node(
+            "encode",
+            serde_json::json!({
+                "args": ["-c", "copy"],
+                "output_extension": "wav",
+            }),
+        );
+
+        let artifact =
+            execute_builtin_ffmpeg(&node, &[Artifact::File(input_file)], &work_dir)
+                .await
+                .expect("无占位符的旧行为应保持不变");
+
+        let Artifact::File(output) = artifact else {
+            panic!("expected file artifact");
+        };
+        assert_eq!(output, work_dir.join("encode_output.wav"));
+        assert!(output.exists());
+        assert!(std::fs::metadata(&output).unwrap().len() > 0);
+
+        cleanup_ffmpeg_dir(&work_dir);
+    }
+
+    /// {input} 占位符但无上游产物 → 中文报错（不需要 ffmpeg 二进制，不 spawn）
+    #[tokio::test]
+    async fn test_ffmpeg_placeholder_without_upstream_fails() {
+        let work_dir = ffmpeg_temp_dir("noin");
+
+        let node = ffmpeg_node(
+            "extract",
+            serde_json::json!({
+                "args": ["-i", "{input}", "-c", "copy", "{output}"],
+            }),
+        );
+
+        let err = execute_builtin_ffmpeg(&node, &[], &work_dir)
+            .await
+            .expect_err("无上游输入必须失败");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("上游") && msg.contains("占位符"),
+            "应为中文错误: {msg}"
+        );
+
+        cleanup_ffmpeg_dir(&work_dir);
+    }
+
+    /// 完整管线（audio_extract.toml 同款形状）：
+    /// file_input → ffmpeg({input}/{output} 占位符) → file_output
+    #[test]
+    fn test_pipeline_audio_extract_shape_with_placeholders() {
+        if !ffmpeg_available() {
+            eprintln!("SKIP: ffmpeg not available");
+            return;
+        }
+
+        let work_dir = ffmpeg_temp_dir("pipe");
+        // m4a(AAC) 输入 → "-acodec copy" 可无损复制到 m4a 容器
+        let source_file = work_dir.join("media.m4a");
+        if !generate_audio_file(&source_file, &["-c:a", "aac"]) {
+            eprintln!("SKIP: failed to generate test audio");
+            cleanup_ffmpeg_dir(&work_dir);
+            return;
+        }
+        let final_output = work_dir.join("final.m4a");
+
+        let toml_str = format!(
+            r#"
+[pipeline]
+id = "audio-extract-shape"
+name = "音频提取（shipped 形状）"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = {{ path = "{}" }}
+
+[[nodes]]
+id = "extract"
+kind = "builtin"
+builtin = "ffmpeg"
+
+[nodes.params]
+args = ["-i", "{{input}}", "-vn", "-acodec", "copy", "{{output}}"]
+output_extension = "m4a"
+
+[[nodes]]
+id = "output"
+kind = "builtin"
+builtin = "file_output"
+params = {{ path = "{}" }}
+
+[[edges]]
+from = ["input", "output"]
+to = ["extract", "input"]
+
+[[edges]]
+from = ["extract", "output"]
+to = ["output", "input"]
+"#,
+            source_file.to_string_lossy().replace('\\', "/"),
+            final_output.to_string_lossy().replace('\\', "/"),
+        );
+
+        let pipeline = Pipeline::from_toml_str(&toml_str).unwrap();
+        let mut runner = PipelineRunnerImpl::new(work_dir.clone());
+
+        let result = runner.execute(&pipeline, &work_dir);
+        assert!(result.is_ok(), "shipped 形状管线应成功: {result:?}");
+        assert_eq!(*runner.task_status(), TaskStatus::Completed);
+
+        // ffmpeg 节点中间产物：output_extension 生效
+        let mid = work_dir.join("extract_output.m4a");
+        assert!(mid.exists(), "ffmpeg 节点输出应落盘");
+
+        // file_output 复制产物
+        assert!(final_output.exists(), "最终输出应落盘");
+        let mid_bytes = std::fs::read(&mid).unwrap();
+        let out_bytes = std::fs::read(&final_output).unwrap();
+        assert!(!mid_bytes.is_empty());
+        assert_eq!(mid_bytes, out_bytes);
+
+        cleanup_ffmpeg_dir(&work_dir);
+    }
 }
 
 // ─── 节点执行辅助函数 ────────────────────────────────────────────────────────
@@ -427,10 +779,13 @@ async fn execute_builtin_file_input(
 }
 
 /// FileOutput: 从上游获取文件，复制到目标路径，返回 Artifact::File
+///
+/// 目标路径解析：优先 `path` 参数；缺省时按 `extension` 参数派生
+/// `<work_dir>/<node_id>_output.<ext>`（产物归集会把它收进任务产物）。
 async fn execute_builtin_file_output(
     node: &PipelineNode,
     upstream: &[Artifact],
-    _work_dir: &Path,
+    work_dir: &Path,
 ) -> anyhow::Result<Artifact> {
     let source_file = upstream
         .iter()
@@ -440,19 +795,31 @@ async fn execute_builtin_file_output(
         })
         .ok_or_else(|| anyhow::anyhow!("file_output node '{}' has no file input from upstream", node.id))?;
 
-    let dest = node
+    let dest_path: PathBuf = match node
         .params
         .get("path")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("file_output node '{}' missing 'path' param", node.id))?;
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(dest) => PathBuf::from(dest),
+        None => {
+            let ext = node
+                .params
+                .get("extension")
+                .and_then(|v| v.as_str())
+                .unwrap_or("out");
+            let safe: String = ext.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+            work_dir.join(format!("{}_output.{safe}", node.id))
+        }
+    };
 
-    let dest_path = Path::new(dest);
     if let Some(parent) = dest_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::copy(&source_file, dest_path)?;
+    std::fs::copy(&source_file, &dest_path)?;
 
-    Ok(Artifact::File(dest_path.to_path_buf()))
+    Ok(Artifact::File(dest_path))
 }
 
 /// 解析 ffmpeg 可执行文件路径
@@ -505,17 +872,91 @@ pub(crate) fn resolve_ffmpeg_path() -> PathBuf {
     PathBuf::from("ffmpeg")
 }
 
+/// args 占位符：上游输入文件路径
+pub(crate) const INPUT_PLACEHOLDER: &str = "{input}";
+/// args 占位符：本节点输出文件路径
+pub(crate) const OUTPUT_PLACEHOLDER: &str = "{output}";
+
+/// 替换 ffmpeg 节点 args 中的 `{input}` / `{output}` 占位符（纯函数，可单测）。
+///
+/// 规则：
+/// - `{input}`  → 上游输入文件路径；args 含 `{input}` 但无可用上游文件时返回中文错误
+/// - `{output}` → 本节点解析出的输出文件路径
+///
+/// 返回 `(替换后的 args, {output} 是否被替换过)`。
+/// 当 `{output}` 被替换过时，调用方**不得**再追加额外输出参数，否则会形成双输出命令。
+pub(crate) fn substitute_ffmpeg_placeholders(
+    args: &[String],
+    node_id: &str,
+    input_file: Option<&Path>,
+    output_path: &Path,
+) -> anyhow::Result<(Vec<String>, bool)> {
+    let mut result = Vec::with_capacity(args.len());
+    let mut output_substituted = false;
+
+    for arg in args {
+        let mut replaced = arg.clone();
+
+        if replaced.contains(INPUT_PLACEHOLDER) {
+            let input = input_file.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ffmpeg 节点 '{node_id}' 的 args 含 {INPUT_PLACEHOLDER} 占位符，\
+                     但该节点没有可用的上游输入文件；请确认上游节点已连接且执行成功"
+                )
+            })?;
+            replaced = replaced.replace(INPUT_PLACEHOLDER, &input.to_string_lossy());
+        }
+
+        if replaced.contains(OUTPUT_PLACEHOLDER) {
+            replaced = replaced.replace(OUTPUT_PLACEHOLDER, &output_path.to_string_lossy());
+            output_substituted = true;
+        }
+
+        result.push(replaced);
+    }
+
+    Ok((result, output_substituted))
+}
+
+/// 解析 ffmpeg 节点的输出文件路径
+///
+/// 优先级：
+/// 1. `output` 参数（显式指定的完整路径，原样使用）
+/// 2. `work_dir/{node_id}_output`；若声明了 `output_extension` 参数则追加对应扩展名
+///    （ffmpeg 依扩展名推断输出容器格式，无扩展名会报
+///    "Unable to find a suitable output format"；shipped 管线均依赖此参数）
+fn resolve_ffmpeg_output_path(node: &PipelineNode, work_dir: &Path) -> PathBuf {
+    if let Some(output) = node.params.get("output").and_then(|v| v.as_str()) {
+        return PathBuf::from(output);
+    }
+
+    let mut name = format!("{}_output", node.id);
+    if let Some(ext) = node
+        .params
+        .get("output_extension")
+        .and_then(|v| v.as_str())
+    {
+        let ext = ext.trim().trim_start_matches('.');
+        if !ext.is_empty() {
+            name.push('.');
+            name.push_str(ext);
+        }
+    }
+    work_dir.join(name)
+}
+
 /// FFmpeg: 构建并执行 ffmpeg 命令，返回输出文件的 Artifact::File
+///
+/// args 占位符语义（shipped 管线 video_to_srt / audio_extract 依赖）：
+/// - `{input}`  → 第一个上游文件产物；此时 args 视为已自行声明输入，不再前置上游输入
+/// - `{output}` → 本节点解析出的输出文件路径；此时不再在末尾追加输出参数
+/// - 无占位符   → 完全向后兼容旧行为（args 无 `-i` 时前置上游文件输入，
+///   且总在末尾追加输出参数；lavfi 等自包含命令不受影响）
 async fn execute_builtin_ffmpeg(
     node: &PipelineNode,
     upstream: &[Artifact],
     work_dir: &Path,
 ) -> anyhow::Result<Artifact> {
-    let ffmpeg_bin = resolve_ffmpeg_path();
-    let mut cmd = tokio::process::Command::new(&ffmpeg_bin);
-    cmd.arg("-y"); // overwrite output
-
-    // 检查 params args 是否已包含 -i（用户自行指定输入源，如 lavfi）
     let args_vec: Vec<String> = node
         .params
         .get("args")
@@ -526,10 +967,33 @@ async fn execute_builtin_ffmpeg(
                 .collect()
         })
         .unwrap_or_default();
-    let args_has_input = args_vec.iter().any(|a| a == "-i");
 
-    // 仅在 args 未指定 -i 时，添加上游文件作为输入
-    if !args_has_input {
+    // 先解析输出路径（占位符替换需要它）
+    let output_path = resolve_ffmpeg_output_path(node, work_dir);
+    if let Some(parent) = output_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    // 第一个上游文件产物 —— `{input}` 占位符的替换来源
+    let input_file: Option<PathBuf> = upstream.iter().find_map(|a| match a {
+        Artifact::File(p) => Some(p.clone()),
+        _ => None,
+    });
+
+    // 替换 {input} / {output} 占位符
+    let (args, output_substituted) =
+        substitute_ffmpeg_placeholders(&args_vec, &node.id, input_file.as_deref(), &output_path)?;
+
+    let ffmpeg_bin = resolve_ffmpeg_path();
+    let mut cmd = tokio::process::Command::new(&ffmpeg_bin);
+    cmd.arg("-y"); // overwrite output
+
+    // args 已通过 -i 或 {input} 自行声明输入时，不再前置上游文件
+    let args_declares_input = args_vec.iter().any(|a| a == "-i")
+        || args_vec.iter().any(|a| a.contains(INPUT_PLACEHOLDER));
+    if !args_declares_input {
         for artifact in upstream {
             if let Artifact::File(path) = artifact {
                 cmd.arg("-i").arg(path);
@@ -537,24 +1001,15 @@ async fn execute_builtin_ffmpeg(
         }
     }
 
-    // 从 params 添加额外参数
-    for arg in &args_vec {
+    // 从 params 添加参数（占位符已替换）
+    for arg in &args {
         cmd.arg(arg);
     }
 
-    // 确定输出路径
-    let output_path = if let Some(output) = node.params.get("output").and_then(|v| v.as_str()) {
-        PathBuf::from(output)
-    } else {
-        work_dir.join(format!("{}_output", node.id))
-    };
-
-    if let Some(parent) = output_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    // {output} 占位符已替换时输出参数已在 args 中就位，追加会形成双输出
+    if !output_substituted {
+        cmd.arg(&output_path);
     }
-    cmd.arg(&output_path);
 
     let output = cmd.output().await?;
     if !output.status.success() {
@@ -643,8 +1098,11 @@ async fn execute_module_node(
         .any(|a| matches!(a, Artifact::File(_)));
 
     // ── 构建 HTTP 客户端 ──────────────────────────────────────────────────
+    // 模块调用永远只打本机地址（127.0.0.1）：显式禁用代理，避免配置的
+    // 出口代理（HTTP_PROXY 等）拦截 localhost 流量
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .no_proxy()
         .build()
         .map_err(|e| {
             anyhow::anyhow!(ModuleCallError {
@@ -723,8 +1181,35 @@ async fn send_module_request(
     node: &PipelineNode,
     upstream: &[Artifact],
     has_file_input: bool,
-    _work_dir: &Path,
+    work_dir: &Path,
 ) -> anyhow::Result<Artifact> {
+    // ── output_format 声明 → 注入 output_path（模块可据此产出文件产物） ──
+    // 约定：节点 params 含 output_format（如 "srt"/"txt"，非 "json"）时，
+    // 执行器在 params 中补充 output_path=<work_dir>/<node_id>_output.<fmt>，
+    // 模块按该路径写出文件并返回 output_type="file" + result=路径。
+    let output_format = node
+        .params
+        .get("output_format")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|f| !f.is_empty() && *f != "json");
+    let mut params_value = node.params.clone();
+    if let Some(fmt) = output_format {
+        let safe: String = fmt.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        let out_path = work_dir.join(format!("{}_output.{safe}", node.id));
+        let obj = match params_value.as_object_mut() {
+            Some(o) => o,
+            None => {
+                params_value = serde_json::Value::Object(serde_json::Map::new());
+                params_value.as_object_mut().expect("just set")
+            }
+        };
+        obj.insert(
+            "output_path".to_string(),
+            serde_json::Value::String(out_path.to_string_lossy().to_string()),
+        );
+    }
+
     let resp = if has_file_input {
         // ── multipart/form-data：文件上传 ─────────────────────────────────
         let mut form = reqwest::multipart::Form::new();
@@ -749,9 +1234,9 @@ async fn send_module_request(
             }
         }
 
-        // 将节点 params 作为 JSON 字符串附加到 params 字段
-        if !node.params.is_null() && node.params.as_object().is_some_and(|o| !o.is_empty()) {
-            form = form.text("params", node.params.to_string());
+        // 将节点 params（含可能的 output_path 注入）作为 JSON 字符串附加到 params 字段
+        if params_value.as_object().is_some_and(|o| !o.is_empty()) {
+            form = form.text("params", params_value.to_string());
         }
 
         client
@@ -764,8 +1249,8 @@ async fn send_module_request(
         // ── JSON body：文本 / JSON 输入 ───────────────────────────────────
         let mut body = serde_json::Map::new();
 
-        // 合并节点 params
-        if let Some(obj) = node.params.as_object() {
+        // 合并节点 params（含可能的 output_path 注入）
+        if let Some(obj) = params_value.as_object() {
             body.insert("params".to_string(), serde_json::Value::Object(obj.clone()));
         }
 

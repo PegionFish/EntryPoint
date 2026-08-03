@@ -65,13 +65,29 @@ impl ServiceInstance {
 /// 进程管理器：跟踪所有模块服务实例
 pub struct ProcessManager {
     instances: HashMap<String, ServiceInstance>,
+    /// 注入模块子进程的网络代理环境变量（仅非空值会被注入）
+    network_env: Vec<(String, String)>,
 }
 
 impl ProcessManager {
     pub fn new() -> Self {
         Self {
             instances: HashMap::new(),
+            network_env: Vec::new(),
         }
+    }
+
+    /// 设置网络代理配置（链式调用）。
+    ///
+    /// 模块服务子进程启动时将被注入这些环境变量（如 HTTP_PROXY 等）。
+    pub fn with_network_env(mut self, env_vars: Vec<(String, String)>) -> Self {
+        self.network_env = env_vars;
+        self
+    }
+
+    /// 设置网络代理环境变量
+    pub fn set_network_env(&mut self, env_vars: Vec<(String, String)>) {
+        self.network_env = env_vars;
     }
 
     /// 启动模块服务。
@@ -149,6 +165,13 @@ impl ProcessManager {
         for (key, value) in &vars {
             let env_key = format!("EP_{}", key.to_uppercase());
             cmd.env(&env_key, value);
+        }
+
+        // 注入网络代理环境变量（仅非空值）
+        for (key, value) in &self.network_env {
+            if !value.is_empty() {
+                cmd.env(key, value);
+            }
         }
 
         cmd.stdout(std::process::Stdio::piped());
