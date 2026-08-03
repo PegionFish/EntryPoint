@@ -1,8 +1,10 @@
+use std::collections::HashMap;
+
 use eframe::egui;
 use ep_core::config::AppConfig;
 use ep_core::deps::DepReport;
-use ep_core::model::ModelView;
-use ep_core::module::DiscoveredModule;
+use ep_core::model::{DownloadState, ModelView, UpdateCheckResult};
+use ep_core::module::{DiscoveredModule, ModelSource};
 use ep_core::pipeline::runner::TaskSummary;
 use ep_core::types::{ComputeDevice, ServiceStatus};
 
@@ -22,12 +24,28 @@ pub enum AppMsg {
     ModuleStatusUpdate(String, ServiceStatus),
     LogLine(String, String),
     Error(String),
+    /// 中性提示（非错误），走 Toast info
+    Info(String),
     /// 模型列表刷新
     ModelsRefreshed(Vec<ModelView>),
-    /// 模型下载进度 (model_id, 0.0~1.0)
-    ModelDownloadProgress(String, f32),
-    /// 模型下载完成 (model_id, success)
+    /// 模型下载进度：percent 0.0~100.0，bytes 为已落盘字节，state 含终态
+    ModelDownloadProgress {
+        model_id: String,
+        percent: f32,
+        bytes: u64,
+        state: DownloadState,
+    },
+    /// 模型下载结束 (model_id, success)。success=true 完成；false 失败/取消
     ModelDownloadFinished(String, bool),
+    /// 单个模型的更新检查结果。notify=true（单个检查）时 UI 弹 Toast；
+    /// notify=false（批量检查）时仅更新状态，汇总 Toast 由 UpdatesCheckSummary 负责。
+    ModelUpdateChecked {
+        model_id: String,
+        result: UpdateCheckResult,
+        notify: bool,
+    },
+    /// 批量更新检查汇总：total 个 Ready 模型中 available 个可更新
+    UpdatesCheckSummary { total: usize, available: usize },
     /// 依赖检测报告
     DepReportRefreshed(DepReport),
     /// 管线任务列表刷新
@@ -41,8 +59,18 @@ pub enum AppCmd {
     StartModule(String),
     StopModule(String),
     Shutdown,
-    /// 下载模型 (module_id, model_id)
-    DownloadModel(String, String),
+    /// 下载模型：source 为下载源覆写（None = 主 source，多源模型可选镜像）
+    DownloadModel {
+        module_id: String,
+        model_id: String,
+        source: Option<ModelSource>,
+    },
+    /// 取消指定模型的下载
+    CancelDownload(String),
+    /// 检查单个模型是否有可用更新
+    CheckUpdate { module_id: String, model_id: String },
+    /// 检查所有 Ready 模型的更新（并发，汇总结果）
+    CheckAllUpdates,
     /// 删除模型 (target_dir)
     DeleteModel(String),
     /// 导入本地模型：module_id 指定目标模块，model_id 指定模型声明，source 为本地文件/目录路径
@@ -168,6 +196,17 @@ pub struct App {
     last_compact: Option<bool>,
 }
 
+/// 单个模型的下载进度 UI 状态（下载进行中才存在于 `AppState::downloads`）
+#[derive(Debug, Clone)]
+pub struct DownloadUiState {
+    /// 进度百分比 0.0~100.0（无大小估算时恒为 0.0）
+    pub percent: f32,
+    /// 已落盘字节数
+    pub bytes: u64,
+    /// 当前状态（Downloading / Completed / Failed / Cancelled）
+    pub state: DownloadState,
+}
+
 pub struct AppState {
     pub devices: Vec<ComputeDevice>,
     pub modules: Vec<ModuleEntry>,
@@ -180,6 +219,12 @@ pub struct AppState {
     pub dep_report: Option<DepReport>,
     /// 管线任务列表
     pub tasks: Vec<TaskSummary>,
+    /// per-model 下载进度状态（model_id → 进度），仅在下载进行中存在
+    pub downloads: HashMap<String, DownloadUiState>,
+    /// per-model 更新检查结果（model_id → 结果），检查后常驻直到下次刷新
+    pub updates: HashMap<String, UpdateCheckResult>,
+    /// 每个模型最近一次下载使用的来源（供"重新下载"复用原 source）
+    pub download_sources: HashMap<String, Option<ModelSource>>,
 }
 
 impl App {
@@ -202,6 +247,9 @@ impl App {
                 model_cache_dir,
                 dep_report: None,
                 tasks: Vec::new(),
+                downloads: HashMap::new(),
+                updates: HashMap::new(),
+                download_sources: HashMap::new(),
             },
             selected_module: None,
             rx,
@@ -256,17 +304,64 @@ impl App {
                 AppMsg::Error(e) => {
                     self.toasts.error(&e);
                 }
+                AppMsg::Info(m) => {
+                    self.toasts.info(&m);
+                }
                 AppMsg::ModelsRefreshed(models) => {
                     self.state.models = models;
                 }
-                AppMsg::ModelDownloadProgress(_model_id, _progress) => {
-                    // TODO: 更新下载进度 UI
+                AppMsg::ModelDownloadProgress {
+                    model_id,
+                    percent,
+                    bytes,
+                    state,
+                } => {
+                    self.state.downloads.insert(
+                        model_id,
+                        DownloadUiState {
+                            percent,
+                            bytes,
+                            state,
+                        },
+                    );
                 }
                 AppMsg::ModelDownloadFinished(model_id, success) => {
+                    // 清理该模型的下载进度状态
+                    self.state.downloads.remove(&model_id);
                     if success {
                         self.toasts.success(format!("模型 {model_id} 下载完成"));
+                        // 清除旧的更新检查结果（刚下载完成必然最新）
+                        self.state.updates.remove(&model_id);
+                    }
+                    // 失败/取消的具体原因由生产侧另行发送 Error/Info 消息，这里只刷新列表
+                    // （状态可能从 Missing → Ready / Incomplete）
+                    let _ = self.cmd_tx.send(AppCmd::RefreshModels);
+                }
+                AppMsg::ModelUpdateChecked {
+                    model_id,
+                    result,
+                    notify,
+                } => {
+                    let available = result.available;
+                    let reason = result.reason.clone();
+                    self.state.updates.insert(model_id.clone(), result);
+                    if notify {
+                        if available {
+                            self.toasts
+                                .success(format!("模型 {model_id} 有可用更新，可重新下载"));
+                        } else {
+                            self.toasts.info(format!("模型 {model_id}：{reason}"));
+                        }
+                    }
+                }
+                AppMsg::UpdatesCheckSummary { total, available } => {
+                    if total == 0 {
+                        self.toasts.info("没有可检查更新的已就绪模型");
+                    } else if available == 0 {
+                        self.toasts.success(format!("检查完成：{total} 个模型均为最新版本"));
                     } else {
-                        self.toasts.error(format!("模型 {model_id} 下载失败"));
+                        self.toasts
+                            .info(format!("检查完成：{available}/{total} 个模型有可用更新"));
                     }
                 }
                 AppMsg::DepReportRefreshed(report) => {
@@ -444,6 +539,9 @@ impl eframe::App for App {
                     ui,
                     &self.state.models,
                     &self.state.model_cache_dir,
+                    &self.state.downloads,
+                    &self.state.updates,
+                    &mut self.state.download_sources,
                     &self.cmd_tx,
                 );
             }

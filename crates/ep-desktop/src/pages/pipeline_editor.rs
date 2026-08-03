@@ -395,8 +395,8 @@ fn compute_layout(pipeline: &Pipeline) -> HashMap<String, egui::Pos2> {
     // Use stored positions if every node has one
     if pipeline.nodes.iter().all(|n| n.position.is_some()) {
         for n in &pipeline.nodes {
-            if let Some([x, y]) = n.position {
-                pos.insert(n.id.clone(), egui::pos2(x, y));
+            if let Some(p) = &n.position {
+                pos.insert(n.id.clone(), egui::pos2(p.x as f32, p.y as f32));
             }
         }
         return pos;
