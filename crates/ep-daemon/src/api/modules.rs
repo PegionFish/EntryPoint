@@ -16,6 +16,7 @@ use ep_core::model::{ModelManager, ModelStatus};
 use ep_core::module::discovery::{DiscoveredModule, DiscoveryStatus};
 use ep_core::types::{DeviceId, ServiceStatus};
 
+use super::err_response;
 use crate::state::AppState;
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -53,11 +54,6 @@ pub(crate) fn status_str(status: &ServiceStatus) -> &'static str {
         ServiceStatus::Running => "running",
         ServiceStatus::Error(_) => "error",
     }
-}
-
-/// 统一错误响应：HTTP 状态码 + {"error": 中文说明}
-fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Value>) {
-    (status, Json(json!({ "error": msg.into() })))
 }
 
 /// 按 module_id 查找已发现的模块
@@ -147,16 +143,27 @@ pub async fn start_module(
     // 1. 模块必须存在
     let module = match find_module(&state, &id).await {
         Some(m) => m,
-        None => return err(StatusCode::NOT_FOUND, format!("模块不存在：{id}")),
+        None => {
+            return err_response(
+                &state,
+                StatusCode::NOT_FOUND,
+                "apiCore.module.notFound",
+                &[("id", id)],
+            )
+            .await
+        }
     };
 
     let manifest = match module.manifest {
         Some(mf) => mf,
         None => {
-            return err(
+            return err_response(
+                &state,
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("模块清单无效，无法启动：{id}"),
+                "apiCore.module.invalidManifest",
+                &[("id", id)],
             )
+            .await
         }
     };
 
@@ -166,10 +173,13 @@ pub async fn start_module(
         if let Some(s) = pm.get_status(&id) {
             match s {
                 ServiceStatus::Running | ServiceStatus::Starting | ServiceStatus::Preparing => {
-                    return err(
+                    return err_response(
+                        &state,
                         StatusCode::CONFLICT,
-                        format!("模块已在运行或正在启动（当前状态：{}）", status_str(s)),
-                    );
+                        "apiCore.module.alreadyRunningWithStatus",
+                        &[("status", status_str(s).to_string())],
+                    )
+                    .await;
                 }
                 _ => {}
             }
@@ -190,13 +200,13 @@ pub async fn start_module(
             .or(manifest.models.first())
         {
             if matches!(statuses.get(&model.id), Some(ModelStatus::Missing)) {
-                return err(
+                return err_response(
+                    &state,
                     StatusCode::CONFLICT,
-                    format!(
-                        "模型未就绪：{}，请先在模型管理页下载或导入",
-                        model.name
-                    ),
-                );
+                    "apiCore.module.modelNotReady",
+                    &[("model", model.name.clone())],
+                )
+                .await;
             }
         }
     }
@@ -207,10 +217,13 @@ pub async fn start_module(
         match pm.allocate(&id) {
             Ok(p) => p,
             Err(e) => {
-                return err(
+                return err_response(
+                    &state,
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("端口分配失败：{e}"),
+                    "apiCore.module.portAllocationFailed",
+                    &[("detail", e.to_string())],
                 )
+                .await
             }
         }
     };
@@ -274,15 +287,21 @@ pub async fn start_module(
             state.port_manager.write().await.release(&id);
             // "already running/starting" 属状态冲突，其余为内部错误
             if e.to_string().contains("already running") {
-                err(
+                err_response(
+                    &state,
                     StatusCode::CONFLICT,
-                    format!("模块已在运行或正在启动：{id}"),
+                    "apiCore.module.alreadyRunning",
+                    &[("id", id)],
                 )
+                .await
             } else {
-                err(
+                err_response(
+                    &state,
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("启动模块失败：{e}"),
+                    "apiCore.module.startFailed",
+                    &[("detail", e.to_string())],
                 )
+                .await
             }
         }
     }
@@ -295,12 +314,24 @@ pub async fn stop_module(
 ) -> (StatusCode, Json<Value>) {
     // 模块必须已被发现
     if find_module(&state, &id).await.is_none() {
-        return err(StatusCode::NOT_FOUND, format!("模块不存在：{id}"));
+        return err_response(
+            &state,
+            StatusCode::NOT_FOUND,
+            "apiCore.module.notFound",
+            &[("id", id)],
+        )
+        .await;
     }
 
     let mut pm = state.process_manager.write().await;
     if pm.get_instance(&id).is_none() {
-        return err(StatusCode::NOT_FOUND, format!("模块未在运行：{id}"));
+        return err_response(
+            &state,
+            StatusCode::NOT_FOUND,
+            "apiCore.module.notRunning",
+            &[("id", id)],
+        )
+        .await;
     }
 
     match pm.stop_module(&id).await {
@@ -316,10 +347,15 @@ pub async fn stop_module(
                 })),
             )
         }
-        Err(e) => err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("停止模块失败：{e}"),
-        ),
+        Err(e) => {
+            err_response(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "apiCore.module.stopFailed",
+                &[("detail", e.to_string())],
+            )
+            .await
+        }
     }
 }
 
@@ -329,7 +365,13 @@ pub async fn module_status(
     Path(id): Path<String>,
 ) -> (StatusCode, Json<Value>) {
     if find_module(&state, &id).await.is_none() {
-        return err(StatusCode::NOT_FOUND, format!("模块不存在：{id}"));
+        return err_response(
+            &state,
+            StatusCode::NOT_FOUND,
+            "apiCore.module.notFound",
+            &[("id", id)],
+        )
+        .await;
     }
 
     let pm = state.process_manager.read().await;
@@ -376,7 +418,13 @@ pub async fn module_logs(
     Path(id): Path<String>,
 ) -> (StatusCode, Json<Value>) {
     if find_module(&state, &id).await.is_none() {
-        return err(StatusCode::NOT_FOUND, format!("模块不存在：{id}"));
+        return err_response(
+            &state,
+            StatusCode::NOT_FOUND,
+            "apiCore.module.notFound",
+            &[("id", id)],
+        )
+        .await;
     }
 
     let pm = state.process_manager.read().await;
@@ -406,6 +454,23 @@ pub async fn module_logs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    /// 构造指定语言的测试 AppState（空模块表，tempdir root）
+    fn test_state(language: &str) -> Arc<AppState> {
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        let mut config = ep_core::config::AppConfig::default();
+        config.general.language = language.to_string();
+        Arc::new(AppState::new(
+            std::env::temp_dir().join(format!("ep-api-modules-test-{}-{seq}", std::process::id())),
+            config,
+            vec![],
+            vec![],
+            ep_core::port::PortManager::new(18000, 19000),
+        ))
+    }
 
     #[test]
     fn status_str_all_variants_are_canonical_lowercase() {
@@ -418,5 +483,65 @@ mod tests {
             status_str(&ServiceStatus::Error("boom".into())),
             "error"
         );
+    }
+
+    // 默认语言 zh-CN：错误文案与迁移前完全一致
+    #[tokio::test]
+    async fn start_unknown_module_error_zh_cn() {
+        let state = test_state("zh-CN");
+        let (status, body) = start_module(State(state), Path("ghost".to_string())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.0["error"], "模块不存在：ghost");
+    }
+
+    // 同一请求在 config.language=en 时返回英文错误
+    #[tokio::test]
+    async fn start_unknown_module_error_en() {
+        let state = test_state("en");
+        let (status, body) = start_module(State(state), Path("ghost".to_string())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.0["error"], "Module not found: ghost");
+    }
+
+    // stop 同一请求双语对照
+    #[tokio::test]
+    async fn stop_unknown_module_error_zh_cn_and_en() {
+        let state = test_state("zh-CN");
+        let (status, body) = stop_module(State(state), Path("ghost".to_string())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.0["error"], "模块不存在：ghost");
+
+        let state = test_state("en");
+        let (status, body) = stop_module(State(state), Path("ghost".to_string())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.0["error"], "Module not found: ghost");
+    }
+
+    // logs 同一请求双语对照
+    #[tokio::test]
+    async fn logs_unknown_module_error_zh_cn_and_en() {
+        let state = test_state("zh-CN");
+        let (status, body) = module_logs(State(state), Path("ghost".to_string())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.0["error"], "模块不存在：ghost");
+
+        let state = test_state("en");
+        let (status, body) = module_logs(State(state), Path("ghost".to_string())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.0["error"], "Module not found: ghost");
+    }
+
+    // status 同一请求双语对照
+    #[tokio::test]
+    async fn status_unknown_module_error_zh_cn_and_en() {
+        let state = test_state("zh-CN");
+        let (status, body) = module_status(State(state), Path("ghost".to_string())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.0["error"], "模块不存在：ghost");
+
+        let state = test_state("en");
+        let (status, body) = module_status(State(state), Path("ghost".to_string())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.0["error"], "Module not found: ghost");
     }
 }

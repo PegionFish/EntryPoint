@@ -30,6 +30,7 @@ use serde_json::{Value, json};
 
 use ep_core::types::TaskStatus;
 
+use crate::api::err_response;
 use crate::state::AppState;
 
 #[path = "../pipeline_bridge.rs"]
@@ -77,7 +78,7 @@ fn scan_specs(dir: &Path) -> Vec<(PathBuf, PipelineSpec)> {
         match pipeline_bridge::load_spec(&path) {
             Ok(spec) => result.push((path, spec)),
             Err(e) => {
-                tracing::warn!(file = %path.display(), error = %e, "管线文件损坏，已跳过");
+                tracing::warn!(file = %path.display(), error = %e, "pipeline file corrupted, skipping");
             }
         }
     }
@@ -89,10 +90,6 @@ fn find_spec_file(dir: &Path, id: &str) -> Option<(PathBuf, PipelineSpec)> {
     scan_specs(dir)
         .into_iter()
         .find(|(_, spec)| spec.pipeline.id == id)
-}
-
-fn error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Value>) {
-    (status, Json(json!({ "error": msg.into() })))
 }
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -132,56 +129,84 @@ async fn get_pipeline(
             StatusCode::OK,
             Json(serde_json::to_value(&spec).unwrap_or_else(|_| json!({}))),
         ),
-        None => error(StatusCode::NOT_FOUND, "管线不存在"),
+        None => {
+            err_response(
+                &state,
+                StatusCode::NOT_FOUND,
+                "apiPipelines.pipelines.notFound",
+                &[],
+            )
+            .await
+        }
     }
 }
 
 /// PUT /api/pipelines/:id — 保存 spec（body 为完整 spec JSON）
 ///
-/// 以 String 提取 body 自行解析，保证解析失败时返回中文 JSON 错误。
+/// 以 String 提取 body 自行解析，保证解析失败时返回本地化 JSON 错误。
 async fn update_pipeline(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
     body: String,
 ) -> (StatusCode, Json<Value>) {
     if !is_valid_pipeline_id(&id) {
-        return error(
+        return err_response(
+            &state,
             StatusCode::BAD_REQUEST,
-            "管线 id 格式非法（只允许小写字母、数字和连字符，且以字母或数字开头）",
-        );
+            "apiPipelines.pipelines.invalidId",
+            &[],
+        )
+        .await;
     }
 
     let raw: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
+        // serde 解析消息为英文技术细节，经 {{detail}} 透传
         Err(e) => {
-            return error(
+            return err_response(
+                &state,
                 StatusCode::BAD_REQUEST,
-                format!("管线 spec 不是合法 JSON: {e}"),
+                "apiPipelines.pipelines.specNotJson",
+                &[("detail", e.to_string())],
             )
+            .await
         }
     };
     let spec: PipelineSpec = match serde_json::from_value(raw) {
         Ok(s) => s,
         Err(e) => {
-            return error(
+            return err_response(
+                &state,
                 StatusCode::BAD_REQUEST,
-                format!("管线 spec 结构不合法: {e}"),
+                "apiPipelines.pipelines.specMalformed",
+                &[("detail", e.to_string())],
             )
+            .await
         }
     };
 
     if spec.pipeline.id != id {
-        return error(
+        return err_response(
+            &state,
             StatusCode::BAD_REQUEST,
-            format!(
-                "spec 中的 pipeline.id（{}）与路径 id（{id}）不一致",
-                spec.pipeline.id
-            ),
-        );
+            "apiPipelines.pipelines.idMismatch",
+            &[
+                ("specId", spec.pipeline.id.clone()),
+                ("pathId", id.clone()),
+            ],
+        )
+        .await;
     }
-    // 用执行层视角做一次完整校验（spec_to_pipeline 内含全部结构校验）
+    // 用执行层视角做一次完整校验（spec_to_pipeline 内含全部结构校验）；
+    // bridge 的 anyhow 消息为英文技术细节，经 {{detail}} 透传
     if let Err(e) = pipeline_bridge::spec_to_pipeline(&spec) {
-        return error(StatusCode::BAD_REQUEST, e.to_string());
+        return err_response(
+            &state,
+            StatusCode::BAD_REQUEST,
+            "apiPipelines.specInvalid",
+            &[("detail", e.to_string())],
+        )
+        .await;
     }
 
     let dir = pipelines_dir(&state);
@@ -192,17 +217,23 @@ async fn update_pipeline(
     for (path, existing) in scan_specs(&dir) {
         if existing.pipeline.id == id && path != target {
             if let Err(e) = std::fs::remove_file(&path) {
-                tracing::warn!(file = %path.display(), error = %e, "清理旧管线文件失败");
+                tracing::warn!(file = %path.display(), error = %e, "failed to clean up stale pipeline file");
             }
         }
     }
 
     match pipeline_bridge::save_spec(&spec, &target) {
         Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))),
-        Err(e) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("保存管线失败: {e}"),
-        ),
+        // bridge/fs 错误为英文技术细节，经 {{detail}} 透传
+        Err(e) => {
+            err_response(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "apiPipelines.pipelines.saveFailed",
+                &[("detail", e.to_string())],
+            )
+            .await
+        }
     }
 }
 
@@ -212,18 +243,37 @@ async fn delete_pipeline(
     AxumPath(id): AxumPath<String>,
 ) -> (StatusCode, Json<Value>) {
     if is_builtin(&id) {
-        return error(StatusCode::FORBIDDEN, "内置管线不可删除");
+        return err_response(
+            &state,
+            StatusCode::FORBIDDEN,
+            "apiPipelines.pipelines.builtinReadOnly",
+            &[],
+        )
+        .await;
     }
 
     let dir = pipelines_dir(&state);
     match find_spec_file(&dir, &id) {
-        None => error(StatusCode::NOT_FOUND, "管线不存在"),
+        None => {
+            err_response(
+                &state,
+                StatusCode::NOT_FOUND,
+                "apiPipelines.pipelines.notFound",
+                &[],
+            )
+            .await
+        }
         Some((path, _)) => match std::fs::remove_file(&path) {
             Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))),
-            Err(e) => error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("删除管线文件失败: {e}"),
-            ),
+            Err(e) => {
+                err_response(
+                    &state,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "apiPipelines.pipelines.deleteFailed",
+                    &[("detail", e.to_string())],
+                )
+                .await
+            }
         },
     }
 }
@@ -407,7 +457,7 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.0["error"].as_str().unwrap().contains("不一致"));
 
-        // 结构错误：空节点列表
+        // 结构错误：空节点列表 → 本地化前缀 + 英文 bridge 技术细节（{{detail}}）
         let (status, body) = update_pipeline(
             State(state.clone()),
             AxumPath("p3".to_string()),
@@ -415,10 +465,9 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body.0["error"]
-            .as_str()
-            .unwrap()
-            .contains("至少要有一个节点"));
+        let msg = body.0["error"].as_str().unwrap();
+        assert!(msg.contains("管线 spec 结构无效"), "got: {msg}");
+        assert!(msg.contains("at least one node"), "got: {msg}");
     }
 
     // ── DELETE ──────────────────────────────────────────────────────────────

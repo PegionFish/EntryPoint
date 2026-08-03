@@ -26,6 +26,7 @@ use tracing::warn;
 use ep_core::pipeline::dag::Pipeline;
 use ep_core::pipeline::load_pipeline;
 
+use crate::api::err_response;
 use crate::api::pipelines::pipeline_bridge::{spec_to_pipeline, PipelineSpec};
 use crate::state::AppState;
 
@@ -54,34 +55,47 @@ async fn execute_pipeline(
     // 二选一校验：两者都缺/都给 → 400
     let pipeline = match (req.pipeline_id, req.spec) {
         (None, None) => {
-            return error(
+            return err_response(
+                &state,
                 StatusCode::BAD_REQUEST,
-                "必须提供 pipeline_id 或 spec 之一",
+                "apiPipelines.execute.eitherRequired",
+                &[],
             )
+            .await
         }
         (Some(_), Some(_)) => {
-            return error(
+            return err_response(
+                &state,
                 StatusCode::BAD_REQUEST,
-                "pipeline_id 与 spec 不能同时提供",
+                "apiPipelines.execute.mutuallyExclusive",
+                &[],
             )
+            .await
         }
         (Some(id), None) => match find_builtin_pipeline(&state.root, &id) {
             Some(pipeline) => pipeline,
             None => {
-                return error(
+                return err_response(
+                    &state,
                     StatusCode::NOT_FOUND,
-                    format!("管线不存在: {id}"),
+                    "apiPipelines.execute.pipelineNotFound",
+                    &[("id", id)],
                 )
+                .await
             }
         },
         (None, Some(spec)) => match spec_to_pipeline(&spec) {
             Ok(pipeline) => pipeline,
-            // 结构错误（缺字段/重复 id/非法边等）→ 400
+            // 结构错误（缺字段/重复 id/非法边等）→ 400；
+            // bridge 的 anyhow 消息为英文技术细节，经 {{detail}} 透传
             Err(e) => {
-                return error(
+                return err_response(
+                    &state,
                     StatusCode::BAD_REQUEST,
-                    format!("管线 spec 结构无效: {e}"),
+                    "apiPipelines.specInvalid",
+                    &[("detail", e.to_string())],
                 )
+                .await
             }
         },
     };
@@ -91,18 +105,43 @@ async fn execute_pipeline(
             StatusCode::ACCEPTED,
             Json(json!({ "task_id": task_id })),
         ),
-        Err(execution::SubmitError::InvalidInputs(msg)) => {
-            error(StatusCode::BAD_REQUEST, msg)
+        Err(execution::SubmitError::UnknownInputNode(node_id)) => {
+            err_response(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "apiPipelines.execute.inputsUnknownNode",
+                &[("nodeId", node_id)],
+            )
+            .await
+        }
+        Err(execution::SubmitError::InputsNotObject(node_id)) => {
+            err_response(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "apiPipelines.execute.inputsNotObject",
+                &[("nodeId", node_id)],
+            )
+            .await
+        }
+        Err(execution::SubmitError::CycleDetected(id)) => {
+            err_response(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "apiPipelines.execute.cycleDetected",
+                &[("id", id)],
+            )
+            .await
         }
         Err(execution::SubmitError::Internal(msg)) => {
-            error(StatusCode::INTERNAL_SERVER_ERROR, msg)
+            err_response(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "apiPipelines.execute.internalError",
+                &[("detail", msg)],
+            )
+            .await
         }
     }
-}
-
-/// 统一错误响应（中文）
-fn error(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<Value>) {
-    (status, Json(json!({ "error": message.into() })))
 }
 
 /// 扫描 `config/pipelines/*.toml`，返回 `[pipeline].id` 匹配的管线定义。
@@ -124,7 +163,7 @@ fn find_builtin_pipeline(root: &Path, pipeline_id: &str) -> Option<Pipeline> {
                 warn!(
                     file = %path.display(),
                     error = %e,
-                    "管线文件解析失败，已跳过"
+                    "failed to parse pipeline file, skipping"
                 );
             }
         }
@@ -162,9 +201,15 @@ mod tests {
     }
 
     fn test_state(root: std::path::PathBuf) -> Arc<AppState> {
+        test_state_lang(root, "zh-CN")
+    }
+
+    fn test_state_lang(root: std::path::PathBuf, language: &str) -> Arc<AppState> {
+        let mut config = AppConfig::default();
+        config.general.language = language.to_string();
         Arc::new(AppState::new(
             root,
-            AppConfig::default(),
+            config,
             vec![],
             vec![],
             PortManager::new(18000, 19000),
@@ -430,5 +475,48 @@ to = ["output", "input"]
         assert_eq!(record.status, execution::TaskState::Completed);
         assert_eq!(record.pipeline_id, "spec-pipe");
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "via spec");
+    }
+
+    // ── 8. language=en → 错误文案为英文（i18n 按配置切换） ──────────────────
+
+    #[tokio::test]
+    async fn test_execute_errors_in_english_when_language_en() {
+        let state = test_state_lang(unique_root("en"), "en");
+
+        // 缺参 → 英文文案
+        let (status, body) =
+            execute_pipeline(State(state.clone()), Json(exec_request(json!({}))))
+                .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.0["error"],
+            "Either pipeline_id or spec must be provided"
+        );
+
+        // 管线不存在 → 英文文案 + id 插值
+        let (status, body) = execute_pipeline(
+            State(state.clone()),
+            Json(exec_request(json!({ "pipeline_id": "ghost-pipeline" }))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.0["error"], "Pipeline not found: ghost-pipeline");
+
+        // spec 无效 → 英文本地化前缀 + 英文 bridge 技术细节（{{detail}} 透传）
+        let (status, body) = execute_pipeline(
+            State(state),
+            Json(exec_request(json!({
+                "spec": {
+                    "pipeline": { "id": "p", "name": "n", "description": "" },
+                    "nodes": [],
+                    "edges": []
+                }
+            }))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let msg = body.0["error"].as_str().unwrap();
+        assert!(msg.starts_with("Pipeline spec is invalid: "), "got: {msg}");
+        assert!(msg.contains("at least one node"), "got: {msg}");
     }
 }
