@@ -180,6 +180,52 @@
 
 ---
 
+## UI/UX 现代化改造（2026-08-03）
+
+> 目标：桌面 GUI 现代视觉（对齐 WebUI 设计系统）+ 全窗口尺寸自适应；WebUI 响应式修补。
+> 方式：13 个并行子代理分批执行（Wave B 2 代理 + Wave C 6 页面代理 + WebUI 巡检/修复 3 代理）。
+
+### 批次① 设计基础 ✅
+- [x] `ui/palette.rs`：Palette 设计令牌（深/浅色板映射 DESIGN_SYSTEM.md）+ service_status 唯一权威状态映射（删除 4 份矛盾定义）
+- [x] `ui/components.rs`：卡片/徽章/页头/空态/响应式网格/确认对话框/主题按钮
+- [x] theme.rs 重构：基于 Palette 的 Visuals + apply_font_size（TextStyle 等比缩放）
+#### Git
+- commit: `f8e98fd` — "feat(ui): 设计基础 — 设计令牌 Palette + 共享组件库 + 主题系统重构（批次①）"
+
+### Wave B 外壳 + 分辨率自适应 ✅
+- [x] 设置页「UI 缩放/字号」死设置复活：set_zoom_factor + TextStyle 缩放，修改即时生效
+- [x] 窗口最小尺寸 900×600 → 720×480；超屏 92% 自动收缩
+- [x] 侧导航 <1000px 收折为图标栏（PanelState 缓存清除实现真响应式）+ 激活指示条
+- [x] 主题切换持久化到 config.general.theme；移除顶部菜单栏；Toast 主题感知
+- [x] 模型管理全接线：启动自动扫描模型 + 依赖检测；刷新/下载(execute_download)/导入(import_model)/删除(remove_dir_all) 全部接通
+#### Git
+- commit: `9eedf10` — "feat(desktop): 外壳现代化 + 分辨率自适应（Wave B）"
+
+### Wave C 六页面重做 ✅（6 并行代理）
+- [x] dashboard：统计/设备卡响应式网格、显存进度条着色、状态徽章、横滚表格
+- [x] modules：响应式 master-detail、停止/重启确认框、日志区保留
+- [x] models：刷新/下载/删除/导入按钮全部启用 + 路径导入框 + 删除确认框
+- [x] tasks：任务卡片化 + 徽章 + 进度条 + 横滚表格
+- [x] settings：六分区卡片化 + Toast 反馈（签名改用 ToastManager）
+- [x] pipeline_editor：全主题化画布（浅色修复）、−/＋/⤢适配 工具栏、<640px 隐藏侧栏
+#### Git
+- commit: `cbf0f60` — "feat(desktop): 六页面现代化重做（Wave C）"
+
+### WebUI 响应式修补 ✅（巡检代理 + 2 修复代理）
+- [x] P0：全局侧栏 <lg 隐藏 + 汉堡菜单 + Sheet 抽屉（复用 shadcn sheet）
+- [x] P1：管线页窄屏节点库抽屉化、参数面板 overlay 化；工具栏图标化降级
+- [x] P2：index.css 新增 23 个语义色令牌（dtype/cat/http/node）替换 24 处硬编码调色板色；page-container 断点内边距；tasks 统计条 wrap；图例窄屏隐藏；节点库触屏点击添加
+- 验证：tsc + vite build 通过
+#### Git
+- commit: `02d3b9b` — "feat(webui): 响应式修复 — 侧栏抽屉收折(P0)/管线页窄屏overlay/工具栏降级/语义色令牌化/触屏添加节点"
+
+### 验证
+- cargo check / clippy（-D warnings）：零警告；cargo test -p ep-desktop：5/5 通过
+- debug 版启动冒烟测试：进程存活、CJK 字体加载正常
+- npm run build：通过
+
+---
+
 ## 最终统计
 
 | 指标 | 值 |
