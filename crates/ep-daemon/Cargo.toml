@@ -13,9 +13,19 @@ ep-core.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-axum.workspace = true
+axum = { workspace = true, features = ["multipart"] }
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
+# 模型上传归档解包（zip / tar.gz），见 api/upload.rs
+zip = { version = "2", default-features = false, features = ["deflate"] }
+flate2 = "1"
+tar = "0.4"
+
+[dev-dependencies]
+# 测试设施：Router::oneshot 与响应体收集（版本与 Cargo.lock 中已有条目一致）
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+toml.workspace = true
