@@ -17,6 +17,9 @@ fn main() -> anyhow::Result<()> {
     let config = ep_core::config::AppConfig::load_or_create(&config_dir)
         .unwrap_or_default();
 
+    // 克隆一份配置供 UI 使用（原配置随后移入后台线程）
+    let ui_config = config.clone();
+
     // mpsc channel: background → UI
     let (tx, rx) = std::sync::mpsc::channel();
 
@@ -36,7 +39,7 @@ fn main() -> anyhow::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("EntryPoint")
             .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([900.0, 600.0]),
+            .with_min_inner_size([720.0, 480.0]),
         ..Default::default()
     };
 
@@ -45,7 +48,10 @@ fn main() -> anyhow::Result<()> {
         native_options,
         Box::new(move |cc| {
             configure_fonts(&cc.egui_ctx);
-            Ok(Box::new(ep_desktop::App::new(rx, cmd_tx)))
+            // 应用配置中的字体大小与整体缩放（egui 0.31 的 API 为 set_zoom_factor）
+            ep_desktop::theme::apply_font_size(&cc.egui_ctx, ui_config.ui.font_size);
+            cc.egui_ctx.set_zoom_factor(ui_config.ui.scale_factor);
+            Ok(Box::new(ep_desktop::App::new(rx, cmd_tx, ui_config)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
@@ -96,6 +102,13 @@ fn configure_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// 从模块发现结果中提取有效的 manifest 列表
+fn manifests_from(
+    discovered: &[ep_core::module::DiscoveredModule],
+) -> Vec<ep_core::module::ModuleManifest> {
+    discovered.iter().filter_map(|m| m.manifest.clone()).collect()
+}
+
 /// Background event loop — owns ProcessManager, PortManager, runs on tokio runtime.
 async fn background_loop(
     tx: std::sync::mpsc::Sender<ep_desktop::app::AppMsg>,
@@ -108,6 +121,7 @@ async fn background_loop(
     let (port_range_start, port_range_end) = config.port_range();
     let mut port_manager = ep_core::port::PortManager::new(port_range_start, port_range_end);
     let mut process_manager = ep_core::process::ProcessManager::new();
+    let mut model_manager = ep_core::model::ModelManager::new(&config.models, &root);
 
     // Initial device detection
     let disabled = &config.compute.disabled_backends;
@@ -116,8 +130,16 @@ async fn background_loop(
 
     // Initial module discovery
     let modules_dir = root.join("modules");
-    let discovered = ep_core::module::discover_modules(&modules_dir);
+    let mut discovered = ep_core::module::discover_modules(&modules_dir);
     let _ = tx.send(AppMsg::ModulesDiscovered(discovered.clone()));
+
+    // 启动时自动检查依赖并刷新模型列表
+    let _ = tx.send(AppMsg::DepReportRefreshed(
+        ep_core::deps::DepReport::check_all(&root),
+    ));
+    let _ = tx.send(AppMsg::ModelsRefreshed(
+        model_manager.list_all_models(&manifests_from(&discovered)),
+    ));
 
     // Periodic timers
     let mut device_timer = tokio::time::interval(std::time::Duration::from_secs(
@@ -196,23 +218,114 @@ async fn background_loop(
                         let _ = tx.send(AppMsg::ModuleStopped(module_id));
                     }
                     Some(AppCmd::DownloadModel(module_id, model_id)) => {
-                        let _ = tx.send(AppMsg::Error(format!(
-                            "模型下载功能待集成: {module_id}/{model_id}"
-                        )));
+                        // 在已发现模块中查找 manifest 与对应模型声明
+                        let decl = discovered
+                            .iter()
+                            .filter_map(|m| m.manifest.as_ref())
+                            .find(|mf| mf.module.id == module_id)
+                            .and_then(|mf| {
+                                mf.models.iter().find(|d| d.id == model_id).cloned()
+                            });
+
+                        if let Some(decl) = decl {
+                            // venv python 解释器路径（Windows: Scripts/python.exe，其他: bin/python）
+                            let venv_python = if cfg!(target_os = "windows") {
+                                root.join("runtime")
+                                    .join("venvs")
+                                    .join(&module_id)
+                                    .join("Scripts")
+                                    .join("python.exe")
+                            } else {
+                                root.join("runtime")
+                                    .join("venvs")
+                                    .join(&module_id)
+                                    .join("bin")
+                                    .join("python")
+                            };
+
+                            if !venv_python.exists() {
+                                let _ = tx.send(AppMsg::ModelDownloadFinished(
+                                    model_id.clone(),
+                                    false,
+                                ));
+                                let _ = tx.send(AppMsg::Error(
+                                    "请先启动一次该模块以准备 Python 环境，然后再下载模型"
+                                        .to_string(),
+                                ));
+                            } else {
+                                // 长耗时操作，直接在当前分支 await
+                                let module_dir = root.join("modules").join(&module_id);
+                                match model_manager
+                                    .execute_download(&decl, &module_dir, &venv_python, &config)
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        let _ = tx.send(AppMsg::ModelDownloadFinished(
+                                            model_id.clone(),
+                                            true,
+                                        ));
+                                        let _ = tx.send(AppMsg::ModelsRefreshed(
+                                            model_manager
+                                                .list_all_models(&manifests_from(&discovered)),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(AppMsg::ModelDownloadFinished(
+                                            model_id.clone(),
+                                            false,
+                                        ));
+                                        let _ = tx.send(AppMsg::Error(format!(
+                                            "模型下载失败: {e}"
+                                        )));
+                                    }
+                                }
+                            }
+                        } else {
+                            let _ = tx
+                                .send(AppMsg::ModelDownloadFinished(model_id.clone(), false));
+                            let _ = tx.send(AppMsg::Error(format!(
+                                "模块 {module_id} 或模型 {model_id} 未找到"
+                            )));
+                        }
                     }
                     Some(AppCmd::DeleteModel(target_dir)) => {
-                        let _ = tx.send(AppMsg::Error(format!(
-                            "模型删除功能待集成: {target_dir}"
-                        )));
+                        let dir = model_manager.model_dir(&target_dir);
+                        match tokio::fs::remove_dir_all(&dir).await {
+                            Ok(()) => {
+                                let _ = tx.send(AppMsg::ModelsRefreshed(
+                                    model_manager.list_all_models(&manifests_from(&discovered)),
+                                ));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(AppMsg::Error(format!("删除模型失败: {e}")));
+                            }
+                        }
                     }
-                    Some(AppCmd::ImportModel(target_dir, source)) => {
-                        let _ = tx.send(AppMsg::Error(format!(
-                            "模型导入功能待集成: {target_dir} <- {}",
-                            source.display()
-                        )));
+                    Some(AppCmd::ImportModel {
+                        module_id,
+                        model_id,
+                        source,
+                    }) => {
+                        match model_manager
+                            .import_model(&module_id, &model_id, &source)
+                            .await
+                        {
+                            Ok(()) => {
+                                let _ = tx.send(AppMsg::ModelsRefreshed(
+                                    model_manager.list_all_models(&manifests_from(&discovered)),
+                                ));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(AppMsg::Error(format!("导入模型失败: {e}")));
+                            }
+                        }
                     }
                     Some(AppCmd::RefreshModels) => {
-                        // TODO: 调用 ModelManager::list_all_models 并发送 ModelsRefreshed
+                        // 重新扫描模块目录并刷新模型列表
+                        discovered = ep_core::module::discover_modules(&modules_dir);
+                        let _ = tx.send(AppMsg::ModelsRefreshed(
+                            model_manager.list_all_models(&manifests_from(&discovered)),
+                        ));
                     }
                     Some(AppCmd::RefreshDeps) => {
                         let report = ep_core::deps::DepReport::check_all(&root);
