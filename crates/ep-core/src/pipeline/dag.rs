@@ -320,14 +320,14 @@ mod tests {
         r#"
 [pipeline]
 id = "test-pipeline"
-name = "测试管线"
-description = "用于单元测试"
+name = "Test pipeline"
+description = "For unit tests"
 
 [[nodes]]
 id = "input"
 kind = "builtin"
 builtin = "file_input"
-label = "输入"
+label = "Input"
 params = { accept = "audio" }
 
 [[nodes]]
@@ -335,13 +335,13 @@ id = "process"
 kind = "module"
 module_id = "faster-whisper"
 capability = "transcribe"
-label = "识别"
+label = "Transcribe"
 
 [[nodes]]
 id = "save"
 kind = "builtin"
 builtin = "file_output"
-label = "保存"
+label = "Save"
 
 [[edges]]
 from = ["input", "output"]
@@ -369,7 +369,7 @@ to = ["save", "input"]
         let toml_str = r#"
 [pipeline]
 id = "parallel"
-name = "并行管线"
+name = "Parallel pipeline"
 
 [[nodes]]
 id = "input"
@@ -424,7 +424,7 @@ to = ["output", "input2"]
         let toml_str = r#"
 [pipeline]
 id = "cycle"
-name = "有环管线"
+name = "Cyclic pipeline"
 
 [[nodes]]
 id = "input"
@@ -465,7 +465,7 @@ to = ["a", "input"]
         let toml_str = r#"
 [pipeline]
 id = "dup"
-name = "重复 ID"
+name = "Duplicate ID"
 
 [[nodes]]
 id = "input"
@@ -489,7 +489,7 @@ builtin = "ffmpeg"
         let toml_str = r#"
 [pipeline]
 id = "bad-edge"
-name = "无效边"
+name = "Invalid edge"
 
 [[nodes]]
 id = "input"
@@ -512,7 +512,7 @@ to = ["ghost", "input"]
         let toml_str = r#"
 [pipeline]
 id = "no-input"
-name = "无输入"
+name = "No input"
 
 [[nodes]]
 id = "process"
@@ -530,8 +530,8 @@ capability = "transcribe"
         let pipeline = Pipeline::from_toml_str(sample_toml()).unwrap();
 
         assert_eq!(pipeline.id, "test-pipeline");
-        assert_eq!(pipeline.name, "测试管线");
-        assert_eq!(pipeline.description, "用于单元测试");
+        assert_eq!(pipeline.name, "Test pipeline");
+        assert_eq!(pipeline.description, "For unit tests");
         assert_eq!(pipeline.nodes.len(), 3);
         assert_eq!(pipeline.edges.len(), 2);
 
@@ -591,7 +591,7 @@ capability = "transcribe"
         let toml_str = r#"
 [pipeline]
 id = "api-test"
-name = "API 测试"
+name = "API test"
 
 [[nodes]]
 id = "input"
@@ -604,7 +604,7 @@ kind = "external_api"
 endpoint = "https://api.example.com/v1"
 api_type = "openai"
 api_key_env = "MY_API_KEY"
-label = "翻译"
+label = "Translate"
 params = { model = "gpt-4", temperature = 0.3 }
 
 [[edges]]
@@ -630,7 +630,7 @@ to = ["translate", "input"]
         let toml_str = r#"
 [pipeline]
 id = "pos-test"
-name = "坐标测试"
+name = "Position test"
 
 [[nodes]]
 id = "input"
@@ -658,7 +658,7 @@ position = { x = 240.5, y = -80.0 }
         // 要求：Pipeline/Node/Edge 均可经 toml::to_string_pretty 序列化输出
         let pipeline = Pipeline::from_toml_str(sample_toml()).unwrap();
         let pretty = toml::to_string_pretty(&pipeline)
-            .expect("Pipeline 应可用 toml::to_string_pretty 序列化");
+            .expect("Pipeline should serialize via toml::to_string_pretty");
         assert!(pretty.contains("test-pipeline"));
         assert!(pretty.contains("[[nodes]]"));
         assert!(pretty.contains("[[edges]]"));
@@ -666,7 +666,7 @@ position = { x = 240.5, y = -80.0 }
         // 带 position 的节点也能序列化，且 position 形状为 {x, y}
         let mut p2 = pipeline.clone();
         p2.nodes[0].position = Some(NodePosition { x: 1.0, y: 2.0 });
-        let pretty2 = toml::to_string_pretty(&p2).expect("带 position 的序列化");
+        let pretty2 = toml::to_string_pretty(&p2).expect("serialization with position");
         assert!(pretty2.contains("x = 1.0"));
         assert!(pretty2.contains("y = 2.0"));
 

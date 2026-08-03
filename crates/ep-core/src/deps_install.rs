@@ -138,7 +138,7 @@ impl SystemDep {
     fn manual_guidance(&self) -> &'static str {
         match self {
             Self::Ffmpeg => "ffmpeg: Debian/Ubuntu: sudo apt install ffmpeg | RHEL: sudo dnf install ffmpeg-free | Arch: sudo pacman -S ffmpeg",
-            Self::CudaToolkit => "CUDA Toolkit: 请从 https://developer.nvidia.com/cuda-downloads 下载安装，或通过发行版仓库安装 nvidia-cuda-toolkit / cuda",
+            Self::CudaToolkit => "CUDA Toolkit: download from https://developer.nvidia.com/cuda-downloads, or install nvidia-cuda-toolkit / cuda from your distribution repositories",
             Self::LibXkbCommon => "libxkbcommon: Debian/Ubuntu: sudo apt install libxkbcommon-dev | RHEL: sudo dnf install libxkbcommon-devel | Arch: sudo pacman -S libxkbcommon",
             Self::Wayland => "wayland: Debian/Ubuntu: sudo apt install libwayland-dev | RHEL: sudo dnf install wayland-devel | Arch: sudo pacman -S wayland",
             Self::Fontconfig => "fontconfig: Debian/Ubuntu: sudo apt install libfontconfig1-dev | RHEL: sudo dnf install fontconfig-devel | Arch: sudo pacman -S fontconfig",
@@ -246,7 +246,7 @@ pub fn auto_install(dep: SystemDep) -> InstallResult {
         Ok(status) => {
             warn!(dep = ?dep, pkg = %pkg, code = ?status.code(), "auto-install failed");
             InstallResult::Failed(format!(
-                "包管理器退出码 {:?}。手动安装: {}",
+                "package manager exited with code {:?}. Manual install: {}",
                 status.code(),
                 dep.manual_guidance()
             ))
@@ -254,7 +254,7 @@ pub fn auto_install(dep: SystemDep) -> InstallResult {
         Err(e) => {
             warn!(dep = ?dep, error = %e, "failed to execute package manager");
             InstallResult::Failed(format!(
-                "无法执行 {pkg_mgr}: {e}。手动安装: {}",
+                "failed to execute {pkg_mgr}: {e}. Manual install: {}",
                 dep.manual_guidance()
             ))
         }
