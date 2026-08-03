@@ -80,12 +80,24 @@ refresh_interval_secs = 5     # 设备状态刷新间隔
 
 [models]
 cache_dir = "./models"        # 模型缓存目录
-hf_endpoint = "https://huggingface.co"  # HuggingFace 端点（可换镜像）
+hf_endpoint = "https://huggingface.co"  # HuggingFace 端点（可换镜像，仅对 HuggingFace 源生效）
+default_source = "huggingface"          # 默认下载源：huggingface | modelscope | url
 
 [ports]
 range_start = 18000           # 模块端口分配范围
 range_end = 19000
+
+[network]                     # 出口代理：注入模型下载 / 依赖安装 / 模块子进程
+http_proxy = ""               # 空 = 不覆盖，继承 daemon 进程的系统环境变量
+https_proxy = ""
+no_proxy = "localhost,127.0.0.1"
+# 服务器需走代理访问 HuggingFace 时：
+# http_proxy = "http://127.0.0.1:7890"
+# https_proxy = "http://127.0.0.1:7890"
 ```
+
+> 代理仅对**新启动的子进程**生效；修改后已运行的模块需重启。
+> 通过 WebUI「设置」页或 `PUT /api/config` 修改配置会直接落盘到 `config/app.toml`，重启不丢失。
 
 完整配置参考见 [CONFIG_REFERENCE.md](CONFIG_REFERENCE.md)。
 
@@ -120,6 +132,8 @@ sudo systemctl status entrypoint
 # 开机自启状态
 systemctl is-enabled entrypoint
 ```
+
+> ⚠️ **重启前先停止运行中的模块**：daemon 重启**不会**回收旧的模块子进程，它们会继续运行并占用已分配的端口（18000–19000 段），导致 daemon 重启后模块端口冲突或状态不一致。重启 daemon 前，先通过 WebUI 或 `POST /api/modules/<module-id>/stop` 停止各运行中模块。
 
 ### 服务文件说明
 
@@ -203,6 +217,16 @@ http://<服务器IP>:9800
 ```
 
 首次访问即可看到仪表盘，包含设备状态、模块列表等。
+
+### WebUI 主要能力
+
+| 功能 | 说明 |
+|---|---|
+| 模型上传 | 从浏览器直接上传本地模型：支持选择整个文件夹（逐文件上传）或单个压缩包（`.zip` / `.tar.gz` / `.tgz`，服务端解包），带真实上传进度 |
+| 模型下载 | 支持 HuggingFace / ModelScope（及 URL 直链）多下载源，可在下载时选择来源；模块声明了 `[[models.mirrors]]` 备选源时，主源失败可切换镜像重试 |
+| 代理配置 | 「设置 → 网络与代理」页可配置 `[network]` 节的 http_proxy / https_proxy / no_proxy，保存即落盘 |
+| 管线在线执行 | 在浏览器中提交管线任务、跟踪各节点执行状态，无需命令行 |
+| 任务中心 | 查看历史任务与状态，下载各节点产物（如字幕、音频、JSON 结果） |
 
 ---
 
@@ -298,6 +322,10 @@ cd /server/EntryPoint
 uv venv runtime/venvs/<module-id>/
 ```
 
+### 首次模型下载超时
+
+全新安装首次下载模型前会自动准备模块的 Python 虚拟环境，耗时取决于依赖规模（含 torch 的模块约 15–20 分钟），可能超过常见 HTTP 客户端超时。建议将客户端超时设为 ≥20 分钟，或超时后直接重试——venv 已存在时下载会立即开始。
+
 ### 构建失败
 
 - **Rust 编译错误**：确认 `rustup update` 到最新 stable
@@ -318,6 +346,11 @@ git pull
 ./build.sh server
 
 # 解压 tar.gz 后运行 install.sh 完成安装（或直接用源码树安装）
+
+# 重启前先停止运行中的模块（daemon 重启不会回收旧的模块子进程，
+# 孤儿子进程会继续占用 18000–19000 段端口）：
+#   WebUI 中逐个停止，或 POST /api/modules/<module-id>/stop
+
 sudo systemctl restart entrypoint
 
 # 确认启动成功
