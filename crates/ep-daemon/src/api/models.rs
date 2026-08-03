@@ -22,6 +22,7 @@ use ep_core::model::{
 };
 use ep_core::module::manifest::{ModelDecl, ModelSource, ModuleManifest};
 
+use super::err_response;
 use crate::state::{AppState, DownloadEntry, WsMessage};
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -82,31 +83,36 @@ async fn find_module_manifest(
         .and_then(|m| m.manifest.clone())
 }
 
-/// 查找模块 manifest 中的模型声明；模块或模型不存在时返回 404 中文错误
+/// 查找模块 manifest 中的模型声明；模块或模型不存在时返回 404 i18n 错误
 async fn find_model_decl(
-    state: &AppState,
+    state: &Arc<AppState>,
     module_id: &str,
     model_id: &str,
 ) -> Result<ModelDecl, (StatusCode, Json<Value>)> {
-    let manifest = find_module_manifest(state, module_id)
-        .await
-        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, format!("模块 '{module_id}' 不存在")))?;
-    manifest
-        .models
-        .iter()
-        .find(|m| m.id == model_id)
-        .cloned()
-        .ok_or_else(|| {
-            error_response(
+    let Some(manifest) = find_module_manifest(state, module_id).await else {
+        return Err(err_response(
+            state,
+            StatusCode::NOT_FOUND,
+            "apiModels.moduleNotFound",
+            &[("module_id", module_id.to_string())],
+        )
+        .await);
+    };
+    match manifest.models.iter().find(|m| m.id == model_id).cloned() {
+        Some(decl) => Ok(decl),
+        None => {
+            Err(err_response(
+                state,
                 StatusCode::NOT_FOUND,
-                format!("模型 '{model_id}' 不存在（模块 '{module_id}'）"),
+                "apiModels.modelNotFound",
+                &[
+                    ("model_id", model_id.to_string()),
+                    ("module_id", module_id.to_string()),
+                ],
             )
-        })
-}
-
-/// 统一错误响应：正确状态码 + `{"error":"中文"}`
-fn error_response(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<Value>) {
-    (status, Json(json!({ "error": message.into() })))
+            .await)
+        }
+    }
 }
 
 /// state.downloads 键约定：`"{module_id}:{model_id}"`
@@ -232,20 +238,24 @@ async fn module_models(
     let manifest = match find_module_manifest(&state, &module_id).await {
         Some(mf) => mf,
         None => {
-            return error_response(
+            return err_response(
+                &state,
                 StatusCode::NOT_FOUND,
-                format!("模块 '{module_id}' 不存在"),
-            );
+                "apiModels.moduleNotFound",
+                &[("module_id", module_id.clone())],
+            )
+            .await;
         }
     };
 
     if manifest.models.is_empty() {
+        let lang = state.lang().await;
         return (
             StatusCode::OK,
             Json(json!({
                 "module_id": module_id,
                 "models": [],
-                "message": "该模块没有模型声明"
+                "message": ep_core::i18n::t(&lang, "apiModels.noModelDecls", &[])
             })),
         );
     }
@@ -288,10 +298,13 @@ async fn import_model(
     let manifest = match find_module_manifest(&state, &module_id).await {
         Some(mf) => mf,
         None => {
-            return error_response(
+            return err_response(
+                &state,
                 StatusCode::NOT_FOUND,
-                format!("模块 '{module_id}' 不存在"),
-            );
+                "apiModels.moduleNotFound",
+                &[("module_id", module_id.clone())],
+            )
+            .await;
         }
     };
 
@@ -300,23 +313,29 @@ async fn import_model(
         Some(m) => m,
         None => {
             let available: Vec<&str> = manifest.models.iter().map(|m| m.id.as_str()).collect();
-            return error_response(
+            return err_response(
+                &state,
                 StatusCode::NOT_FOUND,
-                format!(
-                    "模块 '{module_id}' 中不存在模型 '{}'，可用模型：{}",
-                    req.model_id,
-                    available.join("、")
-                ),
-            );
+                "apiModels.importModelNotFound",
+                &[
+                    ("module_id", module_id.clone()),
+                    ("model_id", req.model_id.clone()),
+                    ("available", available.join(", ")),
+                ],
+            )
+            .await;
         }
     };
 
     let source_path = PathBuf::from(&req.source_path);
     if !source_path.is_dir() {
-        return error_response(
+        return err_response(
+            &state,
             StatusCode::BAD_REQUEST,
-            format!("源路径 '{}' 不存在或不是目录", req.source_path),
-        );
+            "apiModels.importSourceInvalid",
+            &[("path", req.source_path.clone())],
+        )
+        .await;
     }
 
     info!(
@@ -338,10 +357,13 @@ async fn import_model(
         Ok(()) => {}
         Err(e) => {
             warn!(error = %e, "failed to create target dir");
-            return error_response(
+            return err_response(
+                &state,
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("创建目标目录失败：{e}"),
-            );
+                "apiModels.targetDirCreateFailed",
+                &[("detail", e.to_string())],
+            )
+            .await;
         }
     }
 
@@ -384,10 +406,13 @@ async fn import_model(
         }
         Err(e) => {
             warn!(error = %e, "model import failed");
-            error_response(
+            err_response(
+                &state,
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("导入失败：{e}"),
+                "apiModels.importFailed",
+                &[("detail", e.to_string())],
             )
+            .await
         }
     }
 }
@@ -439,7 +464,13 @@ async fn download_model(
     let model_id = match body.get("model_id").and_then(|v| v.as_str()) {
         Some(id) if !id.trim().is_empty() => id.to_string(),
         _ => {
-            return error_response(StatusCode::BAD_REQUEST, "请求体缺少 model_id 字段");
+            return err_response(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "apiModels.missingModelId",
+                &[],
+            )
+            .await;
         }
     };
     let source: Option<ModelSource> = match body.get("source") {
@@ -448,10 +479,13 @@ async fn download_model(
             Ok(s) => Some(s),
             Err(_) => {
                 let given = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
-                return error_response(
+                return err_response(
+                    &state,
                     StatusCode::BAD_REQUEST,
-                    format!("非法的下载源 '{given}'，可用值：huggingface / modelscope / url"),
-                );
+                    "apiModels.invalidSource",
+                    &[("source", given)],
+                )
+                .await;
             }
         },
     };
@@ -462,18 +496,29 @@ async fn download_model(
         Err(resp) => return resp,
     };
     let key = download_key(&module_id, &model_id);
-    {
+    // std MutexGuard 不得跨 await（!Send）：先在短临界区内取标志，再构造响应
+    let already_downloading = {
         let map = state.downloads.lock().unwrap_or_else(|e| e.into_inner());
-        if map.get(&key).is_some_and(|e| e.state == "downloading") {
-            return error_response(StatusCode::CONFLICT, "该模型正在下载中");
-        }
+        map.get(&key).is_some_and(|e| e.state == "downloading")
+    };
+    if already_downloading {
+        return err_response(
+            &state,
+            StatusCode::CONFLICT,
+            "apiModels.downloadInProgress",
+            &[],
+        )
+        .await;
     }
     let mgr = build_model_manager(&state).await;
     if mgr.is_model_present(&decl.target_dir) {
-        return error_response(
+        return err_response(
+            &state,
             StatusCode::CONFLICT,
-            "模型已存在，如需重新下载请先删除",
-        );
+            "apiModels.modelAlreadyExists",
+            &[],
+        )
+        .await;
     }
     let mut venv_python = venv_python_path(&state.root, &module_id);
     if !venv_python.exists() {
@@ -481,10 +526,13 @@ async fn download_model(
         let manifest = match find_module_manifest(&state, &module_id).await {
             Some(mf) => mf,
             None => {
-                return error_response(
+                return err_response(
+                    &state,
                     StatusCode::NOT_FOUND,
-                    format!("模块 '{module_id}' 不存在"),
-                );
+                    "apiModels.moduleNotFound",
+                    &[("module_id", module_id.clone())],
+                )
+                .await;
             }
         };
         let (python_cfg, network_cfg) = {
@@ -499,7 +547,7 @@ async fn download_model(
             .requirements
             .clone()
             .unwrap_or_else(|| "requirements.txt".to_string());
-        info!(module_id = %module_id, "venv 缺失，下载前自动准备 Python 环境");
+        info!(module_id = %module_id, "venv missing, preparing Python environment before download");
         let prep = tokio::task::spawn_blocking(move || {
             let env_mgr =
                 ep_core::env::EnvManager::new(&root, &python_cfg).with_network(&network_cfg);
@@ -510,16 +558,22 @@ async fn download_model(
         match prep {
             Ok(Ok(path)) => venv_python = path,
             Ok(Err(e)) => {
-                return error_response(
+                return err_response(
+                    &state,
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Python 环境准备失败：{e:#}"),
-                );
+                    "apiModels.venvPrepFailed",
+                    &[("detail", format!("{e:#}"))],
+                )
+                .await;
             }
             Err(e) => {
-                return error_response(
+                return err_response(
+                    &state,
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Python 环境准备任务异常：{e}"),
-                );
+                    "apiModels.venvPrepPanicked",
+                    &[("detail", e.to_string())],
+                )
+                .await;
             }
         }
     }
@@ -532,9 +586,36 @@ async fn download_model(
                 .filter(|s| decl.available_sources().contains(s))
         }
     };
-    // 下载源可用性（主源 / mirror）先行校验，失败为用户输入错误 → 400
+    // 下载源可用性（主源 / mirror）先行校验，失败为用户输入错误 → 400。
+    // 不透传 ep-core resolve() 的错误：daemon 按 available_sources 自行本地化。
+    let effective_source = source.unwrap_or(decl.source);
+    if !decl.available_sources().contains(&effective_source) {
+        let available = decl
+            .available_sources()
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return err_response(
+            &state,
+            StatusCode::BAD_REQUEST,
+            "apiModels.sourceUnavailable",
+            &[
+                ("source", effective_source.as_str().to_string()),
+                ("available", available),
+            ],
+        )
+        .await;
+    }
+    // 其余 resolve 失败（声明缺 repo_id / url 等清单缺陷）→ 兜底本地化
     if let Err(e) = decl.resolve(source) {
-        return error_response(StatusCode::BAD_REQUEST, e.to_string());
+        return err_response(
+            &state,
+            StatusCode::BAD_REQUEST,
+            "apiModels.sourceResolveFailed",
+            &[("detail", e.to_string())],
+        )
+        .await;
     }
 
     // ── 启动下载（ep-core 内部 spawn python 子进程 + 轮询目录大小） ──
@@ -548,33 +629,47 @@ async fn download_model(
     ) {
         Ok(h) => h,
         Err(e) => {
-            return error_response(
+            return err_response(
+                &state,
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("启动下载失败：{e}"),
-            );
+                "apiModels.downloadStartFailed",
+                &[("detail", e.to_string())],
+            )
+            .await;
         }
     };
 
-    // 写入下载记录（短临界区；再查一次防并发重复提交，冲突则取消刚启动的下载）
-    {
+    // 写入下载记录（短临界区；再查一次防并发重复提交，冲突则取消刚启动的下载）。
+    // std MutexGuard 不得跨 await（!Send）：临界区内只做判定与插入，响应在锁外构造。
+    let concurrent_submit = {
         let mut map = state.downloads.lock().unwrap_or_else(|e| e.into_inner());
         if map.get(&key).is_some_and(|e| e.state == "downloading") {
-            drop(map);
-            handle.cancel();
-            return error_response(StatusCode::CONFLICT, "该模型正在下载中");
+            true
+        } else {
+            map.insert(
+                key.clone(),
+                DownloadEntry {
+                    module_id: module_id.clone(),
+                    model_id: model_id.clone(),
+                    source: source.unwrap_or(decl.source).as_str().to_string(),
+                    percent: 0.0,
+                    bytes: 0,
+                    state: "downloading".to_string(),
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                },
+            );
+            false
         }
-        map.insert(
-            key.clone(),
-            DownloadEntry {
-                module_id: module_id.clone(),
-                model_id: model_id.clone(),
-                source: source.unwrap_or(decl.source).as_str().to_string(),
-                percent: 0.0,
-                bytes: 0,
-                state: "downloading".to_string(),
-                started_at: chrono::Utc::now().to_rfc3339(),
-            },
-        );
+    };
+    if concurrent_submit {
+        handle.cancel();
+        return err_response(
+            &state,
+            StatusCode::CONFLICT,
+            "apiModels.downloadInProgress",
+            &[],
+        )
+        .await;
     }
 
     // 立即广播一条初始进度，方便刚错过 202 响应的客户端同步状态
@@ -711,23 +806,30 @@ async fn delete_model(
         Err(resp) => return resp,
     };
     let key = download_key(&module_id, &model_id);
-    {
+    // std MutexGuard 不得跨 await（!Send）：先在短临界区内取标志，再构造响应
+    let downloading = {
         let map = state.downloads.lock().unwrap_or_else(|e| e.into_inner());
-        if map.get(&key).is_some_and(|e| e.state == "downloading") {
-            return error_response(StatusCode::CONFLICT, "该模型正在下载中，无法删除");
-        }
+        map.get(&key).is_some_and(|e| e.state == "downloading")
+    };
+    if downloading {
+        return err_response(&state, StatusCode::CONFLICT, "apiModels.deleteInProgress", &[])
+            .await;
     }
 
     let mgr = build_model_manager(&state).await;
     let dir = mgr.model_dir(&decl.target_dir);
     if !dir.is_dir() {
-        return error_response(StatusCode::NOT_FOUND, "模型目录不存在，无需删除");
+        return err_response(&state, StatusCode::NOT_FOUND, "apiModels.modelDirAbsent", &[])
+            .await;
     }
     if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
-        return error_response(
+        return err_response(
+            &state,
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("删除模型目录失败：{e}"),
-        );
+            "apiModels.deleteFailed",
+            &[("detail", e.to_string())],
+        )
+        .await;
     }
 
     // 保持列表干净：移除该模型的历史下载记录（downloading 已在上方拦截）
@@ -742,8 +844,13 @@ async fn delete_model(
 
 /// POST /api/models/:module_id/:model_id/check-update — 检查模型更新
 ///
-/// 透传 ep-core `check_update_available` 的结果（best-effort，永不 Err）：
-/// `{"available": bool, "reason": "中文说明"}`。
+/// 基于 ep-core `check_update_available` 的结果（best-effort，永不 Err），
+/// 由 daemon 按已知事实本地化 reason（不透传 ep-core 的中文文案）：
+/// - URL 来源 → `updateUnsupported`；无下载元数据 → `updateNoMeta`（均本地短路，不触网）
+/// - `available=true` → `updateAvailable`（{{info}} 为远端最后修改时间）
+/// - `available=false` → `updateUpToDate`
+///
+/// 响应形状不变：`{"available": bool, "reason": 本地化说明}`。
 async fn check_model_update(
     State(state): State<Arc<AppState>>,
     Path((module_id, model_id)): Path<(String, String)>,
@@ -752,13 +859,44 @@ async fn check_model_update(
         Ok(d) => d,
         Err(resp) => return resp,
     };
+    let lang = state.lang().await;
+
+    // URL 来源不支持更新检查：daemon 已知事实，直接短路
+    if decl.source == ModelSource::Url {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "available": false,
+                "reason": ep_core::i18n::t(&lang, "apiModels.updateUnsupported", &[]),
+            })),
+        );
+    }
+
     let mgr = build_model_manager(&state).await;
+
+    // 无下载元数据 → 无法比较：daemon 已知事实，直接短路
+    if mgr.read_meta(&decl.target_dir).is_none() {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "available": false,
+                "reason": ep_core::i18n::t(&lang, "apiModels.updateNoMeta", &[]),
+            })),
+        );
+    }
+
     let result = mgr.check_update_available(&decl).await;
+    let reason = if result.available {
+        let info = result.remote_modified.clone().unwrap_or_default();
+        ep_core::i18n::t(&lang, "apiModels.updateAvailable", &[("info", &info)])
+    } else {
+        ep_core::i18n::t(&lang, "apiModels.updateUpToDate", &[])
+    };
     (
         StatusCode::OK,
         Json(json!({
             "available": result.available,
-            "reason": result.reason,
+            "reason": reason,
         })),
     )
 }
@@ -855,8 +993,13 @@ mod tests {
         }
     }
 
-    /// 唯一 tempdir root + 单模块 manifest 的测试 AppState
+    /// 唯一 tempdir root + 单模块 manifest 的测试 AppState（默认 zh-CN）
     fn test_state() -> Arc<AppState> {
+        test_state_with_language("zh-CN")
+    }
+
+    /// 同 test_state，可指定 UI 语言（config.general.language）
+    fn test_state_with_language(language: &str) -> Arc<AppState> {
         let seq = SEQ.fetch_add(1, Ordering::SeqCst);
         let root = std::env::temp_dir().join(format!(
             "ep-daemon-models-test-{}-{seq}",
@@ -864,6 +1007,8 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        let mut config = AppConfig::default();
+        config.general.language = language.to_string();
         let modules = vec![DiscoveredModule {
             manifest: Some(test_manifest()),
             path: root.join("modules").join(MODULE_ID),
@@ -871,7 +1016,7 @@ mod tests {
         }];
         Arc::new(AppState::new(
             root,
-            AppConfig::default(),
+            config,
             vec![],
             modules,
             PortManager::new(18000, 19000),
@@ -1191,7 +1336,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_check_update_url_source_passthrough() {
+    async fn test_check_update_url_source_localized() {
         let state = test_state();
         let (status, json) = check_model_update(
             State(state),
@@ -1204,8 +1349,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_check_update_missing_meta_passthrough() {
-        // 无 .ep_meta.json → ep-core best-effort 返回"缺少下载元数据"（不触网）
+    async fn test_check_update_missing_meta_localized() {
+        // 无 .ep_meta.json → daemon 本地短路返回"缺少下载元数据"（不触网）
         let state = test_state();
         let (status, json) = check_model_update(
             State(state),
@@ -1215,6 +1360,34 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json.0["available"], false);
         assert_eq!(json.0["reason"], "缺少下载元数据，无法比较");
+    }
+
+    // language=en → 下载错误返回英文文案（404 模块不存在 / 400 非法下载源）
+    #[tokio::test]
+    async fn test_download_errors_in_english_when_language_en() {
+        let state = test_state_with_language("en");
+
+        let (status, json) = download_model(
+            State(state.clone()),
+            Path("ghost-mod".to_string()),
+            Some(Json(json!({ "model_id": MODEL_ID }))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json.0["error"], "Module 'ghost-mod' does not exist");
+
+        let (status, json) = download_model(
+            State(state),
+            Path(MODULE_ID.to_string()),
+            Some(Json(json!({ "model_id": MODEL_ID, "source": "ftp" }))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err = json.0["error"].as_str().unwrap();
+        assert!(
+            err.contains("Invalid download source"),
+            "expected English error, got: {err}"
+        );
     }
 
     #[test]

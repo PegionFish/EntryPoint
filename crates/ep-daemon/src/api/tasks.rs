@@ -23,7 +23,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     body::Body,
-    extract::Path,
+    extract::{Path, State},
     http::{Request, StatusCode, header, HeaderValue},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -36,6 +36,7 @@ use tower_http::services::ServeDir;
 
 use ep_core::config::{self, AppConfig};
 
+use crate::api::err_response;
 use crate::api::execute::execution::{self, TaskRecord};
 use crate::state::AppState;
 
@@ -180,13 +181,6 @@ fn detail_out(record: &TaskRecord) -> TaskDetailOut {
     }
 }
 
-fn not_found(message: impl Into<String>) -> (StatusCode, Json<Value>) {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({ "error": message.into() })),
-    )
-}
-
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
 /// GET /api/tasks — 任务列表（新任务在前）
@@ -195,25 +189,45 @@ async fn list_tasks() -> Json<Vec<TaskSummaryOut>> {
 }
 
 /// GET /api/tasks/:task_id — 任务详情（含各节点状态），404 若不存在
-async fn get_task(Path(task_id): Path<String>) -> (StatusCode, Json<Value>) {
+async fn get_task(
+    State(state): State<Arc<AppState>>,
+    Path(task_id): Path<String>,
+) -> (StatusCode, Json<Value>) {
     match execution::snapshot(&task_id) {
         Some(record) => (
             StatusCode::OK,
             Json(
                 serde_json::to_value(detail_out(&record))
-                    .expect("TaskDetailOut 序列化不会失败"),
+                    .expect("TaskDetailOut serialization cannot fail"),
             ),
         ),
-        None => not_found(format!("任务不存在: {task_id}")),
+        None => {
+            err_response(
+                &state,
+                StatusCode::NOT_FOUND,
+                "apiPipelines.tasks.taskNotFound",
+                &[("taskId", task_id)],
+            )
+            .await
+        }
     }
 }
 
 /// GET /api/tasks/:task_id/artifacts — 产物列表，无产物返回空数组
 ///
 /// 形状：`[{node_id, name(文件名), size(字节)}]`（前端 TaskArtifact 契约）。
-async fn list_task_artifacts(Path(task_id): Path<String>) -> (StatusCode, Json<Value>) {
+async fn list_task_artifacts(
+    State(state): State<Arc<AppState>>,
+    Path(task_id): Path<String>,
+) -> (StatusCode, Json<Value>) {
     let Some(record) = execution::snapshot(&task_id) else {
-        return not_found(format!("任务不存在: {task_id}"));
+        return err_response(
+            &state,
+            StatusCode::NOT_FOUND,
+            "apiPipelines.tasks.taskNotFound",
+            &[("taskId", task_id)],
+        )
+        .await;
     };
     let mut out = Vec::new();
     for node_id in &record.node_order {
@@ -241,21 +255,49 @@ async fn list_task_artifacts(Path(task_id): Path<String>) -> (StatusCode, Json<V
 /// 校验通过后 302 到 `/api/task-files/...`（ServeDir 流式发送，支持大文件
 /// 与 Range）；任务/节点/产物不存在 → 404。
 async fn get_task_artifact(
+    State(state): State<Arc<AppState>>,
     Path((task_id, node_id)): Path<(String, String)>,
 ) -> Response {
     let Some(record) = execution::snapshot(&task_id) else {
-        return not_found(format!("任务不存在: {task_id}")).into_response();
+        return err_response(
+            &state,
+            StatusCode::NOT_FOUND,
+            "apiPipelines.tasks.taskNotFound",
+            &[("taskId", task_id)],
+        )
+        .await
+        .into_response();
     };
     if !record.nodes.contains_key(&node_id) {
-        return not_found(format!("任务中不存在节点: {node_id}")).into_response();
+        return err_response(
+            &state,
+            StatusCode::NOT_FOUND,
+            "apiPipelines.tasks.nodeNotFound",
+            &[("nodeId", node_id)],
+        )
+        .await
+        .into_response();
     }
     let Some(served) = execution::ensure_served_artifact(&task_id, &node_id)
     else {
-        return not_found(format!("节点 `{node_id}` 没有可下载的产物"))
-            .into_response();
+        return err_response(
+            &state,
+            StatusCode::NOT_FOUND,
+            "apiPipelines.tasks.noArtifact",
+            &[("nodeId", node_id)],
+        )
+        .await
+        .into_response();
     };
     let Some(file_name) = served.file_name() else {
-        return not_found(format!("节点 `{node_id}` 的产物路径无效")).into_response();
+        return err_response(
+            &state,
+            StatusCode::NOT_FOUND,
+            "apiPipelines.tasks.artifactPathInvalid",
+            &[("nodeId", node_id)],
+        )
+        .await
+        .into_response();
     };
 
     // ServeDir 根内的归集布局：{task_id}/files/{node_id}/{filename}
@@ -415,13 +457,16 @@ to = ["output", "input"]
         assert_eq!(value, json!([]));
     }
 
-    // ── 2. 未知任务详情 → 404 + 中文错误 ────────────────────────────────────
+    // ── 2. 未知任务详情 → 404 + 中文错误（默认 zh-CN） ──────────────────────
 
     #[tokio::test]
     async fn test_get_task_unknown_404() {
-        let (status, body) = get_task(Path("task-ghost".to_string())).await;
+        let state = test_state(unique_root("ghost"));
+        let (status, body) =
+            get_task(State(state), Path("task-ghost".to_string())).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(body.0["error"].as_str().unwrap().contains("任务不存在"));
+        assert!(body.0["error"].as_str().unwrap().contains("task-ghost"));
     }
 
     // ── 3. 列表/详情状态为小写字符串 + 字段形状 ─────────────────────────────
@@ -454,7 +499,8 @@ to = ["output", "input"]
         assert!(entry["finished_at"].is_string());
 
         // 详情形状：TaskSummary 字段 + nodes[]
-        let (status, detail) = get_task(Path(task_id.clone())).await;
+        let (status, detail) =
+            get_task(State(state.clone()), Path(task_id.clone())).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(detail.0["status"], "completed");
         let nodes = detail.0["nodes"].as_array().unwrap();
@@ -514,7 +560,7 @@ to = ["output", "input"]
         let list = serde_json::to_value(&list_tasks().await.0).unwrap();
         assert_eq!(list[0]["status"], "failed");
 
-        let (_, detail) = get_task(Path(task_id)).await;
+        let (_, detail) = get_task(State(state), Path(task_id)).await;
         let nodes = detail.0["nodes"].as_array().unwrap();
         let input = nodes.iter().find(|n| n["node_id"] == "input").unwrap();
         let output = nodes.iter().find(|n| n["node_id"] == "output").unwrap();
@@ -538,7 +584,8 @@ to = ["output", "input"]
         let ok_task = run_copy_task(&state, "art-pipe", &src, &dest).await;
 
         // 有产物：两个文件产物，形状 {node_id, name, size}
-        let (status, body) = list_task_artifacts(Path(ok_task.clone())).await;
+        let (status, body) =
+            list_task_artifacts(State(state.clone()), Path(ok_task.clone())).await;
         assert_eq!(status, StatusCode::OK);
         let arr = body.0.as_array().unwrap();
         assert_eq!(arr.len(), 2);
@@ -575,13 +622,17 @@ params = { path = "/nonexistent/missing-art.txt" }
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let (status, body) = list_task_artifacts(Path(empty_task)).await;
+        let (status, body) =
+            list_task_artifacts(State(state.clone()), Path(empty_task)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body.0, json!([]));
 
         // 未知任务 → 404
-        let (status, body) =
-            list_task_artifacts(Path("task-ghost".to_string())).await;
+        let (status, body) = list_task_artifacts(
+            State(state),
+            Path("task-ghost".to_string()),
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(body.0["error"].as_str().unwrap().contains("任务不存在"));
     }
@@ -601,7 +652,11 @@ params = { path = "/nonexistent/missing-art.txt" }
         let task_id = run_copy_task(&state, "dl-pipe", &src, &dest).await;
 
         // output 节点产物 → 302 + 编码后的 Location
-        let resp = get_task_artifact(Path((task_id.clone(), "output".to_string()))).await;
+        let resp = get_task_artifact(
+            State(state.clone()),
+            Path((task_id.clone(), "output".to_string())),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::FOUND);
         let location = resp
             .headers()
@@ -618,7 +673,11 @@ params = { path = "/nonexistent/missing-art.txt" }
         assert!(location.contains("dl-out.txt"));
 
         // input 节点产物（文件名含中文/空格）→ 必须百分号编码
-        let resp = get_task_artifact(Path((task_id.clone(), "input".to_string()))).await;
+        let resp = get_task_artifact(
+            State(state.clone()),
+            Path((task_id.clone(), "input".to_string())),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::FOUND);
         let location = resp
             .headers()
@@ -631,14 +690,17 @@ params = { path = "/nonexistent/missing-art.txt" }
         assert!(!location.contains(' '), "Location 不允许裸空格: {location}");
 
         // 未知节点 → 404
-        let resp =
-            get_task_artifact(Path((task_id.clone(), "ghost".to_string()))).await;
+        let resp = get_task_artifact(
+            State(state.clone()),
+            Path((task_id.clone(), "ghost".to_string())),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         // 未知任务 → 404
-        let resp = get_task_artifact(Path((
-            "task-ghost".to_string(),
-            "output".to_string(),
-        )))
+        let resp = get_task_artifact(
+            State(state.clone()),
+            Path(("task-ghost".to_string(), "output".to_string())),
+        )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
@@ -666,8 +728,11 @@ params = { path = "/nonexistent/missing-dl.txt" }
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let resp =
-            get_task_artifact(Path((empty_task, "input".to_string()))).await;
+        let resp = get_task_artifact(
+            State(state),
+            Path((empty_task, "input".to_string())),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 

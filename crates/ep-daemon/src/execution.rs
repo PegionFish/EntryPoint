@@ -152,7 +152,7 @@ pub fn ensure_served_artifact(task_id: &str, node_id: &str) -> Option<PathBuf> {
         && std::fs::hard_link(&src, &dest).is_err()
         && std::fs::copy(&src, &dest).is_err()
     {
-        warn!(task_id, node_id, "产物惰性归集失败，下载将不可用");
+        warn!(task_id, node_id, "lazy artifact collection failed; artifact will not be downloadable");
         return None;
     }
     registry()
@@ -165,19 +165,35 @@ pub fn ensure_served_artifact(task_id: &str, node_id: &str) -> Option<PathBuf> {
 
 // ─── 提交错误 ────────────────────────────────────────────────────────────────
 
-/// 提交失败原因（handler 据此映射 HTTP 状态码）
+/// 提交失败原因（handler 据此映射 HTTP 状态码与 i18n 键）。
+///
+/// 内部值均为技术标识（node_id / 管线 id / 英文错误细节），仅用于日志与
+/// 测试；面向用户的文案由 API handler 层经 `err_response` 按语言生成。
 #[derive(Debug)]
 pub enum SubmitError {
-    /// 请求参数问题 → 400
-    InvalidInputs(String),
-    /// 内部错误（工作目录创建失败等）→ 500
+    /// `inputs` 引用了管线中不存在的节点 → 400（node_id）
+    UnknownInputNode(String),
+    /// `inputs[node_id]` 不是参数对象 → 400（node_id）
+    InputsNotObject(String),
+    /// 管线图中存在环 → 400（管线 id）
+    CycleDetected(String),
+    /// 内部错误（工作目录创建失败等）→ 500（英文技术细节）
     Internal(String),
 }
 
 impl std::fmt::Display for SubmitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidInputs(msg) | Self::Internal(msg) => f.write_str(msg),
+            Self::UnknownInputNode(id) => {
+                write!(f, "inputs reference unknown node: {id}")
+            }
+            Self::InputsNotObject(id) => {
+                write!(f, "inputs[\"{id}\"] must be a parameter object")
+            }
+            Self::CycleDetected(id) => {
+                write!(f, "pipeline `{id}` contains a cycle and cannot be executed")
+            }
+            Self::Internal(msg) => f.write_str(msg),
         }
     }
 }
@@ -207,19 +223,17 @@ fn apply_inputs(
             .nodes
             .iter_mut()
             .find(|n| &n.id == node_id)
-            .ok_or_else(|| {
-                SubmitError::InvalidInputs(format!("inputs 引用的节点不存在: {node_id}"))
-            })?;
-        let obj = params.as_object().ok_or_else(|| {
-            SubmitError::InvalidInputs(format!("inputs[\"{node_id}\"] 必须是参数对象"))
-        })?;
+            .ok_or_else(|| SubmitError::UnknownInputNode(node_id.clone()))?;
+        let obj = params
+            .as_object()
+            .ok_or_else(|| SubmitError::InputsNotObject(node_id.clone()))?;
         if !node.params.is_object() {
             node.params = Value::Object(Default::default());
         }
         let target = node
             .params
             .as_object_mut()
-            .expect("刚保证过 params 是对象");
+            .expect("params was just ensured to be an object");
         for (key, value) in obj {
             target.insert(key.clone(), value.clone());
         }
@@ -245,10 +259,7 @@ pub async fn submit_pipeline(
     // 环检测：引擎执行前会做拓扑分层，有环的管线在此直接 400，
     // 避免提交一个注定失败的任务
     if pipeline.topological_layers().is_err() {
-        return Err(SubmitError::InvalidInputs(format!(
-            "管线 `{}` 存在环，无法执行",
-            pipeline.id
-        )));
+        return Err(SubmitError::CycleDetected(pipeline.id.clone()));
     }
 
     let workspace = state
@@ -259,7 +270,10 @@ pub async fn submit_pipeline(
     let task_id = new_task_id();
     let task_dir = workspace.join("tasks").join(&task_id);
     std::fs::create_dir_all(&task_dir).map_err(|e| {
-        SubmitError::Internal(format!("创建任务工作目录失败: {e}"))
+        SubmitError::Internal(format!(
+            "failed to create task working directory `{}`: {e}",
+            task_dir.display()
+        ))
     })?;
 
     // 注册正在运行（Running/Starting）的模块端口
@@ -315,12 +329,12 @@ pub async fn submit_pipeline(
         .await;
         if let Err(e) = joined {
             // 执行线程 panic/被取消——注册表记录不能永远停在 running
-            warn!(task_id = %task_id_watch, error = %e, "管线执行线程异常退出");
+            warn!(task_id = %task_id_watch, error = %e, "pipeline execution thread exited abnormally");
             finalize_aborted(&task_id_watch, &e.to_string());
         }
     });
 
-    info!(task_id = %task_id, pipeline = %pipeline_ref, "管线任务已提交");
+    info!(task_id = %task_id, pipeline = %pipeline_ref, "pipeline task submitted");
     Ok(task_id)
 }
 
@@ -402,8 +416,8 @@ fn run_task(
     finalize_task(&task_id, &task_dir, error_msg, detail.as_ref());
 
     match result {
-        Ok(()) => info!(task_id = %task_id, nodes = node_count, "管线任务执行完成"),
-        Err(e) => warn!(task_id = %task_id, error = %e, "管线任务执行失败"),
+        Ok(()) => info!(task_id = %task_id, nodes = node_count, "pipeline task finished"),
+        Err(e) => warn!(task_id = %task_id, error = %e, "pipeline task failed"),
     }
 }
 
@@ -484,7 +498,7 @@ fn finalize_task(
                 .served_artifacts
                 .insert(node_id.clone(), dest.clone());
         } else {
-            warn!(task_id, node_id = %node_id, "产物归集失败，该节点产物将不可下载");
+            warn!(task_id, node_id = %node_id, "artifact collection failed; node artifact will not be downloadable");
         }
     }
 }
@@ -494,7 +508,8 @@ fn finalize_aborted(task_id: &str, error: &str) {
     let mut reg = registry().lock().unwrap();
     if let Some(record) = reg.get_mut(task_id) {
         if record.status == TaskState::Running {
-            record.status = TaskState::Failed(format!("执行线程异常退出: {error}"));
+            record.status =
+                TaskState::Failed(format!("execution thread exited abnormally: {error}"));
             record.finished_at = Some(Utc::now());
         }
     }
@@ -713,7 +728,7 @@ to = ["output", "input"]
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "inputs 覆盖");
     }
 
-    // ── 3. inputs 引用不存在的节点 → InvalidInputs ──────────────────────────
+    // ── 3. inputs 引用不存在的节点 → UnknownInputNode ──────────────────────
 
     #[tokio::test]
     async fn test_submit_inputs_unknown_node_rejected() {
@@ -730,11 +745,11 @@ to = ["output", "input"]
         let err = submit_pipeline(&state, pipeline, Some(inputs))
             .await
             .unwrap_err();
-        assert!(matches!(err, SubmitError::InvalidInputs(_)));
+        assert!(matches!(err, SubmitError::UnknownInputNode(_)));
         assert!(err.to_string().contains("ghost"));
     }
 
-    // ── 4. inputs 值不是对象 → InvalidInputs ────────────────────────────────
+    // ── 4. inputs 值不是对象 → InputsNotObject ─────────────────────────────
 
     #[tokio::test]
     async fn test_submit_inputs_non_object_rejected() {
@@ -751,8 +766,9 @@ to = ["output", "input"]
         let err = submit_pipeline(&state, pipeline, Some(inputs))
             .await
             .unwrap_err();
-        assert!(matches!(err, SubmitError::InvalidInputs(_)));
-        assert!(err.to_string().contains("必须是参数对象"));
+        assert!(matches!(err, SubmitError::InputsNotObject(_)));
+        // 技术层消息为英文
+        assert!(err.to_string().contains("must be a parameter object"));
     }
 
     // ── 5. 失败管线：缺输入文件 → failed + 空产物 ───────────────────────────
@@ -799,7 +815,7 @@ to = ["output", "input"]
         assert!(record.artifacts.is_empty());
     }
 
-    // ── 6. 有环管线 → 提交期即拒绝（InvalidInputs） ─────────────────────────
+    // ── 6. 有环管线 → 提交期即拒绝（CycleDetected） ─────────────────────────
 
     #[tokio::test]
     async fn test_submit_cycle_rejected_synchronously() {
@@ -835,8 +851,9 @@ to = ["input", "input"]
         let err = submit_pipeline(&state, pipeline, None)
             .await
             .unwrap_err();
-        assert!(matches!(err, SubmitError::InvalidInputs(_)));
-        assert!(err.to_string().contains("环"));
+        assert!(matches!(err, SubmitError::CycleDetected(_)));
+        // 技术层消息为英文
+        assert!(err.to_string().contains("contains a cycle"));
     }
 
     // ── 7. 进度回调 → progress_tx（WS 链路的数据源） ────────────────────────

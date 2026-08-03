@@ -678,6 +678,24 @@ mod tests {
         assert_eq!(json["error"], "接口不存在");
     }
 
+    // 12b. /api/unknown + config.language=en → 404 + 英文错误
+    #[tokio::test]
+    async fn test_api_unknown_route_returns_404_json_en() {
+        let state = test_state();
+        state.config.write().await.general.language = "en".to_string();
+        let static_dir = state.root.join("static");
+        std::fs::create_dir_all(&static_dir).unwrap();
+        std::fs::write(static_dir.join("index.html"), "<html>index</html>").unwrap();
+
+        let app = crate::build_app_router(state, &static_dir);
+        let resp = app.oneshot(request("/api/unknown")).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = body_string(resp).await;
+        let json: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["error"], "API endpoint not found");
+    }
+
     // 13. /ws 路由已注册：非升级请求被拒绝（而不是落入 SPA fallback）
     #[tokio::test]
     async fn test_ws_route_registered_rejects_non_upgrade() {

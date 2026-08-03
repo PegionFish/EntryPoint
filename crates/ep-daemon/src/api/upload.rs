@@ -30,6 +30,7 @@ use tracing::{debug, info, warn};
 use ep_core::model::{dir_total_size, ModelManager, ModelMeta};
 use ep_core::module::manifest::{ModelDecl, ModelSource, ModuleManifest};
 
+use super::err_response;
 use crate::state::AppState;
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -39,11 +40,77 @@ pub fn router() -> Router<Arc<AppState>> {
         .layer(DefaultBodyLimit::disable())
 }
 
-/// 内部错误表示：(HTTP 状态码, 中文错误信息)
-type UploadError = (StatusCode, String);
+/// 内部错误表示：HTTP 状态码 + i18n 键 + 插值参数
+///
+/// 最终文案由 `err_response` 按请求语言（config.general.language）本地化，
+/// 键定义见 `i18n/locales/*/apiModels.json`。
+struct UploadError {
+    status: StatusCode,
+    key: &'static str,
+    params: Vec<(&'static str, String)>,
+}
 
-fn err(status: StatusCode, msg: impl Into<String>) -> UploadError {
-    (status, msg.into())
+fn err(status: StatusCode, key: &'static str) -> UploadError {
+    UploadError {
+        status,
+        key,
+        params: Vec::new(),
+    }
+}
+
+fn err_with(
+    status: StatusCode,
+    key: &'static str,
+    params: Vec<(&'static str, String)>,
+) -> UploadError {
+    UploadError {
+        status,
+        key,
+        params,
+    }
+}
+
+/// 便捷构造：携带单个 {{detail}} 插值（通常为底层系统错误）
+fn err_detail(
+    status: StatusCode,
+    key: &'static str,
+    detail: impl std::fmt::Display,
+) -> UploadError {
+    err_with(status, key, vec![("detail", detail.to_string())])
+}
+
+/// 归档解包错误：i18n 键 + 插值参数（跨 spawn_blocking 边界后转为 UploadError）
+#[derive(Debug)]
+struct ExtractError {
+    key: &'static str,
+    params: Vec<(&'static str, String)>,
+}
+
+impl ExtractError {
+    fn detail(key: &'static str, detail: impl std::fmt::Display) -> Self {
+        Self {
+            key,
+            params: vec![("detail", detail.to_string())],
+        }
+    }
+
+    fn entry(key: &'static str, entry: impl std::fmt::Display) -> Self {
+        Self {
+            key,
+            params: vec![("entry", entry.to_string())],
+        }
+    }
+}
+
+/// 解包错误统一按 400（用户提供的归档内容有问题）返回
+impl From<ExtractError> for UploadError {
+    fn from(xe: ExtractError) -> Self {
+        UploadError {
+            status: StatusCode::BAD_REQUEST,
+            key: xe.key,
+            params: xe.params,
+        }
+    }
 }
 
 /// 暂存区接收到的单个文件块
@@ -64,20 +131,26 @@ async fn upload_model(
         Ok(m) => m,
         Err(e) => {
             warn!(error = %e, "multipart request rejected");
-            return (
+            return err_response(
+                &state,
                 StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "无法解析 multipart/form-data 请求体" })),
-            );
+                "apiModels.uploadMultipartInvalid",
+                &[],
+            )
+            .await;
         }
     };
 
     let manifest = match find_module_manifest(&state, &module_id).await {
         Some(mf) => mf,
         None => {
-            return (
+            return err_response(
+                &state,
                 StatusCode::NOT_FOUND,
-                Json(json!({ "error": "模块不存在" })),
-            );
+                "apiModels.moduleNotFound",
+                &[("module_id", module_id.clone())],
+            )
+            .await;
         }
     };
 
@@ -86,10 +159,13 @@ async fn upload_model(
     // 暂存目录：<模型根>/.upload-staging/<id>；无论成功失败，结束时一律清理
     let staging = mgr.cache_dir().join(".upload-staging").join(staging_id());
     if let Err(e) = tokio::fs::create_dir_all(&staging).await {
-        return (
+        return err_response(
+            &state,
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("无法创建暂存目录: {e}") })),
-        );
+            "apiModels.uploadStagingFailed",
+            &[("detail", e.to_string())],
+        )
+        .await;
     }
 
     let result = handle_upload(&mgr, &manifest, &module_id, multipart, &staging).await;
@@ -105,7 +181,7 @@ async fn upload_model(
 
     match result {
         Ok(body) => (StatusCode::OK, Json(body)),
-        Err((status, msg)) => (status, Json(json!({ "error": msg }))),
+        Err(ue) => err_response(&state, ue.status, ue.key, &ue.params).await,
     }
 }
 
@@ -119,12 +195,15 @@ async fn handle_upload(
 ) -> Result<Value, UploadError> {
     // 临时文件放在独立子目录，避免与用户上传的相对路径撞名
     let parts_dir = staging.join("__parts");
-    tokio::fs::create_dir_all(&parts_dir).await.map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("暂存目录创建失败: {e}"),
-        )
-    })?;
+    tokio::fs::create_dir_all(&parts_dir)
+        .await
+        .map_err(|e| {
+            err_detail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "apiModels.uploadStagingFailed",
+                e,
+            )
+        })?;
 
     let mut model_id: Option<String> = None;
     let mut decl: Option<ModelDecl> = None;
@@ -135,14 +214,17 @@ async fn handle_upload(
     while let Some(mut field) = multipart
         .next_field()
         .await
-        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("读取上传数据失败: {e}")))?
+        .map_err(|e| err_detail(StatusCode::BAD_REQUEST, "apiModels.uploadReadFailed", e))?
     {
         let name = field.name().map(str::to_string);
         match name.as_deref() {
             Some("model_id") => {
-                let id = field.text().await.map_err(|e| {
-                    err(StatusCode::BAD_REQUEST, format!("读取 model_id 失败: {e}"))
-                })?;
+                let id = field
+                    .text()
+                    .await
+                    .map_err(|e| {
+                        err_detail(StatusCode::BAD_REQUEST, "apiModels.uploadReadFailed", e)
+                    })?;
                 // 以第一个 model_id 为准，尽早校验（失败时避免白传后续 GB 级文件）
                 if model_id.is_none() {
                     match manifest.models.iter().find(|m| m.id == id) {
@@ -150,18 +232,16 @@ async fn handle_upload(
                             // 目标已存在且非空 → 尽早 409
                             let target = mgr.model_dir(&d.target_dir);
                             if target_blocked(&target).await {
-                                return Err(err(
-                                    StatusCode::CONFLICT,
-                                    "模型已存在，请先删除后再上传",
-                                ));
+                                return Err(err(StatusCode::CONFLICT, "apiModels.uploadConflict"));
                             }
                             decl = Some(d.clone());
                             model_id = Some(id);
                         }
                         None => {
-                            return Err(err(
+                            return Err(err_with(
                                 StatusCode::NOT_FOUND,
-                                format!("模型声明不存在: {id}"),
+                                "apiModels.uploadModelNotFound",
+                                vec![("model_id", id)],
                             ));
                         }
                     }
@@ -171,28 +251,35 @@ async fn handle_upload(
                 let p = field
                     .text()
                     .await
-                    .map_err(|e| err(StatusCode::BAD_REQUEST, format!("读取 paths 失败: {e}")))?;
+                    .map_err(|e| {
+                        err_detail(StatusCode::BAD_REQUEST, "apiModels.uploadReadFailed", e)
+                    })?;
                 paths.push(p);
             }
             Some("files") => {
                 let file_name = field.file_name().map(str::to_string);
                 let temp = parts_dir.join(format!("part-{:06}", staged.len()));
-                let mut file = tokio::fs::File::create(&temp).await.map_err(|e| {
-                    err(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("暂存文件创建失败: {e}"),
-                    )
-                })?;
+                let mut file =
+                    tokio::fs::File::create(&temp).await.map_err(|e| {
+                        err_detail(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "apiModels.uploadStagingFileFailed",
+                            e,
+                        )
+                    })?;
                 // 逐 chunk 流式写盘，绝不整块读入内存
                 while let Some(chunk) = field
                     .chunk()
                     .await
-                    .map_err(|e| err(StatusCode::BAD_REQUEST, format!("读取上传数据失败: {e}")))?
+                    .map_err(|e| {
+                        err_detail(StatusCode::BAD_REQUEST, "apiModels.uploadReadFailed", e)
+                    })?
                 {
                     file.write_all(&chunk).await.map_err(|e| {
-                        err(
+                        err_detail(
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("文件写入失败: {e}"),
+                            "apiModels.uploadWriteFailed",
+                            e,
                         )
                     })?;
                 }
@@ -205,19 +292,21 @@ async fn handle_upload(
     }
 
     // ── 阶段 2：请求完整性校验 ─────────────────────────────────────────────
-    let model_id = model_id.ok_or_else(|| err(StatusCode::BAD_REQUEST, "缺少 model_id 字段"))?;
-    let decl = decl.ok_or_else(|| err(StatusCode::BAD_REQUEST, "缺少 model_id 字段"))?;
+    let model_id = model_id
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "apiModels.uploadMissingModelId"))?;
+    let decl =
+        decl.ok_or_else(|| err(StatusCode::BAD_REQUEST, "apiModels.uploadMissingModelId"))?;
     if staged.is_empty() {
-        return Err(err(StatusCode::BAD_REQUEST, "未收到任何文件"));
+        return Err(err(StatusCode::BAD_REQUEST, "apiModels.uploadNoFiles"));
     }
     if !paths.is_empty() && paths.len() != staged.len() {
-        return Err(err(
+        return Err(err_with(
             StatusCode::BAD_REQUEST,
-            format!(
-                "paths 字段数量（{}）与 files 数量（{}）不一致",
-                paths.len(),
-                staged.len()
-            ),
+            "apiModels.uploadPathsMismatch",
+            vec![
+                ("paths", paths.len().to_string()),
+                ("files", staged.len().to_string()),
+            ],
         ));
     }
 
@@ -241,9 +330,10 @@ async fn handle_upload(
             let archive_path = staged.into_iter().next().expect("checked len == 1").temp;
             let extract_dir = staging.join("__extract");
             tokio::fs::create_dir_all(&extract_dir).await.map_err(|e| {
-                err(
+                err_detail(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("解包目录创建失败: {e}"),
+                    "apiModels.uploadExtractDirFailed",
+                    e,
                 )
             })?;
 
@@ -255,12 +345,13 @@ async fn handle_upload(
             })
             .await
             .map_err(|e| {
-                err(
+                err_detail(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("解包任务异常: {e}"),
+                    "apiModels.uploadExtractPanicked",
+                    e,
                 )
             })?
-            .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+            .map_err(UploadError::from)?;
 
             // 解包完成立即删除压缩包副本，避免双倍占用磁盘
             let _ = tokio::fs::remove_file(&archive_path).await;
@@ -281,9 +372,11 @@ async fn handle_upload(
     let total = finalize_staging(model_root.clone(), target.clone())
         .await
         .map_err(|fe| match fe {
-            FinalizeError::Conflict => err(StatusCode::CONFLICT, "模型已存在，请先删除后再上传"),
-            FinalizeError::Empty => err(StatusCode::BAD_REQUEST, "上传内容为空"),
-            FinalizeError::Io(msg) => err(StatusCode::INTERNAL_SERVER_ERROR, msg),
+            FinalizeError::Conflict => err(StatusCode::CONFLICT, "apiModels.uploadConflict"),
+            FinalizeError::Empty => err(StatusCode::BAD_REQUEST, "apiModels.uploadEmpty"),
+            FinalizeError::Other(key, detail) => {
+                err_detail(StatusCode::INTERNAL_SERVER_ERROR, key, detail)
+            }
         })?;
 
     // ── 阶段 5：写 .ep_meta.json ───────────────────────────────────────────
@@ -350,9 +443,10 @@ async fn layout_staged_files(
             match sf.file_name.as_deref() {
                 Some(n) if !n.is_empty() => n.to_string(),
                 _ => {
-                    return Err(err(
+                    return Err(err_with(
                         StatusCode::BAD_REQUEST,
-                        format!("第 {} 个文件缺少文件名且未提供 paths 字段", i + 1),
+                        "apiModels.uploadMissingFileName",
+                        vec![("index", (i + 1).to_string())],
                     ));
                 }
             }
@@ -361,25 +455,33 @@ async fn layout_staged_files(
         };
 
         let rel = sanitize_relative_path(&raw).ok_or_else(|| {
-            err(
+            err_with(
                 StatusCode::BAD_REQUEST,
-                format!("非法文件路径: {raw}（不允许绝对路径、空路径或 .. 分段）"),
+                "apiModels.uploadPathInvalid",
+                vec![("path", raw.clone())],
             )
         })?;
         if !seen.insert(rel.clone()) {
-            return Err(err(
+            return Err(err_with(
                 StatusCode::BAD_REQUEST,
-                format!("上传文件路径重复: {raw}"),
+                "apiModels.uploadPathDuplicate",
+                vec![("path", raw.clone())],
             ));
         }
-        let dest = resolve_within(staging, &rel)
-            .ok_or_else(|| err(StatusCode::BAD_REQUEST, format!("非法文件路径: {raw}")))?;
+        let dest = resolve_within(staging, &rel).ok_or_else(|| {
+            err_with(
+                StatusCode::BAD_REQUEST,
+                "apiModels.uploadPathInvalid",
+                vec![("path", raw.clone())],
+            )
+        })?;
 
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                err(
+                err_detail(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("创建目录失败: {e}"),
+                    "apiModels.uploadMkdirFailed",
+                    e,
                 )
             })?;
         }
@@ -387,9 +489,10 @@ async fn layout_staged_files(
             // 同目录 rename 正常不会失败；兜底复制（parts_dir 与 staging 同根）
             debug!(error = %e, "staging rename failed, falling back to copy");
             tokio::fs::copy(&sf.temp, &dest).await.map_err(|e| {
-                err(
+                err_detail(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("暂存文件落盘失败: {e}"),
+                    "apiModels.uploadPlaceFailed",
+                    e,
                 )
             })?;
             let _ = tokio::fs::remove_file(&sf.temp).await;
@@ -405,7 +508,8 @@ enum FinalizeError {
     Conflict,
     /// 暂存内容为空（无文件 / 总大小为 0）
     Empty,
-    Io(String),
+    /// 其他 I/O 失败：(i18n 键, 错误细节)
+    Other(&'static str, String),
 }
 
 /// 把模型根移动到 models/<target_dir>（阻塞任务）：
@@ -450,12 +554,18 @@ fn finalize_blocking(model_root: &Path, target: &Path) -> Result<u64, FinalizeEr
                 return Err(FinalizeError::Conflict);
             }
             if let Err(e) = std::fs::create_dir_all(target) {
-                return Err(FinalizeError::Io(format!("创建目标目录失败: {e}")));
+                return Err(FinalizeError::Other(
+                    "apiModels.targetDirCreateFailed",
+                    e.to_string(),
+                ));
             }
             if let Err(e) = copy_dir_contents(model_root, target) {
                 // target 是刚创建、只含本次复制产物的目录，失败时安全删除
                 let _ = std::fs::remove_dir_all(target);
-                return Err(FinalizeError::Io(format!("复制模型文件失败: {e}")));
+                return Err(FinalizeError::Other(
+                    "apiModels.uploadCopyFailed",
+                    e.to_string(),
+                ));
             }
             let _ = std::fs::remove_dir_all(model_root);
             Ok(dir_total_size(target))
@@ -467,7 +577,9 @@ fn finalize_blocking(model_root: &Path, target: &Path) -> Result<u64, FinalizeEr
 async fn finalize_staging(model_root: PathBuf, target: PathBuf) -> Result<u64, FinalizeError> {
     tokio::task::spawn_blocking(move || finalize_blocking(&model_root, &target))
         .await
-        .map_err(|e| FinalizeError::Io(format!("落位任务异常: {e}")))?
+        .map_err(|e| {
+            FinalizeError::Other("apiModels.uploadFinalizePanicked", e.to_string())
+        })?
 }
 
 /// 递归复制 src 目录内容到 dst（同步，供 spawn_blocking 调用）
@@ -583,31 +695,38 @@ fn classify_archive(name: &str) -> Option<ArchiveKind> {
 ///
 /// zip-slip 防御：先用 zip crate 的 `enclosed_name()`（拒绝绝对路径/越界），
 /// 再走 `sanitize_relative_path` 做二次分段检查，任一失败即整体报错。
-fn extract_zip(archive_path: &Path, dest: &Path) -> Result<(), String> {
-    let file = std::fs::File::open(archive_path).map_err(|e| format!("无法打开压缩包: {e}"))?;
+fn extract_zip(archive_path: &Path, dest: &Path) -> Result<(), ExtractError> {
+    let file = std::fs::File::open(archive_path)
+        .map_err(|e| ExtractError::detail("apiModels.archiveOpenFailed", e))?;
     let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file))
-        .map_err(|e| format!("压缩包解析失败: {e}"))?;
+        .map_err(|e| ExtractError::detail("apiModels.archiveParseFailed", e))?;
 
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
-            .map_err(|e| format!("读取压缩包条目失败: {e}"))?;
+            .map_err(|e| ExtractError::detail("apiModels.archiveEntryReadFailed", e))?;
 
         let rel = entry
             .enclosed_name()
             .and_then(|p| sanitize_relative_path(p.to_str()?))
-            .ok_or_else(|| format!("压缩包包含非法路径条目（疑似 zip-slip）: {}", entry.name()))?;
+            .ok_or_else(|| {
+                ExtractError::entry("apiModels.archiveUnsafePath", entry.name())
+            })?;
 
         let out = dest.join(&rel);
         if entry.is_dir() {
-            std::fs::create_dir_all(&out).map_err(|e| format!("创建目录失败: {e}"))?;
+            std::fs::create_dir_all(&out)
+                .map_err(|e| ExtractError::detail("apiModels.uploadMkdirFailed", e))?;
         } else {
             if let Some(parent) = out.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| ExtractError::detail("apiModels.uploadMkdirFailed", e))?;
             }
-            let mut f = std::fs::File::create(&out).map_err(|e| format!("创建文件失败: {e}"))?;
+            let mut f = std::fs::File::create(&out)
+                .map_err(|e| ExtractError::detail("apiModels.uploadCreateFileFailed", e))?;
             // io::copy 内部按缓冲区分块读写，不会整文件进内存
-            std::io::copy(&mut entry, &mut f).map_err(|e| format!("解压条目失败: {e}"))?;
+            std::io::copy(&mut entry, &mut f)
+                .map_err(|e| ExtractError::detail("apiModels.archiveExtractEntryFailed", e))?;
         }
     }
     Ok(())
@@ -617,43 +736,49 @@ fn extract_zip(archive_path: &Path, dest: &Path) -> Result<(), String> {
 ///
 /// zip-slip 防御：逐条目用 `sanitize_relative_path` 校验 entry 路径，
 /// 符号链接 / 硬链接的目标同样校验，防止链接指向解包目录之外。
-fn extract_tar_gz(archive_path: &Path, dest: &Path) -> Result<(), String> {
-    let file = std::fs::File::open(archive_path).map_err(|e| format!("无法打开压缩包: {e}"))?;
+fn extract_tar_gz(archive_path: &Path, dest: &Path) -> Result<(), ExtractError> {
+    let file = std::fs::File::open(archive_path)
+        .map_err(|e| ExtractError::detail("apiModels.archiveOpenFailed", e))?;
     let decoder = flate2::read::GzDecoder::new(std::io::BufReader::new(file));
     let mut archive = tar::Archive::new(decoder);
 
     let entries = archive
         .entries()
-        .map_err(|e| format!("压缩包解析失败: {e}"))?;
+        .map_err(|e| ExtractError::detail("apiModels.archiveParseFailed", e))?;
     for entry in entries {
-        let mut entry = entry.map_err(|e| format!("读取压缩包条目失败: {e}"))?;
+        let mut entry =
+            entry.map_err(|e| ExtractError::detail("apiModels.archiveEntryReadFailed", e))?;
 
         let raw = entry
             .path()
-            .map_err(|e| format!("条目路径无效: {e}"))?
+            .map_err(|e| ExtractError::detail("apiModels.archiveEntryPathInvalid", e))?
             .to_string_lossy()
             .into_owned();
         let rel = sanitize_relative_path(&raw)
-            .ok_or_else(|| format!("压缩包包含非法路径条目（疑似 zip-slip）: {raw}"))?;
+            .ok_or_else(|| ExtractError::entry("apiModels.archiveUnsafePath", &raw))?;
 
         // 链接目标也必须安全，防止通过 symlink 逃逸（读取失败时跳过，
         // 后续 unpack 会自行报错）
         if let Ok(Some(link)) = entry.link_name() {
             let link_raw = link.to_string_lossy();
             if sanitize_relative_path(&link_raw).is_none() {
-                return Err(format!("压缩包包含非法链接目标: {link_raw}"));
+                return Err(ExtractError::entry(
+                    "apiModels.archiveUnsafeLink",
+                    &link_raw,
+                ));
             }
         }
 
         let out = dest.join(&rel);
         // unpack 不会创建缺失的父目录（tar 内未必有显式目录条目），先补齐
         if let Some(parent) = out.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| ExtractError::detail("apiModels.uploadMkdirFailed", e))?;
         }
         // unpack 写入调用方给定的（已清洗）路径；目录条目会创建对应目录
         entry
             .unpack(&out)
-            .map_err(|e| format!("解压条目失败: {e}"))?;
+            .map_err(|e| ExtractError::detail("apiModels.archiveExtractEntryFailed", e))?;
     }
     Ok(())
 }
@@ -775,15 +900,22 @@ type = "http"
     }
 
     fn test_state(root: PathBuf) -> Arc<AppState> {
+        test_state_with_language(root, "zh-CN")
+    }
+
+    /// 同 test_state，可指定 UI 语言（config.general.language）
+    fn test_state_with_language(root: PathBuf, language: &str) -> Arc<AppState> {
         let manifest: ModuleManifest = toml::from_str(TEST_MANIFEST_TOML).unwrap();
         let module = DiscoveredModule {
             manifest: Some(manifest),
             path: root.join("modules").join("test-module"),
             status: DiscoveryStatus::Valid,
         };
+        let mut config = AppConfig::default();
+        config.general.language = language.to_string();
         Arc::new(AppState::new(
             root,
-            AppConfig::default(),
+            config,
             vec![],
             vec![module],
             PortManager::new(18000, 19000),
@@ -909,7 +1041,7 @@ type = "http"
 
         let result = extract_zip(&archive, &dest);
         assert!(result.is_err(), "必须拒绝含 .. 的条目");
-        assert!(result.unwrap_err().contains("非法路径"));
+        assert_eq!(result.unwrap_err().key, "apiModels.archiveUnsafePath");
         // .. 条目绝不能落到解包目录之外
         assert!(!root.join("evil.txt").exists());
         let _ = std::fs::remove_dir_all(&root);
@@ -1149,7 +1281,8 @@ type = "http"
         let (status, json) = response_json(resp).await;
 
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(json["error"], "模块不存在");
+        // 与下载/导入共用 moduleNotFound 键（带模块 ID 插值）
+        assert_eq!(json["error"], "模块 'no-such-module' 不存在");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1200,6 +1333,35 @@ type = "http"
         assert!(json["error"].as_str().unwrap().contains("非法文件路径"));
         assert!(!root.join("evil.bin").exists());
         assert!(!root.join("models/evil.bin").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// language=en 时上传错误返回英文文案（路径穿越 400，警示语义保持）
+    #[tokio::test]
+    async fn upload_error_in_english_when_language_en() {
+        let root = unique_root("lang-en");
+        let state = test_state_with_language(root.clone(), "en");
+        let app = router().with_state(state);
+
+        let mut body = Vec::new();
+        form_part(&mut body, "model_id", None, b"m1");
+        form_part(&mut body, "files", Some("evil.bin"), b"pwned");
+        form_part(&mut body, "paths", None, b"../../evil.bin");
+        finish_multipart(&mut body);
+
+        let resp = app
+            .oneshot(upload_request("/models/test-module/upload", body))
+            .await
+            .unwrap();
+        let (status, json) = response_json(resp).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err = json["error"].as_str().unwrap();
+        assert!(
+            err.starts_with("Invalid file path"),
+            "expected English error, got: {err}"
+        );
+        assert!(!root.join("evil.bin").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -91,9 +91,11 @@ fn default_params() -> JsonValue {
 // ─── 公共 API ────────────────────────────────────────────────────────────────
 
 /// TOML → spec：从文件加载管线定义并转为前端 spec 形状。
+///
+/// 错误消息为英文技术细节（供日志与 API 层 `{{detail}}` 透传）。
 pub fn load_spec(path: &Path) -> Result<PipelineSpec> {
     let pipeline = ep_core::pipeline::load_pipeline(path)
-        .with_context(|| format!("管线文件 `{}` 加载失败", path.display()))?;
+        .with_context(|| format!("failed to load pipeline file `{}`", path.display()))?;
     pipeline_to_spec(&pipeline)
 }
 
@@ -103,16 +105,17 @@ pub fn save_spec(spec: &PipelineSpec, path: &Path) -> Result<()> {
     let text = spec_to_toml(spec)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
-            .with_context(|| format!("创建目录 `{}` 失败", parent.display()))?;
+            .with_context(|| format!("failed to create directory `{}`", parent.display()))?;
     }
     std::fs::write(path, text)
-        .with_context(|| format!("写入管线文件 `{}` 失败", path.display()))?;
+        .with_context(|| format!("failed to write pipeline file `{}`", path.display()))?;
     Ok(())
 }
 
 /// spec → ep-core `Pipeline`（供执行层使用）。**签名冻结（W2-D 依赖）。**
 ///
-/// 内含完整结构校验；失败返回中文错误。
+/// 内含完整结构校验；失败返回英文技术错误（API 层经 i18n 前缀 + `{{detail}}`
+/// 包装后呈现给用户）。
 pub fn spec_to_pipeline(spec: &PipelineSpec) -> Result<Pipeline> {
     validate_spec(spec)?;
 
@@ -138,50 +141,50 @@ pub fn spec_to_pipeline(spec: &PipelineSpec) -> Result<Pipeline> {
 /// - edges 引用的节点必须存在、端口非空
 pub fn validate_spec(spec: &PipelineSpec) -> Result<()> {
     if spec.pipeline.id.trim().is_empty() {
-        bail!("管线 id 不能为空");
+        bail!("pipeline id must not be empty");
     }
     if spec.pipeline.name.trim().is_empty() {
-        bail!("管线名称不能为空");
+        bail!("pipeline name must not be empty");
     }
     if spec.nodes.is_empty() {
-        bail!("管线至少要有一个节点");
+        bail!("pipeline must have at least one node");
     }
 
     let mut seen = HashSet::new();
     for node in &spec.nodes {
         if node.id.trim().is_empty() {
-            bail!("节点 id 不能为空");
+            bail!("node id must not be empty");
         }
         if !seen.insert(node.id.as_str()) {
-            bail!("节点 id 重复: `{}`", node.id);
+            bail!("duplicate node id: `{}`", node.id);
         }
         match node.kind {
             SpecNodeKind::Builtin => {
                 if node.builtin.as_deref().unwrap_or("").trim().is_empty() {
-                    bail!("builtin 节点 `{}` 缺少 builtin 字段", node.id);
+                    bail!("builtin node `{}` is missing the `builtin` field", node.id);
                 }
             }
             SpecNodeKind::Module => {
                 if node.module_id.as_deref().unwrap_or("").trim().is_empty() {
-                    bail!("module 节点 `{}` 缺少 module_id 字段", node.id);
+                    bail!("module node `{}` is missing the `module_id` field", node.id);
                 }
                 if node.capability.as_deref().unwrap_or("").trim().is_empty() {
-                    bail!("module 节点 `{}` 缺少 capability 字段", node.id);
+                    bail!("module node `{}` is missing the `capability` field", node.id);
                 }
             }
         }
         if !(node.params.is_object() || node.params.is_null()) {
-            bail!("节点 `{}` 的 params 必须是 JSON 对象", node.id);
+            bail!("params of node `{}` must be a JSON object", node.id);
         }
     }
 
     for edge in &spec.edges {
         for (node_id, port) in [&edge.from, &edge.to] {
             if !seen.contains(node_id.as_str()) {
-                bail!("边引用了不存在的节点: `{node_id}`");
+                bail!("edge references a non-existent node: `{node_id}`");
             }
             if port.trim().is_empty() {
-                bail!("节点 `{node_id}` 的边端口不能为空");
+                bail!("edge port of node `{node_id}` must not be empty");
             }
         }
     }
@@ -231,7 +234,10 @@ fn node_to_spec(node: &PipelineNode) -> Result<SpecNode> {
             Some(capability.clone()),
         ),
         NodeKind::ExternalApi { .. } => {
-            bail!("节点 `{}` 为 external_api 类型，不在前端 spec 契约内", node.id)
+            bail!(
+                "node `{}` is of external_api type, which is not part of the frontend spec contract",
+                node.id
+            )
         }
     };
 
@@ -320,7 +326,8 @@ fn spec_to_toml(spec: &PipelineSpec) -> Result<String> {
         }
         if let Some(position) = &node.position {
             // NodePosition 序列化为 {"x": .., "y": ..} → 行内表
-            let v = serde_json::to_value(position).expect("NodePosition 序列化不会失败");
+            let v = serde_json::to_value(position)
+                .expect("NodePosition serialization cannot fail");
             out.push_str(&format!("position = {}\n", toml_value(&v)?));
         }
         if let Some(obj) = node.params.as_object() {
@@ -348,13 +355,15 @@ fn spec_to_toml(spec: &PipelineSpec) -> Result<String> {
 /// JSON 值 → TOML 值文本（字符串/数字/布尔/数组/行内表）。
 fn toml_value(v: &JsonValue) -> Result<String> {
     match v {
-        JsonValue::Null => bail!("params 中不允许 null 值（TOML 无 null）"),
+        JsonValue::Null => bail!("null values are not allowed in params (TOML has no null)"),
         JsonValue::Bool(b) => Ok(if *b { "true".into() } else { "false".into() }),
         JsonValue::Number(n) => {
             if let Some(i) = n.as_i64() {
                 return Ok(i.to_string());
             }
-            let f = n.as_f64().ok_or_else(|| anyhow!("无法表示的数字: {n}"))?;
+            let f = n
+                .as_f64()
+                .ok_or_else(|| anyhow!("number cannot be represented: {n}"))?;
             if f.is_nan() {
                 return Ok("nan".into());
             }
@@ -551,18 +560,19 @@ mod tests {
 
     #[test]
     fn test_spec_to_pipeline_structural_errors() {
+        // 技术层错误消息一律英文（API 层经 i18n 前缀 + {{detail}} 包装）
         // 空节点列表
         let mut spec = sample_spec_body("p1");
         spec.nodes.clear();
         spec.edges.clear();
         let err = spec_to_pipeline(&spec).unwrap_err().to_string();
-        assert!(err.contains("至少要有一个节点"), "got: {err}");
+        assert!(err.contains("at least one node"), "got: {err}");
 
         // 重复节点 id
         let mut spec = sample_spec_body("p2");
         spec.nodes.push(spec.nodes[0].clone());
         let err = spec_to_pipeline(&spec).unwrap_err().to_string();
-        assert!(err.contains("节点 id 重复"), "got: {err}");
+        assert!(err.contains("duplicate node id"), "got: {err}");
 
         // 边引用不存在的节点
         let mut spec = sample_spec_body("p3");
@@ -571,19 +581,19 @@ mod tests {
             to: ("ghost".into(), "input".into()),
         });
         let err = spec_to_pipeline(&spec).unwrap_err().to_string();
-        assert!(err.contains("不存在的节点") && err.contains("ghost"), "got: {err}");
+        assert!(err.contains("non-existent node") && err.contains("ghost"), "got: {err}");
 
         // builtin 节点缺 builtin 字段
         let mut spec = sample_spec_body("p4");
         spec.nodes[0].builtin = None;
         let err = spec_to_pipeline(&spec).unwrap_err().to_string();
-        assert!(err.contains("缺少 builtin 字段"), "got: {err}");
+        assert!(err.contains("missing the `builtin` field"), "got: {err}");
 
         // module 节点缺 capability
         let mut spec = sample_spec_body("p5");
         spec.nodes[1].capability = None;
         let err = spec_to_pipeline(&spec).unwrap_err().to_string();
-        assert!(err.contains("缺少 capability 字段"), "got: {err}");
+        assert!(err.contains("missing the `capability` field"), "got: {err}");
     }
 
     // ── save_spec / 数值与转义细节 ──────────────────────────────────────────
@@ -607,17 +617,20 @@ mod tests {
         assert_eq!(toml_value(&json!(2.5)).unwrap(), "2.5");
         // 整值浮点必须带小数点，否则 TOML 会按整数解析
         assert_eq!(toml_value(&json!(3.0)).unwrap(), "3.0");
-        assert_eq!(toml_value(&json!(null)).err().unwrap().to_string(), "params 中不允许 null 值（TOML 无 null）");
+        assert_eq!(
+            toml_value(&json!(null)).err().unwrap().to_string(),
+            "null values are not allowed in params (TOML has no null)"
+        );
         assert_eq!(toml_key("plain_key-1"), "plain_key-1");
         assert_eq!(toml_key("has space"), "\"has space\"");
         assert_eq!(toml_string("换行\n与\"引号\""), "\"换行\\n与\\\"引号\\\"\"");
     }
 
     #[test]
-    fn test_load_spec_missing_file_errors_in_chinese() {
+    fn test_load_spec_missing_file_errors_in_english() {
         let err = load_spec(Path::new("/nonexistent/dir/pipe.toml"))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("加载失败"), "got: {err}");
+        assert!(err.contains("failed to load pipeline file"), "got: {err}");
     }
 }
