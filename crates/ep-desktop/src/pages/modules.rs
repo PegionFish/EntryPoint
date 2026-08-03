@@ -1,15 +1,18 @@
 //! 模块管理页 — 响应式 master-detail：左栏按类别分组列表，右栏详情 + 操作 + 日志。
 //!
-//! 所有颜色取自 [`crate::ui::Palette`]，状态显示统一走 [`crate::ui::service_status`]。
+//! 所有颜色取自 [`crate::ui::Palette`]，状态颜色统一走 [`crate::ui::service_status`]，
+//! 状态文案走 [`service_label`]（i18n）。
 
 use eframe::egui;
+use ep_core::config::AppConfig;
 use ep_core::types::{ModuleCategory, ServiceStatus};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::{AppCmd, ModuleEntry};
+use crate::i18n::tr;
 use crate::ui::{
-    badge, card, confirm_dialog, danger_button, empty_state, page_header, primary_button,
-    service_status, status_badge, subtle_button, Palette, CARD_ROUNDING, CONTROL_ROUNDING,
+    badge, card, confirm_dialog_with_lang, danger_button, empty_state, page_header, primary_button,
+    service_status, subtle_button, Palette, CARD_ROUNDING, CONTROL_ROUNDING,
 };
 
 /// 左栏列表项行高
@@ -17,20 +20,28 @@ const ITEM_HEIGHT: f32 = 30.0;
 
 pub fn show(
     ui: &mut egui::Ui,
+    config: &AppConfig,
     modules: &mut [ModuleEntry],
     selected: &mut Option<usize>,
     cmd_tx: &UnboundedSender<AppCmd>,
 ) {
+    let lang = ep_core::i18n::normalize_language(&config.general.language);
     let pal = Palette::new(ui.style().visuals.dark_mode);
 
     // ── 页头 + 汇总 ──
-    page_header(ui, "模块管理", |ui| {
+    page_header(ui, &tr(lang, "desktopPages.modules.title", &[]), |ui| {
+        let count = modules.len().to_string();
         ui.label(
-            egui::RichText::new(format!("共 {} 个模块", modules.len())).color(pal.text_dim),
+            egui::RichText::new(tr(
+                lang,
+                "desktopPages.modules.total",
+                &[("count", &count)],
+            ))
+            .color(pal.text_dim),
         );
     });
     ui.add_space(2.0);
-    summary_bar(ui, &pal, modules);
+    summary_bar(ui, lang, &pal, modules);
     ui.add_space(6.0);
 
     // ── 响应式 master-detail ──
@@ -48,7 +59,7 @@ pub fn show(
                 .inner_margin(egui::Margin::symmetric(8, 8)),
         )
         .show_inside(ui, |ui| {
-            module_list(ui, &pal, modules, selected);
+            module_list(ui, lang, &pal, modules, selected);
         });
 
     egui::CentralPanel::default()
@@ -58,14 +69,14 @@ pub fn show(
                 .inner_margin(egui::Margin::symmetric(8, 4)),
         )
         .show_inside(ui, |ui| {
-            detail_area(ui, &pal, modules, selected, cmd_tx);
+            detail_area(ui, lang, &pal, modules, selected, cmd_tx);
         });
 }
 
 // ─── 汇总条 ──────────────────────────────────────────────────────────────────
 
 /// 状态计数徽章（0 不显示）
-fn summary_bar(ui: &mut egui::Ui, pal: &Palette, modules: &[ModuleEntry]) {
+fn summary_bar(ui: &mut egui::Ui, lang: &str, pal: &Palette, modules: &[ModuleEntry]) {
     let running = modules.iter().filter(|m| m.status.is_running()).count();
     let stopped = modules
         .iter()
@@ -82,19 +93,46 @@ fn summary_bar(ui: &mut egui::Ui, pal: &Palette, modules: &[ModuleEntry]) {
 
     ui.horizontal(|ui| {
         if running > 0 {
-            badge(ui, pal, pal.success, format!("{running} 运行中"));
+            let count = running.to_string();
+            badge(
+                ui,
+                pal,
+                pal.success,
+                tr(lang, "desktopPages.modules.summary.running", &[("count", &count)]),
+            );
         }
         if stopped > 0 {
-            badge(ui, pal, pal.neutral, format!("{stopped} 已停止"));
+            let count = stopped.to_string();
+            badge(
+                ui,
+                pal,
+                pal.neutral,
+                tr(lang, "desktopPages.modules.summary.stopped", &[("count", &count)]),
+            );
         }
         if errors > 0 {
-            badge(ui, pal, pal.danger, format!("{errors} 错误"));
+            let count = errors.to_string();
+            badge(
+                ui,
+                pal,
+                pal.danger,
+                tr(lang, "desktopPages.modules.summary.errors", &[("count", &count)]),
+            );
         }
         if not_ready > 0 {
-            badge(ui, pal, pal.notready, format!("{not_ready} 未就绪"));
+            let count = not_ready.to_string();
+            badge(
+                ui,
+                pal,
+                pal.notready,
+                tr(lang, "desktopPages.modules.summary.notReady", &[("count", &count)]),
+            );
         }
         if modules.is_empty() {
-            ui.label(egui::RichText::new("暂无模块").color(pal.text_faint));
+            ui.label(
+                egui::RichText::new(tr(lang, "desktopPages.modules.summary.none", &[]))
+                    .color(pal.text_faint),
+            );
         }
     });
 }
@@ -103,13 +141,20 @@ fn summary_bar(ui: &mut egui::Ui, pal: &Palette, modules: &[ModuleEntry]) {
 
 fn module_list(
     ui: &mut egui::Ui,
+    lang: &str,
     pal: &Palette,
     modules: &[ModuleEntry],
     selected: &mut Option<usize>,
 ) {
     egui::ScrollArea::vertical().show(ui, |ui| {
         if modules.is_empty() {
-            empty_state(ui, pal, "🧩", "未发现模块", "请检查 modules/ 目录");
+            empty_state(
+                ui,
+                pal,
+                "🧩",
+                &tr(lang, "desktopPages.modules.empty.title", &[]),
+                &tr(lang, "desktopPages.modules.empty.hint", &[]),
+            );
             return;
         }
 
@@ -121,14 +166,14 @@ fn module_list(
                 .count();
 
             egui::CollapsingHeader::new(
-                egui::RichText::new(format!("{}  {running}/{count}", category_label(cat)))
+                egui::RichText::new(format!("{}  {running}/{count}", category_label(lang, cat)))
                     .strong(),
             )
             .default_open(true)
             .show(ui, |ui| {
                 for (idx, m) in modules.iter().enumerate() {
                     if m.category == *cat {
-                        module_list_item(ui, pal, m, idx, selected);
+                        module_list_item(ui, lang, pal, m, idx, selected);
                     }
                 }
             });
@@ -139,6 +184,7 @@ fn module_list(
 /// 自绘列表项：状态色圆点 + 名称 + 版本 + 端口；选中/hover 背景，点击选中
 fn module_list_item(
     ui: &mut egui::Ui,
+    lang: &str,
     pal: &Palette,
     m: &ModuleEntry,
     idx: usize,
@@ -207,13 +253,18 @@ fn module_list_item(
         }
     }
 
+    let status = service_label(lang, &m.status);
+    let category = category_label(lang, &m.category);
     response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(format!(
-            "{}\n状态: {}\n类别: {}",
-            m.name,
-            service_status(&m.status, pal).label,
-            category_label(&m.category),
+        .on_hover_text(tr(
+            lang,
+            "desktopPages.modules.hover.detail",
+            &[
+                ("name", m.name.as_str()),
+                ("status", &status),
+                ("category", &category),
+            ],
         ));
 }
 
@@ -221,28 +272,42 @@ fn module_list_item(
 
 fn detail_area(
     ui: &mut egui::Ui,
+    lang: &str,
     pal: &Palette,
     modules: &mut [ModuleEntry],
     selected: &mut Option<usize>,
     cmd_tx: &UnboundedSender<AppCmd>,
 ) {
     let Some(idx) = *selected else {
-        empty_state(ui, pal, "🧩", "选择一个模块", "在左侧列表中点击模块查看详情");
+        empty_state(
+            ui,
+            pal,
+            "🧩",
+            &tr(lang, "desktopPages.modules.select.title", &[]),
+            &tr(lang, "desktopPages.modules.select.hint", &[]),
+        );
         return;
     };
 
     let Some(m) = modules.get_mut(idx) else {
         // 失效选择（模块列表已变化）：清空并回到空态
         *selected = None;
-        empty_state(ui, pal, "🧩", "选择一个模块", "在左侧列表中点击模块查看详情");
+        empty_state(
+            ui,
+            pal,
+            "🧩",
+            &tr(lang, "desktopPages.modules.select.title", &[]),
+            &tr(lang, "desktopPages.modules.select.hint", &[]),
+        );
         return;
     };
 
-    detail_panel(ui, pal, m, cmd_tx);
+    detail_panel(ui, lang, pal, m, cmd_tx);
 }
 
 fn detail_panel(
     ui: &mut egui::Ui,
+    lang: &str,
     pal: &Palette,
     m: &mut ModuleEntry,
     cmd_tx: &UnboundedSender<AppCmd>,
@@ -257,7 +322,7 @@ fn detail_panel(
             ui.horizontal(|ui| {
                 ui.heading(&m.name);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    status_badge(ui, pal, meta);
+                    badge(ui, pal, meta.color, service_label(lang, &m.status));
                 });
             });
 
@@ -275,21 +340,31 @@ fn detail_panel(
                 .spacing([12.0, 6.0])
                 .show(ui, |ui| {
                     info_row(ui, pal, "ID", egui::RichText::new(m.id.clone()).monospace());
-                    info_row(ui, pal, "版本", egui::RichText::new(m.version.clone()));
                     info_row(
                         ui,
                         pal,
-                        "类别",
-                        egui::RichText::new(category_label(&m.category)),
+                        &tr(lang, "desktopPages.modules.info.version", &[]),
+                        egui::RichText::new(m.version.clone()),
+                    );
+                    info_row(
+                        ui,
+                        pal,
+                        &tr(lang, "desktopPages.modules.info.category", &[]),
+                        egui::RichText::new(category_label(lang, &m.category)),
                     );
                     if let Some(dev) = &m.device {
-                        info_row(ui, pal, "设备", egui::RichText::new(dev.clone()));
+                        info_row(
+                            ui,
+                            pal,
+                            &tr(lang, "desktopPages.modules.info.device", &[]),
+                            egui::RichText::new(dev.clone()),
+                        );
                     }
                     if let Some(port) = m.port {
                         info_row(
                             ui,
                             pal,
-                            "端口",
+                            &tr(lang, "desktopPages.modules.info.port", &[]),
                             egui::RichText::new(format!("{port}")).monospace(),
                         );
                     }
@@ -297,8 +372,8 @@ fn detail_panel(
                         info_row(
                             ui,
                             pal,
-                            "运行时间",
-                            egui::RichText::new(format_uptime(started.elapsed())),
+                            &tr(lang, "desktopPages.modules.info.uptime", &[]),
+                            egui::RichText::new(format_uptime(lang, started.elapsed())),
                         );
                     }
                 });
@@ -312,13 +387,13 @@ fn detail_panel(
             ui.separator();
             ui.add_space(8.0);
 
-            action_bar(ui, pal, m, cmd_tx);
+            action_bar(ui, lang, pal, m, cmd_tx);
         });
 
         ui.add_space(14.0);
 
         // ── 日志 ──
-        log_section(ui, pal, m);
+        log_section(ui, lang, pal, m);
         ui.add_space(6.0);
     });
 }
@@ -334,6 +409,7 @@ fn info_row(ui: &mut egui::Ui, pal: &Palette, label: &str, value: egui::RichText
 
 fn action_bar(
     ui: &mut egui::Ui,
+    lang: &str,
     pal: &Palette,
     m: &ModuleEntry,
     cmd_tx: &UnboundedSender<AppCmd>,
@@ -345,17 +421,20 @@ fn action_bar(
     ui.horizontal(|ui| match &m.status {
         // 启动无破坏性，直接执行
         ServiceStatus::Stopped => {
-            if ui.add(primary_button(pal, "▶ 启动")).clicked() {
+            let label = format!("▶ {}", tr(lang, "common.action.start", &[]));
+            if ui.add(primary_button(pal, label)).clicked() {
                 let _ = cmd_tx.send(AppCmd::StartModule(m.id.clone()));
             }
         }
         ServiceStatus::Running | ServiceStatus::Starting => {
-            if ui.add(danger_button(pal, "⏹ 停止")).clicked() {
+            let label = format!("⏹ {}", tr(lang, "common.action.stop", &[]));
+            if ui.add(danger_button(pal, label)).clicked() {
                 ui.ctx().data_mut(|d| d.insert_temp(key_stop, true));
             }
         }
         ServiceStatus::Error(_) => {
-            let btn = egui::Button::new(egui::RichText::new("🔄 重启").color(pal.bg))
+            let label = format!("🔄 {}", tr(lang, "common.action.restart", &[]));
+            let btn = egui::Button::new(egui::RichText::new(label).color(pal.bg))
                 .fill(pal.warning)
                 .corner_radius(egui::CornerRadius::same(CONTROL_ROUNDING))
                 .stroke(egui::Stroke::NONE);
@@ -365,27 +444,41 @@ fn action_bar(
         }
         ServiceStatus::Preparing => {
             ui.spinner();
-            ui.label(egui::RichText::new("准备中…").color(pal.text_dim));
+            ui.label(
+                egui::RichText::new(format!("{}…", tr(lang, "common.status.preparing", &[])))
+                    .color(pal.text_dim),
+            );
         }
         ServiceStatus::NotReady => {
             ui.label(
-                egui::RichText::new("⚠ 模块未就绪（缺少依赖或 manifest 无效）")
-                    .small()
-                    .color(pal.text_dim),
+                egui::RichText::new(format!(
+                    "⚠ {}",
+                    tr(lang, "desktopPages.modules.notReadyHint", &[])
+                ))
+                .small()
+                .color(pal.text_dim),
             );
         }
     });
 
     // 停止确认
     if ui.ctx().data(|d| d.get_temp::<bool>(key_stop).unwrap_or(false)) {
-        match confirm_dialog(
+        let title = tr(lang, "desktopPages.modules.dlg.stop.title", &[]);
+        let message = tr(
+            lang,
+            "desktopPages.modules.dlg.stop.message",
+            &[("name", m.name.as_str())],
+        );
+        let confirm = tr(lang, "common.action.stop", &[]);
+        match confirm_dialog_with_lang(
             ui.ctx(),
             pal,
             &format!("dlg_stop_{}", m.id),
-            "停止模块",
-            &format!("确定停止「{}」吗？正在进行的请求将被中断。", m.name),
-            "停止",
+            &title,
+            &message,
+            &confirm,
             true,
+            lang,
         ) {
             Some(true) => {
                 ui.ctx().data_mut(|d| d.remove_temp::<bool>(key_stop));
@@ -400,14 +493,22 @@ fn action_bar(
 
     // 重启确认（确认后先发 Stop 再发 Start）
     if ui.ctx().data(|d| d.get_temp::<bool>(key_restart).unwrap_or(false)) {
-        match confirm_dialog(
+        let title = tr(lang, "desktopPages.modules.dlg.restart.title", &[]);
+        let message = tr(
+            lang,
+            "desktopPages.modules.dlg.restart.message",
+            &[("name", m.name.as_str())],
+        );
+        let confirm = tr(lang, "common.action.restart", &[]);
+        match confirm_dialog_with_lang(
             ui.ctx(),
             pal,
             &format!("dlg_restart_{}", m.id),
-            "重启模块",
-            &format!("确定重启「{}」吗？将先停止再启动该模块。", m.name),
-            "重启",
+            &title,
+            &message,
+            &confirm,
             false,
+            lang,
         ) {
             Some(true) => {
                 ui.ctx().data_mut(|d| d.remove_temp::<bool>(key_restart));
@@ -424,11 +525,21 @@ fn action_bar(
 
 // ─── 日志区 ──────────────────────────────────────────────────────────────────
 
-fn log_section(ui: &mut egui::Ui, pal: &Palette, m: &mut ModuleEntry) {
+fn log_section(ui: &mut egui::Ui, lang: &str, pal: &Palette, m: &mut ModuleEntry) {
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(format!("日志 ({})", m.logs.len())).strong());
+        let count = m.logs.len().to_string();
+        ui.label(
+            egui::RichText::new(tr(lang, "desktopPages.modules.logs", &[("count", &count)]))
+                .strong(),
+        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.add(subtle_button(pal, "清空")).clicked() {
+            if ui
+                .add(subtle_button(
+                    pal,
+                    tr(lang, "desktopPages.modules.clearLogs", &[]),
+                ))
+                .clicked()
+            {
                 m.logs.clear();
             }
         });
@@ -448,7 +559,7 @@ fn log_section(ui: &mut egui::Ui, pal: &Palette, m: &mut ModuleEntry) {
                 .show(ui, |ui| {
                     if m.logs.is_empty() {
                         ui.label(
-                            egui::RichText::new("暂无日志")
+                            egui::RichText::new(tr(lang, "desktopPages.modules.noLogs", &[]))
                                 .small()
                                 .color(pal.text_faint),
                         );
@@ -487,28 +598,56 @@ fn unique_categories(modules: &[ModuleEntry]) -> Vec<ModuleCategory> {
     cats
 }
 
-fn category_label(c: &ModuleCategory) -> String {
+/// 本地化的模块类别文案；`Other` 承载 manifest 原始字符串，按数据原样显示。
+pub fn category_label(lang: &str, c: &ModuleCategory) -> String {
     match c {
-        ModuleCategory::Asr => "语音识别 (ASR)".into(),
-        ModuleCategory::Tts => "语音合成 (TTS)".into(),
-        ModuleCategory::Denoise => "降噪".into(),
-        ModuleCategory::Ocr => "文字识别 (OCR)".into(),
-        ModuleCategory::Image => "图像处理".into(),
-        ModuleCategory::Translate => "翻译".into(),
-        ModuleCategory::Video => "视频处理".into(),
-        ModuleCategory::Face => "人脸识别".into(),
-        ModuleCategory::Custom => "自定义".into(),
+        ModuleCategory::Asr => tr(lang, "desktopPages.modules.cat.asr", &[]),
+        ModuleCategory::Tts => tr(lang, "desktopPages.modules.cat.tts", &[]),
+        ModuleCategory::Denoise => tr(lang, "desktopPages.modules.cat.denoise", &[]),
+        ModuleCategory::Ocr => tr(lang, "desktopPages.modules.cat.ocr", &[]),
+        ModuleCategory::Image => tr(lang, "desktopPages.modules.cat.image", &[]),
+        ModuleCategory::Translate => tr(lang, "desktopPages.modules.cat.translate", &[]),
+        ModuleCategory::Video => tr(lang, "desktopPages.modules.cat.video", &[]),
+        ModuleCategory::Face => tr(lang, "desktopPages.modules.cat.face", &[]),
+        ModuleCategory::Custom => tr(lang, "desktopPages.modules.cat.custom", &[]),
         ModuleCategory::Other(s) => s.clone(),
     }
 }
 
-fn format_uptime(d: std::time::Duration) -> String {
+/// 本地化的服务状态文案；颜色仍取自 [`crate::ui::service_status`]。
+pub fn service_label(lang: &str, status: &ServiceStatus) -> String {
+    let key = match status {
+        ServiceStatus::Running => "common.status.running",
+        ServiceStatus::Stopped => "common.status.stopped",
+        ServiceStatus::Starting => "common.status.starting",
+        ServiceStatus::Preparing => "common.status.preparing",
+        ServiceStatus::Error(_) => "common.status.error",
+        ServiceStatus::NotReady => "common.status.notReady",
+    };
+    tr(lang, key, &[])
+}
+
+fn format_uptime(lang: &str, d: std::time::Duration) -> String {
     let secs = d.as_secs();
     if secs < 60 {
-        format!("{secs} 秒")
+        let s = secs.to_string();
+        tr(lang, "desktopPages.modules.uptime.seconds", &[("s", &s)])
     } else if secs < 3600 {
-        format!("{} 分 {} 秒", secs / 60, secs % 60)
+        let m = (secs / 60).to_string();
+        let s = (secs % 60).to_string();
+        tr(
+            lang,
+            "desktopPages.modules.uptime.minutes",
+            &[("m", &m), ("s", &s)],
+        )
     } else {
-        format!("{} 时 {} 分 {} 秒", secs / 3600, (secs % 3600) / 60, secs % 60)
+        let h = (secs / 3600).to_string();
+        let m = ((secs % 3600) / 60).to_string();
+        let s = (secs % 60).to_string();
+        tr(
+            lang,
+            "desktopPages.modules.uptime.hours",
+            &[("h", &h), ("m", &m), ("s", &s)],
+        )
     }
 }

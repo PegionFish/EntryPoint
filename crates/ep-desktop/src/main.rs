@@ -117,9 +117,14 @@ async fn background_loop(
     root: std::path::PathBuf,
 ) {
     use ep_desktop::app::{AppCmd, AppMsg};
+    use ep_desktop::i18n::tr;
     use ep_core::model::DownloadState;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+
+    // UI 文案语言：从启动时配置归一化（&'static str，可安全移入各异步任务）。
+    // 注：设置页的语言切换即时作用于 UI 渲染；后台错误文案在下次启动后跟随新语言。
+    let lang = ep_core::i18n::normalize_language(&config.general.language);
 
     let (port_range_start, port_range_end) = config.port_range();
     let mut port_manager = ep_core::port::PortManager::new(port_range_start, port_range_end);
@@ -205,21 +210,30 @@ async fn background_loop(
                                         }
                                         Err(e) => {
                                             port_manager.release(&module_id);
-                                            let _ = tx.send(AppMsg::Error(format!(
-                                                "启动 {module_id} 失败: {e}"
+                                            let _ = tx.send(AppMsg::Error(tr(
+                                                lang,
+                                                "desktopApp.error.startModuleFailed",
+                                                &[
+                                                    ("id", &module_id),
+                                                    ("detail", &e.to_string()),
+                                                ],
                                             )));
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    let _ = tx.send(AppMsg::Error(format!(
-                                        "端口分配失败: {e}"
+                                    let _ = tx.send(AppMsg::Error(tr(
+                                        lang,
+                                        "desktopApp.error.portAllocFailed",
+                                        &[("detail", &e.to_string())],
                                     )));
                                 }
                             }
                         } else {
-                            let _ = tx.send(AppMsg::Error(format!(
-                                "模块 {module_id} 未找到或 manifest 无效"
+                            let _ = tx.send(AppMsg::Error(tr(
+                                lang,
+                                "desktopApp.error.moduleNotFoundOrInvalid",
+                                &[("id", &module_id)],
                             )));
                         }
                     }
@@ -255,10 +269,11 @@ async fn background_loop(
                             };
 
                             if !venv_python.exists() {
-                                let _ = tx.send(AppMsg::Error(
-                                    "请先启动一次该模块以准备 Python 环境，然后再下载模型"
-                                        .to_string(),
-                                ));
+                                let _ = tx.send(AppMsg::Error(tr(
+                                    lang,
+                                    "desktopApp.error.startModuleFirst",
+                                    &[],
+                                )));
                                 let _ = tx.send(AppMsg::ModelDownloadFinished(
                                     model_id.clone(),
                                     false,
@@ -308,15 +323,22 @@ async fn background_loop(
                                                                 }
                                                                 DownloadState::Failed(msg) => {
                                                                     let _ = tx2.send(
-                                                                        AppMsg::Error(format!(
-                                                                            "模型 {mid} 下载失败：{msg}"
+                                                                        AppMsg::Error(tr(
+                                                                            lang,
+                                                                            "desktopApp.error.downloadFailed",
+                                                                            &[
+                                                                                ("id", &mid),
+                                                                                ("detail", msg),
+                                                                            ],
                                                                         )),
                                                                     );
                                                                 }
                                                                 DownloadState::Cancelled => {
                                                                     let _ = tx2.send(
-                                                                        AppMsg::Info(format!(
-                                                                            "模型 {mid} 下载已取消"
+                                                                        AppMsg::Info(tr(
+                                                                            lang,
+                                                                            "desktopApp.error.downloadCancelled",
+                                                                            &[("id", &mid)],
                                                                         )),
                                                                     );
                                                                 }
@@ -342,8 +364,10 @@ async fn background_loop(
                                         });
                                     }
                                     Err(e) => {
-                                        let _ = tx.send(AppMsg::Error(format!(
-                                            "启动模型下载失败: {e}"
+                                        let _ = tx.send(AppMsg::Error(tr(
+                                            lang,
+                                            "desktopApp.error.startDownloadFailed",
+                                            &[("detail", &e.to_string())],
                                         )));
                                         let _ = tx.send(AppMsg::ModelDownloadFinished(
                                             model_id.clone(),
@@ -353,8 +377,10 @@ async fn background_loop(
                                 }
                             }
                         } else {
-                            let _ = tx.send(AppMsg::Error(format!(
-                                "模块 {module_id} 或模型 {model_id} 未找到"
+                            let _ = tx.send(AppMsg::Error(tr(
+                                lang,
+                                "desktopApp.error.moduleOrModelNotFound",
+                                &[("module", &module_id), ("model", &model_id)],
                             )));
                             let _ = tx
                                 .send(AppMsg::ModelDownloadFinished(model_id.clone(), false));
@@ -392,8 +418,10 @@ async fn background_loop(
                                 });
                             });
                         } else {
-                            let _ = tx.send(AppMsg::Error(format!(
-                                "模块 {module_id} 或模型 {model_id} 未找到，无法检查更新"
+                            let _ = tx.send(AppMsg::Error(tr(
+                                lang,
+                                "desktopApp.error.moduleOrModelNotFoundUpdate",
+                                &[("module", &module_id), ("model", &model_id)],
                             )));
                         }
                     }
@@ -466,7 +494,11 @@ async fn background_loop(
                                 ));
                             }
                             Err(e) => {
-                                let _ = tx.send(AppMsg::Error(format!("删除模型失败: {e}")));
+                                let _ = tx.send(AppMsg::Error(tr(
+                                    lang,
+                                    "desktopApp.error.deleteModelFailed",
+                                    &[("detail", &e.to_string())],
+                                )));
                             }
                         }
                     }
@@ -485,7 +517,11 @@ async fn background_loop(
                                 ));
                             }
                             Err(e) => {
-                                let _ = tx.send(AppMsg::Error(format!("导入模型失败: {e}")));
+                                let _ = tx.send(AppMsg::Error(tr(
+                                    lang,
+                                    "desktopApp.error.importModelFailed",
+                                    &[("detail", &e.to_string())],
+                                )));
                             }
                         }
                     }

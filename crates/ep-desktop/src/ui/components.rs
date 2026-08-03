@@ -2,7 +2,8 @@
 
 use eframe::egui;
 
-use crate::ui::palette::{Palette, StatusMeta};
+use crate::i18n::tr;
+use crate::ui::palette::Palette;
 
 /// 卡片圆角
 pub const CARD_ROUNDING: u8 = 10;
@@ -48,11 +49,6 @@ pub fn badge(ui: &mut egui::Ui, pal: &Palette, color: egui::Color32, label: impl
                 ui.label(egui::RichText::new(label).size(12.0).color(color));
             });
         });
-}
-
-/// 服务状态徽章
-pub fn status_badge(ui: &mut egui::Ui, pal: &Palette, meta: StatusMeta) {
-    badge(ui, pal, meta.color, meta.label);
 }
 
 // ─── 页面骨架 ────────────────────────────────────────────────────────────────
@@ -149,9 +145,11 @@ pub fn subtle_button(pal: &Palette, text: impl Into<egui::WidgetText>) -> egui::
 
 /// 模态确认对话框。
 ///
+/// 取消按钮文案按 `lang` 走 i18n 键 `common.action.cancel`。
 /// 调用方在对话框"打开期间"每帧调用一次。
 /// 返回 `Some(true)` = 用户确认，`Some(false)` = 取消/关闭，`None` = 仍然打开。
-pub fn confirm_dialog(
+#[allow(clippy::too_many_arguments)]
+pub fn confirm_dialog_with_lang(
     ctx: &egui::Context,
     pal: &Palette,
     id: &str,
@@ -159,9 +157,11 @@ pub fn confirm_dialog(
     message: &str,
     confirm_label: &str,
     danger: bool,
+    lang: &str,
 ) -> Option<bool> {
     let mut result: Option<bool> = None;
     let mut open = true;
+    let cancel_label = tr(lang, "common.action.cancel", &[]);
 
     egui::Window::new(title)
         .id(egui::Id::new(id))
@@ -175,7 +175,7 @@ pub fn confirm_dialog(
             ui.add_space(14.0);
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(subtle_button(pal, "取消")).clicked() {
+                    if ui.add(subtle_button(pal, cancel_label)).clicked() {
                         result = Some(false);
                     }
                     let fill = if danger { pal.danger } else { pal.primary };
