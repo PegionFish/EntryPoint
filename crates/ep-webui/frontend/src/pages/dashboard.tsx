@@ -7,6 +7,7 @@ import {
   TriangleAlert,
 } from 'lucide-react'
 import type { ReactNode } from 'react'
+import { Trans, useTranslation } from 'react-i18next'
 import type {
   DepReport,
   DeviceResponse,
@@ -34,7 +35,7 @@ import { cn } from '@/lib/utils'
 
 /* ---------- 页面内局部组件 ---------- */
 
-/** 局部状态徽章：状态圆点 + 中文标签，过渡态附加脉冲动画 */
+/** 局部状态徽章：状态圆点 + 状态标签，过渡态附加脉冲动画 */
 function StatusBadge({ status }: { status: string }) {
   const meta = statusMeta(status)
   return (
@@ -124,19 +125,25 @@ function DevicesSection({
   loading: boolean
   hasError: boolean
 }) {
+  const { t } = useTranslation('dashboard')
   return (
     <section>
       <SectionHeader
         icon={<Cpu className="size-4" />}
-        title="计算设备"
+        title={t('device.title')}
         extra={
           devices && devices.length > 0 ? (
             <span className="text-xs text-muted-foreground">
-              共{' '}
-              <span className="font-mono font-semibold text-foreground">
-                {devices.length}
-              </span>{' '}
-              台
+              <Trans
+                i18nKey="device.count"
+                ns="dashboard"
+                values={{ count: devices.length }}
+                components={{
+                  b: (
+                    <span className="font-mono font-semibold text-foreground" />
+                  ),
+                }}
+              />
             </span>
           ) : undefined
         }
@@ -159,12 +166,12 @@ function DevicesSection({
             </div>
             <div>
               <p className="text-sm font-medium">
-                {hasError ? '设备信息加载失败' : '未检测到计算设备'}
+                {hasError ? t('device.loadFailed') : t('device.empty')}
               </p>
               <p className="mx-auto mt-1 max-w-sm text-xs leading-relaxed text-muted-foreground">
                 {hasError
-                  ? '无法获取设备数据，请检查后端服务是否正常运行。'
-                  : '未检测到可用的 GPU 或 CPU 计算后端，请确认驱动已正确安装。'}
+                  ? t('device.loadFailedHint')
+                  : t('device.emptyHint')}
               </p>
             </div>
           </CardContent>
@@ -200,6 +207,7 @@ function ModulesSection({
   moduleStatus: Record<string, ModuleStatusResponse>
   loading: boolean
 }) {
+  const { t } = useTranslation('dashboard')
   const runningCount = modules?.filter(isRunning).length ?? 0
   const errorCount = modules?.filter(isError).length ?? 0
 
@@ -207,13 +215,13 @@ function ModulesSection({
     <section>
       <SectionHeader
         icon={<Puzzle className="size-4" />}
-        title="模块状态"
+        title={t('module.title')}
         extra={
           modules ? (
             <span className="flex items-center gap-3 text-xs text-muted-foreground">
               <span className="flex items-center gap-1.5">
                 <span className="size-1.5 rounded-full bg-status-running" />
-                运行中{' '}
+                {t('common:status.running')}{' '}
                 <span className="font-mono font-semibold text-foreground">
                   {runningCount}
                 </span>
@@ -230,7 +238,7 @@ function ModulesSection({
                       : 'text-muted-foreground/50',
                   )}
                 />
-                异常{' '}
+                {t('module.errorLabel')}{' '}
                 <span
                   className={cn(
                     'font-mono font-semibold',
@@ -249,19 +257,19 @@ function ModulesSection({
           <TableHeader>
             <TableRow className="hover:bg-transparent">
               <TableHead className="text-xs font-medium text-muted-foreground">
-                名称
+                {t('common:label.name')}
               </TableHead>
               <TableHead className="text-xs font-medium text-muted-foreground">
-                类别
+                {t('table.header.category')}
               </TableHead>
               <TableHead className="text-xs font-medium text-muted-foreground">
-                状态
+                {t('common:label.status')}
               </TableHead>
               <TableHead className="text-xs font-medium text-muted-foreground">
-                设备
+                {t('table.header.device')}
               </TableHead>
               <TableHead className="text-right text-xs font-medium text-muted-foreground">
-                端口
+                {t('table.header.port')}
               </TableHead>
             </TableRow>
           </TableHeader>
@@ -276,7 +284,7 @@ function ModulesSection({
                   {/* 复用 shared/empty-state 预设组件，替代手写空态 */}
                   <NoModulesState
                     className="py-8"
-                    description="暂无已注册模块，请确认 modules 目录内容后等待自动扫描"
+                    description={t('module.emptyHint')}
                   />
                 </TableCell>
               </TableRow>
@@ -305,7 +313,7 @@ function ModulesSection({
                     {/* API 无模块 → 设备映射，无法给出真实设备归属；
                         明示「暂不支持」而非占用符号，避免误以为数据缺失（P2-37） */}
                     <TableCell className="text-xs text-muted-foreground/60">
-                      暂不支持
+                      {t('table.deviceUnsupported')}
                     </TableCell>
                     <TableCell className="text-right font-mono text-xs">
                       {st?.port != null ? (
@@ -343,6 +351,7 @@ function DepCard({
   /** 缺失时的安装指引 */
   guidance?: string | null
 }) {
+  const { t } = useTranslation('dashboard')
   return (
     <Card
       className={cn(
@@ -382,7 +391,7 @@ function DepCard({
                   : 'border-status-preparing/30 bg-status-preparing/15 text-status-preparing'
               }
             >
-              {available ? '已就绪' : '未安装'}
+              {available ? t('dep.ready') : t('dep.notInstalled')}
             </Badge>
           </div>
           {available ? (
@@ -393,7 +402,7 @@ function DepCard({
             )
           ) : (
             <p className="text-xs leading-relaxed text-status-preparing">
-              {guidance ?? '该依赖缺失，部分功能可能无法使用。'}
+              {guidance ?? t('dep.missingHint')}
             </p>
           )}
         </div>
@@ -409,9 +418,13 @@ function DepsSection({
   deps: DepReport | null
   loading: boolean
 }) {
+  const { t } = useTranslation('dashboard')
   return (
     <section>
-      <SectionHeader icon={<HardDrive className="size-4" />} title="系统依赖" />
+      <SectionHeader
+        icon={<HardDrive className="size-4" />}
+        title={t('dep.title')}
+      />
       {loading && !deps ? (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           <DepCardSkeleton />
@@ -454,12 +467,13 @@ function DepsSection({
 /* ---------- 页面 ---------- */
 
 export function DashboardPage() {
+  const { t } = useTranslation('dashboard')
   const { devices, modules, deps, moduleStatus, loading, error } = useDevices()
 
   return (
     <PageContainer
-      title="仪表盘"
-      description="系统总览、设备与模块实时状态"
+      title={t('page.title')}
+      description={t('page.description')}
       actions={
         <div className="flex items-center gap-2 rounded-full border border-border bg-muted/40 px-3 py-1.5 text-xs text-muted-foreground">
           <span className="relative flex size-2">
@@ -473,7 +487,7 @@ export function DashboardPage() {
               )}
             />
           </span>
-          {error ? '连接异常' : '每 3 秒自动刷新'}
+          {error ? t('page.connectionError') : t('page.autoRefresh')}
         </div>
       }
     >
@@ -483,7 +497,7 @@ export function DashboardPage() {
             <CircleAlert className="mt-0.5 size-4 shrink-0 text-status-error" />
             <div className="min-w-0">
               <p className="text-sm font-medium text-status-error">
-                数据加载失败
+                {t('page.loadFailed')}
               </p>
               <p className="mt-0.5 break-all font-mono text-xs text-status-error/80">
                 {error}

@@ -18,6 +18,7 @@ import {
 } from '@xyflow/react'
 import type { Connection, Edge, OnSelectionChangeParams } from '@xyflow/react'
 import { Link } from 'react-router-dom'
+import { useTranslation } from 'react-i18next'
 import {
   ChevronDown,
   CircleCheck,
@@ -42,6 +43,7 @@ import type {
   PipelineSummary,
 } from '@/api/types'
 import { wsManager } from '@/api/ws'
+import i18n from '@/i18n'
 import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -106,6 +108,14 @@ function useMediaQuery(query: string): boolean {
     return () => mql.removeEventListener('change', onChange)
   }, [query])
   return matches
+}
+
+/**
+ * 模块级（非组件上下文）取 pipeline 命名空间文案。
+ * 用于模块顶层执行的 examplePipeline / 纯函数 toSpec 等无法调用 hook 的位置。
+ */
+function tp(key: string, options?: Record<string, unknown>): string {
+  return i18n.t(key, { ns: 'pipeline', ...(options ?? {}) })
 }
 
 // ============================================================
@@ -174,7 +184,7 @@ function examplePipeline(): { nodes: PipelineFlowNode[]; edges: Edge[] } {
       data: {
         kind: 'builtin',
         builtin: 'file_input',
-        label: '文件输入',
+        label: tp('template.exampleFileInput'),
         status: 'waiting',
         params: {
           ...defaultParams(BUILTIN_DEFS.file_input.params),
@@ -188,7 +198,7 @@ function examplePipeline(): { nodes: PipelineFlowNode[]; edges: Edge[] } {
       position: { x: 300, y: 50 },
       data: {
         kind: 'module',
-        label: 'Paraformer 语音识别',
+        label: tp('template.exampleAsrNode'),
         moduleId: 'funasr-paraformer',
         moduleVersion: '1.0.0',
         category: 'asr',
@@ -204,7 +214,7 @@ function examplePipeline(): { nodes: PipelineFlowNode[]; edges: Edge[] } {
       position: { x: 610, y: 210 },
       data: {
         kind: 'module',
-        label: 'Qwen2.5 文本生成',
+        label: tp('template.exampleLlmNode'),
         moduleId: 'qwen2-7b-instruct',
         moduleVersion: '0.3.1',
         category: 'llm',
@@ -221,7 +231,7 @@ function examplePipeline(): { nodes: PipelineFlowNode[]; edges: Edge[] } {
       data: {
         kind: 'builtin',
         builtin: 'file_output',
-        label: '文件输出',
+        label: tp('template.exampleFileOutput'),
         status: 'waiting',
         params: {
           ...defaultParams(BUILTIN_DEFS.file_output.params),
@@ -258,8 +268,6 @@ function examplePipeline(): { nodes: PipelineFlowNode[]; edges: Edge[] } {
   ]
   return { nodes, edges }
 }
-
-const EXAMPLE = examplePipeline()
 
 // ============================================================
 // 辅助函数
@@ -344,7 +352,7 @@ function toSpec(
           capability: n.data.capabilityId,
         }
       case 'external':
-        throw new Error(`外部 API 节点「${n.data.label}」不支持保存到服务端`)
+        throw new Error(tp('save.externalNodeRejected', { label: n.data.label }))
     }
   })
   const specEdges: PipelineEdgeSpec[] = edges.map((e) => ({
@@ -676,6 +684,7 @@ interface ParamFieldProps {
 }
 
 function ParamField({ spec, value, onChange }: ParamFieldProps) {
+  const { t } = useTranslation('pipeline')
   const numberValue = typeof value === 'number' && Number.isFinite(value) ? value : ''
   const stringValue = typeof value === 'string' ? value : value === undefined ? '' : String(value)
   return (
@@ -683,7 +692,11 @@ function ParamField({ spec, value, onChange }: ParamFieldProps) {
       <div className="flex items-baseline justify-between gap-2">
         <span className="text-xs font-medium">
           {spec.label}
-          {spec.required && <span className="ml-0.5 text-status-error">*</span>}
+          {spec.required && (
+            <span className="ml-0.5 text-status-error" aria-label={t('common:label.required')}>
+              *
+            </span>
+          )}
         </span>
         {spec.hint && <span className="text-[10px] text-muted-foreground">{spec.hint}</span>}
       </div>
@@ -707,14 +720,16 @@ function ParamField({ spec, value, onChange }: ParamFieldProps) {
       )}
       {spec.type === 'boolean' && (
         <div className="flex items-center justify-between rounded-md border border-border bg-muted/30 px-3 py-2">
-          <span className="text-xs text-muted-foreground">{spec.placeholder ?? '启用'}</span>
+          <span className="text-xs text-muted-foreground">
+            {spec.placeholder ?? t('params.enable')}
+          </span>
           <Switch checked={value === true} onCheckedChange={(checked) => onChange(checked)} />
         </div>
       )}
       {spec.type === 'select' && (
         <Select value={stringValue} onValueChange={(v) => onChange(v)}>
           <SelectTrigger className="h-8 w-full text-xs">
-            <SelectValue placeholder="请选择" />
+            <SelectValue placeholder={t('params.selectPlaceholder')} />
           </SelectTrigger>
           <SelectContent>
             {spec.options?.map((option) => (
@@ -745,6 +760,7 @@ function NodeParamsPanel({
   onClose,
   className,
 }: NodeParamsPanelProps) {
+  const { t } = useTranslation('pipeline')
   const specs = getParamSpecs(node.data)
   const status = NODE_STATUS_META[node.data.status]
   return (
@@ -765,8 +781,8 @@ function NodeParamsPanel({
           variant="ghost"
           size="icon-xs"
           onClick={onClose}
-          aria-label="关闭参数面板"
-          title="关闭"
+          aria-label={t('nodePanel.closeAria')}
+          title={t('common:action.close')}
         >
           <X className="h-3.5 w-3.5" />
         </Button>
@@ -776,7 +792,7 @@ function NodeParamsPanel({
         <div className="space-y-5 p-4">
           <div className="flex items-center gap-2 rounded-md border border-border bg-muted/40 px-3 py-2">
             <span className={cn('h-2 w-2 rounded-full', status.dot)} />
-            <span className="text-xs">{status.label}</span>
+            <span className="text-xs">{t(`nodeStatus.${node.data.status}`)}</span>
             <span className="ml-auto truncate font-mono text-[10px] text-muted-foreground">
               {node.id}
             </span>
@@ -784,10 +800,10 @@ function NodeParamsPanel({
 
           <section className="space-y-3">
             <h3 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-              参数配置
+              {t('nodePanel.paramsTitle')}
             </h3>
             {specs.length === 0 ? (
-              <p className="text-xs text-muted-foreground">此节点无可配置参数</p>
+              <p className="text-xs text-muted-foreground">{t('nodePanel.noParams')}</p>
             ) : (
               specs.map((spec) => (
                 <ParamField
@@ -808,7 +824,7 @@ function NodeParamsPanel({
               onClick={onDelete}
             >
               <Trash2 className="h-3.5 w-3.5" />
-              删除节点
+              {t('nodePanel.deleteNode')}
             </Button>
           </section>
         </div>
@@ -837,12 +853,13 @@ interface PipelineLibraryBarProps {
 }
 
 function SourceBadge({ source }: { source: 'builtin' | 'custom' }) {
+  const { t } = useTranslation('pipeline')
   return (
     <Badge
       variant={source === 'builtin' ? 'secondary' : 'outline'}
       className="h-4 shrink-0 px-1 text-[9px]"
     >
-      {source === 'builtin' ? '内置' : '自定义'}
+      {source === 'builtin' ? t('source.builtin') : t('source.custom')}
     </Badge>
   )
 }
@@ -861,13 +878,14 @@ function PipelineLibraryBar({
   onSaveAs,
   onDelete,
 }: PipelineLibraryBarProps) {
+  const { t } = useTranslation('pipeline')
   return (
     <div className="flex h-11 shrink-0 items-center gap-2 overflow-x-auto border-b border-border bg-muted/30 px-3">
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <Button variant="outline" size="sm" className="shrink-0" title="服务端管线库">
+          <Button variant="outline" size="sm" className="shrink-0" title={t('library.title')}>
             <FolderOpen className="h-3.5 w-3.5" />
-            管线库
+            {t('library.label')}
             {pipelines === null && !error ? (
               <Loader2 className="h-3 w-3 animate-spin" />
             ) : (
@@ -881,16 +899,18 @@ function PipelineLibraryBar({
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start" className="max-h-96 w-80 overflow-y-auto">
-          <DropdownMenuLabel>服务端管线</DropdownMenuLabel>
+          <DropdownMenuLabel>{t('library.serverPipelines')}</DropdownMenuLabel>
           {error && (
             <DropdownMenuItem onSelect={onRefresh}>
-              <span className="text-status-error">列表加载失败，点击重试</span>
+              <span className="text-status-error">{t('library.loadFailedRetry')}</span>
             </DropdownMenuItem>
           )}
-          {!error && pipelines === null && <DropdownMenuItem disabled>加载中…</DropdownMenuItem>}
+          {!error && pipelines === null && (
+            <DropdownMenuItem disabled>{t('library.loading')}</DropdownMenuItem>
+          )}
           {!error && pipelines !== null && pipelines.length === 0 && (
             <DropdownMenuItem onSelect={onLoadExample}>
-              <span>暂无已保存管线，点击载入本地示例</span>
+              <span>{t('library.emptyLoadExample')}</span>
             </DropdownMenuItem>
           )}
           {!error &&
@@ -899,14 +919,17 @@ function PipelineLibraryBar({
                 key={p.id}
                 onSelect={() => onSelect(p.id)}
                 className="items-start gap-2"
-                title={`加载管线「${p.name}」`}
+                title={t('library.loadPipeline', { name: p.name })}
               >
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-1.5">
                     <span className="truncate text-[13px]">{p.name}</span>
                     <SourceBadge source={p.source} />
                     {p.id === currentId && (
-                      <CircleCheck className="h-3 w-3 shrink-0 text-primary" aria-label="当前管线" />
+                      <CircleCheck
+                        className="h-3 w-3 shrink-0 text-primary"
+                        aria-label={t('library.currentPipeline')}
+                      />
                     )}
                   </div>
                   {p.description && (
@@ -919,11 +942,11 @@ function PipelineLibraryBar({
           <DropdownMenuSeparator />
           <DropdownMenuItem onSelect={onNewBlank}>
             <Plus className="h-3.5 w-3.5" />
-            新建空白管线
+            {t('library.newBlank')}
           </DropdownMenuItem>
           <DropdownMenuItem onSelect={onLoadExample}>
             <Sparkles className="h-3.5 w-3.5" />
-            载入示例管线（本地模板）
+            {t('library.loadExample')}
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
@@ -937,13 +960,17 @@ function PipelineLibraryBar({
             {currentSource && <SourceBadge source={currentSource} />}
           </>
         ) : (
-          <span className="whitespace-nowrap">未保存到服务端</span>
+          <span className="whitespace-nowrap">{t('library.notSaved')}</span>
         )}
-        {dirty && <span className="whitespace-nowrap text-status-starting">● 未保存更改</span>}
+        {dirty && (
+          <span className="whitespace-nowrap text-status-starting">
+            {t('library.unsavedChanges')}
+          </span>
+        )}
         {executing && (
           <span className="flex items-center gap-1 whitespace-nowrap text-status-starting">
             <Loader2 className="h-3 w-3 animate-spin" />
-            执行中
+            {t('library.executing')}
           </span>
         )}
       </div>
@@ -953,14 +980,14 @@ function PipelineLibraryBar({
           variant="ghost"
           size="xs"
           onClick={onNewBlank}
-          title="新建空白管线（文件输入 → 文件输出）"
+          title={t('library.newBlankHint')}
         >
           <Plus className="h-3.5 w-3.5" />
-          新建
+          {t('library.new')}
         </Button>
-        <Button variant="ghost" size="xs" onClick={onSaveAs} title="另存为新的服务端管线">
+        <Button variant="ghost" size="xs" onClick={onSaveAs} title={t('library.saveAsHint')}>
           <Copy className="h-3.5 w-3.5" />
-          另存为
+          {t('library.saveAs')}
         </Button>
         {/* 内置管线不显示删除按钮（后端亦会 403 拒绝） */}
         {currentId && currentSource === 'custom' && (
@@ -969,18 +996,18 @@ function PipelineLibraryBar({
             size="xs"
             className="text-destructive hover:bg-destructive/10 hover:text-destructive"
             onClick={onDelete}
-            title="删除当前服务端管线"
+            title={t('library.deleteHint')}
           >
             <Trash2 className="h-3.5 w-3.5" />
-            删除
+            {t('common:action.delete')}
           </Button>
         )}
         <Button
           variant="ghost"
           size="icon-xs"
           onClick={onRefresh}
-          title="刷新管线列表"
-          aria-label="刷新管线列表"
+          title={t('library.refreshList')}
+          aria-label={t('library.refreshList')}
         >
           <RefreshCw className="h-3 w-3" />
         </Button>
@@ -1003,6 +1030,7 @@ interface SaveAsDialogProps {
 }
 
 function SaveAsDialog({ open, onOpenChange, defaultName, pipelines, onConfirm }: SaveAsDialogProps) {
+  const { t } = useTranslation('pipeline')
   const [name, setName] = useState('')
   const [id, setId] = useState('')
   const [attempted, setAttempted] = useState(false)
@@ -1037,32 +1065,34 @@ function SaveAsDialog({ open, onOpenChange, defaultName, pipelines, onConfirm }:
     <Dialog open={open} onOpenChange={(next) => !pending && onOpenChange(next)}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>另存为新管线</DialogTitle>
-          <DialogDescription>
-            为当前画布指定新的名称与 ID，保存到服务端管线库。
-          </DialogDescription>
+          <DialogTitle>{t('saveAs.title')}</DialogTitle>
+          <DialogDescription>{t('saveAs.description')}</DialogDescription>
         </DialogHeader>
         <div className="space-y-4 py-1">
           <div className="space-y-1.5">
             <span className="text-xs font-medium">
-              管线名称
-              <span className="ml-0.5 text-status-error">*</span>
+              {t('saveAs.nameLabel')}
+              <span className="ml-0.5 text-status-error" aria-label={t('common:label.required')}>
+                *
+              </span>
             </span>
             <Input
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder="例如：视频字幕提取"
+              placeholder={t('saveAs.namePlaceholder')}
               className="h-8 text-sm"
               autoFocus
             />
             {attempted && !nameOk && (
-              <p className="text-[11px] text-status-error">管线名称不能为空</p>
+              <p className="text-[11px] text-status-error">{t('saveAs.nameRequired')}</p>
             )}
           </div>
           <div className="space-y-1.5">
             <span className="text-xs font-medium">
-              管线 ID
-              <span className="ml-0.5 text-status-error">*</span>
+              {t('saveAs.idLabel')}
+              <span className="ml-0.5 text-status-error" aria-label={t('common:label.required')}>
+                *
+              </span>
             </span>
             <Input
               value={id}
@@ -1070,28 +1100,28 @@ function SaveAsDialog({ open, onOpenChange, defaultName, pipelines, onConfirm }:
               placeholder="my-pipeline-1"
               className="h-8 font-mono text-xs"
             />
-            <p className="text-[11px] text-muted-foreground">
-              仅允许小写字母、数字、连字符，且以字母或数字开头
-            </p>
+            <p className="text-[11px] text-muted-foreground">{t('saveAs.idHint')}</p>
             {attempted && !idValid && (
               <p className="text-[11px] text-status-error">
-                ID 格式不合法：{id ? `「${id}」不符合规则` : '不能为空'}
+                {id ? t('saveAs.idInvalid', { id }) : t('saveAs.idEmpty')}
               </p>
             )}
             {conflict && (
               <p className="text-[11px] text-status-starting">
-                已存在同 ID 管线（{conflict.source === 'builtin' ? '内置' : '自定义'}），继续将覆盖
+                {t('saveAs.idConflict', {
+                  source: conflict.source === 'builtin' ? t('source.builtin') : t('source.custom'),
+                })}
               </p>
             )}
           </div>
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={pending}>
-            取消
+            {t('common:action.cancel')}
           </Button>
           <Button onClick={handleSubmit} disabled={pending}>
             {pending && <Loader2 className="animate-spin" />}
-            保存
+            {t('common:action.save')}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -1113,6 +1143,7 @@ interface ExecuteDialogProps {
 }
 
 function ExecuteDialog({ open, onOpenChange, fields, submitting, onSubmit }: ExecuteDialogProps) {
+  const { t } = useTranslation('pipeline')
   const [values, setValues] = useState<Record<string, ParamValue>>({})
   const [attempted, setAttempted] = useState(false)
 
@@ -1146,7 +1177,7 @@ function ExecuteDialog({ open, onOpenChange, fields, submitting, onSubmit }: Exe
   const handleSubmit = () => {
     setAttempted(true)
     if (emptyCount > 0) {
-      toast.error(`仍有 ${emptyCount} 个必填参数未填写`)
+      toast.error(t('execute.missingRequired', { count: emptyCount }))
       return
     }
     onSubmit(values)
@@ -1156,10 +1187,8 @@ function ExecuteDialog({ open, onOpenChange, fields, submitting, onSubmit }: Exe
     <Dialog open={open} onOpenChange={(next) => !submitting && onOpenChange(next)}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>执行管线</DialogTitle>
-          <DialogDescription>
-            确认并补齐以下执行参数。文件输入节点的路径为服务器上的文件路径。
-          </DialogDescription>
+          <DialogTitle>{t('execute.title')}</DialogTitle>
+          <DialogDescription>{t('execute.description')}</DialogDescription>
         </DialogHeader>
         <ScrollArea className="max-h-[50vh]">
           <div className="space-y-5 p-1 pr-3">
@@ -1183,7 +1212,7 @@ function ExecuteDialog({ open, onOpenChange, fields, submitting, onSubmit }: Exe
                     >
                       {f.isInputPath && (
                         <p className="mb-1.5 text-[10px] text-muted-foreground">
-                          输入文件路径（服务器路径，每次执行可覆盖）
+                          {t('execute.inputPathHint')}
                         </p>
                       )}
                       <ParamField
@@ -1193,7 +1222,7 @@ function ExecuteDialog({ open, onOpenChange, fields, submitting, onSubmit }: Exe
                       />
                       {empty && (
                         <p className="mt-1 text-[11px] text-status-error">
-                          必填参数，请填写后再提交
+                          {t('execute.requiredHint')}
                         </p>
                       )}
                     </div>
@@ -1202,17 +1231,17 @@ function ExecuteDialog({ open, onOpenChange, fields, submitting, onSubmit }: Exe
               </section>
             ))}
             {fields.length === 0 && (
-              <p className="text-xs text-muted-foreground">没有需要填写的参数，可直接提交执行。</p>
+              <p className="text-xs text-muted-foreground">{t('execute.noFields')}</p>
             )}
           </div>
         </ScrollArea>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={submitting}>
-            取消
+            {t('common:action.cancel')}
           </Button>
           <Button onClick={handleSubmit} disabled={submitting}>
             {submitting && <Loader2 className="animate-spin" />}
-            提交执行
+            {t('execute.submit')}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -1225,10 +1254,11 @@ function ExecuteDialog({ open, onOpenChange, fields, submitting, onSubmit }: Exe
 // ============================================================
 
 function PipelineEditor() {
+  const { t } = useTranslation('pipeline')
   const { screenToFlowPosition, fitView } = useReactFlow()
   const [nodes, setNodes, onNodesChange] = useNodesState<PipelineFlowNode>([])
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([])
-  const [name, setName] = useState('未命名管线')
+  const [name, setName] = useState(t('canvas.untitledName'))
   const [description, setDescription] = useState('')
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
   /** 窄屏（<lg）节点库抽屉开关 */
@@ -1244,7 +1274,7 @@ function PipelineEditor() {
   const [currentSource, setCurrentSource] = useState<'builtin' | 'custom' | null>(null)
   /** 上次加载 / 保存时的画布指纹，用于判定未保存更改 */
   const [baseline, setBaseline] = useState(() =>
-    canvasFingerprint([], [], { id: '', name: '未命名管线', description: '' }),
+    canvasFingerprint([], [], { id: '', name: t('canvas.untitledName'), description: '' }),
   )
   const [saveAsOpen, setSaveAsOpen] = useState(false)
 
@@ -1336,9 +1366,9 @@ function PipelineEditor() {
       }
       const node = createPipelineNode(payload, { x: target.x - 112, y: target.y - 40 })
       setNodes((nds) => [...nds, node])
-      toast.success(`已添加节点「${node.data.label}」`)
+      toast.success(t('node.addedToast', { label: node.data.label }))
     },
-    [screenToFlowPosition, setNodes],
+    [screenToFlowPosition, setNodes, t],
   )
 
   const onDrop = useCallback(
@@ -1351,10 +1381,10 @@ function PipelineEditor() {
         const position = screenToFlowPosition({ x: event.clientX, y: event.clientY })
         addNodeFromPayload(payload, position)
       } catch {
-        toast.error('无法添加节点', { description: '拖拽数据解析失败' })
+        toast.error(t('node.addFailed'), { description: t('node.dragParseFailed') })
       }
     },
-    [addNodeFromPayload, screenToFlowPosition],
+    [addNodeFromPayload, screenToFlowPosition, t],
   )
 
   /** 点击节点库项：添加到画布中央；窄屏下同时收起抽屉 */
@@ -1392,9 +1422,9 @@ function PipelineEditor() {
       setNodes((nds) => nds.filter((n) => n.id !== nodeId))
       setEdges((eds) => eds.filter((e) => e.source !== nodeId && e.target !== nodeId))
       setSelectedNodeId(null)
-      toast.success('节点已删除')
+      toast.success(t('node.deletedToast'))
     },
-    [setNodes, setEdges],
+    [setNodes, setEdges, t],
   )
 
   /**
@@ -1407,14 +1437,17 @@ function PipelineEditor() {
     async (nodeId: string) => {
       const target = nodes.find((n) => n.id === nodeId)
       const ok = await confirmDialog({
-        title: '删除节点',
-        description: `确认删除节点「${target?.data.label ?? nodeId}」？其相关连线会一并删除。`,
-        confirmLabel: '删除',
+        title: t('node.deleteTitle'),
+        description: t('node.deleteDescriptionSingle', {
+          label: target?.data.label ?? nodeId,
+        }),
+        confirmLabel: t('common:action.delete'),
+        cancelLabel: t('common:action.cancel'),
         variant: 'destructive',
       })
       if (ok) deleteNode(nodeId)
     },
-    [nodes, deleteNode],
+    [nodes, deleteNode, t],
   )
 
   // ---- WebSocket 管线进度（实时驱动节点状态） ----
@@ -1463,11 +1496,12 @@ function PipelineEditor() {
   const confirmDiscardIfDirty = useCallback(async (): Promise<boolean> => {
     if (!dirty) return true
     return confirmDialog({
-      title: '丢弃未保存更改？',
-      description: '当前画布有未保存的更改，继续将丢弃这些更改。',
-      confirmLabel: '丢弃并继续',
+      title: t('discard.title'),
+      description: t('discard.description'),
+      confirmLabel: t('discard.confirm'),
+      cancelLabel: t('common:action.cancel'),
     })
-  }, [dirty])
+  }, [dirty, t])
 
   /** 重置为空白画布（未保存到服务端状态） */
   const resetCanvas = useCallback(
@@ -1494,7 +1528,7 @@ function PipelineEditor() {
   const handleSelectPipeline = useCallback(
     async (id: string) => {
       if (!(await confirmDiscardIfDirty())) return
-      const toastId = toast.loading('加载管线中…')
+      const toastId = toast.loading(t('load.loading'))
       try {
         const spec = await api.getPipeline(id)
         const { nodes: loadedNodes, edges: loadedEdges, skippedNodes } = fromSpec(spec)
@@ -1512,63 +1546,60 @@ function PipelineEditor() {
         setSelectedNodeId(null)
         setBaseline(canvasFingerprint(loadedNodes, loadedEdges, loadedMeta))
         fitSoon()
+        const stats = t('canvas.stats', { nodes: loadedNodes.length, edges: loadedEdges.length })
         if (skippedNodes > 0) {
-          toast.success('管线已加载（部分节点不受支持已跳过）', {
-            id: toastId,
-            description: `${loadedNodes.length} 个节点 · ${loadedEdges.length} 条连接`,
-          })
+          toast.success(t('load.successSkipped'), { id: toastId, description: stats })
         } else {
-          toast.success('管线已加载', {
-            id: toastId,
-            description: `${loadedNodes.length} 个节点 · ${loadedEdges.length} 条连接`,
-          })
+          toast.success(t('load.success'), { id: toastId, description: stats })
         }
       } catch (err) {
-        toast.error('加载管线失败', { id: toastId, description: errMsg(err) })
+        toast.error(t('load.failed'), { id: toastId, description: errMsg(err) })
       }
     },
-    [confirmDiscardIfDirty, pipelines, setNodes, setEdges, fitSoon],
+    [confirmDiscardIfDirty, pipelines, setNodes, setEdges, fitSoon, t],
   )
 
   /** 新建空白管线（file_input → file_output 最小模板） */
   const handleNewBlank = useCallback(async () => {
     if (!(await confirmDiscardIfDirty())) return
     const { nodes: n, edges: e } = blankTemplate()
-    resetCanvas(n, e, '未命名管线', '')
+    resetCanvas(n, e, t('canvas.untitledName'), '')
     fitSoon()
-    toast.success('已新建空白管线', { description: '文件输入 → 文件输出 最小模板' })
-  }, [confirmDiscardIfDirty, resetCanvas, fitSoon])
+    toast.success(t('template.blankCreated'), { description: t('template.blankDescription') })
+  }, [confirmDiscardIfDirty, resetCanvas, fitSoon, t])
 
   /** 载入本地示例模板（深拷贝，避免画布编辑污染模板） */
   const handleLoadExample = useCallback(async () => {
     if (!(await confirmDiscardIfDirty())) return
-    const cloned = structuredClone(EXAMPLE)
-    resetCanvas(cloned.nodes, cloned.edges, '示例：音频转写摘要管线', '')
+    // 每次调用时构建，确保模板节点标签取当前语言的文案
+    const cloned = structuredClone(examplePipeline())
+    resetCanvas(cloned.nodes, cloned.edges, t('canvas.exampleName'), '')
     fitSoon()
-    toast.success('已载入本地示例管线', { description: '可编辑后另存为你的管线' })
-  }, [confirmDiscardIfDirty, resetCanvas, fitSoon])
+    toast.success(t('template.exampleLoaded'), { description: t('template.exampleDescription') })
+  }, [confirmDiscardIfDirty, resetCanvas, fitSoon, t])
 
   /** 删除当前服务端管线（仅 custom；builtin 不显示删除按钮） */
   const handleDeletePipeline = useCallback(async () => {
     if (!currentId || currentSource !== 'custom') return
     const ok = await confirmDialog({
-      title: '删除管线',
-      description: `确认删除管线「${name}」？此操作不可恢复。`,
-      confirmLabel: '删除',
+      title: t('deletePipeline.title'),
+      description: t('deletePipeline.description', { name }),
+      confirmLabel: t('common:action.delete'),
+      cancelLabel: t('common:action.cancel'),
       variant: 'destructive',
     })
     if (!ok) return
-    const toastId = toast.loading('删除中…')
+    const toastId = toast.loading(t('deletePipeline.deleting'))
     try {
       await api.deletePipeline(currentId)
-      toast.success('管线已删除', { id: toastId })
-      resetCanvas([], [], '未命名管线', '')
+      toast.success(t('deletePipeline.success'), { id: toastId })
+      resetCanvas([], [], t('canvas.untitledName'), '')
       refreshPipelines()
     } catch (err) {
-      toast.error('删除失败', { id: toastId, description: errMsg(err) })
+      toast.error(t('deletePipeline.failed'), { id: toastId, description: errMsg(err) })
       refreshPipelines()
     }
-  }, [currentId, currentSource, name, resetCanvas, refreshPipelines])
+  }, [currentId, currentSource, name, resetCanvas, refreshPipelines, t])
 
   // ---- 保存 ----
 
@@ -1580,25 +1611,23 @@ function PipelineEditor() {
     async (id: string, opts?: { nameOverride?: string }): Promise<boolean> => {
       const effectiveName = opts?.nameOverride ?? name
       if (nodes.some((n) => n.data.kind === 'external')) {
-        toast.error('无法保存', {
-          description: '画布包含「外部 API」节点，服务端管线契约暂不支持该类型，请移除后保存。',
-        })
+        toast.error(t('save.cannotSave'), { description: t('save.externalNotSupported') })
         return false
       }
       if (nodes.length === 0) {
-        toast.error('无法保存', { description: '画布为空，请先添加节点。' })
+        toast.error(t('save.cannotSave'), { description: t('save.emptyCanvas') })
         return false
       }
       if (!effectiveName.trim()) {
-        toast.error('无法保存', { description: '管线名称不能为空，请先填写名称。' })
+        toast.error(t('save.cannotSave'), { description: t('save.nameEmpty') })
         return false
       }
       const badModule = nodes.find(
         (n) => n.data.kind === 'module' && (!n.data.moduleId || !n.data.capabilityId),
       )
       if (badModule) {
-        toast.error('无法保存', {
-          description: `模块节点「${badModule.data.label}」缺少模块或能力信息，请重新添加该节点。`,
+        toast.error(t('save.cannotSave'), {
+          description: t('save.moduleIncomplete', { label: badModule.data.label }),
         })
         return false
       }
@@ -1607,32 +1636,35 @@ function PipelineEditor() {
         pipelines?.some((p) => p.id === id && p.source === 'builtin') === true
       if (builtinTarget) {
         const ok = await confirmDialog({
-          title: '覆盖内置管线？',
-          description: '这是内置示例管线，覆盖后不可恢复原样。',
-          confirmLabel: '覆盖',
+          title: t('save.overwriteTitle'),
+          description: t('save.overwriteDescription'),
+          confirmLabel: t('save.overwrite'),
+          cancelLabel: t('common:action.cancel'),
           variant: 'destructive',
         })
         if (!ok) return false
       }
       const spec = toSpec(nodes, edges, { id, name: effectiveName, description })
-      const toastId = toast.loading('保存中…')
+      const toastId = toast.loading(t('save.saving'))
       try {
         await api.savePipeline(id, spec)
         setCurrentId(id)
         setCurrentSource(builtinTarget ? 'builtin' : 'custom')
         setBaseline(canvasFingerprint(nodes, edges, { id, name: effectiveName, description }))
-        toast.success('管线已保存', {
+        toast.success(t('save.success'), {
           id: toastId,
-          description: `${nodes.length} 个节点 · ${edges.length} 条连接${builtinTarget ? '（已覆盖内置管线）' : ''}`,
+          description: builtinTarget
+            ? t('save.statsOverwritten', { nodes: nodes.length, edges: edges.length })
+            : t('canvas.stats', { nodes: nodes.length, edges: edges.length }),
         })
         refreshPipelines()
         return true
       } catch (err) {
-        toast.error('保存失败', { id: toastId, description: errMsg(err) })
+        toast.error(t('save.failed'), { id: toastId, description: errMsg(err) })
         return false
       }
     },
-    [nodes, edges, name, description, currentSource, pipelines, refreshPipelines],
+    [nodes, edges, name, description, currentSource, pipelines, refreshPipelines, t],
   )
 
   /** 保存：已有服务端 id → 直接保存；否则打开「另存为」对话框 */
@@ -1703,40 +1735,47 @@ function PipelineEditor() {
       requestAnimationFrame(() => {
         void fitView({ padding: 0.25, duration: 300 })
       })
-      toast.success('管线已加载', { description: `${loadedNodes.length} 个节点` })
+      toast.success(t('load.success'), {
+        description: t('load.nodeCount', { count: loadedNodes.length }),
+      })
     },
-    [setNodes, setEdges, fitView],
+    [setNodes, setEdges, fitView, t],
   )
 
   // ---- 校验与执行 ----
 
   const validatePipeline = useCallback((): string[] => {
-    if (nodes.length === 0) return ['管线为空，请先从左侧节点库添加节点']
+    if (nodes.length === 0) return [t('validate.emptyCanvas')]
     const issues: string[] = []
     for (const n of nodes) {
       const { inputs, outputs } = getNodePorts(n.data)
       if (inputs.length > 0 && !edges.some((e) => e.target === n.id)) {
-        issues.push(`「${n.data.label}」缺少输入连接`)
+        issues.push(t('validate.missingInput', { label: n.data.label }))
       }
       if (outputs.length > 0 && !edges.some((e) => e.source === n.id)) {
-        issues.push(`「${n.data.label}」缺少输出连接`)
+        issues.push(t('validate.missingOutput', { label: n.data.label }))
       }
     }
     return issues
-  }, [nodes, edges])
+  }, [nodes, edges, t])
 
   const handleValidate = useCallback(() => {
     const issues = validatePipeline()
     if (issues.length === 0) {
-      toast.success('验证通过', {
-        description: `${nodes.length} 个节点 · ${edges.length} 条连接，未发现问题`,
+      toast.success(t('validate.passed'), {
+        description: t('validate.passedDescription', {
+          nodes: nodes.length,
+          edges: edges.length,
+        }),
       })
     } else {
-      toast.error(`验证发现 ${issues.length} 个问题`, {
-        description: issues.slice(0, 4).join('；') + (issues.length > 4 ? '…' : ''),
+      toast.error(t('validate.issueCount', { count: issues.length }), {
+        description:
+          issues.slice(0, 4).join(t('validate.issueSeparator')) +
+          (issues.length > 4 ? '…' : ''),
       })
     }
-  }, [validatePipeline, nodes.length, edges.length])
+  }, [validatePipeline, nodes.length, edges.length, t])
 
   /**
    * 执行前置校验：连线完整性 + 必填参数校验（P1-21）+ file_input 存在性。
@@ -1744,35 +1783,35 @@ function PipelineEditor() {
    */
   const handleExecute = useCallback(() => {
     if (executing) {
-      toast.info('管线正在执行中', { description: '请等待当前执行结束后再提交。' })
+      toast.info(t('exec.alreadyRunning'), { description: t('exec.waitFinish') })
       return
     }
     const issues = validatePipeline()
     if (issues.length > 0) {
-      toast.error('管线验证未通过', {
-        description: issues.slice(0, 4).join('；') + (issues.length > 4 ? '…' : ''),
+      toast.error(t('exec.validationFailed'), {
+        description:
+          issues.slice(0, 4).join(t('validate.issueSeparator')) +
+          (issues.length > 4 ? '…' : ''),
       })
       return
     }
     if (nodes.some((n) => n.data.kind === 'external')) {
-      toast.error('无法执行', {
-        description: '画布包含「外部 API」节点，服务端执行暂不支持该类型，请先移除。',
-      })
+      toast.error(t('exec.cannotExecute'), { description: t('exec.externalNotSupported') })
       return
     }
     if (!nodes.some((n) => n.data.kind === 'builtin' && n.data.builtin === 'file_input')) {
-      toast.error('管线验证未通过', { description: '管线必须包含至少一个「文件输入」节点。' })
+      toast.error(t('exec.validationFailed'), { description: t('exec.fileInputRequired') })
       return
     }
     const missing = collectMissingRequired(nodes)
     if (missing.length > 0) {
-      toast.info(`有 ${missing.length} 个必填参数为空`, {
-        description: '请在执行对话框中补齐后再提交。',
+      toast.info(t('exec.missingParamsTitle', { count: missing.length }), {
+        description: t('exec.missingParamsHint'),
       })
     }
     setExecFields(buildExecFields(nodes))
     setExecDialogOpen(true)
-  }, [executing, validatePipeline, nodes])
+  }, [executing, validatePipeline, nodes, t])
 
   /** 执行对话框提交：合并参数 → 清空旧状态 → executePipeline → 任务链接 */
   const handleSubmitExecution = useCallback(
@@ -1831,25 +1870,25 @@ function PipelineEditor() {
         executingRef.current = true
         setExecuting(true)
         setExecDialogOpen(false)
-        toast.success('管线已提交执行', {
-          description: `任务 ID：${resp.task_id}`,
+        toast.success(t('exec.submitted'), {
+          description: t('exec.taskId', { taskId: resp.task_id }),
           duration: 8000,
           action: {
             label: (
               <Link to="/tasks" className="text-xs font-medium underline-offset-4 hover:underline">
-                任务中心
+                {t('exec.taskCenter')}
               </Link>
             ),
             onClick: () => {},
           },
         })
       } catch (err) {
-        toast.error('提交执行失败', { description: errMsg(err) })
+        toast.error(t('exec.submitFailed'), { description: errMsg(err) })
       } finally {
         setExecSubmitting(false)
       }
     },
-    [execFields, nodes, edges, currentId, dirty, name, description, setNodes],
+    [execFields, nodes, edges, currentId, dirty, name, description, setNodes, t],
   )
 
   // ---- 渲染 ----
@@ -1921,12 +1960,13 @@ function PipelineEditor() {
               if (doomedNodes.length === 0) return true
               const subject =
                 doomedNodes.length === 1
-                  ? `节点「${doomedNodes[0].data.label}」`
-                  : `${doomedNodes.length} 个节点`
+                  ? t('node.deleteSubjectNode', { label: doomedNodes[0].data.label })
+                  : t('node.deleteSubjectCount', { count: doomedNodes.length })
               return confirmDialog({
-                title: '删除节点',
-                description: `确认删除${subject}？相关连线会一并删除。`,
-                confirmLabel: '删除',
+                title: t('node.deleteTitle'),
+                description: t('node.deleteDescription', { subject }),
+                confirmLabel: t('common:action.delete'),
+                cancelLabel: t('common:action.cancel'),
                 variant: 'destructive',
               })
             }}
@@ -1946,7 +1986,7 @@ function PipelineEditor() {
                     className="flex items-center gap-1.5 text-[11px] text-muted-foreground"
                   >
                     <span className={cn('h-2 w-2 rounded-full', meta.dot)} />
-                    {meta.label}
+                    {t(`nodeStatus.${key}`)}
                   </span>
                 ))}
               </div>
@@ -1958,10 +1998,8 @@ function PipelineEditor() {
               <span className="flex h-14 w-14 items-center justify-center rounded-2xl border border-dashed border-border bg-card/60">
                 <Waypoints className="h-6 w-6 text-muted-foreground" />
               </span>
-              <p className="text-sm font-medium">画布还是空的</p>
-              <p className="text-xs text-muted-foreground">
-                从左侧节点库点击或拖入模块 / 内置节点，或从上方管线库加载已保存的管线
-              </p>
+              <p className="text-sm font-medium">{t('canvas.emptyTitle')}</p>
+              <p className="text-xs text-muted-foreground">{t('canvas.emptyHint')}</p>
               <Button
                 variant="outline"
                 size="sm"
@@ -1969,7 +2007,7 @@ function PipelineEditor() {
                 onClick={() => void handleLoadExample()}
               >
                 <Sparkles className="h-3.5 w-3.5" />
-                载入本地示例管线
+                {t('canvas.loadExample')}
               </Button>
             </div>
           )}

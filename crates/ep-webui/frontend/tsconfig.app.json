@@ -6,11 +6,13 @@
     "module": "esnext",
     "types": ["vite/client"],
     "allowArbitraryExtensions": true,
+    "resolveJsonModule": true,
     "skipLibCheck": true,
 
-    /* Path alias */
+    /* Path alias（@i18n 指向仓库级 i18n 目录，与 vite.config.ts 保持一致） */
     "paths": {
-      "@/*": ["./src/*"]
+      "@/*": ["./src/*"],
+      "@i18n/*": ["../../../i18n/*"]
     },
 
     /* Bundler mode */

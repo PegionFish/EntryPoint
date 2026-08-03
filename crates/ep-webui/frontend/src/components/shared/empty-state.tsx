@@ -1,5 +1,6 @@
 import type { LucideIcon } from 'lucide-react'
 import { Database, GitBranch, ListTodo, Puzzle } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
@@ -66,11 +67,12 @@ export interface EmptyStatePresetProps {
 
 /** 模块列表为空 */
 export function NoModulesState({ description, action, className }: EmptyStatePresetProps) {
+  const { t } = useTranslation('components')
   return (
     <EmptyState
       icon={Puzzle}
-      title="暂无模块"
-      description={description ?? '尚未发现可用模块，请检查模块目录配置后刷新'}
+      title={t('emptyState.noModules.title')}
+      description={description ?? t('emptyState.noModules.description')}
       action={action}
       className={className}
     />
@@ -79,11 +81,12 @@ export function NoModulesState({ description, action, className }: EmptyStatePre
 
 /** 任务队列为空 */
 export function NoTasksState({ description, action, className }: EmptyStatePresetProps) {
+  const { t } = useTranslation('components')
   return (
     <EmptyState
       icon={ListTodo}
-      title="暂无任务"
-      description={description ?? '任务队列为空，提交新任务后将在此显示执行进度'}
+      title={t('emptyState.noTasks.title')}
+      description={description ?? t('emptyState.noTasks.description')}
       action={action}
       className={className}
     />
@@ -92,11 +95,12 @@ export function NoTasksState({ description, action, className }: EmptyStatePrese
 
 /** 模型列表为空 */
 export function NoModelsState({ description, action, className }: EmptyStatePresetProps) {
+  const { t } = useTranslation('components')
   return (
     <EmptyState
       icon={Database}
-      title="暂无模型"
-      description={description ?? '尚未下载或导入模型，前往模型页面添加所需模型'}
+      title={t('emptyState.noModels.title')}
+      description={description ?? t('emptyState.noModels.description')}
       action={action}
       className={className}
     />
@@ -105,11 +109,12 @@ export function NoModelsState({ description, action, className }: EmptyStatePres
 
 /** 管线列表为空 */
 export function NoPipelinesState({ description, action, className }: EmptyStatePresetProps) {
+  const { t } = useTranslation('components')
   return (
     <EmptyState
       icon={GitBranch}
-      title="暂无管线"
-      description={description ?? '尚未创建处理管线，尝试编排你的第一条流水线'}
+      title={t('emptyState.noPipelines.title')}
+      description={description ?? t('emptyState.noPipelines.description')}
       action={action}
       className={className}
     />

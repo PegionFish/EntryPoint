@@ -1,4 +1,5 @@
 import { Activity, Cpu, MemoryStick, Thermometer, Zap } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import type { DeviceResponse } from '@/api/types'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -62,6 +63,7 @@ interface DeviceCardProps {
 
 /** 计算设备卡片：名称、后端徽章、内存进度条、利用率、温度 */
 export function DeviceCard({ device }: DeviceCardProps) {
+  const { t } = useTranslation('components')
   const tone = backendTone(device.backend)
   const percent =
     device.used_memory_mb != null &&
@@ -102,7 +104,7 @@ export function DeviceCard({ device }: DeviceCardProps) {
           <div className="flex items-baseline justify-between gap-2">
             <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
               <MemoryStick className="size-3.5" />
-              显存
+              {t('deviceCard.memory')}
             </span>
             {percent != null && level ? (
               <span
@@ -114,7 +116,9 @@ export function DeviceCard({ device }: DeviceCardProps) {
                 {percent.toFixed(1)}%
               </span>
             ) : (
-              <span className="text-xs text-muted-foreground">不可用</span>
+              <span className="text-xs text-muted-foreground">
+                {t('deviceCard.unavailable')}
+              </span>
             )}
           </div>
           <Progress
@@ -132,7 +136,7 @@ export function DeviceCard({ device }: DeviceCardProps) {
             <Activity className="size-3.5 shrink-0 text-muted-foreground" />
             <div className="min-w-0">
               <p className="text-[10px] leading-none text-muted-foreground">
-                利用率
+                {t('deviceCard.utilization')}
               </p>
               <p className="mt-1 font-mono text-sm font-semibold leading-none">
                 {device.utilization != null ? `${device.utilization}%` : '—'}
@@ -143,7 +147,7 @@ export function DeviceCard({ device }: DeviceCardProps) {
             <Thermometer className="size-3.5 shrink-0 text-muted-foreground" />
             <div className="min-w-0">
               <p className="text-[10px] leading-none text-muted-foreground">
-                温度
+                {t('deviceCard.temperature')}
               </p>
               <p
                 className={cn(

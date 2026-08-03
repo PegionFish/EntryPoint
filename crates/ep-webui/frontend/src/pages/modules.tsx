@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import {
   Activity,
@@ -69,6 +70,7 @@ function SummaryStat({ icon: Icon, label, value, tone }: SummaryStatProps) {
 }
 
 export function ModulesPage() {
+  const { t } = useTranslation('modules')
   const { modules, statusMap, loading, error, refresh } = useModules()
   const [spinning, setSpinning] = useState(false)
   /** 待确认停止的模块（非 null 时显示确认对话框） */
@@ -91,10 +93,10 @@ export function ModulesPage() {
     try {
       const res = await api.startModule(m.id)
       if (res.error) throw new Error(res.error)
-      toast.success(`「${m.name}」已开始启动`)
+      toast.success(t('toast.startStarted', { name: m.name }))
       await refresh()
     } catch (e) {
-      toast.error('启动失败', {
+      toast.error(t('toast.startFailed'), {
         description: e instanceof Error ? e.message : String(e),
       })
     } finally {
@@ -108,10 +110,10 @@ export function ModulesPage() {
     try {
       const res = await api.stopModule(stopTarget.id)
       if (res.error) throw new Error(res.error)
-      toast.success(`「${stopTarget.name}」已停止`)
+      toast.success(t('toast.stopSucceeded', { name: stopTarget.name }))
       await refresh()
     } catch (e) {
-      toast.error('停止失败', {
+      toast.error(t('toast.stopFailed'), {
         description: e instanceof Error ? e.message : String(e),
       })
       throw e
@@ -155,8 +157,8 @@ export function ModulesPage() {
 
   return (
     <PageContainer
-      title="模块管理"
-      description="管理已安装模块的启动、停止与日志"
+      title={t('page.title')}
+      description={t('page.description')}
       actions={
         <Button
           variant="outline"
@@ -165,7 +167,7 @@ export function ModulesPage() {
           disabled={spinning || loading}
         >
           <RefreshCw className={cn(spinning && 'animate-spin')} />
-          刷新
+          {t('common:action.refresh')}
         </Button>
       }
     >
@@ -184,7 +186,7 @@ export function ModulesPage() {
       ) : error && modules.length === 0 ? (
         <div className="flex flex-col items-center justify-center rounded-lg border border-dashed py-16 text-center">
           <CircleX className="size-8 text-status-error" />
-          <p className="mt-3 text-sm font-medium">模块列表加载失败</p>
+          <p className="mt-3 text-sm font-medium">{t('page.loadFailed')}</p>
           <p className="mt-1 max-w-sm break-all px-6 text-xs text-muted-foreground">
             {error}
           </p>
@@ -195,15 +197,18 @@ export function ModulesPage() {
             onClick={() => void handleRefresh()}
           >
             <RefreshCw />
-            重试
+            {t('common:action.retry')}
           </Button>
         </div>
       ) : modules.length === 0 ? (
         /* 复用 shared/empty-state 预设组件，替代手写空态 */
         <div className="rounded-lg border border-dashed">
           <NoModulesState
-            description="暂无已安装模块。将模块放入 modules 目录后，点击右上角「刷新」重新扫描"
-            action={{ label: '刷新', onClick: () => void handleRefresh() }}
+            description={t('page.emptyHint')}
+            action={{
+              label: t('common:action.refresh'),
+              onClick: () => void handleRefresh(),
+            }}
           />
         </div>
       ) : (
@@ -212,24 +217,28 @@ export function ModulesPage() {
           <div
             className="grid animate-[ep-fade-up_0.35s_ease_both] grid-cols-2 gap-px overflow-hidden rounded-lg border border-border bg-border lg:grid-cols-4"
             role="status"
-            aria-label="模块状态汇总"
+            aria-label={t('summary.ariaLabel')}
           >
-            <SummaryStat icon={Puzzle} label="模块总数" value={modules.length} />
+            <SummaryStat
+              icon={Puzzle}
+              label={t('summary.total')}
+              value={modules.length}
+            />
             <SummaryStat
               icon={Activity}
-              label="运行中"
+              label={t('common:status.running')}
               value={counts.running}
               tone="text-status-running"
             />
             <SummaryStat
               icon={CircleStop}
-              label="已停止"
+              label={t('common:status.stopped')}
               value={counts.stopped}
               tone="text-muted-foreground"
             />
             <SummaryStat
               icon={CircleAlert}
-              label="错误"
+              label={t('common:status.error')}
               value={counts.errored}
               tone="text-status-error"
             />
@@ -239,7 +248,7 @@ export function ModulesPage() {
           {error && (
             <p className="flex items-center gap-2 rounded-md border border-status-error/30 bg-status-error/10 px-3 py-2 text-xs text-status-error">
               <CircleAlert className="size-3.5 shrink-0" />
-              刷新失败：{error}（当前展示最近一次成功的数据）
+              {t('poll.failed', { error })}
             </p>
           )}
 
@@ -263,7 +272,7 @@ export function ModulesPage() {
                     />
                     {categoryLabel(group.category)}
                     <span className="text-xs font-normal text-muted-foreground">
-                      {group.items.length} 个模块
+                      {t('group.moduleCount', { count: group.items.length })}
                     </span>
                   </h2>
                   <span className="font-mono text-xs text-muted-foreground">
@@ -274,7 +283,7 @@ export function ModulesPage() {
                     >
                       {runningInGroup}
                     </span>
-                    /{group.items.length} 运行中
+                    /{group.items.length} {t('group.runningLabel')}
                   </span>
                 </div>
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
@@ -302,9 +311,9 @@ export function ModulesPage() {
         onOpenChange={(open) => {
           if (!open) setStopTarget(null)
         }}
-        title={`停止「${stopTarget?.name ?? ''}」`}
-        description="停止后该模块的服务进程将被终止，正在处理的请求会中断，确定要停止吗？"
-        confirmLabel="停止模块"
+        title={t('stopDialog.title', { name: stopTarget?.name ?? '' })}
+        description={t('stopDialog.description')}
+        confirmLabel={t('stopDialog.confirm')}
         variant="destructive"
         onConfirm={() => handleStopConfirmed()}
       />

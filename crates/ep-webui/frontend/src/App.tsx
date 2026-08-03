@@ -1,10 +1,13 @@
 import { useEffect, useState } from 'react'
 import { Route, Routes } from 'react-router-dom'
+import '@/i18n'
+import { normalizeLanguage, setAppLanguage } from '@/i18n'
 import { Header } from '@/components/layout/header'
 import { MobileNav } from '@/components/layout/mobile-nav'
 import { Sidebar } from '@/components/layout/sidebar'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { Toaster } from '@/components/ui/sonner'
+import { api } from '@/api/client'
 import { wsManager } from '@/api/ws'
 import { DashboardPage } from '@/pages/dashboard'
 import { ModulesPage } from '@/pages/modules'
@@ -23,6 +26,17 @@ export default function App() {
   useEffect(() => {
     wsManager.connect()
     return () => wsManager.disconnect()
+  }, [])
+
+  // 挂载时以服务器 config.general.language 为全局真源校准界面语言
+  // （i18n 初始化时已用 localStorage 缓存防首屏闪烁，这里纠正偏差并回写缓存）
+  useEffect(() => {
+    api
+      .getConfig()
+      .then((cfg) => setAppLanguage(normalizeLanguage(cfg.general.language)))
+      .catch(() => {
+        // 服务器暂不可达时保留本地缓存语言，下次挂载再校准
+      })
   }, [])
 
   return (

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { DragEvent, KeyboardEvent } from 'react'
 import { CircleAlert, Globe, GripVertical, RefreshCw, Search, Wrench, X } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import { api } from '@/api/client'
 import type { ModuleResponse } from '@/api/types'
 import { categoryLabel, statusMeta } from '@/lib/constants'
@@ -35,6 +36,7 @@ function PaletteItem({
   payload,
   onAdd,
 }: PaletteItemProps) {
+  const { t } = useTranslation('components')
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key === 'Enter' || event.key === ' ') {
       event.preventDefault()
@@ -46,11 +48,11 @@ function PaletteItem({
       draggable
       role="button"
       tabIndex={0}
-      aria-label={`添加节点：${title}`}
+      aria-label={t('pipelineSidebar.addNodeAria', { title })}
       onDragStart={(e) => startDrag(e, payload)}
       onClick={() => onAdd(payload)}
       onKeyDown={handleKeyDown}
-      title="点击或拖拽到画布以添加节点"
+      title={t('pipelineSidebar.addHint')}
       className="group flex cursor-grab items-center gap-2.5 rounded-md border border-transparent px-2 py-1.5 transition-all duration-150 hover:border-border hover:bg-accent active:cursor-grabbing active:scale-[0.98]"
     >
       <span
@@ -98,6 +100,8 @@ interface PipelineSidebarProps {
 
 /** 管线节点库：内置节点 + 按分类分组的模块（可点击 / 拖入画布） */
 export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarProps) {
+  // i18n.language 进入过滤 memo 依赖：语言切换后按新语言文案重新匹配
+  const { t, i18n } = useTranslation('components')
   const [modules, setModules] = useState<ModuleResponse[] | null>(null)
   const [failed, setFailed] = useState(false)
   const [filter, setFilter] = useState('')
@@ -125,7 +129,7 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
           b.label.toLowerCase().includes(query) ||
           b.description.toLowerCase().includes(query),
       ),
-    [query],
+    [query, i18n.language],
   )
 
   const groupedModules = useMemo(() => {
@@ -145,10 +149,16 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
       groups.set(m.category, list)
     }
     return [...groups.entries()]
-  }, [modules, query])
+  }, [modules, query, i18n.language])
 
+  // 「外部 API」项的显隐：命中翻译后的标题 / 描述，或语言无关的检索词
+  const externalTitle = t('pipeline.external.title')
+  const externalSubtitle = t('pipeline.external.description')
   const externalVisible =
-    !query || '外部 api external http 接口'.includes(query) || 'api'.includes(query)
+    !query ||
+    externalTitle.toLowerCase().includes(query) ||
+    externalSubtitle.toLowerCase().includes(query) ||
+    'api external http'.includes(query)
 
   return (
     <aside
@@ -156,14 +166,14 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
     >
       <div className="shrink-0 space-y-2.5 border-b border-border p-3">
         <div className="flex items-center justify-between">
-          <span className="text-sm font-semibold">节点库</span>
+          <span className="text-sm font-semibold">{t('pipelineSidebar.title')}</span>
           <div className="flex items-center gap-1">
             <Button
               variant="ghost"
               size="icon-xs"
               onClick={load}
-              title="刷新模块列表"
-              aria-label="刷新模块列表"
+              title={t('pipelineSidebar.refreshModules')}
+              aria-label={t('pipelineSidebar.refreshModules')}
             >
               <RefreshCw
                 className={cn('h-3 w-3', modules === null && !failed && 'animate-spin')}
@@ -174,8 +184,8 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
                 variant="ghost"
                 size="icon-xs"
                 onClick={onClose}
-                title="关闭节点库"
-                aria-label="关闭节点库"
+                title={t('pipelineSidebar.closeLibrary')}
+                aria-label={t('pipelineSidebar.closeLibrary')}
               >
                 <X className="h-3 w-3" />
               </Button>
@@ -187,8 +197,8 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
           <input
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
-            placeholder="搜索节点…"
-            aria-label="搜索节点"
+            placeholder={t('pipelineSidebar.searchPlaceholder')}
+            aria-label={t('pipelineSidebar.searchLabel')}
             className="h-8 w-full rounded-md border border-input bg-transparent pl-8 pr-2 text-xs outline-none transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
           />
         </div>
@@ -196,7 +206,7 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
 
       <ScrollArea className="flex-1">
         <div className="p-2 pb-6">
-          <SectionTitle>内置节点</SectionTitle>
+          <SectionTitle>{t('pipelineSidebar.builtinSection')}</SectionTitle>
           <div className="space-y-0.5">
             {builtinItems.map((b) => (
               <PaletteItem
@@ -212,8 +222,8 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
             {externalVisible && (
               <PaletteItem
                 icon={<Globe className="h-4 w-4" />}
-                title="外部 API"
-                subtitle="调用外部 HTTP 接口"
+                title={externalTitle}
+                subtitle={externalSubtitle}
                 accent="bg-node-external/15 text-node-external"
                 payload={{ nodeType: 'external' }}
                 onAdd={onAdd}
@@ -221,7 +231,7 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
             )}
           </div>
 
-          <SectionTitle count={modules?.length}>模块</SectionTitle>
+          <SectionTitle count={modules?.length}>{t('common:label.module')}</SectionTitle>
           {modules === null && !failed && (
             <div className="space-y-1.5 px-2 py-1">
               {Array.from({ length: 4 }).map((_, i) => (
@@ -239,9 +249,11 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
           {failed && (
             <div className="mx-1 flex flex-col items-center gap-2 rounded-md border border-dashed border-border px-3 py-5 text-center">
               <CircleAlert className="h-5 w-5 text-status-error" />
-              <p className="text-xs text-muted-foreground">模块列表加载失败</p>
+              <p className="text-xs text-muted-foreground">
+                {t('pipelineSidebar.loadFailed')}
+              </p>
               <Button variant="outline" size="xs" onClick={load}>
-                重试
+                {t('common:action.retry')}
               </Button>
             </div>
           )}
@@ -250,7 +262,9 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
             <div className="flex flex-col items-center gap-1.5 px-3 py-5 text-center">
               <Wrench className="h-4 w-4 text-muted-foreground" />
               <p className="text-xs text-muted-foreground">
-                {query ? '没有匹配的节点' : '暂无已安装模块'}
+                {query
+                  ? t('pipelineSidebar.noMatches')
+                  : t('pipelineSidebar.noModules')}
               </p>
             </div>
           )}
@@ -274,7 +288,7 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
                       accent={visual.accent}
                       trailing={
                         <span
-                          title={`模块状态：${st.label}`}
+                          title={t('pipelineSidebar.moduleStatusTitle', { status: st.label })}
                           className={cn('h-1.5 w-1.5 shrink-0 rounded-full', st.dot)}
                         />
                       }
@@ -296,7 +310,7 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
       </ScrollArea>
 
       <div className="shrink-0 border-t border-border px-3 py-2.5 text-[11px] text-muted-foreground">
-        点击或拖拽节点到画布以添加
+        {t('pipelineSidebar.footerHint')}
       </div>
     </aside>
   )

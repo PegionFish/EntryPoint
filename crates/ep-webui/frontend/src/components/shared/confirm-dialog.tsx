@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { Loader2, TriangleAlert } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 
 import { Button } from '@/components/ui/button'
 import {
@@ -38,13 +39,17 @@ export function ConfirmDialog({
   onOpenChange,
   title,
   description,
-  confirmLabel = '确认',
-  cancelLabel = '取消',
+  confirmLabel,
+  cancelLabel,
   variant = 'default',
   onConfirm,
 }: ConfirmDialogProps) {
+  const { t } = useTranslation('components')
   const [pending, setPending] = useState(false)
   const destructive = variant === 'destructive'
+  // 调用方可覆盖按钮文案，缺省复用 common 命名空间
+  const finalConfirmLabel = confirmLabel ?? t('common:action.confirm')
+  const finalCancelLabel = cancelLabel ?? t('common:action.cancel')
 
   // 异步操作进行中时拦截关闭（ESC / 点击遮罩 / 右上角关闭）
   const handleOpenChange = (next: boolean) => {
@@ -96,7 +101,7 @@ export function ConfirmDialog({
             disabled={pending}
             autoFocus={destructive}
           >
-            {cancelLabel}
+            {finalCancelLabel}
           </Button>
           <Button
             variant={destructive ? 'destructive' : 'default'}
@@ -104,7 +109,7 @@ export function ConfirmDialog({
             disabled={pending}
           >
             {pending && <Loader2 className="animate-spin" />}
-            {confirmLabel}
+            {finalConfirmLabel}
           </Button>
         </DialogFooter>
       </DialogContent>

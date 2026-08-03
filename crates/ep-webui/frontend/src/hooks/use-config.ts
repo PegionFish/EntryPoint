@@ -12,6 +12,8 @@ export interface UseConfigResult {
   setConfig: (updater: ConfigUpdater) => void
   /** 保存配置到服务端（PUT /api/config），成功返回 true */
   save: () => Promise<boolean>
+  /** 立即持久化单项改动（不等保存按钮），成功返回 true */
+  persistPartial: (apply: (serverLatest: AppConfig) => AppConfig) => Promise<boolean>
   /** 重新从服务端拉取配置（丢弃未保存的本地修改） */
   reload: () => Promise<void>
   /** 首次加载中 */
@@ -82,5 +84,46 @@ export function useConfig(): UseConfigResult {
     }
   }, [config])
 
-  return { config, setConfig, save, reload, loading, saving, error, dirty }
+  /**
+   * 立即持久化单项改动（如语言切换），不经过草稿保存按钮：
+   * 以服务器最新配置为 PUT 基线，仅应用 `apply` 描述的改动，
+   * 避免把本地其他未保存的草稿改动一起提交。
+   * 成功后同步本地草稿与已保存快照中的对应字段，脏检查不受影响。
+   */
+  const persistPartial = useCallback(
+    async (apply: (serverLatest: AppConfig) => AppConfig): Promise<boolean> => {
+      setSaving(true)
+      setError(null)
+      try {
+        const baseline = await api.getConfig()
+        const saved = await api.putConfig(apply(baseline))
+        // 快照更新为「原快照 + 同一改动」：只冲抵本次改动，保留其他草稿差异的脏状态
+        // （极端情况下快照为空时，退化为服务端返回结果）
+        savedRef.current = savedRef.current
+          ? JSON.stringify(apply(JSON.parse(savedRef.current) as AppConfig))
+          : JSON.stringify(saved)
+        // 将同一改动应用到本地草稿（幂等：调用方通常已乐观更新）
+        setConfigState((prev) => (prev ? apply(prev) : prev))
+        return true
+      } catch (e) {
+        setError(toMessage(e))
+        return false
+      } finally {
+        setSaving(false)
+      }
+    },
+    [],
+  )
+
+  return {
+    config,
+    setConfig,
+    save,
+    persistPartial,
+    reload,
+    loading,
+    saving,
+    error,
+    dirty,
+  }
 }

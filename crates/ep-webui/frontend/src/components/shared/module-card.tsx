@@ -1,5 +1,6 @@
 import { Link, useNavigate } from 'react-router-dom'
 import { ChevronRight, LoaderCircle, Play, Square, TriangleAlert } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import { Badge } from '@/components/ui/badge'
 import { categoryLabel, statusMeta } from '@/lib/constants'
 import { cn } from '@/lib/utils'
@@ -28,6 +29,7 @@ export function ModuleCard({
   starting,
   onStop,
 }: ModuleCardProps) {
+  const { t } = useTranslation('components')
   const navigate = useNavigate()
   const raw = status ?? module.service_status ?? ''
   const meta = statusMeta(raw)
@@ -72,8 +74,8 @@ export function ModuleCard({
           {onStart && key === 'stopped' && (
             <button
               type="button"
-              aria-label={`启动「${module.name}」`}
-              title={`启动「${module.name}」`}
+              aria-label={t('moduleCard.start', { name: module.name })}
+              title={t('moduleCard.start', { name: module.name })}
               disabled={starting}
               onClick={(e) => {
                 e.stopPropagation()
@@ -99,8 +101,8 @@ export function ModuleCard({
           {onStop && (key === 'running' || meta.transitional) && (
             <button
               type="button"
-              aria-label={`停止「${module.name}」`}
-              title={`停止「${module.name}」`}
+              aria-label={t('moduleCard.stop', { name: module.name })}
+              title={t('moduleCard.stop', { name: module.name })}
               onClick={(e) => {
                 e.stopPropagation()
                 onStop()
@@ -155,20 +157,20 @@ export function ModuleCard({
         >
           <span className="flex min-w-0 items-center gap-1.5 text-xs text-status-preparing">
             <TriangleAlert className="size-3.5 shrink-0" aria-hidden />
-            缺少模型或依赖
+            {t('moduleCard.missingDeps')}
           </span>
           <span className="flex shrink-0 items-center gap-2.5 text-xs font-medium">
             <Link
               to="/models"
               className="rounded-sm text-status-preparing underline-offset-2 transition-colors hover:text-status-preparing/80 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
             >
-              模型管理
+              {t('moduleCard.manageModels')}
             </Link>
             <Link
               to="/"
               className="rounded-sm text-status-preparing underline-offset-2 transition-colors hover:text-status-preparing/80 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
             >
-              依赖报告
+              {t('moduleCard.dependencyReport')}
             </Link>
           </span>
         </div>
