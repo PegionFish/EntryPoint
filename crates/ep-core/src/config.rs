@@ -40,6 +40,17 @@ pub fn resolve_root() -> PathBuf {
                 }
             }
         }
+
+        // macOS .app 布局: EntryPoint.app/Contents/MacOS/entrypoint → root = Contents/Resources
+        if let Some(bin_dir) = exe.parent() {
+            if let Some(contents_dir) = bin_dir.parent() {
+                let resources = contents_dir.join("Resources");
+                if resources.join("config").is_dir() && resources.join("modules").is_dir() {
+                    info!(root = %resources.display(), "resolved root from macOS app bundle");
+                    return resources;
+                }
+            }
+        }
     }
 
     // 3. 当前工作目录
