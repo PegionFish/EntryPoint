@@ -6,7 +6,7 @@ pub mod dag;
 pub mod executor;
 pub mod runner;
 
-pub use dag::{Edge, NodeKind, Pipeline, PipelineNode, ValidationError};
+pub use dag::{Edge, NodeKind, Pipeline, PipelineNode, PortType, ValidationError};
 pub use executor::{ModuleCallError, NodeState, PipelineTask};
 pub use runner::{NodeDetail, PipelineRunnerImpl, TaskDetail, TaskSummary};
 
