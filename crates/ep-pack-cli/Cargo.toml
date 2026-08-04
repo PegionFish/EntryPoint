@@ -1,0 +1,26 @@
+[package]
+name = "ep-pack-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "EntryPoint 整合包作者离线命令行工具（ep-pack new/validate/build/import/info/export）"
+
+# §4.7：crate 名 ep-pack-cli，二进制名 `ep-pack`（`ep-pack new / validate / ...`）
+[[bin]]
+name = "ep-pack"
+path = "src/main.rs"
+
+[dependencies]
+# SDK 库（§4.7：ep-daemon 与 CLI 共用）
+ep-pack.workspace = true
+# 模块清单解析（import/export 的 resolve 回调读 modules/*/module.toml）
+# 与设备检测（import 适配报告输入，§4.6）
+ep-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+# info 直接流式读 `.epzip`（不做全量解包）；依赖写法与 ep-pack 保持一致
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# info 的 CHECKSUMS 状态核对（流式 sha256）
+sha2 = "0.11"
+hex = "0.4"
