@@ -395,6 +395,9 @@ async fn handle_upload(
         revision: String::new(),
         downloaded_at: chrono::Utc::now().to_rfc3339(),
         total_size_bytes: total,
+        qualified_id: None,
+        tags: vec![],
+        pack_id: None,
     };
     if let Err(e) = mgr.write_meta(&decl.target_dir, &meta) {
         warn!(error = %e, "failed to write model meta after upload (non-fatal)");
