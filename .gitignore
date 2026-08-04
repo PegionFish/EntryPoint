@@ -17,12 +17,11 @@ node_modules/
 Thumbs.db
 desktop.ini
 
-# Runtime
+# Runtime（自动生成：venvs/、cuda-libs/、.uv-cache/ 等，不入 git）
 workspace/
 logs/
 *.log
-runtime/bin/
-runtime/ffmpeg.zip
+runtime/
 
 # Fallback binaries (not in git/release)
 modules/test-ffmpeg/

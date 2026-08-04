@@ -288,6 +288,24 @@
 
 ---
 
+## 整合包 SDK + 统一页 + 依赖栈统一 — 规划设计（2026-08-04）
+
+### 产出（仅规划，未动代码）
+- `reports/feature_audit_report.md` — 8 个并行侦察/审计代理的功能完成度审计（P0×6 / P1×13 / P2×18 + 死代码清单）
+- `docs/PACK_UNIFY_PLAN.md` v2 — 设计方案 + 多代理执行计划（27 Agent / 6 波次 / 峰值并行 8），用户已确认全部 6 个决策点
+
+### 范围
+依赖栈统一（UV_CACHE_DIR + constraints + 硬链接去重 + cuda-libs 注入）、整合包 SDK（ep-pack crate + CLI）、模块/模型统一页 + 直跑 + tag + 变体单槽位 + 全限定 ID、管线修复与增强（VRAM 账本 / 设备绑定 / 导入导出 / OpenAI 兼容 LLM 节点 / 多管线并发）、ROCm/OpenVINO/DirectML 检测器、审计缺口全补。
+
+### 执行环境
+Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平台；执行时按 PACK_UNIFY_PLAN.md §9 规则与 §10 波次矩阵。
+
+### 同期环境修复（本地，不入 git）
+- 从 /server/samba/Files/AI 核对/导入 5 模块模型；faster-whisper GPU 推理修复（补 libcublas.so.12 → runtime/cuda-libs，管线 80s→15s）
+- .gitignore 修正：runtime/ 整目录忽略（原仅 runtime/bin/，venvs/cuda-libs 有误导入风险）
+
+---
+
 ## 最终统计
 
 | 指标 | 值 |
