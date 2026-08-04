@@ -15,7 +15,7 @@
 pub mod execution;
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::{Router, extract::State, http::StatusCode, routing::post, Json};
@@ -23,15 +23,19 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
 
+use ep_core::module::manifest::{CapabilityDecl, ModuleManifest, ParamSchema};
 use ep_core::pipeline::dag::Pipeline;
 use ep_core::pipeline::load_pipeline;
 
+use super::autostart::{self, AutoStartError};
 use crate::api::err_response;
 use crate::api::pipelines::pipeline_bridge::{spec_to_pipeline, PipelineSpec};
 use crate::state::AppState;
 
 pub fn router() -> Router<Arc<AppState>> {
-    Router::new().route("/pipelines/execute", post(execute_pipeline))
+    Router::new()
+        .route("/pipelines/execute", post(execute_pipeline))
+        .route("/execute/single", post(execute_single))
 }
 
 /// POST /api/pipelines/execute 请求体（前端 ExecutePipelineRequest 契约）
@@ -171,6 +175,340 @@ fn find_builtin_pipeline(root: &Path, pipeline_id: &str) -> Option<Pipeline> {
     None
 }
 
+// ─── 单模型直跑（§5.3 / §8.1）───────────────────────────────────────────────
+
+/// 单条参数校验失败（纯数据，单测直接断言；handler 映射 400 + i18n 键）
+#[derive(Debug, PartialEq)]
+enum ParamError {
+    /// 必填参数缺失（schema 无 default 且请求未提供）
+    Missing(String),
+    /// 类型不符：(参数名, 期望类型描述)
+    TypeMismatch { name: String, expected: String },
+    /// 取值不在 enum_values 内
+    EnumMismatch(String),
+}
+
+/// 按 capability schema 做基础参数校验（必填/类型/枚举），并注入缺省值。
+///
+/// 规则：
+/// - 声明了 `default` 的参数缺失 → 注入默认值；无 `default` 且缺失 → `Missing`（必填）；
+/// - 类型按 `ParamSchema.type` 基础核对：string / integer / float|number / boolean；
+///   未知类型不校验（前向兼容，如模块自定义类型）；
+/// - `enum_values` 非空且值为字符串 → 必须在列表内；
+/// - 请求中的未声明参数原样透传（宽容，引擎侧不读即无副作用）。
+///
+/// 返回最终提交给引擎的参数对象（请求值 + 注入的默认值）。
+fn validate_and_fill_params(
+    capability: &CapabilityDecl,
+    request_params: Value,
+) -> Result<Value, ParamError> {
+    let mut params = request_params.as_object().cloned().unwrap_or_default();
+    let Some(schema) = capability.params.as_ref() else {
+        return Ok(Value::Object(params));
+    };
+
+    for (name, decl) in schema {
+        match params.get(name) {
+            None => {
+                // 缺失：有默认值 → 注入；否则必填校验失败
+                if let Some(default) = &decl.default {
+                    params.insert(name.clone(), default.clone());
+                } else {
+                    return Err(ParamError::Missing(name.clone()));
+                }
+            }
+            Some(value) => {
+                check_param_type(name, decl, value)?;
+            }
+        }
+    }
+    Ok(Value::Object(params))
+}
+
+/// 单参数类型/枚举核对
+fn check_param_type(name: &str, decl: &ParamSchema, value: &Value) -> Result<(), ParamError> {
+    let expected = decl.param_type.as_str();
+    let ok = match expected {
+        "string" => value.is_string(),
+        "integer" => value.is_i64() || value.is_u64(),
+        "float" | "number" => value.is_number(),
+        "boolean" => value.is_boolean(),
+        // 未知类型（模块自定义）不校验
+        _ => true,
+    };
+    if !ok {
+        return Err(ParamError::TypeMismatch {
+            name: name.to_string(),
+            expected: expected.to_string(),
+        });
+    }
+    if let Some(enum_values) = &decl.enum_values {
+        let in_enum = value
+            .as_str()
+            .map(|s| enum_values.iter().any(|v| v == s))
+            .unwrap_or(false);
+        if !in_enum {
+            return Err(ParamError::EnumMismatch(name.to_string()));
+        }
+    }
+    Ok(())
+}
+
+/// 按 module_id 查找模块清单
+async fn find_module_manifest(state: &AppState, module_id: &str) -> Option<ModuleManifest> {
+    let modules = state.modules.read().await;
+    modules
+        .iter()
+        .find(|m| {
+            m.manifest
+                .as_ref()
+                .map(|mf| mf.module.id == module_id)
+                .unwrap_or(false)
+        })
+        .and_then(|m| m.manifest.clone())
+}
+
+/// POST /api/execute/single — 单模型直跑（§5.3）
+///
+/// 请求体：`{module_id, capability, params?, input_path}`。
+/// 流程：字段/模块/capability/参数/输入文件校验 → 模块未运行则自动拉起并等健康
+/// （[`autostart::ensure_module_running`]，修 P1-2 直跑侧）→
+/// [`execution::submit_direct`]（B3：退化三节点 DAG）→ 202 `{"task_id"}`。
+///
+/// 状态码：400 字段/capability/参数/输入文件错误；404 模块不存在；
+/// 409 模型未就绪；500 venv/端口/启动/提交失败；504 自动拉起后等健康超时。
+async fn execute_single(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<Value>>,
+) -> (StatusCode, Json<Value>) {
+    let body = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
+
+    // ── 1. 请求体字段解析 ──
+    let module_id = match body.get("module_id").and_then(|v| v.as_str()) {
+        Some(id) if !id.trim().is_empty() => id.to_string(),
+        _ => {
+            return err_response(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "apiPipelines.single.missingModuleId",
+                &[],
+            )
+            .await
+        }
+    };
+    let capability = match body.get("capability").and_then(|v| v.as_str()) {
+        Some(c) if !c.trim().is_empty() => c.to_string(),
+        _ => {
+            return err_response(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "apiPipelines.single.missingCapability",
+                &[],
+            )
+            .await
+        }
+    };
+    let input_path = match body.get("input_path").and_then(|v| v.as_str()) {
+        Some(p) if !p.trim().is_empty() => PathBuf::from(p),
+        _ => {
+            return err_response(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "apiPipelines.single.missingInputPath",
+                &[],
+            )
+            .await
+        }
+    };
+    let request_params = match body.get("params") {
+        None | Some(Value::Null) => json!({}),
+        Some(p) if p.is_object() => p.clone(),
+        Some(_) => {
+            return err_response(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "apiPipelines.single.paramsNotObject",
+                &[],
+            )
+            .await
+        }
+    };
+
+    // ── 2. 模块与 capability 校验（capability 必须在 manifest 声明内） ──
+    let manifest = match find_module_manifest(&state, &module_id).await {
+        Some(mf) => mf,
+        None => {
+            return err_response(
+                &state,
+                StatusCode::NOT_FOUND,
+                "apiCore.module.notFound",
+                &[("id", module_id)],
+            )
+            .await
+        }
+    };
+    let cap = match manifest
+        .interface
+        .capabilities
+        .iter()
+        .find(|c| c.name == capability)
+    {
+        Some(c) => c.clone(),
+        None => {
+            return err_response(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "apiPipelines.single.capabilityNotFound",
+                &[
+                    ("module_id", module_id),
+                    ("capability", capability),
+                ],
+            )
+            .await
+        }
+    };
+
+    // ── 3. 参数按 schema 基础校验（必填/类型/枚举）+ 默认值注入 ──
+    let params = match validate_and_fill_params(&cap, request_params) {
+        Ok(p) => p,
+        Err(ParamError::Missing(name)) => {
+            return err_response(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "apiPipelines.single.paramMissing",
+                &[("param", name)],
+            )
+            .await
+        }
+        Err(ParamError::TypeMismatch { name, expected }) => {
+            return err_response(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "apiPipelines.single.paramTypeInvalid",
+                &[("param", name), ("expected", expected)],
+            )
+            .await
+        }
+        Err(ParamError::EnumMismatch(name)) => {
+            return err_response(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "apiPipelines.single.paramEnumInvalid",
+                &[("param", name)],
+            )
+            .await
+        }
+    };
+
+    // ── 4. 输入文件必须已存在于服务器本地（含 workspace/uploads 暂存） ──
+    if !input_path.is_file() {
+        return err_response(
+            &state,
+            StatusCode::BAD_REQUEST,
+            "apiPipelines.single.inputNotFound",
+            &[("path", input_path.display().to_string())],
+        )
+        .await;
+    }
+
+    // ── 5. 模块自动拉起（§6.5：未运行 → 启动并等健康；超时计入任务错误语义） ──
+    if let Err(e) = autostart::ensure_module_running(&state, &module_id).await {
+        return autostart_error_response(&state, e).await;
+    }
+
+    // ── 6. 提交退化三节点 DAG（B3 实现；任务/产物/WS 全套复用） ──
+    match execution::submit_direct(&state, &module_id, &capability, params, input_path).await {
+        Ok(task_id) => (StatusCode::ACCEPTED, Json(json!({ "task_id": task_id }))),
+        Err(e) => {
+            err_response(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "apiPipelines.single.submitFailed",
+                &[("detail", e.to_string())],
+            )
+            .await
+        }
+    }
+}
+
+/// 自动拉起错误 → HTTP 状态码 + i18n 键映射
+async fn autostart_error_response(
+    state: &Arc<AppState>,
+    e: AutoStartError,
+) -> (StatusCode, Json<Value>) {
+    match e {
+        AutoStartError::ModuleNotFound(id) => {
+            err_response(
+                state,
+                StatusCode::NOT_FOUND,
+                "apiCore.module.notFound",
+                &[("id", id)],
+            )
+            .await
+        }
+        AutoStartError::InvalidManifest(id) => {
+            err_response(
+                state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "apiCore.module.invalidManifest",
+                &[("id", id)],
+            )
+            .await
+        }
+        AutoStartError::ModelNotReady { module_id: _, model } => {
+            err_response(
+                state,
+                StatusCode::CONFLICT,
+                "apiCore.module.modelNotReady",
+                &[("model", model)],
+            )
+            .await
+        }
+        AutoStartError::VenvPrepFailed(detail) => {
+            err_response(
+                state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "apiModels.venvPrepFailed",
+                &[("detail", detail)],
+            )
+            .await
+        }
+        AutoStartError::PortAllocationFailed(detail) => {
+            err_response(
+                state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "apiCore.module.portAllocationFailed",
+                &[("detail", detail)],
+            )
+            .await
+        }
+        AutoStartError::StartFailed(detail) => {
+            err_response(
+                state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "apiCore.module.startFailed",
+                &[("detail", detail)],
+            )
+            .await
+        }
+        AutoStartError::HealthTimeout {
+            module_id,
+            timeout_secs,
+        } => {
+            err_response(
+                state,
+                StatusCode::GATEWAY_TIMEOUT,
+                "apiPipelines.single.autostartTimeout",
+                &[
+                    ("module_id", module_id),
+                    ("secs", timeout_secs.to_string()),
+                ],
+            )
+            .await
+        }
+    }
+}
+
 // ─── 测试 ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -182,6 +520,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    use tower::ServiceExt;
 
     use ep_core::config::AppConfig;
     use ep_core::port::PortManager;
@@ -518,5 +858,413 @@ to = ["output", "input"]
         let msg = body.0["error"].as_str().unwrap();
         assert!(msg.starts_with("Pipeline spec is invalid: "), "got: {msg}");
         assert!(msg.contains("at least one node"), "got: {msg}");
+    }
+
+    // ─── /api/execute/single 测试（Router::oneshot）────────────────────────
+
+    /// 直跑测试模块清单：capability `run` 带三类参数——
+    /// `beam_size` integer 无默认（必填）、`language` string 有默认、
+    /// `mode` string 枚举。`ready_timeout_secs = 1` 加速自动拉起失败路径；
+    /// start_command 为跨平台保活命令（自动拉起路径测试需要存活子进程）。
+    fn direct_manifest_toml() -> String {
+        let keepalive = if cfg!(target_os = "windows") {
+            "ping -n 30 127.0.0.1 > NUL"
+        } else {
+            "sleep 30"
+        };
+        format!(
+            r#"
+[module]
+id = "direct-mod"
+name = "直跑测试模块"
+version = "0.1.0"
+description = "direct exec test module"
+category = "asr"
+genre = "test"
+
+[runtime]
+type = "native"
+binaries = {{ "test" = "test" }}
+start_command = "{keepalive}"
+
+[compute]
+backends = ["cpu"]
+
+[interface]
+type = "http"
+health_endpoint = "/health"
+ready_timeout_secs = 1
+
+[[interface.capabilities]]
+name = "run"
+description = "run it"
+input_type = "file"
+output_type = "file"
+
+[interface.capabilities.params]
+beam_size = {{ type = "integer", min = 1, max = 20 }}
+language = {{ type = "string", default = "auto" }}
+mode = {{ type = "string", default = "fast", enum = ["fast", "slow"] }}
+"#
+        )
+    }
+
+    fn direct_test_state(root: std::path::PathBuf) -> Arc<AppState> {
+        let manifest: ModuleManifest = toml::from_str(&direct_manifest_toml()).unwrap();
+        let module = ep_core::module::discovery::DiscoveredModule {
+            path: root.join("modules").join("direct-mod"),
+            manifest: Some(manifest),
+            status: ep_core::module::discovery::DiscoveryStatus::Valid,
+        };
+        Arc::new(AppState::new(
+            root,
+            AppConfig::default(),
+            vec![],
+            vec![module],
+            PortManager::new(18000, 18010),
+        ))
+    }
+
+    /// 构造 Router::oneshot 用的 JSON POST 请求
+    fn single_request(body: Value) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/execute/single")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn single_response(
+        resp: axum::response::Response,
+    ) -> (StatusCode, Value) {
+        use http_body_util::BodyExt;
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|e| panic!("响应不是合法 JSON: {e}; body={bytes:?}"));
+        (status, json)
+    }
+
+    // ── 1. 未知模块 → 404（复用 apiCore.module.notFound 现有键） ──────────
+
+    #[tokio::test]
+    async fn test_single_unknown_module_404() {
+        let state = direct_test_state(unique_root("s-nomod"));
+        let app = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(state);
+
+        let resp = app
+            .oneshot(single_request(json!({
+                "module_id": "ghost",
+                "capability": "run",
+                "input_path": "/tmp/x.txt"
+            })))
+            .await
+            .unwrap();
+        let (status, json) = single_response(resp).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["error"], "模块不存在：ghost");
+    }
+
+    // ── 2. 未知 capability → 400 ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_single_unknown_capability_400() {
+        let state = direct_test_state(unique_root("s-nocap"));
+        let app = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(state);
+
+        let resp = app
+            .oneshot(single_request(json!({
+                "module_id": "direct-mod",
+                "capability": "fly",
+                "input_path": "/tmp/x.txt"
+            })))
+            .await
+            .unwrap();
+        let (status, json) = single_response(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // 新键待 C8 落盘：缺失时 err_response 回退为键本身（键名即契约）
+        assert_eq!(json["error"], "apiPipelines.single.capabilityNotFound");
+    }
+
+    // ── 3. 缺必填参数（beam_size 无默认）→ 400 ─────────────────────────────
+
+    #[tokio::test]
+    async fn test_single_missing_required_param_400() {
+        let root = unique_root("s-missparam");
+        let input = root.join("in.txt");
+        std::fs::write(&input, "data").unwrap();
+
+        let state = direct_test_state(root.clone());
+        let app = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(state);
+
+        let resp = app
+            .oneshot(single_request(json!({
+                "module_id": "direct-mod",
+                "capability": "run",
+                "params": { "language": "zh" },
+                "input_path": input.display().to_string()
+            })))
+            .await
+            .unwrap();
+        let (status, json) = single_response(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "apiPipelines.single.paramMissing");
+    }
+
+    // ── 4. 参数类型不符 → 400 ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_single_param_type_invalid_400() {
+        let root = unique_root("s-badtype");
+        let input = root.join("in.txt");
+        std::fs::write(&input, "data").unwrap();
+
+        let state = direct_test_state(root.clone());
+        let app = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(state);
+
+        let resp = app
+            .oneshot(single_request(json!({
+                "module_id": "direct-mod",
+                "capability": "run",
+                "params": { "beam_size": "five" },
+                "input_path": input.display().to_string()
+            })))
+            .await
+            .unwrap();
+        let (status, json) = single_response(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "apiPipelines.single.paramTypeInvalid");
+    }
+
+    // ── 5. 枚举越界 → 400 ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_single_param_enum_invalid_400() {
+        let root = unique_root("s-badenum");
+        let input = root.join("in.txt");
+        std::fs::write(&input, "data").unwrap();
+
+        let state = direct_test_state(root.clone());
+        let app = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(state);
+
+        let resp = app
+            .oneshot(single_request(json!({
+                "module_id": "direct-mod",
+                "capability": "run",
+                "params": { "beam_size": 5, "mode": "turbo" },
+                "input_path": input.display().to_string()
+            })))
+            .await
+            .unwrap();
+        let (status, json) = single_response(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "apiPipelines.single.paramEnumInvalid");
+    }
+
+    // ── 6. 输入文件不存在 → 400 ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_single_input_not_found_400() {
+        let state = direct_test_state(unique_root("s-noinput"));
+        let app = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(state);
+
+        let resp = app
+            .oneshot(single_request(json!({
+                "module_id": "direct-mod",
+                "capability": "run",
+                "params": { "beam_size": 5 },
+                "input_path": "/definitely/not/here.txt"
+            })))
+            .await
+            .unwrap();
+        let (status, json) = single_response(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "apiPipelines.single.inputNotFound");
+    }
+
+    // ── 7. 缺字段（空 body / params 非对象）→ 400 ──────────────────────────
+
+    #[tokio::test]
+    async fn test_single_missing_fields_400() {
+        let state = direct_test_state(unique_root("s-empty"));
+        let app = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(state.clone());
+
+        // 空 body → 缺 module_id
+        let resp = app.oneshot(single_request(json!({}))).await.unwrap();
+        let (status, json) = single_response(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "apiPipelines.single.missingModuleId");
+
+        // 缺 capability
+        let app = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(state.clone());
+        let resp = app
+            .oneshot(single_request(json!({ "module_id": "direct-mod" })))
+            .await
+            .unwrap();
+        let (status, json) = single_response(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "apiPipelines.single.missingCapability");
+
+        // params 非对象
+        let app = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(state);
+        let resp = app
+            .oneshot(single_request(json!({
+                "module_id": "direct-mod",
+                "capability": "run",
+                "params": "not-an-object",
+                "input_path": "/tmp/x.txt"
+            })))
+            .await
+            .unwrap();
+        let (status, json) = single_response(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "apiPipelines.single.paramsNotObject");
+    }
+
+    // ── 8. 自动拉起失败 → 504（等健康超时计入调用方错误语义） ───────────────
+
+    #[tokio::test]
+    async fn test_single_autostart_health_timeout_504() {
+        let root = unique_root("s-timeout");
+        let input = root.join("in.txt");
+        std::fs::write(&input, "data").unwrap();
+
+        // manifest ready_timeout_secs = 1：外层等待预算 1s，先于
+        // monitor_process 内部 ~2s 的 Error 翻转 → HealthTimeout → 504。
+        // 端口范围内无任何服务监听 → 健康探测必然不成功。
+        let state = direct_test_state(root.clone());
+        let app = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(state.clone());
+
+        let started = std::time::Instant::now();
+        let resp = app
+            .oneshot(single_request(json!({
+                "module_id": "direct-mod",
+                "capability": "run",
+                "params": { "beam_size": 5 },
+                "input_path": input.display().to_string()
+            })))
+            .await
+            .unwrap();
+        let (status, json) = single_response(resp).await;
+
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "响应: {json}");
+        assert_eq!(json["error"], "apiPipelines.single.autostartTimeout");
+        // 不应久等：预算 1s + 清理余量
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
+        // 失败清理：模块被停止、端口被释放
+        {
+            let pm = state.process_manager.read().await;
+            assert_eq!(
+                pm.get_status("direct-mod"),
+                Some(&ep_core::types::ServiceStatus::Stopped)
+            );
+        }
+        assert!(state.port_manager.read().await.get_port("direct-mod").is_none());
+    }
+
+    // ── 9. validate_and_fill_params 纯函数单测 ──────────────────────────────
+
+    fn direct_capability() -> CapabilityDecl {
+        let manifest: ModuleManifest = toml::from_str(&direct_manifest_toml()).unwrap();
+        manifest.interface.capabilities.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn test_validate_params_fills_defaults() {
+        let cap = direct_capability();
+        let out = validate_and_fill_params(&cap, json!({ "beam_size": 5 })).unwrap();
+        assert_eq!(out["beam_size"], 5);
+        assert_eq!(out["language"], "auto"); // schema 默认值注入
+        assert_eq!(out["mode"], "fast");
+    }
+
+    #[test]
+    fn test_validate_params_missing_required() {
+        let cap = direct_capability();
+        let err = validate_and_fill_params(&cap, json!({})).unwrap_err();
+        assert_eq!(err, ParamError::Missing("beam_size".to_string()));
+    }
+
+    #[test]
+    fn test_validate_params_type_mismatch() {
+        let cap = direct_capability();
+        let err = validate_and_fill_params(&cap, json!({ "beam_size": 2.5 })).unwrap_err();
+        // 2.5 是 number 但不是 integer → 类型不符
+        assert_eq!(
+            err,
+            ParamError::TypeMismatch {
+                name: "beam_size".to_string(),
+                expected: "integer".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_validate_params_enum_check() {
+        let cap = direct_capability();
+        assert!(validate_and_fill_params(&cap, json!({ "beam_size": 5, "mode": "slow" })).is_ok());
+        let err = validate_and_fill_params(&cap, json!({ "beam_size": 5, "mode": "warp" }))
+            .unwrap_err();
+        assert_eq!(err, ParamError::EnumMismatch("mode".to_string()));
+    }
+
+    #[test]
+    fn test_validate_params_unknown_type_skipped() {
+        // 无 params schema 的 capability：请求参数原样透传
+        let mut cap = direct_capability();
+        cap.params = None;
+        let out = validate_and_fill_params(&cap, json!({ "anything": [1, 2] })).unwrap();
+        assert_eq!(out["anything"], json!([1, 2]));
+    }
+
+    // ── 10. autostart 错误映射（504 分支直测，不依赖真实进程） ─────────────
+
+    #[tokio::test]
+    async fn test_autostart_error_mapping() {
+        let state = test_state(unique_root("s-errmap"));
+
+        let (status, body) = autostart_error_response(
+            &state,
+            autostart::AutoStartError::HealthTimeout {
+                module_id: "m".into(),
+                timeout_secs: 30,
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(body.0["error"], "apiPipelines.single.autostartTimeout");
+
+        let (status, body) = autostart_error_response(
+            &state,
+            autostart::AutoStartError::ModelNotReady {
+                module_id: "m".into(),
+                model: "large-v3".into(),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.0["error"], "模型未就绪：large-v3，请先在模型管理页下载或导入");
     }
 }
