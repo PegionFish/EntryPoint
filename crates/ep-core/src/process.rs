@@ -11,6 +11,7 @@ use tokio::process::Child;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use crate::config::AppConfig;
 use crate::health::{check_health, HealthStatus};
 use crate::module::manifest::ModuleManifest;
 use crate::types::{DeviceId, ServiceStatus};
@@ -124,18 +125,18 @@ pub fn venv_python_path(root: &Path, module_id: &str) -> PathBuf {
 /// - 网络代理变量（`with_network_env`）
 pub fn build_module_env(
     root: &Path,
+    config: &AppConfig,
     module_id: &str,
     manifest: &ModuleManifest,
     device: &DeviceId,
 ) -> HashMap<String, String> {
     let module_dir = root.join("modules").join(module_id);
-    let default_model = manifest
-        .models
-        .iter()
-        .find(|m| m.default)
-        .or(manifest.models.first());
-    let model_dir = match default_model {
-        Some(model) => root.join("models").join(&model.target_dir),
+    // 激活变体单槽位（A6，§5.2）：active_models 配置 → default=true → 首个变体；
+    // MODEL_DIR 走 config.models.cache_dir 解析（修 P2-9 同款硬编码）。
+    let active_model = crate::model::active_model_for(config, manifest)
+        .and_then(|id| manifest.models.iter().find(|m| m.id == id));
+    let model_dir = match active_model {
+        Some(model) => config.resolve_model_cache_dir(root).join(&model.target_dir),
         None => module_dir.clone(),
     };
 
@@ -161,7 +162,7 @@ pub fn build_module_env(
         "DEVICE_INDEX".to_string(),
         device.index().map(|i| i.to_string()).unwrap_or_default(),
     );
-    if let Some(model) = default_model {
+    if let Some(model) = active_model {
         vars.insert("MODEL_ID".to_string(), model.id.clone());
     }
     vars
@@ -1162,7 +1163,13 @@ mod tests {
         } else {
             PathBuf::from("/opt/ep")
         };
-        let vars = build_module_env(&root, "test-mod", &manifest, &DeviceId::Cuda(1));
+        let vars = build_module_env(
+            &root,
+            &crate::config::AppConfig::default(),
+            "test-mod",
+            &manifest,
+            &DeviceId::Cuda(1),
+        );
 
         assert_eq!(vars.get("ROOT").unwrap(), &root.to_string_lossy().to_string());
         assert_eq!(vars.get("MODULE_ID").unwrap(), "test-mod");
@@ -1225,7 +1232,13 @@ mod tests {
         } else {
             PathBuf::from("/opt/ep")
         };
-        let vars = build_module_env(&root, "m", &manifest, &DeviceId::Cpu);
+        let vars = build_module_env(
+            &root,
+            &crate::config::AppConfig::default(),
+            "m",
+            &manifest,
+            &DeviceId::Cpu,
+        );
         // default=true 的模型优先
         assert_eq!(vars.get("MODEL_ID").unwrap(), "large");
         assert_eq!(

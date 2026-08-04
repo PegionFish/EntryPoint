@@ -81,7 +81,7 @@ use ep_core::pipeline::runner::TaskDetail;
 use ep_core::pipeline::vram;
 use ep_core::pipeline::PipelineRunnerImpl;
 use ep_core::task_registry::TaskRegistry;
-use ep_core::types::{Artifact, PipelineRunner, ServiceStatus};
+use ep_core::types::{Artifact, PipelineRunner};
 
 use crate::state::{AppState, ProgressMessage};
 
@@ -1200,156 +1200,13 @@ async fn ensure_pipeline_modules(state: &Arc<AppState>, pipeline: &Pipeline) -> 
 
 /// 确保模块运行中：已运行直接返回；未运行则启动并等待健康检查通过。
 ///
-/// **Wave 2 接口契约（B3/B4 互写）**：`ensure_module_running(state, module_id)
-/// -> Result<()>`。本实现位于 execution.rs；B4 的 `api/autostart.rs` 公共件
-/// 按同签名提供（合并期二选一，建议保留本实现并由 autostart.rs 转发，
-/// 因 execute/single 两路提交均经此进入执行层）。
+/// **门禁 #25 归一**：委托 `api/autostart.rs` 权威实现（B4 公共件，含模型就绪
+/// 前置检查、失败清理 stop_module+释放端口、并发竞态转等健康）。管线侧
+/// （ensure_pipeline_modules）与直跑侧（execute/single）共用同一拉起逻辑。
 pub async fn ensure_module_running(state: &Arc<AppState>, module_id: &str) -> anyhow::Result<()> {
-    // 已运行 → 直接返回；启动中/准备中 → 仅等健康
-    let current = state
-        .process_manager
-        .read()
+    crate::api::autostart::ensure_module_running(state, module_id)
         .await
-        .get_status(module_id)
-        .cloned();
-    match current {
-        Some(ServiceStatus::Running) => return Ok(()),
-        Some(ServiceStatus::Starting) | Some(ServiceStatus::Preparing) => {
-            return wait_module_healthy(state, module_id).await;
-        }
-        _ => {}
-    }
-
-    // 模块 + manifest
-    let (manifest, ready_timeout_secs) = {
-        let modules = state.modules.read().await;
-        let module = modules
-            .iter()
-            .find(|m| {
-                m.manifest
-                    .as_ref()
-                    .map(|mf| mf.module.id == module_id)
-                    .unwrap_or(false)
-            })
-            .ok_or_else(|| anyhow::anyhow!("module not found: {module_id}"))?;
-        let manifest = module
-            .manifest
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("module `{module_id}` has an invalid manifest"))?;
-        (
-            manifest.clone(),
-            manifest.interface.ready_timeout_secs.unwrap_or(30),
-        )
-    };
-
-    // 模型前置检查（§5.2：active_models 优先，回退 default/首个变体）
-    if !manifest.models.is_empty() {
-        let active_variant = state
-            .config
-            .read()
-            .await
-            .active_models
-            .get(module_id)
-            .cloned();
-        let chosen = active_variant
-            .as_deref()
-            .filter(|id| manifest.models.iter().any(|m| m.id == *id))
-            .map(str::to_string)
-            .or_else(|| {
-                manifest
-                    .models
-                    .iter()
-                    .find(|m| m.default)
-                    .or(manifest.models.first())
-                    .map(|m| m.id.clone())
-            });
-        let config = state.config.read().await;
-        let mgr = ep_core::model::ModelManager::new(&config.models, &state.root);
-        let statuses = mgr.check_model_status(module_id, &manifest);
-        if let Some(variant) = chosen {
-            if matches!(
-                statuses.get(&variant),
-                Some(ep_core::model::ModelStatus::Missing)
-            ) {
-                anyhow::bail!("model `{variant}` is not ready (missing); download it first");
-            }
-        }
-    }
-
-    // 端口分配
-    let port = {
-        let mut pm = state.port_manager.write().await;
-        pm.allocate(module_id)
-            .map_err(|e| anyhow::anyhow!("port allocation failed: {e}"))?
-    };
-
-    // 设备选择：manifest 声明后端 ∩ 本机设备，回退 CPU
-    let device = {
-        let devices = state.devices.read().await;
-        devices
-            .iter()
-            .find(|d| manifest.compute.backends.contains(&d.backend))
-            .map(|d| d.id.clone())
-            .unwrap_or(ep_core::types::DeviceId::Cpu)
-    };
-
-    // 环境变量（A2 公共构建函数：EP_ 前缀归一 + 占位符替换）
-    let env_vars = ep_core::process::build_module_env(&state.root, module_id, &manifest, &device);
-
-    info!(module_id, %port, %device, "auto-starting module for task submission");
-    let start_result = {
-        let mut pm = state.process_manager.write().await;
-        pm.start_module(module_id, &manifest, device, port, env_vars)
-            .await
-    };
-    if let Err(e) = start_result {
-        state.port_manager.write().await.release(module_id);
-        // “already running/starting” 竞态 → 转为等健康
-        if e.to_string().contains("already running") {
-            return wait_module_healthy(state, module_id).await;
-        }
-        return Err(e);
-    }
-
-    wait_module_healthy(state, module_id).await.map_err(|e| {
-        anyhow::anyhow!("module started but failed to become healthy within {ready_timeout_secs}s(+margin): {e}")
-    })
-}
-
-/// 轮询健康检查直至 Running；Error/Stopped/超时 → 错误。
-async fn wait_module_healthy(state: &Arc<AppState>, module_id: &str) -> anyhow::Result<()> {
-    // 上限：manifest ready_timeout + 15s 启动余量
-    let timeout_secs = {
-        let modules = state.modules.read().await;
-        modules
-            .iter()
-            .find_map(|m| m.manifest.as_ref())
-            .filter(|mf| mf.module.id == module_id)
-            .and_then(|mf| mf.interface.ready_timeout_secs)
-            .unwrap_or(30)
-            + 15
-    };
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs as u64);
-    loop {
-        {
-            let mut pm = state.process_manager.write().await;
-            let _ = pm.monitor_process(module_id).await;
-            match pm.get_status(module_id) {
-                Some(ServiceStatus::Running) => return Ok(()),
-                Some(ServiceStatus::Error(e)) => {
-                    anyhow::bail!("module entered error state: {e}")
-                }
-                Some(ServiceStatus::Stopped) | Some(ServiceStatus::NotReady) => {
-                    anyhow::bail!("module stopped while starting")
-                }
-                _ => {}
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            anyhow::bail!("timed out after {timeout_secs}s waiting for module health");
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 async fn collect_module_ports(state: &Arc<AppState>) -> HashMap<String, u16> {
@@ -1460,6 +1317,7 @@ pub fn build_direct_pipeline(
                     module_id: module_id.to_string(),
                     capability: capability.to_string(),
                     model_id: None,
+                    device: None,
                 },
                 "模块执行",
                 params,
@@ -2654,6 +2512,7 @@ builtin = "file_output"
                 module_id: "deep-filter".to_string(),
                 capability: "denoise".to_string(),
                 model_id: None,
+                device: None,
             }
         );
         assert_eq!(pipeline.nodes[1].params["atten_lim_db"], 60);
