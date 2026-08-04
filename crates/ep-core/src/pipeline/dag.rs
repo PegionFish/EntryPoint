@@ -6,6 +6,8 @@ use std::path::Path;
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::types::DeviceId;
+
 // ─── 错误类型 ────────────────────────────────────────────────────────────────
 
 /// 管线验证错误
@@ -43,17 +45,46 @@ pub enum NodeKind {
     Module {
         module_id: String,
         capability: String,
+        /// 变体 pin（§6.2 冻结字段 `model`；缺省 = 跟随激活变体）。
+        /// 对外契约（TOML/JSON）字段名为 `model`（仲裁 #2）；Rust 侧保留
+        /// `model_id` 命名以免破坏既有消费方，旧 TOML 的 `model_id` 键经
+        /// `alias` 仍可反序列化，序列化恒定输出 `model`。
         /// `skip_serializing_if`：TOML 无 null，None 时不写出该键（反序列化行为不变）
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "model",
+            alias = "model_id"
+        )]
         model_id: Option<String>,
+        /// 设备绑定（§6.2 冻结字段 `device`）：`"auto"` | `"cuda:0"` | `"rocm:1"`
+        /// | `"openvino:GPU.0"` …… **软约束**：加载/导入时本机无此设备 → 警告 +
+        /// 回退 auto，不硬失败（见 [`resolve_device_soft_constraint`]）。
+        /// None = 未声明（等价 auto）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device: Option<String>,
     },
     /// 内置工具节点
     Builtin { builtin: String },
-    /// 外部 API 调用
+    /// 外部 API 调用 — **遗留形状**：§6.7（决策点 4）起更名并限定为接入
+    /// OpenAI 兼容 LLM 端点，规范形状是 `kind = "builtin"` + `builtin = "llm"`。
+    ///
+    /// 兼容语义：
+    /// - `kind = "external_api"`（旧名）与 `kind = "llm"`（别名）均可解析；
+    /// - 执行统一走 executor 的 llm 路径（chat/completions 单一形状）；
+    /// - kind 级 `endpoint` 映射为 llm 的 `base_url`；`kind = "llm"` 形状的节点
+    ///   可省略 `endpoint`，改由 `params.base_url` 声明。
+    ///
+    /// P2-13 清理：原 `api_type` 字段从未被消费，已移除（旧 TOML 中的该键
+    /// 反序列化时按未知字段忽略，不影响加载）。
+    #[serde(alias = "llm")]
     ExternalApi {
+        /// OpenAI 兼容端点 base_url（如 `https://api.openai.com/v1`），
+        /// 可为空（`kind = "llm"` 形状改由 `params.base_url` 声明）。
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         endpoint: String,
-        #[serde(default = "default_api_type")]
-        api_type: String,
+        /// 持有 API Key 的**环境变量名**（绝不落盘明文密钥）；执行时读取。
+        /// 缺省 = 不携带 Authorization（本地免密钥端点，如 Ollama/vLLM）。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         api_key_env: Option<String>,
     },
@@ -81,10 +112,6 @@ pub struct PipelineNode {
 
 fn default_params() -> serde_json::Value {
     serde_json::Value::Object(Default::default())
-}
-
-fn default_api_type() -> String {
-    "openai".to_string()
 }
 
 /// 边：连接两个节点的端口
@@ -306,6 +333,59 @@ impl Pipeline {
         }
 
         result
+    }
+}
+
+// ─── 节点 device 软约束（§6.2） ─────────────────────────────────────────────
+
+/// 请求的设备字符串是否可被本机设备列表满足。
+///
+/// 匹配规则（大小写不敏感）：
+/// - `None` / 空串 / `"auto"` → 恒为 true（auto 由调度器落位，总是可满足）
+/// - 与 [`DeviceId`] 显示形式全等：`cuda:0`、`rocm:1`、`openvino:GPU.0`、
+///   `directml:0`、`cpu`
+/// - 后端前缀匹配：`cuda` / `rocm` / `openvino` / `directml` / `cpu`
+///   匹配该后端下的任一设备
+pub fn device_is_available(requested: Option<&str>, available_devices: &[DeviceId]) -> bool {
+    let Some(req) = requested.map(str::trim).filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    if req.eq_ignore_ascii_case("auto") {
+        return true;
+    }
+    available_devices.iter().any(|id| {
+        id.to_string().eq_ignore_ascii_case(req)
+            || id.backend().to_string().eq_ignore_ascii_case(req)
+    })
+}
+
+/// 节点 `device` 软约束解析（§6.2）：**软约束** —— 不满足时警告并回退 auto，
+/// 绝不硬失败。供管线加载/整合包导入路径消费（有设备清单上下文时调用）。
+///
+/// 返回 `(resolved_device, warning)`：
+/// - 请求为 `None` / 空 / `"auto"` → `(None, None)`（None 即 auto）
+/// - 请求设备存在于 `available_devices` → `(Some(请求值原样), None)`
+/// - 请求设备缺失 → `(None, Some(英文警告))`，调用方记录警告并按 auto 处理
+pub fn resolve_device_soft_constraint(
+    requested: Option<&str>,
+    available_devices: &[DeviceId],
+) -> (Option<String>, Option<String>) {
+    let Some(req) = requested
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto"))
+    else {
+        return (None, None);
+    };
+
+    if device_is_available(Some(req), available_devices) {
+        (Some(req.to_string()), None)
+    } else {
+        (
+            None,
+            Some(format!(
+                "requested device `{req}` is not available on this machine; falling back to `auto`"
+            )),
+        )
     }
 }
 
@@ -548,6 +628,7 @@ capability = "transcribe"
                 module_id: "faster-whisper".to_string(),
                 capability: "transcribe".to_string(),
                 model_id: None,
+                device: None,
             }
         );
 
@@ -588,6 +669,8 @@ capability = "transcribe"
 
     #[test]
     fn test_external_api_node_parsing() {
+        // 旧形状 TOML（含已移除的 api_type 键）必须仍可加载：
+        // api_type 按未知字段忽略（P2-13 清理，向后兼容）
         let toml_str = r#"
 [pipeline]
 id = "api-test"
@@ -616,11 +699,185 @@ to = ["translate", "input"]
             pipeline.nodes[1].kind,
             NodeKind::ExternalApi {
                 endpoint: "https://api.example.com/v1".to_string(),
-                api_type: "openai".to_string(),
                 api_key_env: Some("MY_API_KEY".to_string()),
             }
         );
         assert!(pipeline.validate().is_ok());
+    }
+
+    // ─── §6.2 节点 schema：model / device（仲裁 #2） ───────────────────────
+
+    #[test]
+    fn test_module_node_model_and_device_parse() {
+        let toml_str = r#"
+[pipeline]
+id = "schema-test"
+name = "Schema test"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+
+[[nodes]]
+id = "asr"
+kind = "module"
+module_id = "faster-whisper"
+capability = "transcribe"
+model = "ep.systran.faster-whisper@medium"
+device = "cuda:0"
+"#;
+        let pipeline = Pipeline::from_toml_str(toml_str).unwrap();
+        assert_eq!(
+            pipeline.nodes[1].kind,
+            NodeKind::Module {
+                module_id: "faster-whisper".to_string(),
+                capability: "transcribe".to_string(),
+                model_id: Some("ep.systran.faster-whisper@medium".to_string()),
+                device: Some("cuda:0".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_module_node_legacy_model_id_alias_and_serialization() {
+        // 旧 TOML 键 `model_id` 仍可反序列化（alias 向后兼容）
+        let toml_str = r#"
+[pipeline]
+id = "legacy-model-field"
+name = "Legacy model field"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+
+[[nodes]]
+id = "asr"
+kind = "module"
+module_id = "faster-whisper"
+capability = "transcribe"
+model_id = "large-v3"
+"#;
+        let pipeline = Pipeline::from_toml_str(toml_str).unwrap();
+        match &pipeline.nodes[1].kind {
+            NodeKind::Module { model_id, device, .. } => {
+                assert_eq!(model_id.as_deref(), Some("large-v3"));
+                assert_eq!(device, &None);
+            }
+            other => panic!("expected module node, got {other:?}"),
+        }
+
+        // 序列化恒定输出新契约键 `model`，绝不输出 `model_id`
+        let out = toml::to_string_pretty(&pipeline).unwrap();
+        assert!(out.contains("model = \"large-v3\""), "got: {out}");
+        assert!(!out.contains("model_id ="), "legacy key must not be re-emitted: {out}");
+
+        // serde 层往返：JSON 形状同样用新键 `model`，且往返等价
+        let v = serde_json::to_value(&pipeline.nodes[1]).unwrap();
+        assert_eq!(v["model"], "large-v3");
+        assert!(v.get("model_id").is_none(), "legacy key must not appear in JSON: {v}");
+        let again: PipelineNode = serde_json::from_value(v).unwrap();
+        assert_eq!(again, pipeline.nodes[1]);
+    }
+
+    #[test]
+    fn test_llm_kind_alias_parses_as_external_api_shape() {
+        // §6.7：`kind = "llm"` 作为 external_api 的别名可解析；
+        // endpoint 可省略（由 params.base_url 声明）
+        let toml_str = r#"
+[pipeline]
+id = "llm-alias"
+name = "LLM alias"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+
+[[nodes]]
+id = "translate"
+kind = "llm"
+api_key_env = "OPENAI_API_KEY"
+
+[nodes.params]
+base_url = "https://api.openai.com/v1"
+model = "gpt-4o-mini"
+"#;
+        let pipeline = Pipeline::from_toml_str(toml_str).unwrap();
+        assert_eq!(
+            pipeline.nodes[1].kind,
+            NodeKind::ExternalApi {
+                endpoint: String::new(),
+                api_key_env: Some("OPENAI_API_KEY".to_string()),
+            }
+        );
+        assert_eq!(
+            pipeline.nodes[1].params.get("base_url").and_then(|v| v.as_str()),
+            Some("https://api.openai.com/v1")
+        );
+        assert!(pipeline.validate().is_ok());
+    }
+
+    // ─── device 软约束（§6.2） ──────────────────────────────────────────────
+
+    use crate::types::DeviceId;
+
+    fn sample_devices() -> Vec<DeviceId> {
+        vec![
+            DeviceId::Cuda(0),
+            DeviceId::OpenVINO("GPU.0".to_string()),
+            DeviceId::Cpu,
+        ]
+    }
+
+    #[test]
+    fn test_device_is_available_matching_rules() {
+        let devices = sample_devices();
+        // auto / 缺省恒可满足
+        assert!(device_is_available(None, &devices));
+        assert!(device_is_available(Some(""), &devices));
+        assert!(device_is_available(Some("auto"), &devices));
+        assert!(device_is_available(Some("AUTO"), &devices));
+        // 全等匹配（大小写不敏感）
+        assert!(device_is_available(Some("cuda:0"), &devices));
+        assert!(device_is_available(Some("CUDA:0"), &devices));
+        assert!(device_is_available(Some("openvino:GPU.0"), &devices));
+        assert!(device_is_available(Some("cpu"), &devices));
+        // 后端前缀匹配
+        assert!(device_is_available(Some("cuda"), &devices));
+        assert!(device_is_available(Some("openvino"), &devices));
+        // 缺失
+        assert!(!device_is_available(Some("cuda:1"), &devices));
+        assert!(!device_is_available(Some("rocm:0"), &devices));
+        assert!(!device_is_available(Some("rocm"), &devices));
+        // 空设备列表：仅 auto 可满足
+        assert!(device_is_available(Some("auto"), &[]));
+        assert!(!device_is_available(Some("cuda:0"), &[]));
+    }
+
+    #[test]
+    fn test_resolve_device_soft_constraint_fallback_warns_not_fails() {
+        let devices = sample_devices();
+
+        // 缺省 / auto → 无警告
+        assert_eq!(resolve_device_soft_constraint(None, &devices), (None, None));
+        assert_eq!(
+            resolve_device_soft_constraint(Some("auto"), &devices),
+            (None, None)
+        );
+
+        // 设备存在 → 原样保留
+        assert_eq!(
+            resolve_device_soft_constraint(Some("cuda:0"), &devices),
+            (Some("cuda:0".to_string()), None)
+        );
+
+        // 设备缺失 → 回退 auto + 英文警告（软约束，非错误）
+        let (resolved, warning) = resolve_device_soft_constraint(Some("rocm:1"), &devices);
+        assert_eq!(resolved, None);
+        let warn = warning.expect("missing device must produce a warning");
+        assert!(warn.contains("rocm:1") && warn.contains("auto"), "got: {warn}");
     }
 
     // ─── position 字段与 TOML 序列化（WebUI 桥接依赖） ─────────────────────
