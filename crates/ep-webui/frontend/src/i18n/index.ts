@@ -6,6 +6,7 @@ import zhCommon from '@i18n/locales/zh-CN/common.json'
 import zhDashboard from '@i18n/locales/zh-CN/dashboard.json'
 import zhModules from '@i18n/locales/zh-CN/modules.json'
 import zhModels from '@i18n/locales/zh-CN/models.json'
+import zhPacks from '@i18n/locales/zh-CN/packs.json'
 import zhPipeline from '@i18n/locales/zh-CN/pipeline.json'
 import zhTasks from '@i18n/locales/zh-CN/tasks.json'
 import zhSettings from '@i18n/locales/zh-CN/settings.json'
@@ -14,6 +15,7 @@ import enCommon from '@i18n/locales/en/common.json'
 import enDashboard from '@i18n/locales/en/dashboard.json'
 import enModules from '@i18n/locales/en/modules.json'
 import enModels from '@i18n/locales/en/models.json'
+import enPacks from '@i18n/locales/en/packs.json'
 import enPipeline from '@i18n/locales/en/pipeline.json'
 import enTasks from '@i18n/locales/en/tasks.json'
 import enSettings from '@i18n/locales/en/settings.json'
@@ -36,6 +38,7 @@ const resources = {
     dashboard: zhDashboard,
     modules: zhModules,
     models: zhModels,
+    packs: zhPacks,
     pipeline: zhPipeline,
     tasks: zhTasks,
     settings: zhSettings,
@@ -46,6 +49,7 @@ const resources = {
     dashboard: enDashboard,
     modules: enModules,
     models: enModels,
+    packs: enPacks,
     pipeline: enPipeline,
     tasks: enTasks,
     settings: enSettings,
