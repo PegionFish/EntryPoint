@@ -102,8 +102,9 @@ if (-not $SkipTest) {
 }
 
 # ── 5. 编译 ──
-Write-Step "编译 ($Target) — $CrateName"
-$buildArgs = @("build", "--manifest-path", "$ProjectRoot\Cargo.toml", "-p", $CrateName)
+# 仲裁 #36：ep-pack-cli（bin 名 ep-pack）随主 crate 一并构建并纳入打包
+Write-Step "编译 ($Target) — $CrateName + ep-pack-cli"
+$buildArgs = @("build", "--manifest-path", "$ProjectRoot\Cargo.toml", "-p", $CrateName, "-p", "ep-pack-cli")
 if ($Target -eq "release") { $buildArgs += "--release" }
 $prevErr = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
@@ -133,7 +134,15 @@ if (-not (Test-Path "$binSrc\$exeName")) { Write-Err "二进制不存在: $binSr
 Copy-Item "$binSrc\$exeName" "$packageDir\bin\" -Force
 Write-Ok "二进制: bin\$exeName"
 
+# ep-pack CLI（仲裁 #36：gui/server 包均附带，bin 名 ep-pack）
+if (-not (Test-Path "$binSrc\ep-pack.exe")) { Write-Err "ep-pack 二进制不存在: $binSrc\ep-pack.exe（请先编译）" }
+Copy-Item "$binSrc\ep-pack.exe" "$packageDir\bin\" -Force
+Write-Ok "ep-pack CLI: bin\ep-pack.exe"
+
 # VC 运行库（免装 VC++ Redistributable）
+# 说明（§3.1/§15.3）：Windows 侧共享 CUDA 库目录 runtime\cuda-libs 的 PATH 前置
+# 由 daemon/桌面端运行时代码处理（ep-core process.rs 按 DLL 搜索序注入模块子进程），
+# 打包脚本无需在此注入 PATH；若存在 runtime\cuda-libs 则按存在性随包附带（见下）。
 $crtDir = Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Directory -Filter "Microsoft.VC14*.CRT" -ErrorAction SilentlyContinue |
     Where-Object { $_.Parent.Name -eq "x64" -and $_.Parent.Parent.Name -match "^\d+\.\d+" } |
     ForEach-Object { [PSCustomObject]@{ Path = $_.FullName; Ver = [version]$_.Parent.Parent.Name } } |
@@ -147,9 +156,9 @@ if ($crtDir) {
     Write-Info "未找到 VS Redist 目录，跳过 VC 运行库（需目标机已装 VC++ 运行库）"
 }
 
-# 配置
-Copy-Item "$ProjectRoot\config\app.toml" "$packageDir\config\" -Force
-Copy-Item "$ProjectRoot\config\pipelines\*" "$packageDir\config\pipelines\" -Force
+# 配置（整目录复制，与 build.sh 的 cp -a config/. 等价——
+# constraints.txt 等后续新增文件自动包含，避免双平台漂移）
+Copy-Item "$ProjectRoot\config\*" "$packageDir\config\" -Recurse -Force
 Write-Ok "config\ 已复制"
 
 # 模块
@@ -159,6 +168,17 @@ Get-ChildItem "$ProjectRoot\modules" -Directory | ForEach-Object {
     Remove-Item "$packageDir\modules\$($_.Name)\__pycache__" -Recurse -Force -ErrorAction SilentlyContinue
 }
 Write-Ok "modules\ 已复制"
+
+# 共享 CUDA 库目录（§3.1）：可选资产，存在才随包附带（缺失不报错；
+# .gitignore 忽略 runtime/，由部署者自备）。PATH 前置由 daemon 代码处理（见上注）。
+$cudaLibs = Join-Path $ProjectRoot "runtime\cuda-libs"
+if (Test-Path $cudaLibs) {
+    New-Item -ItemType Directory -Force -Path "$packageDir\runtime" | Out-Null
+    Copy-Item $cudaLibs "$packageDir\runtime\cuda-libs" -Recurse -Force
+    Write-Ok "runtime\cuda-libs 已随包附带（可选目录）"
+} else {
+    Write-Info "runtime\cuda-libs 不存在，跳过（可选目录）"
+}
 
 # 服务器包：WebUI 静态资源 → webui\
 if ($Mode -eq "server") {

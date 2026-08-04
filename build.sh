@@ -175,8 +175,9 @@ else
 fi
 
 # ── 编译 ──────────────────────────────────────────────────────────────────────
-step "编译 ($TARGET) — $CRATE"
-BUILD_ARGS=(build --manifest-path "$PROJECT_ROOT/Cargo.toml" -p "$CRATE")
+# 仲裁 #36：ep-pack-cli（bin 名 ep-pack）随主 crate 一并构建并纳入打包
+step "编译 ($TARGET) — $CRATE + ep-pack-cli"
+BUILD_ARGS=(build --manifest-path "$PROJECT_ROOT/Cargo.toml" -p "$CRATE" -p ep-pack-cli)
 [[ "$TARGET" == "release" ]] && BUILD_ARGS+=(--release)
 if ! cargo "${BUILD_ARGS[@]}" >/dev/null 2>&1; then
     cargo "${BUILD_ARGS[@]}" 2>&1 | grep -E "^error" | head -30
@@ -196,18 +197,27 @@ EXE_NAME="entrypoint"
 [[ -f "$BIN_SRC/$EXE_NAME" ]] || die "二进制不存在: $BIN_SRC/$EXE_NAME"
 
 if [[ "$OS_ID" == "macos" ]]; then
-    # macOS: 二进制直接放入 .app 的 MacOS 目录
+    # macOS: 二进制直接放入 .app 的 MacOS 目录（macOS 仅 gui 模式）
     APP_DIR="$STAGING/EntryPoint.app"
     mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
     cp "$BIN_SRC/$EXE_NAME" "$APP_DIR/Contents/MacOS/entrypoint"
     chmod +x "$APP_DIR/Contents/MacOS/entrypoint"
     RES="$APP_DIR/Contents/Resources"
 else
-    cp "$BIN_SRC/$EXE_NAME" "$STAGING/bin/entrypoint"
-    chmod +x "$STAGING/bin/entrypoint"
+    # 包内二进制名与角色一致：gui=entrypoint / server=ep-daemon
+    # （与 start-*.sh、systemd ExecStart=/opt/entrypoint/bin/ep-daemon 对齐）
+    cp "$BIN_SRC/$EXE_NAME" "$STAGING/bin/$EXE_NAME"
+    chmod +x "$STAGING/bin/$EXE_NAME"
     RES="$STAGING"
 fi
-ok "二进制已就位"
+ok "二进制已就位: bin/$EXE_NAME"
+
+# ep-pack CLI（仲裁 #36：gui/server 包均附带，bin 名 ep-pack）
+[[ -f "$BIN_SRC/ep-pack" ]] || die "ep-pack 二进制不存在: $BIN_SRC/ep-pack"
+mkdir -p "$RES/bin"
+cp "$BIN_SRC/ep-pack" "$RES/bin/ep-pack"
+chmod +x "$RES/bin/ep-pack"
+ok "ep-pack CLI 已就位: bin/ep-pack"
 
 # 配置
 cp -a "$PROJECT_ROOT/config/." "$RES/config/"
@@ -220,6 +230,17 @@ for m in "$PROJECT_ROOT"/modules/*/; do
     rm -rf "$RES/modules/$name/__pycache__"
 done
 ok "modules/ 已复制"
+
+# 共享 CUDA 库目录（§3.1）：可选资产，存在才随包附带（缺失不报错）。
+# runtime/ 不入 git（.gitignore），由部署者自备 libcublas 等库文件；
+# LD_LIBRARY_PATH 前置注入由 start.sh / systemd Environment / daemon 代码完成。
+if [[ -d "$PROJECT_ROOT/runtime/cuda-libs" ]]; then
+    mkdir -p "$RES/runtime"
+    cp -a "$PROJECT_ROOT/runtime/cuda-libs" "$RES/runtime/cuda-libs"
+    ok "runtime/cuda-libs 已随包附带（可选目录）"
+else
+    info "runtime/cuda-libs 不存在，跳过（可选目录）"
+fi
 
 # 服务器包附加内容
 if [[ "$MODE" == "server" ]]; then
@@ -239,6 +260,9 @@ Restart=on-failure
 RestartSec=5
 Environment=RUST_LOG=info
 Environment=EP_ROOT=/opt/entrypoint
+# 共享 CUDA 库目录（§3.1）：可选目录，缺失无副作用；
+# 模块子进程的 LD_LIBRARY_PATH 前置注入由 daemon 代码负责（ep-core process.rs）
+Environment=LD_LIBRARY_PATH=/opt/entrypoint/runtime/cuda-libs
 
 [Install]
 WantedBy=multi-user.target
@@ -253,6 +277,8 @@ DEST="${DEST:-/opt/entrypoint}"
 if [[ "$(id -u)" != "0" ]]; then exec sudo -E "$0" "$@"; fi
 mkdir -p "$DEST"
 cp -a "$SRC/bin" "$SRC/webui" "$SRC/config" "$SRC/modules" "$SRC/workspace" "$DEST/"
+# runtime/（含可选 cuda-libs，§3.1）：存在才复制
+if [[ -d "$SRC/runtime" ]]; then cp -a "$SRC/runtime" "$DEST/"; fi
 install -m644 "$SRC/entrypoint.service" /etc/systemd/system/entrypoint.service
 systemctl daemon-reload
 systemctl enable entrypoint
@@ -326,12 +352,13 @@ stage_fhs() {
     local root="$1"
     mkdir -p "$root/opt/entrypoint" "$root/usr/bin" "$root/usr/lib/systemd/system"
     cp -a "$STAGING/." "$root/opt/entrypoint/"
-    cat > "$root/usr/bin/entrypoint" <<'EOF'
+    # ep-pack CLI 包装器（仲裁 #36：gui/server 均附带）
+    cat > "$root/usr/bin/ep-pack" <<'EOF'
 #!/bin/sh
 export EP_ROOT=/opt/entrypoint
-exec /opt/entrypoint/bin/entrypoint "$@"
+exec /opt/entrypoint/bin/ep-pack "$@"
 EOF
-    chmod +x "$root/usr/bin/entrypoint"
+    chmod +x "$root/usr/bin/ep-pack"
     if [[ "$MODE" == "server" ]]; then
         cat > "$root/usr/bin/ep-daemon" <<'EOF'
 #!/bin/sh
@@ -340,6 +367,13 @@ exec /opt/entrypoint/bin/ep-daemon "$@"
 EOF
         chmod +x "$root/usr/bin/ep-daemon"
         cp "$STAGING/entrypoint.service" "$root/usr/lib/systemd/system/entrypoint.service"
+    else
+        cat > "$root/usr/bin/entrypoint" <<'EOF'
+#!/bin/sh
+export EP_ROOT=/opt/entrypoint
+exec /opt/entrypoint/bin/entrypoint "$@"
+EOF
+        chmod +x "$root/usr/bin/entrypoint"
     fi
 }
 
@@ -348,6 +382,7 @@ pkg_deb() {
     info "生成 deb ..."
     local root="$WORK_DIR/deb-root"
     stage_fhs "$root"
+    mkdir -p "$root/DEBIAN"
     local pkgname="entrypoint-${MODE}"
     local desc="EntryPoint AI 模块编排平台"
     [[ "$MODE" == "server" ]] && desc="EntryPoint AI 模块编排平台（服务器）"
@@ -399,7 +434,7 @@ $desc
 
 %files
 /opt/entrypoint
-/usr/bin/entrypoint
+/usr/bin/ep-pack
 EOF
     if [[ "$MODE" == "server" ]]; then
         cat >> "$top/SPECS/entrypoint-${MODE}.spec" <<'EOF'
@@ -410,6 +445,8 @@ EOF
 systemctl daemon-reload 2>/dev/null || true
 systemctl enable entrypoint 2>/dev/null || true
 EOF
+    else
+        printf '/usr/bin/entrypoint\n' >> "$top/SPECS/entrypoint-${MODE}.spec"
     fi
     rpmbuild -bb --define "_topdir $top" "$top/SPECS/entrypoint-${MODE}.spec" >/dev/null
     cp "$top"/RPMS/x86_64/entrypoint-${MODE}-${VERSION}-1.x86_64.rpm "$DIST_DIR/"
@@ -423,6 +460,10 @@ pkg_arch() {
     if [[ ! -f "$src" ]]; then info "跳过 Arch（未找到 $src）"; return 0; fi
     mkdir -p "$DIST_DIR/arch-$MODE"
     cp "$src" "$DIST_DIR/arch-$MODE/PKGBUILD"
+    # server PKGBUILD 声明 install=entrypoint.install，需随附才能 makepkg
+    if [[ "$MODE" == "server" && -f "$PROJECT_ROOT/packaging/entrypoint.install" ]]; then
+        cp "$PROJECT_ROOT/packaging/entrypoint.install" "$DIST_DIR/arch-$MODE/"
+    fi
     echo "arch-$MODE/PKGBUILD" >> "$MANIFEST"
     ok "Arch PKGBUILD: dist/arch-$MODE/PKGBUILD"
 }
