@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 ep-core.workspace = true
+ep-pack.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

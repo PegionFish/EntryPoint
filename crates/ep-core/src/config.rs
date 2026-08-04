@@ -137,6 +137,9 @@ pub struct ComputeConfig {
     pub allow_overcommit: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub single_device: Option<String>,
+    /// 共享 CUDA 库目录（Linux 注入 LD_LIBRARY_PATH / Windows 前置 PATH，§3.1）
+    #[serde(default = "default_cuda_libs_dir")]
+    pub cuda_libs_dir: String,
 }
 
 impl Default for ComputeConfig {
@@ -147,8 +150,13 @@ impl Default for ComputeConfig {
             refresh_interval_secs: 2,
             allow_overcommit: true,
             single_device: None,
+            cuda_libs_dir: default_cuda_libs_dir(),
         }
     }
+}
+
+fn default_cuda_libs_dir() -> String {
+    "runtime/cuda-libs".to_string()
 }
 
 impl ComputeConfig {
@@ -205,12 +213,36 @@ impl Default for ModelsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
 pub struct PythonConfig {
     #[serde(default)]
     pub path: String,
     #[serde(default)]
     pub uv_path: String,
+    /// uv 缓存目录（应用根下，与 venv 同盘 → 硬链接去重，§3.1；A1 接线）
+    #[serde(default = "default_uv_cache_dir")]
+    pub uv_cache_dir: String,
+    /// 全局 constraints 文件（锁 torch 全家桶等版本，§3.1；空字符串 = 停用；A1 接线）
+    #[serde(default = "default_constraints")]
+    pub constraints: String,
+}
+
+impl Default for PythonConfig {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            uv_path: String::new(),
+            uv_cache_dir: default_uv_cache_dir(),
+            constraints: default_constraints(),
+        }
+    }
+}
+
+fn default_uv_cache_dir() -> String {
+    "runtime/.uv-cache".to_string()
+}
+
+fn default_constraints() -> String {
+    "config/constraints.txt".to_string()
 }
 
 /// 网络代理配置 — 统一控制模型下载、依赖安装、模块子进程的出口代理。
@@ -335,6 +367,26 @@ impl Default for ServerConfig {
 
 // ─── AppConfig ──────────────────────────────────────────────────────────────
 
+/// 整合包配置（§8.3）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PacksConfig {
+    /// 导入暂存目录（解包 + 校验的隔离区，§4.4；B1/B2 消费）
+    #[serde(default = "default_pack_staging_dir")]
+    pub staging_dir: String,
+}
+
+impl Default for PacksConfig {
+    fn default() -> Self {
+        Self {
+            staging_dir: default_pack_staging_dir(),
+        }
+    }
+}
+
+fn default_pack_staging_dir() -> String {
+    ".pack-staging".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[derive(Default)]
 pub struct AppConfig {
@@ -357,6 +409,12 @@ pub struct AppConfig {
     /// 网络代理配置（下载 / 依赖安装 / 模块进程出口）
     #[serde(default)]
     pub network: NetworkConfig,
+    /// 整合包配置（§8.3）
+    #[serde(default)]
+    pub packs: PacksConfig,
+    /// 每模块激活模型变体（单槽位语义 §5.2）：module_id → model_id；A6 消费
+    #[serde(default)]
+    pub active_models: std::collections::HashMap<String, String>,
 }
 
 
