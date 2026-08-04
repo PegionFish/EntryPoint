@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tracing::{debug, info};
 
@@ -513,6 +513,54 @@ impl AppConfig {
     pub fn port_range(&self) -> (u16, u16) {
         (self.ports.range_start, self.ports.range_end)
     }
+
+    /// 深度合并部分配置补丁（P1-9：PUT /api/config 合并语义的 config 层支持）。
+    ///
+    /// 语义（JSON 深度合并）：
+    /// - **缺省字段保留原值**：patch 中未出现的字段一律不动
+    /// - **显式字段覆盖**：patch 中出现的标量字段覆盖原值（含空字符串——如
+    ///   `python.constraints = ""` 即显式停用 constraints）
+    /// - 嵌套表（`general`/`compute`/`python` 等）递归深合并，未出现的子字段保留
+    /// - 数组（`disabled_backends`/`cache_paths` 等）整体替换（不做元素级合并）
+    /// - 映射字段（`active_models`）按键合并：已有键保留，显式键覆盖/新增
+    /// - 未知键忽略（与 load 的 serde 行为一致）
+    /// - `Option` 字段的 `null` 清空为 `None`；非 Option 字段的 `null` 按类型错误拒绝
+    ///
+    /// all-or-nothing：patch 非法或任一字段类型不匹配时返回错误，`self` 保持不变。
+    /// 成功返回时 `self` 为合并后的完整配置。API 层接线（PUT /api/config）由 Wave 3 C7 完成。
+    pub fn merge_partial(&mut self, patch: &serde_json::Value) -> Result<()> {
+        let Some(patch_obj) = patch.as_object() else {
+            bail!("config patch must be a JSON object");
+        };
+        if patch_obj.is_empty() {
+            return Ok(());
+        }
+
+        let mut merged =
+            serde_json::to_value(&*self).context("failed to serialize current config")?;
+        json_deep_merge(&mut merged, patch);
+        let updated: Self = serde_json::from_value(merged)
+            .context("failed to apply config patch (field type mismatch?)")?;
+        *self = updated;
+        Ok(())
+    }
+}
+
+/// 递归深度合并：两侧均为对象时按键合并（patch 优先），否则整体替换（patch 胜出）。
+fn json_deep_merge(base: &mut serde_json::Value, patch: &serde_json::Value) {
+    match (base.as_object_mut(), patch.as_object()) {
+        (Some(base_map), Some(patch_map)) => {
+            for (key, value) in patch_map {
+                match base_map.get_mut(key) {
+                    Some(existing) => json_deep_merge(existing, value),
+                    None => {
+                        base_map.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        _ => *base = patch.clone(),
+    }
 }
 
 // ─── Default value functions ────────────────────────────────────────────────
@@ -826,6 +874,191 @@ disabled_backends = ["directml", "rocm"]
             loaded.compute.resolved_strategy(),
             AssignStrategy::Single(Some("cuda:0".into()))
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── merge_partial 深度合并（P1-9）────────────────────────────────────
+
+    #[test]
+    fn merge_partial_explicit_overrides_missing_preserved() {
+        let mut config = AppConfig::default();
+        let patch = serde_json::json!({
+            "general": { "language": "en-US" }
+        });
+        config.merge_partial(&patch).expect("merge");
+
+        // 显式字段覆盖
+        assert_eq!(config.general.language, "en-US");
+        // 缺省字段保留原值（同表其他字段 + 其他段）
+        assert_eq!(config.general.theme, "dark");
+        assert!(config.general.check_updates);
+        assert_eq!(config.ports.range_start, 18000);
+        assert_eq!(config.python.uv_cache_dir, "runtime/.uv-cache");
+        assert_eq!(config.compute.strategy, AssignStrategy::LeastMemory);
+    }
+
+    #[test]
+    fn merge_partial_multiple_sections() {
+        let mut config = AppConfig::default();
+        let patch = serde_json::json!({
+            "server": { "port": 9900 },
+            "compute": { "allow_overcommit": false, "refresh_interval_secs": 5 },
+            "python": { "constraints": "" }
+        });
+        config.merge_partial(&patch).expect("merge");
+
+        assert_eq!(config.server.port, 9900);
+        assert_eq!(config.server.host, "0.0.0.0", "未显式给出的字段保留");
+        assert!(!config.compute.allow_overcommit);
+        assert_eq!(config.compute.refresh_interval_secs, 5);
+        // 显式空字符串 = 停用 constraints（覆盖默认值，不触发默认回填）
+        assert_eq!(config.python.constraints, "");
+    }
+
+    #[test]
+    fn merge_partial_arrays_replaced_wholesale() {
+        let mut config = AppConfig::default();
+        config.compute.disabled_backends = vec![ComputeBackend::Rocm];
+        config.models.cache_paths = vec!["/old/path".into()];
+
+        let patch = serde_json::json!({
+            "compute": { "disabled_backends": ["directml"] },
+            "models": { "cache_paths": [] }
+        });
+        config.merge_partial(&patch).expect("merge");
+
+        assert_eq!(
+            config.compute.disabled_backends,
+            vec![ComputeBackend::DirectML],
+            "数组整体替换而非合并"
+        );
+        assert!(config.models.cache_paths.is_empty());
+    }
+
+    #[test]
+    fn merge_partial_active_models_per_key_merge() {
+        let mut config = AppConfig::default();
+        config.active_models.insert("mod-a".into(), "model-1".into());
+
+        let patch = serde_json::json!({
+            "active_models": { "mod-b": "model-2" }
+        });
+        config.merge_partial(&patch).expect("merge");
+        assert_eq!(
+            config.active_models.get("mod-a").map(String::as_str),
+            Some("model-1"),
+            "映射按键合并：已有键保留"
+        );
+        assert_eq!(config.active_models.get("mod-b").map(String::as_str), Some("model-2"));
+
+        // 显式覆盖已有键
+        let patch2 = serde_json::json!({ "active_models": { "mod-a": "model-9" } });
+        config.merge_partial(&patch2).expect("merge");
+        assert_eq!(config.active_models.get("mod-a").map(String::as_str), Some("model-9"));
+    }
+
+    #[test]
+    fn merge_partial_empty_object_is_noop() {
+        let mut config = AppConfig::default();
+        config.general.language = "fr-FR".into();
+        config.merge_partial(&serde_json::json!({})).expect("empty patch is ok");
+        assert_eq!(config.general.language, "fr-FR");
+    }
+
+    #[test]
+    fn merge_partial_non_object_rejected() {
+        let mut config = AppConfig::default();
+        assert!(config.merge_partial(&serde_json::json!(["general"])).is_err());
+        assert!(config.merge_partial(&serde_json::json!("general")).is_err());
+        assert!(config.merge_partial(&serde_json::Value::Null).is_err());
+        assert!(config.merge_partial(&serde_json::json!(42)).is_err());
+    }
+
+    #[test]
+    fn merge_partial_type_mismatch_rejected_and_unchanged() {
+        let mut config = AppConfig::default();
+        config.general.language = "fr-FR".into();
+
+        let patch = serde_json::json!({
+            "ports": { "range_start": "not-a-number" },
+            "general": { "theme": "light" }
+        });
+        assert!(config.merge_partial(&patch).is_err());
+        // all-or-nothing：失败时原配置保持不变（theme 也未被部分写入）
+        assert_eq!(config.ports.range_start, 18000);
+        assert_eq!(config.general.language, "fr-FR");
+        assert_eq!(config.general.theme, "dark");
+    }
+
+    #[test]
+    fn merge_partial_unknown_keys_ignored() {
+        let mut config = AppConfig::default();
+        let patch = serde_json::json!({
+            "general": { "language": "en-US", "no_such_field": 42 },
+            "no_such_section": { "x": 1 }
+        });
+        config
+            .merge_partial(&patch)
+            .expect("unknown keys ignored (与 load 的 serde 行为一致)");
+        assert_eq!(config.general.language, "en-US");
+    }
+
+    #[test]
+    fn merge_partial_null_semantics() {
+        let mut config = AppConfig::default();
+        config.compute.single_device = Some("cuda:0".into());
+
+        // Option 字段：null → 清空为 None
+        let patch = serde_json::json!({ "compute": { "single_device": null } });
+        config.merge_partial(&patch).expect("null into Option clears it");
+        assert!(config.compute.single_device.is_none());
+
+        // 非 Option 字段：null → 类型错误
+        let patch2 = serde_json::json!({ "general": { "language": null } });
+        assert!(config.merge_partial(&patch2).is_err());
+    }
+
+    #[test]
+    fn merge_partial_invalid_enum_rejected() {
+        let mut config = AppConfig::default();
+        let patch = serde_json::json!({ "compute": { "strategy": "bogus_strategy" } });
+        assert!(config.merge_partial(&patch).is_err());
+
+        let patch2 = serde_json::json!({ "compute": { "disabled_backends": ["warp9"] } });
+        assert!(config.merge_partial(&patch2).is_err());
+    }
+
+    #[test]
+    fn merge_partial_wrong_shape_rejected() {
+        let mut config = AppConfig::default();
+        // 段应为表却给标量 → 反序列化失败
+        let patch = serde_json::json!({ "general": "dark" });
+        assert!(config.merge_partial(&patch).is_err());
+    }
+
+    #[test]
+    fn merge_partial_roundtrip_with_save_load() {
+        let dir = std::env::temp_dir().join(format!("ep_config_merge_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut config = AppConfig::default();
+        config
+            .merge_partial(&serde_json::json!({
+                "general": { "theme": "light" },
+                "python": { "uv_cache_dir": "cache/uv" },
+                "active_models": { "deep-filter": "v2" }
+            }))
+            .expect("merge");
+        config.save(&dir).expect("save");
+
+        let loaded = AppConfig::load(&dir).expect("load");
+        assert_eq!(loaded.general.theme, "light");
+        assert_eq!(loaded.python.uv_cache_dir, "cache/uv");
+        assert_eq!(loaded.active_models.get("deep-filter").map(String::as_str), Some("v2"));
+        // 未显式给出的字段保持默认并正确往返
+        assert_eq!(loaded.general.language, "zh-CN");
+        assert_eq!(loaded.python.constraints, "config/constraints.txt");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
