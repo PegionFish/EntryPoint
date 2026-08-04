@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { DragEvent, KeyboardEvent } from 'react'
-import { CircleAlert, Globe, GripVertical, RefreshCw, Search, Wrench, X } from 'lucide-react'
+import { CircleAlert, GripVertical, RefreshCw, Search, Wrench, X } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { api } from '@/api/client'
-import type { ModuleResponse } from '@/api/types'
+import type { CapabilityDecl, ModuleResponse } from '@/api/types'
 import { categoryLabel, statusMeta } from '@/lib/constants'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -11,6 +11,18 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { BUILTIN_LIST, DRAG_MIME, categoryVisual } from '@/components/shared/pipeline-node'
 import type { DragPayload } from '@/components/shared/pipeline-node'
+
+/**
+ * ModuleResponse.capabilities 的能力裸名列表（null 安全）。
+ * B5 过渡期 / 无能力模块返回空数组，消费方展示兜底文案。
+ */
+function capabilityNames(module_: ModuleResponse): string[] {
+  const caps: CapabilityDecl[] | null | undefined = module_.capabilities
+  if (!Array.isArray(caps)) return []
+  return caps
+    .filter((c) => c && typeof c.name === 'string' && c.name.trim())
+    .map((c) => c.name.trim())
+}
 
 function startDrag(event: DragEvent<HTMLDivElement>, payload: DragPayload) {
   event.dataTransfer.setData(DRAG_MIME, JSON.stringify(payload))
@@ -140,7 +152,8 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
         m.name.toLowerCase().includes(query) ||
         m.id.toLowerCase().includes(query) ||
         m.description.toLowerCase().includes(query) ||
-        categoryLabel(m.category).toLowerCase().includes(query),
+        categoryLabel(m.category).toLowerCase().includes(query) ||
+        capabilityNames(m).some((name) => name.toLowerCase().includes(query)),
     )
     const groups = new Map<string, ModuleResponse[]>()
     for (const m of matched) {
@@ -151,15 +164,7 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
     return [...groups.entries()]
   }, [modules, query, i18n.language])
 
-  // 「外部 API」项的显隐：命中翻译后的标题 / 描述，或语言无关的检索词
-  const externalTitle = t('pipeline.external.title')
-  const externalSubtitle = t('pipeline.external.description')
-  const externalVisible =
-    !query ||
-    externalTitle.toLowerCase().includes(query) ||
-    externalSubtitle.toLowerCase().includes(query) ||
-    'api external http'.includes(query)
-
+  // §6.7：external_api 不进 palette —— LLM 接入统一走 llm builtin 项
   return (
     <aside
       className={cn('flex h-full w-60 shrink-0 flex-col border-r border-border bg-card', className)}
@@ -219,16 +224,6 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
                 onAdd={onAdd}
               />
             ))}
-            {externalVisible && (
-              <PaletteItem
-                icon={<Globe className="h-4 w-4" />}
-                title={externalTitle}
-                subtitle={externalSubtitle}
-                accent="bg-node-external/15 text-node-external"
-                payload={{ nodeType: 'external' }}
-                onAdd={onAdd}
-              />
-            )}
           </div>
 
           <SectionTitle count={modules?.length}>{t('common:label.module')}</SectionTitle>
@@ -279,12 +274,18 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
                   const visual = categoryVisual(m.category)
                   const Icon = visual.icon
                   const st = statusMeta(m.status)
+                  // P0-1：能力裸名随载荷传递，节点创建完全数据驱动
+                  const caps = capabilityNames(m)
+                  const subtitle =
+                    caps.length > 0
+                      ? `${m.id} · ${caps.join(' / ')}`
+                      : `${m.id} · ${t('pipelineSidebar.noCapabilities', { defaultValue: '未声明能力' })}`
                   return (
                     <PaletteItem
                       key={m.id}
                       icon={<Icon className="h-4 w-4" />}
                       title={m.name}
-                      subtitle={`${m.id} · v${m.version}`}
+                      subtitle={subtitle}
                       accent={visual.accent}
                       trailing={
                         <span
@@ -298,6 +299,7 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
                         moduleName: m.name,
                         moduleVersion: m.version,
                         category: m.category,
+                        capabilities: m.capabilities ?? [],
                       }}
                       onAdd={onAdd}
                     />
