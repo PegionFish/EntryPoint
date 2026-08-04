@@ -335,6 +335,9 @@ fn full_roundtrip_bundle_and_reference() {
         serde_json::from_str(&fs::read_to_string(&report.registry_path).unwrap()).unwrap();
     assert_eq!(registry["id"], "tester.demo-pack");
     assert_eq!(registry["version"], "1.0.0");
+    // name/description 由清单 [pack] 填充（前端 PackInfo 列表展示的唯一持久数据源）
+    assert_eq!(registry["name"], "Demo Pack");
+    assert_eq!(registry["description"], "integration test pack");
     assert_eq!(registry["models"].as_array().unwrap().len(), 2);
     assert_eq!(registry["models"][0]["mode"], "bundle");
     assert_eq!(registry["models"][1]["mode"], "reference");

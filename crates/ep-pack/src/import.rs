@@ -406,6 +406,13 @@ pub struct InstalledPackModel {
 pub struct InstalledPack {
     pub id: String,
     pub version: String,
+    /// 包显示名（来自清单 `[pack].name`；前端 `PackInfo` 列表展示用）。
+    /// `serde(default)`：旧注册表 JSON 无此字段可正常加载（None）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 包描述（来自清单 `[pack].description`）；兼容语义同 [`Self::name`]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// 安装时间（RFC 3339）
     pub installed_at: String,
     /// 包内全部模型条目（bundle 已落位 + reference 待下载均在此）
@@ -1013,6 +1020,9 @@ where
     let installed = InstalledPack {
         id: manifest.pack.id.clone(),
         version: manifest.pack.version.clone(),
+        // 注册表是 GET /api/packs 列表 name/description 的唯一持久数据源
+        name: Some(manifest.pack.name.clone()),
+        description: Some(manifest.pack.description.clone()),
         installed_at: chrono::Utc::now().to_rfc3339(),
         models: manifest
             .models
@@ -1412,6 +1422,8 @@ model = "Not.Valid@v"
         let pack = InstalledPack {
             id: "tester.demo-pack".to_string(),
             version: "1.0.0".to_string(),
+            name: Some("Demo Pack".to_string()),
+            description: Some("demo description".to_string()),
             installed_at: chrono::Utc::now().to_rfc3339(),
             models: vec![InstalledPackModel {
                 qualified_id: "ep.acme.asr".to_string(),
@@ -1430,11 +1442,25 @@ model = "Not.Valid@v"
         write_installed_pack(&path, &pack2).unwrap();
         assert_eq!(read_installed_pack(&path).unwrap(), Some(pack2));
 
-        // 列表：json 之外的文件忽略
+        // 旧版注册表 JSON（无 name/description 字段）向后兼容：读取为 None
+        let legacy_path = registry_entry_path(&dir, "legacy.pack");
+        std::fs::write(
+            &legacy_path,
+            r#"{"id":"legacy.pack","version":"0.9.0","installed_at":"2026-01-01T00:00:00Z","models":[],"pipelines":[]}"#,
+        )
+        .unwrap();
+        let legacy = read_installed_pack(&legacy_path).unwrap().unwrap();
+        assert_eq!(legacy.id, "legacy.pack");
+        assert!(legacy.name.is_none());
+        assert!(legacy.description.is_none());
+
+        // 列表：json 之外的文件忽略（demo-pack + legacy 两条）
         std::fs::write(dir.join("README.txt"), b"not a registry entry").unwrap();
-        let listed = list_installed_packs(&dir).unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].id, "tester.demo-pack");
+        let mut listed = list_installed_packs(&dir).unwrap();
+        listed.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, "legacy.pack");
+        assert_eq!(listed[1].id, "tester.demo-pack");
 
         // 空目录 / 不存在目录
         assert!(list_installed_packs(&root.join("nope")).unwrap().is_empty());
@@ -1447,6 +1473,8 @@ model = "Not.Valid@v"
         let pack = InstalledPack {
             id: "a.b".to_string(),
             version: "0.1.0".to_string(),
+            name: Some("Pack B".to_string()),
+            description: None,
             installed_at: "2026-08-05T00:00:00Z".to_string(),
             models: vec![InstalledPackModel {
                 qualified_id: "ep.a.b".to_string(),
@@ -1459,6 +1487,9 @@ model = "Not.Valid@v"
         let json = serde_json::to_value(&pack).unwrap();
         assert_eq!(json["id"], "a.b");
         assert_eq!(json["version"], "0.1.0");
+        // name 供前端 PackInfo 列表展示；None 字段不序列化（skip_serializing_if）
+        assert_eq!(json["name"], "Pack B");
+        assert!(json.get("description").is_none());
         assert_eq!(json["installed_at"], "2026-08-05T00:00:00Z");
         assert_eq!(json["models"][0]["qualified_id"], "ep.a.b");
         assert_eq!(json["models"][0]["mode"], "reference");
