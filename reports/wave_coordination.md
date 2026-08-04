@@ -34,6 +34,21 @@
 | 26 | B3 越界机械改动（state.rs task_id/bind_persistence、ws/all.rs、execute.rs match 臂、Cargo.toml reqwest） | **追认**（均为编译必需最小改动；B2 合并 state.rs 时注意与 B3 两处共存） | B3 |
 | 27 | B3：dag validate 补漏（孤儿/重复边/端口类型）+ PipelineMeta.max_instances + bridge spec_to_toml 保留 max_instances | **B7 返工**（dag.rs/bridge 所有权）；B3 现走 TOML 原文扫描兜底，B7 落地后可切换 | B3→B7 |
 | 28 | B3 vram-budget 形状 `device_id`/`items[]`/`unassigned[]` vs S2 types.ts `device` | **B3 形状为契约**（已冗余输出兼容字段）；**C3 消费 device_id**，types.ts 由 C3 对齐 | B3→C3 |
+| 29 | C8 先于 C2 完成，C2 的 27 个 components:pipeline.* 键迟到 | **门禁期复活 C8 批量补落盘**（键已登记 i18n_key_requests.md「待落盘-迟到」段）；C2 报告的废弃旧键暂不清理（无害） | C2→C8 |
+| 30 | C2：PipelineNodeSpec 缺节点级 timeout_secs/retry_count | **授权 C3 追加式扩展 types.ts**（本波无主；只增不改既有字段）+ toSpec/fromSpec 读写 | C2→C3 |
+| 31 | C8 发现：/api/pipelines/execute 请求体未解析 wait/callback_url（引擎 SubmitOptions 已支持） | **编排者门禁期接线**（pipelines.rs execute handler 解析两可选字段 → submit_pipeline_full） | C8→门禁 |
+| 32 | C1：types.ts 两处小扩展（ModelDownloadState +'queued'、AppConfig.active_models） | **编排者门禁期机械补**（S2 文件本波无主；C1 已本地放宽不受阻） | C1→门禁 |
+| 33 | C1：/api/models 未透传 vram_estimate_mb + 无 active_model_id 暴露 | **编排者门禁期补**（models.rs json 输出加 vram_estimate_mb；modules.rs ModuleResponse 加 active_model_id，均机械透传） | C1→门禁 |
+| 34 | C1 约 100 个 i18n 键迟到（common.status.queued + models.* ~55 + packs.* ~45） | **门禁期复活 C8 批量落盘**：键文案以 models.tsx/packs.tsx 源码 defaultValue 为准提取（zh 已定稿，en 需 C8 翻译补齐） | C1→C8 |
+| 35 | C6：CLI validate（ep-core DAG 全校验）严于 B1 import（TOML 解析级） | **追认"作者工具从严"**：不下沉全校验到 import（保持 B1 语义）；D1 E2E 注意该差异 | C6→D1 |
+| 36 | C6：打包脚本纳入 ep-pack CLI 二进制 | **D3 任务追加**：build.ps1/build.sh 构建目标加 ep-pack-cli（bin 名 ep-pack），GUI/server 包 bin\ 附带 | C6→D3 |
+| 37 | C7：log_level daemon 接线需改 main.rs（tracing 初始化顺序）+ check_updates 无消费者（P1-10） | **延后为已知限制**（UI 已如实标注文案；接线归后续迭代）；keep_workspace 清理实现归 D2/D3 评估 | C7→后续 |
+| 38 | C7：types.ts 补 §8.3 字段（python.uv_cache_dir/constraints、compute.cuda_libs_dir/single_device、packs、active_models）+ PUT 新形状 | **编排者门禁期机械补**（与 #32 同批；C7 本地 AppConfigExt 届时可回收） | C7→门禁 |
+| 39 | C4→C5：pages show() 签名需 cmd_tx（ExecutePipeline/CancelTask 接线） | **已转发 C5**：机械加参；冻结入口 ExecutePipeline{pipeline}/CancelTask{task_id}/RefreshPipelineTasks/ExecuteSingle | C4→C5 |
+| 40 | C4：TaskSummary 缺 artifacts 字段（任务页产物列表） | **门禁期编排者扩 ep-core TaskSummary**（runner.rs，机械透传 TaskRecord.artifacts）；C5 先做"打开任务目录"兜底 | C4→门禁 |
+| 41 | C3：model pin 双形态（裸变体 vs qualified_id@variant） | **裁决：双形态均合法**（后端 vram.rs rsplit('@') 已兼容；PIPELINE_SPEC 补说明归 C8-revive 文档批）；C2 改产完整 pin 不强制 | C3 |
+| 42 | C3：PipelineToolbar 缺 executeDisabled props（VRAM 超限真禁用） | **接受 MVP 现状**（handleExecute 拦截+toast+账本红点）；工具栏 props 增强列后续 | C3 |
+| 43 | C3 分支已 fast-forward 合入 C2 提交 42d9cb6 | 门禁合并顺序：先 C2 后 C3（或 C3 直接带入 C2），注意勿重复合并 | C2/C3→门禁 |
 
 ## 待收集（各波代理报告中来）
 
