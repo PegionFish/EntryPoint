@@ -152,33 +152,33 @@
 
 | 键 | zh-CN | en | 提交方 | 状态 |
 |---|---|---|---|---|
-| `components:pipeline.builtin.llm.label` | LLM（OpenAI 兼容） | LLM (OpenAI-compatible) | C2 | 待落盘-迟到 |
-| `components:pipeline.builtin.llm.description` | 翻译 / 摘要 / 润色（chat/completions） | Translate / summarize / refine text via chat/completions | C2 | 待落盘-迟到 |
-| `components:pipeline.param.baseUrl` | 接口地址 (base_url) | Endpoint (base_url) | C2 | 待落盘-迟到 |
-| `components:pipeline.param.llmModel` | 模型名称 (model) | Model name (model) | C2 | 待落盘-迟到 |
-| `components:pipeline.param.apiKeyEnv` | API Key 环境变量名 | API key environment variable name | C2 | 待落盘-迟到 |
-| `components:pipeline.param.apiKeyEnv.hint` | 只填环境变量名，切勿填写密钥本身；执行时从环境变量读取，绝不收集或落盘明文密钥 | Env var name only — never the secret itself; the key is read from the environment at runtime and never collected or stored | C2 | 待落盘-迟到 |
-| `components:pipeline.param.systemPrompt` | 系统提示词 | System prompt | C2 | 待落盘-迟到 |
-| `components:pipeline.param.systemPrompt.placeholder` | 把 {input} 翻译成中文（{input} 占位符引用上游输入） | Translate {input} into Chinese ({input} placeholder references upstream input) | C2 | 待落盘-迟到 |
-| `components:pipeline.param.temperature` | 温度 (temperature) | Temperature | C2 | 待落盘-迟到 |
-| `components:pipeline.param.outputFormat` | 输出格式 | Output format | C2 | 待落盘-迟到 |
-| `components:pipeline.param.args.hintArray` | 每行一个参数（数组）；{input}/{output} 为占位符 | One argument per entry (array); {input}/{output} are placeholders | C2 | 待落盘-迟到 |
-| `components:pipeline.param.args.itemPlaceholder` | 单个参数，如 -c:v libx264 | Single argument, e.g. -c:v libx264 | C2 | 待落盘-迟到 |
-| `components:pipeline.param.args.empty` | 尚无参数，点击下方按钮逐条添加 | No arguments yet; add them one by one with the button below | C2 | 待落盘-迟到 |
-| `components:pipeline.param.args.add` | 添加参数 | Add argument | C2 | 待落盘-迟到 |
-| `components:pipeline.param.args.removeAria` | 删除该参数 | Remove this argument | C2 | 待落盘-迟到 |
-| `components:pipeline.param.outputExtension` | 输出扩展名 (output_extension) | Output extension (output_extension) | C2 | 待落盘-迟到 |
-| `components:pipeline.param.outputExtension.hint` | 本节点输出产物的扩展名 | Extension of this node's output artifact | C2 | 待落盘-迟到 |
-| `components:pipeline.module.noCapabilities` | 该模块未声明任何能力（manifest capabilities 缺失） | This module declares no capabilities (manifest capabilities missing) | C2 | 待落盘-迟到 |
-| `components:pipeline.module.noCapabilitySelected` | 未选择能力 | No capability selected | C2 | 待落盘-迟到 |
-| `components:pipeline.module.capabilityLabel` | 能力 | Capability | C2 | 待落盘-迟到 |
-| `components:pipeline.module.pickCapability` | 选择能力 | Pick a capability | C2 | 待落盘-迟到 |
-| `components:pipeline.module.variantPin` | 变体 pin (model) | Variant pin (model) | C2 | 待落盘-迟到 |
-| `components:pipeline.module.variantPin.hint` | 缺省跟随激活变体；执行前校验 pin 与激活是否一致 | Defaults to the active variant; pin vs. active consistency is validated before execution | C2 | 待落盘-迟到 |
-| `components:pipeline.module.variantFollowActive` | 跟随激活变体 | Follow active variant | C2 | 待落盘-迟到 |
-| `components:pipeline.module.deviceAuto` | auto（调度器自动分配） | auto (scheduler assigns) | C2 | 待落盘-迟到 |
-| `components:pipeline.module.deviceUnknown` | 本机未检测到该设备；执行时将警告并回退 auto（软约束，不阻断） | Device not detected locally; execution will warn and fall back to auto (soft constraint, non-blocking) | C2 | 待落盘-迟到 |
-| `components:pipelineSidebar.noCapabilities` | 未声明能力 | No capabilities declared | C2 | 待落盘-迟到 |
+| `components:pipeline.builtin.llm.label` | LLM（OpenAI 兼容） | LLM (OpenAI-compatible) | C2 | 已落盘 |
+| `components:pipeline.builtin.llm.description` | 翻译 / 摘要 / 润色（chat/completions） | Translate / summarize / refine text via chat/completions | C2 | 已落盘 |
+| `components:pipeline.param.baseUrl` | 接口地址 (base_url) | Endpoint (base_url) | C2 | 已落盘 |
+| `components:pipeline.param.llmModel` | 模型名称 (model) | Model name (model) | C2 | 已落盘 |
+| `components:pipeline.param.apiKeyEnv` | API Key 环境变量名 | API key environment variable name | C2 | 已落盘 |
+| `components:pipeline.param.apiKeyEnv.hint` | 只填环境变量名，切勿填写密钥本身；执行时从环境变量读取，绝不收集或落盘明文密钥 | Env var name only — never the secret itself; the key is read from the environment at runtime and never collected or stored | C2 | 已落盘 |
+| `components:pipeline.param.systemPrompt` | 系统提示词 | System prompt | C2 | 已落盘 |
+| `components:pipeline.param.systemPrompt.placeholder` | 把 {input} 翻译成中文（{input} 占位符引用上游输入） | Translate {input} into Chinese ({input} placeholder references upstream input) | C2 | 已落盘 |
+| `components:pipeline.param.temperature` | 温度 (temperature) | Temperature | C2 | 已落盘 |
+| `components:pipeline.param.outputFormat` | 输出格式 | Output format | C2 | 已落盘 |
+| `components:pipeline.param.args.hintArray` | 每行一个参数（数组）；{input}/{output} 为占位符 | One argument per entry (array); {input}/{output} are placeholders | C2 | 已落盘 |
+| `components:pipeline.param.args.itemPlaceholder` | 单个参数，如 -c:v libx264 | Single argument, e.g. -c:v libx264 | C2 | 已落盘 |
+| `components:pipeline.param.args.empty` | 尚无参数，点击下方按钮逐条添加 | No arguments yet; add them one by one with the button below | C2 | 已落盘 |
+| `components:pipeline.param.args.add` | 添加参数 | Add argument | C2 | 已落盘 |
+| `components:pipeline.param.args.removeAria` | 删除该参数 | Remove this argument | C2 | 已落盘 |
+| `components:pipeline.param.outputExtension` | 输出扩展名 (output_extension) | Output extension (output_extension) | C2 | 已落盘 |
+| `components:pipeline.param.outputExtension.hint` | 本节点输出产物的扩展名 | Extension of this node's output artifact | C2 | 已落盘 |
+| `components:pipeline.module.noCapabilities` | 该模块未声明任何能力（manifest capabilities 缺失） | This module declares no capabilities (manifest capabilities missing) | C2 | 已落盘 |
+| `components:pipeline.module.noCapabilitySelected` | 未选择能力 | No capability selected | C2 | 已落盘 |
+| `components:pipeline.module.capabilityLabel` | 能力 | Capability | C2 | 已落盘 |
+| `components:pipeline.module.pickCapability` | 选择能力 | Pick a capability | C2 | 已落盘 |
+| `components:pipeline.module.variantPin` | 变体 pin (model) | Variant pin (model) | C2 | 已落盘 |
+| `components:pipeline.module.variantPin.hint` | 缺省跟随激活变体；执行前校验 pin 与激活是否一致 | Defaults to the active variant; pin vs. active consistency is validated before execution | C2 | 已落盘 |
+| `components:pipeline.module.variantFollowActive` | 跟随激活变体 | Follow active variant | C2 | 已落盘 |
+| `components:pipeline.module.deviceAuto` | auto（调度器自动分配） | auto (scheduler assigns) | C2 | 已落盘 |
+| `components:pipeline.module.deviceUnknown` | 本机未检测到该设备；执行时将警告并回退 auto（软约束，不阻断） | Device not detected locally; execution will warn and fall back to auto (soft constraint, non-blocking) | C2 | 已落盘 |
+| `components:pipelineSidebar.noCapabilities` | 未声明能力 | No capabilities declared | C2 | 已落盘 |
 
 ### C1（约 100 键，文案以源码 defaultValue 为准，en 由 C8 翻译）
 
@@ -186,37 +186,37 @@
 - `models:*` 约 55 键：source.pack / module.{startStarted,startFailed,stopSucceeded,stopFailed,stopConfirmTitle,stopConfirmDescription,logs,detail,run} / card.{activeVariant,selectVariant,assumedActive,assumedActiveHint,serviceFallback,vramEstimate,fromPack,tagFilterHint,activeMissingHint} / tags.{action,addFirst,editTitle,editDescription,empty,placeholder,add,saved,saveFailed} / filter.{clear,empty,emptyDescription} / variant.{switchSuccess,switchFailed,needsDownload,downloadNow,needsRestart,restartNow} / download.{cancelRequested,cancelFailed} / detail.{expand,drawerSuffix,capabilities,noCapabilities,paramName,paramType,paramDefault,paramConstraint} / logs.{title,description} / run.{title,description,noCapabilities,capability,selectCapability,params,input,inputPlaceholder,upload,uploadDone,uploadFailed,inputHint,submit,startingModule,startingModuleHint,accepted,submitFailed,submitTimeout,submitTimeoutDesc,nodeInput,nodeRun,nodeOutput,progressHint,artifacts,preview,previewFailed,previewBinary}
 - `packs:*` 约 45 键：page/empty（S2 已提）/ action.{import,build,export,uninstall} / toast.{importCompleted,buildCompleted,buildAccepted,buildFailed,importFailed,accepted,uploadCancelled,failed,uninstalled,uninstallFailed} / stage.{accepted,extracting,verifying,manifest,models,pipelines,registering,done,build} / card.{modelsCount,pipelinesCount} / import.{title,description,tabLocal,tabUpload,localPlaceholder,urlHint,pickFile,uploading,startUpload} / build.{title,description,identity,idPlaceholder,namePlaceholder,versionPlaceholder,descriptionPlaceholder,tagSelect,models,noCandidates,bundle,bundleHint,pipelines,noPipelines,submit,invalidId,invalidIdHint} / uninstall.{title,description,keepModels} / detail.{installedAt,contents,noModels,modeHint,adaptation,noAdaptation}
 
-> 提取来源：`frontend/src/pages/models.tsx` 与 `pages/packs.tsx` 中全部 `defaultValue` 用法（C1 已定稿 zh 文案）。状态：待落盘-迟到。
+> 提取来源：`frontend/src/pages/models.tsx` 与 `pages/packs.tsx` 中全部 `defaultValue` 用法（C1 已定稿 zh 文案）。状态：已落盘（C8-R2：models 76 键 + packs 60 键 + common.status.queued；`run.nodeInput/nodeRun/nodeOutput` 无 defaultValue，zh 由 C8 拟写=输入/运行/输出；`stage.*` 为动态键，zh 参照 C4 desktopApp:packs.stage.* 口径）。
 
 ### C7（settings + apiCore 命名空间）
 
 | 键 | zh-CN | en | 提交方 | 状态 |
 |---|---|---|---|---|
-| `settings:toast.savedRestart` | 配置已保存，部分改动需重启服务生效 | Settings saved — restart required for some changes | C7 | 待落盘-迟到 |
-| `settings:toast.savedRestartDescription` | 本次改动包含重启敏感项（监听地址/端口、端口范围、工作区目录、CUDA 库目录、日志级别、代理等），需重启 daemon 后生效 | This change touches restart-sensitive items (listen host/port, port range, workspace dir, CUDA libs dir, log level, proxy) — restart the daemon to apply. | C7 | 待落盘-迟到 |
-| `settings:general.logLevelDescription` | daemon 日志输出级别。保存后需重启生效；当前 daemon 启动时读取 RUST_LOG 环境变量，本项后端接线待完成 | Daemon log level. Requires restart; the daemon currently reads RUST_LOG at startup — backend wiring pending. | C7 | 待落盘-迟到 |
-| `settings:general.checkUpdatesPending` | 启动时自动检测新版本并发出提示（daemon 更新检查后端尚未接线，开关已保存但暂不生效） | Check for updates at startup (backend not wired yet — saved but inactive for now). | C7 | 待落盘-迟到 |
-| `settings:compute.cudaLibsDir` | 共享 CUDA 库目录 | Shared CUDA libraries directory | C7 | 待落盘-迟到 |
-| `settings:compute.cudaLibsDirDescription` | 启动模块时注入的共享 CUDA 库路径（Linux LD_LIBRARY_PATH / Windows PATH 前置），相对应用根目录 | Shared CUDA libs path injected at module start (LD_LIBRARY_PATH on Linux / PATH prepend on Windows), relative to app root | C7 | 待落盘-迟到 |
-| `settings:python.uvCacheDir` | uv 缓存目录 | uv cache directory | C7 | 待落盘-迟到 |
-| `settings:python.uvCacheDirDescription` | uv 依赖缓存目录（与 venv 同盘时硬链接去重），相对应用根目录 | uv dependency cache dir (hardlink dedup when same volume as venvs), relative to app root | C7 | 待落盘-迟到 |
-| `settings:python.constraints` | 全局 constraints 文件 | Global constraints file | C7 | 待落盘-迟到 |
-| `settings:python.constraintsDescription` | 锁定依赖版本的全局 constraints 文件（如 torch 全家桶统一版本）；留空 = 停用 | Global constraints file pinning dependency versions (e.g. unified torch stack); empty = disabled | C7 | 待落盘-迟到 |
-| `settings:packs.title` | 整合包 | Model packs | C7 | 待落盘-迟到 |
-| `settings:packs.description` | 模型整合包导入相关配置 | Settings for model pack import | C7 | 待落盘-迟到 |
-| `settings:packs.stagingDir` | 导入暂存目录 | Import staging directory | C7 | 待落盘-迟到 |
-| `settings:packs.stagingDirDescription` | 整合包导入解包与校验的隔离暂存区，相对应用根目录 | Isolated staging area for pack extraction and verification, relative to app root | C7 | 待落盘-迟到 |
-| `settings:advanced.title` | 高级 | Advanced | C7 | 待落盘-迟到 |
-| `settings:advanced.description` | 面向进阶用户的配置，变更前请确认理解其作用 | Advanced settings; make sure you understand each item before changing | C7 | 待落盘-迟到 |
-| `settings:advanced.activeModels` | 激活模型变体（active_models） | Active model variants (active_models) | C7 | 待落盘-迟到 |
-| `settings:advanced.activeModelsHint` | 每模块同一时间一个激活变体（单槽位）。已有键只读、可新增；受合并语义限制，删除键请手动编辑 config/app.toml | One active variant per module (single slot). Existing keys are read-only; to remove a key edit config/app.toml manually | C7 | 待落盘-迟到 |
-| `settings:advanced.empty` | 暂无激活变体覆盖（各模块使用清单默认变体） | No active-variant overrides (modules use manifest defaults) | C7 | 待落盘-迟到 |
-| `settings:advanced.keyReadOnly` | 已有键只读（合并语义不支持删键/改键） | Existing keys are read-only (merge semantics cannot delete/rename keys) | C7 | 待落盘-迟到 |
-| `settings:advanced.addEntry` | 新增映射 | Add mapping | C7 | 待落盘-迟到 |
-| `settings:advanced.moduleIdPlaceholder` | 模块 ID | Module ID | C7 | 待落盘-迟到 |
-| `settings:advanced.modelIdPlaceholder` | 模型 ID | Model ID | C7 | 待落盘-迟到 |
-| `settings:pipeline.keepWorkspaceNote` | 实验性预留：任务结束后的工作区清理尚未实现，本开关当前不影响行为 | Experimental: post-task workspace cleanup is not implemented yet; this toggle has no effect | C7 | 待落盘-迟到 |
-| `apiCore:config.invalidPatch` | 配置补丁无效：{{detail}} | Invalid config patch: {{detail}} | C7 | 待落盘-迟到 |
+| `settings:toast.savedRestart` | 配置已保存，部分改动需重启服务生效 | Settings saved — restart required for some changes | C7 | 已落盘 |
+| `settings:toast.savedRestartDescription` | 本次改动包含重启敏感项（监听地址/端口、端口范围、工作区目录、CUDA 库目录、日志级别、代理等），需重启 daemon 后生效 | This change touches restart-sensitive items (listen host/port, port range, workspace dir, CUDA libs dir, log level, proxy) — restart the daemon to apply. | C7 | 已落盘 |
+| `settings:general.logLevelDescription` | daemon 日志输出级别。保存后需重启生效；当前 daemon 启动时读取 RUST_LOG 环境变量，本项后端接线待完成 | Daemon log level. Requires restart; the daemon currently reads RUST_LOG at startup — backend wiring pending. | C7 | 已落盘 |
+| `settings:general.checkUpdatesPending` | 启动时自动检测新版本并发出提示（daemon 更新检查后端尚未接线，开关已保存但暂不生效） | Check for updates at startup (backend not wired yet — saved but inactive for now). | C7 | 已落盘 |
+| `settings:compute.cudaLibsDir` | 共享 CUDA 库目录 | Shared CUDA libraries directory | C7 | 已落盘 |
+| `settings:compute.cudaLibsDirDescription` | 启动模块时注入的共享 CUDA 库路径（Linux LD_LIBRARY_PATH / Windows PATH 前置），相对应用根目录 | Shared CUDA libs path injected at module start (LD_LIBRARY_PATH on Linux / PATH prepend on Windows), relative to app root | C7 | 已落盘 |
+| `settings:python.uvCacheDir` | uv 缓存目录 | uv cache directory | C7 | 已落盘 |
+| `settings:python.uvCacheDirDescription` | uv 依赖缓存目录（与 venv 同盘时硬链接去重），相对应用根目录 | uv dependency cache dir (hardlink dedup when same volume as venvs), relative to app root | C7 | 已落盘 |
+| `settings:python.constraints` | 全局 constraints 文件 | Global constraints file | C7 | 已落盘 |
+| `settings:python.constraintsDescription` | 锁定依赖版本的全局 constraints 文件（如 torch 全家桶统一版本）；留空 = 停用 | Global constraints file pinning dependency versions (e.g. unified torch stack); empty = disabled | C7 | 已落盘 |
+| `settings:packs.title` | 整合包 | Model packs | C7 | 已落盘 |
+| `settings:packs.description` | 模型整合包导入相关配置 | Settings for model pack import | C7 | 已落盘 |
+| `settings:packs.stagingDir` | 导入暂存目录 | Import staging directory | C7 | 已落盘 |
+| `settings:packs.stagingDirDescription` | 整合包导入解包与校验的隔离暂存区，相对应用根目录 | Isolated staging area for pack extraction and verification, relative to app root | C7 | 已落盘 |
+| `settings:advanced.title` | 高级 | Advanced | C7 | 已落盘 |
+| `settings:advanced.description` | 面向进阶用户的配置，变更前请确认理解其作用 | Advanced settings; make sure you understand each item before changing | C7 | 已落盘 |
+| `settings:advanced.activeModels` | 激活模型变体（active_models） | Active model variants (active_models) | C7 | 已落盘 |
+| `settings:advanced.activeModelsHint` | 每模块同一时间一个激活变体（单槽位）。已有键只读、可新增；受合并语义限制，删除键请手动编辑 config/app.toml | One active variant per module (single slot). Existing keys are read-only; to remove a key edit config/app.toml manually | C7 | 已落盘 |
+| `settings:advanced.empty` | 暂无激活变体覆盖（各模块使用清单默认变体） | No active-variant overrides (modules use manifest defaults) | C7 | 已落盘 |
+| `settings:advanced.keyReadOnly` | 已有键只读（合并语义不支持删键/改键） | Existing keys are read-only (merge semantics cannot delete/rename keys) | C7 | 已落盘 |
+| `settings:advanced.addEntry` | 新增映射 | Add mapping | C7 | 已落盘 |
+| `settings:advanced.moduleIdPlaceholder` | 模块 ID | Module ID | C7 | 已落盘 |
+| `settings:advanced.modelIdPlaceholder` | 模型 ID | Model ID | C7 | 已落盘 |
+| `settings:pipeline.keepWorkspaceNote` | 实验性预留：任务结束后的工作区清理尚未实现，本开关当前不影响行为 | Experimental: post-task workspace cleanup is not implemented yet; this toggle has no effect | C7 | 已落盘 |
+| `apiCore:config.invalidPatch` | 配置补丁无效：{{detail}} | Invalid config patch: {{detail}} | C7 | 已落盘 |
 
 > C7 另注：`settings.toast.savedRestartNote` 已无代码引用，落盘时可跳过/删除。
 
@@ -224,34 +224,34 @@
 
 | 键 | zh-CN | en | 提交方 | 状态 |
 |---|---|---|---|---|
-| `desktopApp:info.venvPreparing` | 正在为模块 {{id}} 准备 Python 环境（首次可能需数分钟） | Preparing Python environment for {{id}} (may take minutes on first run) | C4 | 待落盘-迟到 |
-| `desktopApp:info.packImportDone` | 整合包导入完成：{{models}} 个模型落位，{{downloads}} 个开始下载，{{pipelines}} 条管线注册 | Pack import completed: {{models}} model(s) installed, {{downloads}} download(s) started, {{pipelines}} pipeline(s) registered | C4 | 待落盘-迟到 |
-| `desktopApp:info.taskSubmitted` | 管线任务已提交：{{id}} | Pipeline task submitted: {{id}} | C4 | 待落盘-迟到 |
-| `desktopApp:toast.directExecSubmitted` | 直跑任务已提交：{{task}} | Direct exec task submitted: {{task}} | C4 | 待落盘-迟到 |
-| `desktopApp:error.venvPrepFailed` | Python 环境准备失败：{{detail}} | Failed to prepare Python environment: {{detail}} | C4 | 待落盘-迟到 |
-| `desktopApp:error.noCompatibleDevice` | 模块 {{id}} 无兼容计算设备 | No compatible device for module {{id}} | C4 | 待落盘-迟到 |
-| `desktopApp:error.pipelineInvalid` | 管线校验失败：{{detail}} | Pipeline validation failed: {{detail}} | C4 | 待落盘-迟到 |
-| `desktopApp:error.moduleAutoStartFailed` | 模块 {{id}} 自动拉起失败：{{detail}} | Failed to auto-start module {{id}}: {{detail}} | C4 | 待落盘-迟到 |
-| `desktopApp:error.taskSubmitFailed` | 任务提交失败：{{detail}} | Task submission failed: {{detail}} | C4 | 待落盘-迟到 |
-| `desktopApp:error.taskNotFound` | 任务 {{id}} 不存在 | Task {{id}} not found | C4 | 待落盘-迟到 |
-| `desktopApp:error.packListFailed` | 读取整合包注册表失败：{{detail}} | Failed to read pack registry: {{detail}} | C4 | 待落盘-迟到 |
-| `desktopApp:error.packImportFailed` | 整合包导入失败：{{detail}} | Pack import failed: {{detail}} | C4 | 待落盘-迟到 |
-| `desktopApp:error.capabilityNotFound` | 模块 {{module}} 没有能力 {{capability}} | Module {{module}} has no capability {{capability}} | C4 | 待落盘-迟到 |
-| `desktopApp:error.inputFileMissing` | 输入文件不存在：{{path}} | Input file does not exist: {{path}} | C4 | 待落盘-迟到 |
-| `desktopApp:error.paramInvalid` | 直跑参数无效：{{detail}} | Invalid direct-exec parameters: {{detail}} | C4 | 待落盘-迟到 |
-| `desktopApp:packs.title` | 整合包管理 | Pack Manager | C4 | 待落盘-迟到 |
-| `desktopApp:packs.refresh` | 刷新 | Refresh | C4 | 待落盘-迟到 |
-| `desktopApp:packs.refreshTip` | 重新读取已装包注册表 | Re-read installed pack registry | C4 | 待落盘-迟到 |
-| `desktopApp:packs.import` | 导入整合包 | Import Pack | C4 | 待落盘-迟到 |
-| `desktopApp:packs.importing` | 导入中 | Importing | C4 | 待落盘-迟到 |
-| `desktopApp:packs.emptyTitle` | 尚未安装整合包 | No packs installed | C4 | 待落盘-迟到 |
-| `desktopApp:packs.emptyHint` | 点击右上角「导入整合包」选择 .epzip 包文件导入 | Click "Import Pack" (top right) and choose a .epzip file | C4 | 待落盘-迟到 |
-| `desktopApp:packs.stage.extracting` | 解包中 | Extracting | C4 | 待落盘-迟到 |
-| `desktopApp:packs.stage.verifying` | 校验校验和 | Verifying checksums | C4 | 待落盘-迟到 |
-| `desktopApp:packs.stage.manifest` | 校验清单 | Validating manifest | C4 | 待落盘-迟到 |
-| `desktopApp:packs.stage.models` | 处理模型 | Processing models | C4 | 待落盘-迟到 |
-| `desktopApp:packs.stage.pipelines` | 注册管线 | Registering pipelines | C4 | 待落盘-迟到 |
-| `desktopApp:packs.stage.registering` | 写入注册表 | Registering pack | C4 | 待落盘-迟到 |
+| `desktopApp:info.venvPreparing` | 正在为模块 {{id}} 准备 Python 环境（首次可能需数分钟） | Preparing Python environment for {{id}} (may take minutes on first run) | C4 | 已落盘 |
+| `desktopApp:info.packImportDone` | 整合包导入完成：{{models}} 个模型落位，{{downloads}} 个开始下载，{{pipelines}} 条管线注册 | Pack import completed: {{models}} model(s) installed, {{downloads}} download(s) started, {{pipelines}} pipeline(s) registered | C4 | 已落盘 |
+| `desktopApp:info.taskSubmitted` | 管线任务已提交：{{id}} | Pipeline task submitted: {{id}} | C4 | 已落盘 |
+| `desktopApp:toast.directExecSubmitted` | 直跑任务已提交：{{task}} | Direct exec task submitted: {{task}} | C4 | 已落盘 |
+| `desktopApp:error.venvPrepFailed` | Python 环境准备失败：{{detail}} | Failed to prepare Python environment: {{detail}} | C4 | 已落盘 |
+| `desktopApp:error.noCompatibleDevice` | 模块 {{id}} 无兼容计算设备 | No compatible device for module {{id}} | C4 | 已落盘 |
+| `desktopApp:error.pipelineInvalid` | 管线校验失败：{{detail}} | Pipeline validation failed: {{detail}} | C4 | 已落盘 |
+| `desktopApp:error.moduleAutoStartFailed` | 模块 {{id}} 自动拉起失败：{{detail}} | Failed to auto-start module {{id}}: {{detail}} | C4 | 已落盘 |
+| `desktopApp:error.taskSubmitFailed` | 任务提交失败：{{detail}} | Task submission failed: {{detail}} | C4 | 已落盘 |
+| `desktopApp:error.taskNotFound` | 任务 {{id}} 不存在 | Task {{id}} not found | C4 | 已落盘 |
+| `desktopApp:error.packListFailed` | 读取整合包注册表失败：{{detail}} | Failed to read pack registry: {{detail}} | C4 | 已落盘 |
+| `desktopApp:error.packImportFailed` | 整合包导入失败：{{detail}} | Pack import failed: {{detail}} | C4 | 已落盘 |
+| `desktopApp:error.capabilityNotFound` | 模块 {{module}} 没有能力 {{capability}} | Module {{module}} has no capability {{capability}} | C4 | 已落盘 |
+| `desktopApp:error.inputFileMissing` | 输入文件不存在：{{path}} | Input file does not exist: {{path}} | C4 | 已落盘 |
+| `desktopApp:error.paramInvalid` | 直跑参数无效：{{detail}} | Invalid direct-exec parameters: {{detail}} | C4 | 已落盘 |
+| `desktopApp:packs.title` | 整合包管理 | Pack Manager | C4 | 已落盘 |
+| `desktopApp:packs.refresh` | 刷新 | Refresh | C4 | 已落盘 |
+| `desktopApp:packs.refreshTip` | 重新读取已装包注册表 | Re-read installed pack registry | C4 | 已落盘 |
+| `desktopApp:packs.import` | 导入整合包 | Import Pack | C4 | 已落盘 |
+| `desktopApp:packs.importing` | 导入中 | Importing | C4 | 已落盘 |
+| `desktopApp:packs.emptyTitle` | 尚未安装整合包 | No packs installed | C4 | 已落盘 |
+| `desktopApp:packs.emptyHint` | 点击右上角「导入整合包」选择 .epzip 包文件导入 | Click "Import Pack" (top right) and choose a .epzip file | C4 | 已落盘 |
+| `desktopApp:packs.stage.extracting` | 解包中 | Extracting | C4 | 已落盘 |
+| `desktopApp:packs.stage.verifying` | 校验校验和 | Verifying checksums | C4 | 已落盘 |
+| `desktopApp:packs.stage.manifest` | 校验清单 | Validating manifest | C4 | 已落盘 |
+| `desktopApp:packs.stage.models` | 处理模型 | Processing models | C4 | 已落盘 |
+| `desktopApp:packs.stage.pipelines` | 注册管线 | Registering pipelines | C4 | 已落盘 |
+| `desktopApp:packs.stage.registering` | 写入注册表 | Registering pack | C4 | 已落盘 |
 
 > C4 另注：`desktopApp:nav.packs` 与 `toast.packImportComplete/Failed` 已由 S2 提且 C8 首轮已落盘，无需重复。
 
@@ -264,4 +264,15 @@
 - `pipeline:io.*`（20 键）：exportHint、importHint、exportEmpty、exportSuccess、exportStats、exportFailed、invalidFile、importParseFailed、importTitle、importDescription、importStats、issuesTitle、issuesHint、missingModule、missingVariant、invalidPin、builtinSkipped、register、registering、registerSuccess、registerFailed
 - `pipeline:execute.*`（5 键）：advancedTitle、wait、waitHint、callbackUrl、callbackHint；`pipeline:exec.*`（4 键）：pollLost、pollLostHint、waitDone、waitTerminal；`pipeline:template.*`（2 键）：exampleDenoiseNode、exampleAsrNodeFw
 
-> 提取来源：`frontend/src/pages/pipeline.tsx` 全部 defaultValue 用法（zh 已定稿）。状态：待落盘-迟到。
+> 提取来源：`frontend/src/pages/pipeline.tsx` 全部 defaultValue 用法（zh 已定稿）。状态：已落盘（C8-R2：共 84 键；`ptasks.statusQueued` 取自状态徽章 fallback；`template.exampleDenoiseNode/exampleAsrNodeFw` 为 tp() 调用形态）。
+
+### C5（desktopPages/desktopApp/common 命名空间，en 由 C8 翻译）
+
+- `desktopPages:models.*`（38 键，zh 文案以 ep-desktop/src/pages/models.rs 的 trfb 兜底为准）：filter.label / filter.clear / active / vram / run / runTip / config / snapshotMissing / logs / logs.staleHint / tags.editTip / tags.title / tags.noMeta / tags.removeTip / tags.inputHint / tags.add / tags.hint / tags.saved / tags.saveFailed / run.title / run.noManifest / run.noCapability / run.capability / run.browse / run.pickFile / run.inputHint / run.submit / run.inputMissing / run.submitted / config.title / config.noVariants / config.apply / config.saved / config.saveFailed / config.current / service.title / service.native / service.noModel
+- `desktopApp:pipeline.*` + `desktopApp:palette.*`（53 键，以 pipeline_editor.rs trfb 兜底为准）：emptyHintEdit / browse / openTitle / new / newTip / saveToml2 / saveTip / run / runTip / refreshTasks / refreshTasksTip / palette.addTip / palette.llmTip / palette.noModules / helpTextEdit / props / edgeSelected / deleteEdge / paramLabel2 / timeoutEdit / retryEdit / builtinNoParams / manifestMissing / modelPin / followActive / deviceBind / addArg / argsTip / apiKeyTip / promptTip / temperature / maxTokens / deleteNode / vram.title / vram.over / vram.unknownCap / vram.unassigned / vram.schedulerNote / vram.noDevices / vram.suggestion / vram.overcommitOff / vram.cycle / connSelf / connDup / connCycle / connType / connOk / pickInput / saveTitle / saved / saveFailed / saveSerializeFailed / execPendingWire（保留，见下注）
+- `desktopApp:tasks.*`（5 键）：queuePosition / cancelPending（保留，见下注） / artifacts.title / artifacts.dirMissing / artifacts.openDir
+- `common:*`（3 键）：status.queued（与 C1 归并取一份） / label.name2 / label.description2
+
+> 旧键清理（C5 报告）：`desktopApp.pipeline.saveToml`/`saveTomlTip`/`saveNotImplemented` 已被 saveToml2/saveTip 取代——C8-R2 grep 确认全仓库零引用，**已删除**。
+> ⚠️ C8-R2 执行偏差（grep 优先原则）：`desktopApp.pipeline.execPendingWire`（pipeline_editor.rs:2810/2819 仍在用）与 `desktopApp.tasks.cancelPending`（tasks.rs:260 仍在用）在 master 合并态**仍有代码引用**，故未删除、已落盘；C5 清单中的 `desktopApp.tasks.cancel` 与 `desktopApp.pipeline.execSubmitted/execChannelClosed` 在 master 代码中**无任何引用**，未落盘。若后续门禁接线改用这些新键名，请补提键需求。
+> 状态：已落盘（C8-R2：desktopPages 38 + desktopApp 58 + common 2 新增；common.status.queued 与 C1 归并只落一份）。
