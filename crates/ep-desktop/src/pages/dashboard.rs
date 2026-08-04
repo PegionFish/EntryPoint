@@ -29,6 +29,11 @@ pub fn show(
     let lang = ep_core::i18n::normalize_language(&config.general.language);
     let pal = Palette::new(ui.style().visuals.dark_mode);
 
+    // 发布权威快照：设备列表（管线编辑器 VRAM 账本消费）+ 模块状态
+    // （统一页镜像消费）。仪表盘为默认首页，启动后快照即存在。
+    crate::pages::publish_device_snapshot(ui.ctx(), devices);
+    crate::pages::publish_module_snapshot(ui.ctx(), modules);
+
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.add_space(16.0);
         ui.horizontal(|ui| {
