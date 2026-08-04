@@ -109,6 +109,8 @@ export interface AppConfig {
   }
   network: { http_proxy: string; https_proxy: string; no_proxy: string }
   ui: { scale_factor: number; font_size: number; dashboard_refresh_secs: number }
+  /** 每模块激活模型变体（§5.2 单槽位）：module_id → model_id；后端恒返回，旧前端类型缺失故设可选 */
+  active_models?: Record<string, string>
 }
 
 // ===== Models =====
@@ -270,6 +272,10 @@ export interface TaskSummary {
   pipeline_id?: string
   /** 队列位置（§6.8；status="queued" 时存在，全局/管线闸门等待） */
   queue_position?: number | null
+  /** 实际开始运行时间（§6.8 pipeline_tasks 响应；排队耗时可算） */
+  started_running_at?: string
+  /** 任务错误信息（failed 时存在） */
+  error?: string
 }
 
 export interface TaskNodeState {
@@ -309,6 +315,10 @@ export interface PipelineNodeSpec {
   device?: string
   params: Record<string, unknown>
   position?: { x: number; y: number }
+  /** 节点级超时（秒）— P1-11：后端 SpecNode 透传；前端暂无编辑面，往返保真不丢失 */
+  timeout_secs?: number
+  /** 节点级重试次数 — P1-11：同 timeout_secs */
+  retry_count?: number
 }
 
 export interface PipelineEdgeSpec {
@@ -334,6 +344,10 @@ export interface ExecutePipelineRequest {
 
 export interface ExecutePipelineResponse {
   task_id: string
+  /** 同步模式（wait=true）终态快照：任务状态（§6.5；异步模式缺失） */
+  status?: string
+  /** 同步模式（wait=true）终态快照：产物清单（§6.5） */
+  artifacts?: TaskArtifact[]
 }
 
 // ===== Packs（整合包 §4 / §8.1）=====
@@ -447,24 +461,39 @@ export interface VramBudgetRequest {
   spec: PipelineSpec
 }
 
-/** 每设备 VRAM 预算条目（§6.3 每设备账本） */
+/** VRAM 预算条目：峰值层单个节点的 VRAM 需求（§6.3） */
+export interface VramBudgetItem {
+  node_id: string
+  mb: number
+}
+
+/**
+ * 每设备 VRAM 预算条目（§6.3 每设备账本）。
+ * 形状以 B3 后端为契约（仲裁 #28）：消费 `device_id` + `items` 峰值层明细。
+ */
 export interface VramDeviceBudget {
   /** 设备标识（如 "cuda:0"） */
-  device: string
+  device_id: string
   total_mb: number | null
   /** 当前占用（来自 /api/devices） */
   used_mb: number | null
   /** 该管线在此设备的峰值 VRAM 需求 */
   pipeline_mb: number
+  /** 峰值层的节点明细 */
+  items: VramBudgetItem[]
   /** 是否超出预算（compute.allow_overcommit 决定是否放行执行） */
   over: boolean
 }
 
-/** POST /api/pipelines/vram-budget 响应 */
+/** POST /api/pipelines/vram-budget 响应（B3 形状为契约，仲裁 #28） */
 export interface VramBudgetResponse {
   devices: VramDeviceBudget[]
-  /** device="auto" 未分配节点的 VRAM 需求合计（由调度器按 least_memory 落位） */
+  /** device="auto" 未分配池峰值层的节点明细 */
+  unassigned: VramBudgetItem[]
+  /** 未分配池峰值（MB；由调度器按 least_memory 落位） */
   unassigned_mb: number
+  /** 是否允许超额提交（compute.allow_overcommit，放行策略由执行层决定） */
+  allow_overcommit: boolean
 }
 
 // ===== 模型扩展操作（§5.2 / §8.1）=====
