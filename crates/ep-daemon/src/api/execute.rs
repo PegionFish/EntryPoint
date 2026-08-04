@@ -443,8 +443,14 @@ to = ["output", "input"]
                     builtin: Some("file_input".into()),
                     module_id: None,
                     capability: None,
+                    // B7（wave-2）SpecNode 新增 §6.2/P1-11 字段后的机械补齐
+                    //（仲裁 #11 同款模式，测试字面量无行为含义）
+                    model: None,
+                    device: None,
                     params: json!({ "path": src.display().to_string() }),
                     position: None,
+                    timeout_secs: None,
+                    retry_count: None,
                 },
                 SpecNode {
                     id: "output".into(),
@@ -453,8 +459,12 @@ to = ["output", "input"]
                     builtin: Some("file_output".into()),
                     module_id: None,
                     capability: None,
+                    model: None,
+                    device: None,
                     params: json!({ "path": dest.display().to_string() }),
                     position: None,
+                    timeout_secs: None,
+                    retry_count: None,
                 },
             ],
             edges: vec![ep_core::pipeline::dag::Edge {
