@@ -243,6 +243,8 @@ mod tests {
                     target_dir: "test-model-dir".to_string(),
                     revision: Some("main".to_string()),
                     size_estimate_mb: None,
+                    qualified_id: None,
+                    vram_estimate_mb: None,
                     default: true,
                     mirrors: vec![],
                 }]
