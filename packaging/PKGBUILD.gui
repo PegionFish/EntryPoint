@@ -20,25 +20,37 @@ sha256sums=('SKIP')
 
 build() {
     cd "$srcdir/$pkgname-$pkgver"
-    cargo build --release --locked -p ep-desktop
+    # 桌面端 + 整合包作者 CLI（仲裁 #36：ep-pack-cli，bin 名 ep-pack）
+    cargo build --release --locked -p ep-desktop -p ep-pack-cli
 }
 
 package() {
     cd "$srcdir/$pkgname-$pkgver"
 
     # /opt/entrypoint 布局（与 resolve_root 匹配）
+    # runtime/ models/ 为运行期目录（cuda-libs、venvs、模型落盘），随包预建
     install -dm755 "$pkgdir/opt/entrypoint/bin" \
         "$pkgdir/opt/entrypoint/config/pipelines" \
         "$pkgdir/opt/entrypoint/modules" \
-        "$pkgdir/opt/entrypoint/workspace"
+        "$pkgdir/opt/entrypoint/workspace" \
+        "$pkgdir/opt/entrypoint/runtime" \
+        "$pkgdir/opt/entrypoint/models"
 
     install -Dm755 target/release/entrypoint "$pkgdir/opt/entrypoint/bin/entrypoint"
+    # 整合包作者 CLI（仲裁 #36）
+    install -Dm755 target/release/ep-pack "$pkgdir/opt/entrypoint/bin/ep-pack"
 
     # 配置与模块
     install -Dm644 config/*.toml "$pkgdir/opt/entrypoint/config/" 2>/dev/null || true
     install -Dm644 config/pipelines/*.toml "$pkgdir/opt/entrypoint/config/pipelines/" 2>/dev/null || true
     cp -r modules/* "$pkgdir/opt/entrypoint/modules/" 2>/dev/null || true
     find "$pkgdir/opt/entrypoint/modules" -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true
+
+    # 共享 CUDA 库目录（§3.1）：可选资产，存在才随包附带（缺失不报错；
+    # runtime/ 不入 git，由打包者在源码树中自备）
+    if [[ -d runtime/cuda-libs ]]; then
+        cp -a runtime/cuda-libs "$pkgdir/opt/entrypoint/runtime/cuda-libs"
+    fi
 
     # /usr/bin 包装器（注入 EP_ROOT）
     cat > "$pkgdir/usr/bin/entrypoint" <<'EOF'
@@ -47,6 +59,13 @@ export EP_ROOT=/opt/entrypoint
 exec /opt/entrypoint/bin/entrypoint "$@"
 EOF
     chmod 755 "$pkgdir/usr/bin/entrypoint"
+
+    cat > "$pkgdir/usr/bin/ep-pack" <<'EOF'
+#!/bin/sh
+export EP_ROOT=/opt/entrypoint
+exec /opt/entrypoint/bin/ep-pack "$@"
+EOF
+    chmod 755 "$pkgdir/usr/bin/ep-pack"
 
     # 桌面启动器
     install -Dm644 packaging/entrypoint.desktop "$pkgdir/usr/share/applications/entrypoint.desktop"

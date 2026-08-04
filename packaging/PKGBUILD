@@ -17,12 +17,13 @@ optdepends=(
 
 source=("$pkgname-$pkgver.tar.gz")
 sha256sums=('SKIP')
+install=entrypoint.install
 
 build() {
     cd "$srcdir/$pkgname-$pkgver"
 
-    # Rust daemon
-    cargo build --release --locked -p ep-daemon
+    # Rust daemon + 整合包作者 CLI（仲裁 #36：ep-pack-cli，bin 名 ep-pack）
+    cargo build --release --locked -p ep-daemon -p ep-pack-cli
 
     # WebUI 前端
     cd crates/ep-webui/frontend
@@ -34,13 +35,18 @@ package() {
     cd "$srcdir/$pkgname-$pkgver"
 
     # /opt/entrypoint 布局（与 resolve_root 匹配）
+    # runtime/ models/ 为运行期目录（cuda-libs、venvs、模型落盘），随包预建
     install -dm755 "$pkgdir/opt/entrypoint/bin" \
         "$pkgdir/opt/entrypoint/config/pipelines" \
         "$pkgdir/opt/entrypoint/modules" \
         "$pkgdir/opt/entrypoint/workspace" \
+        "$pkgdir/opt/entrypoint/runtime" \
+        "$pkgdir/opt/entrypoint/models" \
         "$pkgdir/opt/entrypoint/webui"
 
     install -Dm755 target/release/ep-daemon "$pkgdir/opt/entrypoint/bin/ep-daemon"
+    # 整合包作者 CLI（仲裁 #36）
+    install -Dm755 target/release/ep-pack "$pkgdir/opt/entrypoint/bin/ep-pack"
 
     # 配置与模块
     install -Dm644 config/*.toml "$pkgdir/opt/entrypoint/config/" 2>/dev/null || true
@@ -50,6 +56,12 @@ package() {
 
     # WebUI 静态文件
     cp -r crates/ep-webui/static/* "$pkgdir/opt/entrypoint/webui/" 2>/dev/null || true
+
+    # 共享 CUDA 库目录（§3.1）：可选资产，存在才随包附带（缺失不报错；
+    # runtime/ 不入 git，由打包者在源码树中自备）
+    if [[ -d runtime/cuda-libs ]]; then
+        cp -a runtime/cuda-libs "$pkgdir/opt/entrypoint/runtime/cuda-libs"
+    fi
 
     # systemd 服务（EP_ROOT 指向 /opt/entrypoint）
     install -Dm644 packaging/entrypoint.service "$pkgdir/usr/lib/systemd/system/entrypoint.service"
@@ -61,6 +73,13 @@ export EP_ROOT=/opt/entrypoint
 exec /opt/entrypoint/bin/ep-daemon "$@"
 EOF
     chmod 755 "$pkgdir/usr/bin/ep-daemon"
+
+    cat > "$pkgdir/usr/bin/ep-pack" <<'EOF'
+#!/bin/sh
+export EP_ROOT=/opt/entrypoint
+exec /opt/entrypoint/bin/ep-pack "$@"
+EOF
+    chmod 755 "$pkgdir/usr/bin/ep-pack"
 
     # License
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE" 2>/dev/null || true
