@@ -72,7 +72,7 @@ if (-not $SkipClippy) {
     $clippyExit = $LASTEXITCODE
     $ErrorActionPreference = $prevErr
     if ($clippyExit -ne 0) {
-        $clippyOutput | Where-Object { $_ -match "warning:|error" } | ForEach-Object { Write-Err "  $_" }
+        $clippyOutput | Where-Object { $_ -match "^(warning:|error(\[|:))" } | ForEach-Object { Write-Host "  [FAIL] $_" -ForegroundColor Red }
         Write-Err "Clippy 失败"
     }
     $warnCount = ($clippyOutput | Select-String "warning:" | Measure-Object).Count
@@ -90,7 +90,7 @@ if (-not $SkipTest) {
     $testExit = $LASTEXITCODE
     $ErrorActionPreference = $prevErr
     if ($testExit -ne 0) {
-        $testOutput | Where-Object { $_ -match "FAILED|failures:|error\[" } | ForEach-Object { Write-Err "  $_" }
+        $testOutput | Where-Object { $_ -match "FAILED|failures:|error\[" } | ForEach-Object { Write-Host "  [FAIL] $_" -ForegroundColor Red }
         Write-Err "测试失败"
     }
     $failCount = ($testOutput | Select-String "test result:" | Select-String "failed" |
@@ -111,7 +111,7 @@ $buildOutput = & $Cargo @buildArgs 2>&1
 $buildExit = $LASTEXITCODE
 $ErrorActionPreference = $prevErr
 if ($buildExit -ne 0) {
-    $buildOutput | Where-Object { $_ -match "^error" } | ForEach-Object { Write-Err "  $_" }
+    $buildOutput | Where-Object { $_ -match "^error" } | ForEach-Object { Write-Host "  [FAIL] $_" -ForegroundColor Red }
     Write-Err "编译失败"
 }
 Write-Ok "编译成功"
