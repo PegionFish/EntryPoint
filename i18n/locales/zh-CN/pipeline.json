@@ -114,5 +114,17 @@
   "nodeStatus.waiting": "等待",
   "nodeStatus.running": "运行中",
   "nodeStatus.done": "完成",
-  "nodeStatus.failed": "失败"
+  "nodeStatus.failed": "失败",
+  "error.llmMissingBaseUrl": "LLM 节点 {{node}} 缺少必填参数 base_url（OpenAI 兼容端点）",
+  "error.llmMissingModel": "LLM 节点 {{node}} 缺少必填参数 model",
+  "error.llmApiKeyNotSet": "LLM 节点 {{node}}：环境变量 {{env_var}} 未设置（API Key 只从环境变量读取，不落盘）",
+  "error.llmApiKeyEmpty": "LLM 节点 {{node}}：环境变量 {{env_var}} 为空",
+  "error.llmHttpStatus": "LLM 节点 {{node}} 请求失败（HTTP {{status}}）：{{detail}}",
+  "error.llmResponseShape": "LLM 节点 {{node}}：响应缺少 choices[0].message.content",
+  "error.llmInvalidJsonOutput": "LLM 节点 {{node}}：output_format 为 json 但响应不是合法 JSON",
+  "error.llmInvalidOutputFormat": "LLM 节点 {{node}}：output_format 仅支持 text/json",
+  "error.llmParamRange": "LLM 节点 {{node}}：参数 {{param}} 取值非法（{{hint}}）",
+  "error.llmInputNotText": "LLM 节点 {{node}}：上游文件非文本类型（.{{ext}}）",
+  "warn.deviceFallback": "节点 {{node}} 请求的设备 {{device}} 本机不存在，已回退 auto",
+  "warn.ffmpegStringArgs": "ffmpeg 节点 {{node}} 的 args 为字符串，已按词法拆分为数组（契约形状为数组）"
 }

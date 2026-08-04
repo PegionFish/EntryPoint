@@ -1,6 +1,11 @@
 # 配置参考 (Configuration Reference)
 
-> 版本：1.1 | 适用于 EntryPoint v0.x（更新于 2026-08-04）
+> 版本：1.2 | 适用于 EntryPoint v0.x（更新于 2026-08-05）
+>
+> v1.2 变更（PACK_UNIFY_PLAN §3/§8.3）：新增 `[python].uv_cache_dir` /
+> `[python].constraints`、`[compute].cuda_libs_dir`、`[packs].staging_dir`、
+> `[active_models]`；`PUT /api/config` 深度合并语义与 `requires_restart` 标记；
+> `compute.env` 后端环境变量注入已实现（§3.2）；下载并发闸已生效（§1.4）。
 
 本文档是 EntryPoint 所有配置项、环境变量和内部文件格式的完整参考。
 
@@ -33,6 +38,7 @@ check_updates = true
 | `disabled_backends` | string[] | `[]` | 禁用的计算后端列表 |
 | `refresh_interval_secs` | u32 | `2` | 设备状态刷新间隔 |
 | `allow_overcommit` | bool | `true` | 允许显存超额分配（仅警告） |
+| `cuda_libs_dir` | string | `"runtime/cuda-libs"` | 共享 CUDA 库目录（§3.1 依赖栈统一）。启动模块时前置注入（Linux `LD_LIBRARY_PATH` / Windows `PATH`），多模块共用同一份 cuBLAS 等库；空字符串 = 不注入；相对路径基于应用根目录 |
 
 **strategy 可选值：**
 
@@ -49,6 +55,7 @@ strategy = "least_memory"
 disabled_backends = []
 refresh_interval_secs = 2
 allow_overcommit = true
+cuda_libs_dir = "runtime/cuda-libs"
 # single_device = "cuda:0"    # strategy = "single" 时指定
 ```
 
@@ -73,7 +80,7 @@ range_end = 19000
 | `cache_paths` | string[] | `[]` | 本地模型缓存搜索路径（按优先级排序），用于发现用户已有的模型文件 |
 | `hf_endpoint` | string | `""` | HuggingFace 镜像站 URL（空=官方）。**仅对 HuggingFace 源生效**（下载时注入 `HF_ENDPOINT`） |
 | `default_source` | string | `"huggingface"` | 默认下载源（见下方生效规则） |
-| `max_concurrent_downloads` | u32 | `2` | 最大并行下载数（**保留，暂未生效**——尚未实现并发下载调度） |
+| `max_concurrent_downloads` | u32 | `2` | 最大并行下载数。已生效：下载并发闸（Semaphore），超额请求以 `queued` 状态排队，空位释放后按提交顺序自动启动；运行时改小不影响在途下载 |
 
 **`default_source` 生效规则：**
 
@@ -110,7 +117,7 @@ cache_paths = []
 hf_endpoint = ""
 # hf_endpoint = "https://hf-mirror.com"
 default_source = "huggingface"
-max_concurrent_downloads = 2   # 保留，暂未生效
+max_concurrent_downloads = 2
 ```
 
 ### 1.5 `[python]` — Python 环境
@@ -119,13 +126,18 @@ max_concurrent_downloads = 2   # 保留，暂未生效
 |---|---|---|---|
 | `path` | string | `""` | Python 解释器路径（空=自动检测） |
 | `uv_path` | string | `""` | uv 可执行文件路径（空=自动检测） |
+| `uv_cache_dir` | string | `"runtime/.uv-cache"` | uv 缓存目录（依赖栈统一，PACK_UNIFY_PLAN §3.1）。对模块 venv 安装注入 `UV_CACHE_DIR`：缓存与 venv 同盘时硬链接生效，跨模块同版本依赖只占一份物理空间；缓存随应用目录可移植。**属重启敏感项**（影响后续 venv 构建） |
+| `constraints` | string | `"config/constraints.txt"` | 全局 pip constraints 文件（锁 torch 全家桶等版本，保证多模块解析到同一版本 → 硬链接去重）。`uv pip install` 追加 `-c <file>`；文件不存在则跳过；**显式空字符串 = 停用**。constraints 内容变化会触发依赖哈希变更 → 自动重装 |
 
 ```toml
 [python]
 path = ""
 uv_path = ""
+uv_cache_dir = "runtime/.uv-cache"
+constraints = "config/constraints.txt"
 # path = "C:/Python312/python.exe"
 # uv_path = "C:/Users/me/.local/bin/uv.exe"
+# constraints = ""   # 显式停用 constraints
 ```
 
 **自动检测顺序：**
@@ -209,6 +221,35 @@ no_proxy = "localhost,127.0.0.1"
 # https_proxy = "http://127.0.0.1:7890"
 ```
 
+### 1.10 `[packs]` — 整合包（PACK_UNIFY_PLAN §8.3）
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `staging_dir` | string | `".pack-staging"` | 整合包导入/构建暂存根目录（相对路径基于应用根目录）。解包 → CHECKSUMS 校验 → 落位均在此目录内完成，结束后清理 |
+
+```toml
+[packs]
+staging_dir = ".pack-staging"
+```
+
+### 1.11 `[active_models]` — 每模块激活变体（版本单槽位）
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `<module_id>` | string | — | 该模块当前激活的模型变体 id（`[[models]].id`）。键值对形式，每模块一条 |
+
+**单槽位语义**（PACK_UNIFY_PLAN §5.2）：每模块同一时间一个激活变体。
+daemon 启动模块时按三级回退选择模型：`[active_models]` 配置 → manifest
+`default = true` → 首个变体。变体切换端点
+（`PUT /api/models/{m}/{mid}/variant`）写入本表并落盘；激活变体与管线节点
+`model` pin 不一致时执行前报错并引导切换（不静默热切换）。
+
+```toml
+[active_models]
+faster-whisper = "large-v3"
+qwen3-tts = "default"
+```
+
 ---
 
 ## 2. 完整 app.toml 示例
@@ -233,6 +274,7 @@ strategy = "least_memory"
 disabled_backends = []
 refresh_interval_secs = 2
 allow_overcommit = true
+cuda_libs_dir = "runtime/cuda-libs"
 
 [ports]
 range_start = 18000
@@ -243,11 +285,13 @@ cache_dir = "models"
 cache_paths = []
 hf_endpoint = "https://hf-mirror.com"
 default_source = "huggingface"
-max_concurrent_downloads = 2   # 保留，暂未生效
+max_concurrent_downloads = 2
 
 [python]
 path = ""
 uv_path = ""
+uv_cache_dir = "runtime/.uv-cache"
+constraints = "config/constraints.txt"
 
 [pipeline]
 max_parallel = 4
@@ -262,9 +306,21 @@ font_size = 14.0
 http_proxy = ""
 https_proxy = ""
 no_proxy = "localhost,127.0.0.1"
+
+[packs]
+staging_dir = ".pack-staging"
+
+[active_models]
+# faster-whisper = "large-v3"   # 每模块激活变体（变体切换端点自动写入）
 ```
 
 > 通过 WebUI「设置」页或 `PUT /api/config` 修改配置会**直接落盘**到 `config/app.toml`，重启后不丢失。
+>
+> **`PUT /api/config` 为深度合并语义**（PACK_UNIFY_PLAN §8.2）：请求体中缺省的
+> 字段**保留原值**，只有显式给出的字段被更新——补丁式修改单个配置项不再需要
+> 回传整份配置。重启敏感项（监听地址/端口、Python/uv 解释器路径等影响已建
+> 运行时状态的字段）变更时，响应携带 `requires_restart: true` 标记，提示客户端
+> 需重启 daemon 才能完全生效。
 
 ---
 
@@ -286,18 +342,21 @@ no_proxy = "localhost,127.0.0.1"
 | `EP_WORKSPACE` | 任务工作目录 | `...\workspace\task-abc123` |
 | `EP_LOG_LEVEL` | 日志级别（保留，当前版本暂未注入；模块适配器自行兜底默认值） | `info` |
 
-### 3.2 计算后端相关环境变量（计划中，暂未实现）
+### 3.2 计算后端相关环境变量（`compute.env` 接线，已实现）
 
-> ⚠️ 当前版本**尚未实现**按后端注入设备可见性变量。module.toml 中的 `[compute.env]` 段能被解析，但启动模块时不会应用；设备选择通过 `EP_DEVICE` / `EP_DEVICE_INDEX` / `EP_BACKEND` 传入，由模块适配器自行处理。
+启动模块进程时，按当前设备的后端读取 module.toml 的 `[compute.env].<backend>`
+表，替换 `{device_index}` 占位符后注入（多卡隔离立即生效）。格式与每后端
+键表见 MODULE_SPEC.md §2.3。
 
-计划中的注入规则：
-
-| 后端 | 变量 | 值 |
+| 后端 | 典型变量 | 值 |
 |---|---|---|
-| CUDA | `CUDA_VISIBLE_DEVICES` | 设备索引 |
+| CUDA | `CUDA_VISIBLE_DEVICES` | 设备索引（`{device_index}` 替换后） |
 | ROCm | `HIP_VISIBLE_DEVICES` | 设备索引 |
 | OpenVINO | `OPENVINO_DEVICE` | 设备名（`GPU.0` / `NPU.0`） |
-| CPU | — | — |
+| CPU | —（模块自定义，如 `TORCH_DEVICE`） | — |
+
+> 共享 CUDA 库目录（`[compute].cuda_libs_dir`）另以搜索路径前置方式注入
+> （Linux `LD_LIBRARY_PATH` / Windows `PATH`），不属于本表。
 
 ### 3.3 用户可设置的环境变量（影响 EntryPoint 自身）
 
@@ -330,7 +389,10 @@ no_proxy = "localhost,127.0.0.1"
   "repo_id": "Systran/faster-whisper-large-v3",
   "revision": "main",
   "downloaded_at": "2026-07-20T10:30:00Z",
-  "total_size_bytes": 3094850000
+  "total_size_bytes": 3094850000,
+  "qualified_id": "ep.systran.faster-whisper",
+  "tags": ["字幕"],
+  "pack_id": "pigeonfish.subtitle-kit"
 }
 ```
 
@@ -338,11 +400,14 @@ no_proxy = "localhost,127.0.0.1"
 |---|---|---|
 | `module_id` | string | 所属模块 ID |
 | `model_id` | string | 模型 ID（对应 module.toml 中 [[models]].id） |
-| `source` | string | 下载源（`huggingface` / `modelscope` / `url`） |
+| `source` | string | 获取来源（`huggingface` / `modelscope` / `url` / `pack`——整合包导入落位为 `pack`） |
 | `repo_id` | string | 仓库 ID |
 | `revision` | string | 版本/分支 |
 | `downloaded_at` | string | 下载完成时间（ISO 8601） |
 | `total_size_bytes` | u64 | 总大小 |
+| `qualified_id` | string? | 全限定模型 ID（§4.3 PACK_UNIFY_PLAN；旧数据可缺省） |
+| `tags` | string[] | 用户/整合包标签（统一页 chips 筛选，随整合包流转） |
+| `pack_id` | string? | 来源整合包 id（可空；非 pack 来源无此字段） |
 
 **用户可安全删除此文件**。删除后系统视为手动放置的模型。
 
@@ -354,8 +419,9 @@ no_proxy = "localhost,127.0.0.1"
 sha256:a1b2c3d4e5f6...
 ```
 
-单行文本，记录 `requirements.txt` 的 SHA-256 哈希。
-用于检测依赖是否变更，避免每次启动都重新安装。
+单行文本。哈希输入 = `requirements.txt` 字节 + constraints 文件字节（若存在）
++ link-mode 版本号（依赖栈统一，PACK_UNIFY_PLAN §3.1）：任一输入变化（改依赖、
+改 constraints、换链接模式）都会触发 venv 重装。
 
 ### 4.3 `ep.lock` — 依赖锁定文件
 
@@ -428,11 +494,15 @@ EntryPoint/                        ← 应用根目录
 │       ├── adapter.py
 │       └── requirements.txt
 ├── runtime/                       ← 运行时（自动生成）
-│   └── venvs/
-│       └── <module-id>/
-│           ├── .ep_deps_hash
-│           ├── ep.lock
-│           └── ... (venv 内容)
+│   ├── venvs/
+│   │   └── <module-id>/
+│   │       ├── .ep_deps_hash
+│   │       ├── ep.lock
+│   │       └── ... (venv 内容)
+│   ├── .uv-cache/                 ← uv 缓存（[python].uv_cache_dir，硬链接去重源）
+│   ├── cuda-libs/                 ← 共享 CUDA 库（[compute].cuda_libs_dir）
+│   └── packs/                     ← 已装整合包注册表（<pack-id>.json）
+├── .pack-staging/                 ← 整合包导入/构建暂存（[packs].staging_dir，随用随清）
 ├── workspace/                     ← 管线任务工作目录
 │   └── <task-id>/
 ├── logs/                          ← 日志

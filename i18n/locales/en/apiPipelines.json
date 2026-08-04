@@ -18,5 +18,22 @@
   "tasks.taskNotFound": "Task not found: {{taskId}}",
   "tasks.nodeNotFound": "Node not found in task: {{nodeId}}",
   "tasks.noArtifact": "Node `{{nodeId}}` has no downloadable artifact",
-  "tasks.artifactPathInvalid": "Artifact path of node `{{nodeId}}` is invalid"
+  "tasks.artifactPathInvalid": "Artifact path of node `{{nodeId}}` is invalid",
+  "tasks.cancelAlreadyTerminal": "Task already terminal ({{status}}), cannot cancel",
+  "execute.capabilityNotFound": "Module {{moduleId}} has no capability {{capability}}",
+  "execute.inputMissing": "Input file does not exist: {{path}}",
+  "execute.moduleStartFailed": "Failed to auto-start module: {{detail}}",
+  "single.missingModuleId": "module_id is required",
+  "single.missingCapability": "capability is required",
+  "single.missingInputPath": "input_path is required",
+  "single.paramsNotObject": "params must be an object",
+  "single.capabilityNotFound": "Capability '{{capability}}' not found in module '{{module_id}}'",
+  "single.paramMissing": "Missing required parameter '{{param}}'",
+  "single.paramTypeInvalid": "Parameter '{{param}}' has invalid type (expected {{expected}})",
+  "single.paramEnumInvalid": "Value for parameter '{{param}}' is not in the allowed enum values",
+  "single.inputNotFound": "Input file does not exist: {{path}}",
+  "single.autostartTimeout": "Module '{{module_id}}' did not become healthy within {{secs}}s after autostart",
+  "single.submitFailed": "Direct execution submit failed: {{detail}}",
+  "vramBudget.specEmpty": "VRAM budget request has no nodes",
+  "vramBudget.cycleDetected": "Pipeline contains a cycle; VRAM budget cannot be computed"
 }
