@@ -17,6 +17,9 @@ pub mod model;
 // Wave 3 modules
 pub mod pipeline;
 
+// Wave 2 B3：任务注册表下沉（daemon/桌面共用，P1-4）
+pub mod task_registry;
+
 // Wave 0+ modules (skeleton)
 pub mod health;
 pub mod deps;
