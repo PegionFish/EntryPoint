@@ -24,6 +24,138 @@ pub enum ValidationError {
 
     #[error("pipeline must have at least one file_input node")]
     NoFileInput,
+
+    #[error("orphan node `{0}`: not connected to any edge and not a file_input/file_output endpoint")]
+    OrphanNode(String),
+
+    #[error("duplicate edge: `{from_node}:{from_port}` -> `{to_node}:{to_port}`")]
+    DuplicateEdge {
+        from_node: String,
+        from_port: String,
+        to_node: String,
+        to_port: String,
+    },
+
+    #[error(
+        "port type mismatch: `{from_node}:{from_port}` outputs `{from_type}` \
+         but `{to_node}:{to_port}` expects `{to_type}`"
+    )]
+    PortTypeMismatch {
+        from_node: String,
+        from_port: String,
+        from_type: PortType,
+        to_node: String,
+        to_port: String,
+        to_type: PortType,
+    },
+}
+
+// ─── 端口数据类型（PIPELINE_SPEC §7.1 / §7.2） ──────────────────────────────
+
+/// 端口数据类型（PIPELINE_SPEC §7.1）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortType {
+    Audio,
+    Video,
+    Image,
+    Text,
+    Json,
+    File,
+}
+
+impl PortType {
+    /// 从字符串解析（大小写不敏感）；未知类型 → `None`
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "audio" => Some(Self::Audio),
+            "video" => Some(Self::Video),
+            "image" => Some(Self::Image),
+            "text" => Some(Self::Text),
+            "json" => Some(Self::Json),
+            "file" => Some(Self::File),
+            _ => None,
+        }
+    }
+
+    /// §7.2 兼容矩阵：输出类型 `self` 是否可流入输入类型 `target`。
+    ///
+    /// - 同类型 ✅
+    /// - 任意类型 → `file` ✅（文件类端口接受一切）
+    /// - `json` → `text` ✅（隐式序列化为 JSON 字符串，§7.3）
+    /// - `file` → 具体文件类型（audio/video/image）✅（运行时检查扩展名，§7.3）
+    /// - 其余组合 ❌
+    pub fn is_compatible_with(self, target: PortType) -> bool {
+        self == target
+            || matches!(
+                (self, target),
+                // 任意 → file ✅；json → text ✅*；file → 具体文件类型 ✅
+                (_, PortType::File)
+                    | (PortType::Json, PortType::Text)
+                    | (PortType::File, PortType::Audio | PortType::Video | PortType::Image)
+            )
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Audio => "audio",
+            Self::Video => "video",
+            Self::Image => "image",
+            Self::Text => "text",
+            Self::Json => "json",
+            Self::File => "file",
+        }
+    }
+}
+
+impl std::fmt::Display for PortType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// builtin 节点指定端口的数据类型（PIPELINE_SPEC §5 + §6.7）。
+///
+/// `is_output`：true 查输出端口，false 查输入端口。仅识别默认端口名
+/// `"input"` / `"output"`；module 节点（端口类型由模块清单声明，DAG 层不可见）、
+/// 未知 builtin、自定义端口名一律返回 `None`（调用方跳过类型检查，不误报）。
+fn builtin_port_type(
+    builtin: &str,
+    params: &serde_json::Value,
+    port: &str,
+    is_output: bool,
+) -> Option<PortType> {
+    match builtin {
+        "file_input" if is_output && port == "output" => Some(
+            params
+                .get("accept")
+                .and_then(|v| v.as_str())
+                .and_then(PortType::parse)
+                .unwrap_or(PortType::File),
+        ),
+        "file_output" if !is_output && port == "input" => Some(PortType::File),
+        "ffmpeg" if !is_output && port == "input" => Some(PortType::File),
+        "ffmpeg" if is_output && port == "output" => Some(PortType::File),
+        // §6.7：llm input_type=text；output_format=json 时输出 Json
+        "llm" | "external_api" if !is_output && port == "input" => Some(PortType::Text),
+        "llm" | "external_api" if is_output && port == "output" => {
+            let is_json = params
+                .get("output_format")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().eq_ignore_ascii_case("json"))
+                .unwrap_or(false);
+            Some(if is_json { PortType::Json } else { PortType::Text })
+        }
+        _ => None,
+    }
+}
+
+/// 边端点的数据类型解析（供 validate 的端口类型检查使用）
+fn endpoint_port_type(node: &PipelineNode, port: &str, is_output: bool) -> Option<PortType> {
+    match &node.kind {
+        NodeKind::Builtin { builtin } => builtin_port_type(builtin, &node.params, port, is_output),
+        // module / 遗留 external_api kind：类型在模块清单/运行期才可见，跳过
+        _ => None,
+    }
 }
 
 // ─── 节点类型 ────────────────────────────────────────────────────────────────
@@ -135,6 +267,11 @@ pub struct Pipeline {
     pub nodes: Vec<PipelineNode>,
     #[serde(default)]
     pub edges: Vec<Edge>,
+    /// 管线级并发上限（§6.8）：本管线同时运行实例数的 semaphore 上限。
+    /// `None` = 跟随全局 `max_parallel`；TOML `[pipeline]` 段 `max_instances` 键。
+    /// GPU 重管线可锁 `1` 防显存打架。执行层（B3）消费。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_instances: Option<u32>,
 }
 
 /// TOML 文件顶层结构（用于反序列化）
@@ -153,6 +290,9 @@ struct PipelineMeta {
     name: String,
     #[serde(default)]
     description: String,
+    /// §6.8 管线级并发上限；`[pipeline]` 段可选键
+    #[serde(default)]
+    max_instances: Option<u32>,
 }
 
 impl Pipeline {
@@ -174,6 +314,7 @@ impl Pipeline {
             description: file.pipeline.description,
             nodes: file.nodes,
             edges: file.edges,
+            max_instances: file.pipeline.max_instances,
         })
     }
 
@@ -184,6 +325,9 @@ impl Pipeline {
     /// - 边引用的节点存在
     /// - 无环（拓扑排序检测）
     /// - 至少一个 file_input 节点
+    /// - 无孤儿节点（无任何边相连且非 file_input/file_output 端点，P2-11）
+    /// - 无重复边（from/to 四元组完全相同，P2-11）
+    /// - 端口数据类型兼容（PIPELINE_SPEC §7.2 矩阵，P2-11）
     pub fn validate(&self) -> Result<(), Vec<ValidationError>> {
         let mut errors = Vec::new();
 
@@ -217,6 +361,70 @@ impl Pipeline {
         });
         if !has_file_input {
             errors.push(ValidationError::NoFileInput);
+        }
+
+        // 5. 孤儿节点：无任何边相连且非 file_input/file_output 端点（P2-11）
+        let mut connected: HashSet<&str> = HashSet::new();
+        for edge in &self.edges {
+            connected.insert(edge.from.0.as_str());
+            connected.insert(edge.to.0.as_str());
+        }
+        for node in &self.nodes {
+            let is_endpoint = matches!(
+                &node.kind,
+                NodeKind::Builtin { builtin } if builtin == "file_input" || builtin == "file_output"
+            );
+            if !connected.contains(node.id.as_str()) && !is_endpoint {
+                errors.push(ValidationError::OrphanNode(node.id.clone()));
+            }
+        }
+
+        // 6. 重复边：from/to 四元组完全相同（P2-11）
+        let mut seen_edges: HashSet<(&str, &str, &str, &str)> = HashSet::new();
+        for edge in &self.edges {
+            let key = (
+                edge.from.0.as_str(),
+                edge.from.1.as_str(),
+                edge.to.0.as_str(),
+                edge.to.1.as_str(),
+            );
+            if !seen_edges.insert(key) {
+                errors.push(ValidationError::DuplicateEdge {
+                    from_node: edge.from.0.clone(),
+                    from_port: edge.from.1.clone(),
+                    to_node: edge.to.0.clone(),
+                    to_port: edge.to.1.clone(),
+                });
+            }
+        }
+
+        // 7. 端口类型兼容性（PIPELINE_SPEC §7.2）：仅两端类型均可解析时检查
+        //    （module 节点端口类型在模块清单层声明，DAG 层不可见 → 跳过不误报）
+        let node_by_id: HashMap<&str, &PipelineNode> =
+            self.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+        for edge in &self.edges {
+            let (Some(from_node), Some(to_node)) = (
+                node_by_id.get(edge.from.0.as_str()),
+                node_by_id.get(edge.to.0.as_str()),
+            ) else {
+                continue; // 缺失节点已在检查 2 报告
+            };
+            let (Some(from_type), Some(to_type)) = (
+                endpoint_port_type(from_node, &edge.from.1, true),
+                endpoint_port_type(to_node, &edge.to.1, false),
+            ) else {
+                continue; // 任一端类型未知 → 跳过（运行期校验兜底）
+            };
+            if !from_type.is_compatible_with(to_type) {
+                errors.push(ValidationError::PortTypeMismatch {
+                    from_node: edge.from.0.clone(),
+                    from_port: edge.from.1.clone(),
+                    from_type,
+                    to_node: edge.to.0.clone(),
+                    to_port: edge.to.1.clone(),
+                    to_type,
+                });
+            }
         }
 
         if errors.is_empty() {
@@ -803,6 +1011,10 @@ api_key_env = "OPENAI_API_KEY"
 [nodes.params]
 base_url = "https://api.openai.com/v1"
 model = "gpt-4o-mini"
+
+[[edges]]
+from = ["input", "output"]
+to = ["translate", "input"]
 "#;
         let pipeline = Pipeline::from_toml_str(toml_str).unwrap();
         assert_eq!(
@@ -878,6 +1090,344 @@ model = "gpt-4o-mini"
         assert_eq!(resolved, None);
         let warn = warning.expect("missing device must produce a warning");
         assert!(warn.contains("rocm:1") && warn.contains("auto"), "got: {warn}");
+    }
+
+    // ─── P2-11：validate 补漏（孤儿节点 / 重复边 / 端口类型） ────────────────
+
+    /// §7.2 兼容矩阵全表（纯函数级）
+    #[test]
+    fn test_port_type_compatibility_matrix() {
+        use PortType::*;
+        let types = [Audio, Video, Image, Text, Json, File];
+        for &src in &types {
+            for &dst in &types {
+                let expected = src == dst
+                    || dst == File // 任意 → file ✅
+                    || (src, dst) == (Json, Text) // json → text ✅*
+                    || (src == File && matches!(dst, Audio | Video | Image)); // file → 具体文件类型 ✅
+                assert_eq!(
+                    src.is_compatible_with(dst),
+                    expected,
+                    "{src} -> {dst} should be {expected} per §7.2"
+                );
+            }
+        }
+        // parse 大小写不敏感 + 未知类型
+        assert_eq!(PortType::parse("AUDIO"), Some(Audio));
+        assert_eq!(PortType::parse(" json "), Some(Json));
+        assert_eq!(PortType::parse("nope"), None);
+    }
+
+    #[test]
+    fn test_validate_orphan_node_detected_endpoints_exempt() {
+        // stray(module) 无边相连 → 孤儿；loose_out(file_output) 无边但是端点 → 豁免
+        let toml_str = r#"
+[pipeline]
+id = "orphan"
+name = "Orphan test"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+
+[[nodes]]
+id = "mid"
+kind = "builtin"
+builtin = "ffmpeg"
+
+[[nodes]]
+id = "stray"
+kind = "module"
+module_id = "faster-whisper"
+capability = "transcribe"
+
+[[nodes]]
+id = "loose_out"
+kind = "builtin"
+builtin = "file_output"
+
+[[edges]]
+from = ["input", "output"]
+to = ["mid", "input"]
+"#;
+        let pipeline = Pipeline::from_toml_str(toml_str).unwrap();
+        let errors = pipeline.validate().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::OrphanNode(id) if id == "stray")),
+            "stray module node must be flagged: {errors:?}"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::OrphanNode(id) if id == "loose_out")),
+            "file_output endpoint must be exempt: {errors:?}"
+        );
+        // 英文技术层消息
+        let msg = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::OrphanNode(_) => Some(e.to_string()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(msg.contains("orphan") && msg.contains("stray"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_validate_no_orphan_when_fully_connected() {
+        // 反例：全连接 + 未连接端点 → 无孤儿错误
+        let toml_str = r#"
+[pipeline]
+id = "no-orphan"
+name = "No orphan"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+
+[[nodes]]
+id = "save"
+kind = "builtin"
+builtin = "file_output"
+
+[[nodes]]
+id = "save2"
+kind = "builtin"
+builtin = "file_output"
+
+[[edges]]
+from = ["input", "output"]
+to = ["save", "input"]
+"#;
+        let pipeline = Pipeline::from_toml_str(toml_str).unwrap();
+        assert!(pipeline.validate().is_ok(), "endpoints without edges are exempt");
+    }
+
+    #[test]
+    fn test_validate_duplicate_edge_detected() {
+        let toml_str = r#"
+[pipeline]
+id = "dup-edge"
+name = "Duplicate edge"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+
+[[nodes]]
+id = "a"
+kind = "builtin"
+builtin = "ffmpeg"
+
+[[edges]]
+from = ["input", "output"]
+to = ["a", "input"]
+
+[[edges]]
+from = ["input", "output"]
+to = ["a", "input"]
+"#;
+        let pipeline = Pipeline::from_toml_str(toml_str).unwrap();
+        let errors = pipeline.validate().unwrap_err();
+        let dup: Vec<_> = errors
+            .iter()
+            .filter(|e| matches!(e, ValidationError::DuplicateEdge { .. }))
+            .collect();
+        assert_eq!(dup.len(), 1, "exactly one duplicate-edge error: {errors:?}");
+        let msg = dup[0].to_string();
+        assert!(
+            msg.contains("input:output") && msg.contains("a:input"),
+            "error should name both endpoints: {msg}"
+        );
+
+        // 反例：同一对节点但端口不同 → 不算重复
+        let toml_str = r#"
+[pipeline]
+id = "fanout"
+name = "Fanout ok"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+
+[[nodes]]
+id = "a"
+kind = "builtin"
+builtin = "ffmpeg"
+
+[[nodes]]
+id = "b"
+kind = "builtin"
+builtin = "ffmpeg"
+
+[[edges]]
+from = ["input", "output"]
+to = ["a", "input"]
+
+[[edges]]
+from = ["input", "output"]
+to = ["b", "input"]
+"#;
+        let pipeline = Pipeline::from_toml_str(toml_str).unwrap();
+        assert!(
+            pipeline.validate().is_ok(),
+            "fanout to different nodes is not a duplicate: {:?}",
+            pipeline.validate().unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_validate_port_type_mismatch_detected() {
+        // file_input(accept=audio) → llm(input_type=text)：audio → text ❌
+        let toml_str = r#"
+[pipeline]
+id = "type-mismatch"
+name = "Type mismatch"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = { accept = "audio" }
+
+[[nodes]]
+id = "translate"
+kind = "builtin"
+builtin = "llm"
+
+[[edges]]
+from = ["input", "output"]
+to = ["translate", "input"]
+"#;
+        let pipeline = Pipeline::from_toml_str(toml_str).unwrap();
+        let errors = pipeline.validate().unwrap_err();
+        let mismatch = errors.iter().find_map(|e| match e {
+            ValidationError::PortTypeMismatch {
+                from_node,
+                from_type,
+                to_node,
+                to_type,
+                ..
+            } => Some((from_node.clone(), *from_type, to_node.clone(), *to_type)),
+            _ => None,
+        });
+        assert_eq!(
+            mismatch,
+            Some((
+                "input".to_string(),
+                PortType::Audio,
+                "translate".to_string(),
+                PortType::Text
+            )),
+            "audio -> text must be flagged: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_port_type_realistic_llm_chain_ok() {
+        // file_input → ffmpeg(file→file ✅) → module(类型不可见，跳过)
+        // → llm(output_format=json) → llm(json→text ✅，§7.2 *)
+        let toml_str = r#"
+[pipeline]
+id = "llm-chain"
+name = "Realistic LLM chain"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = { accept = "video" }
+
+[[nodes]]
+id = "extract"
+kind = "builtin"
+builtin = "ffmpeg"
+
+[[nodes]]
+id = "asr"
+kind = "module"
+module_id = "faster-whisper"
+capability = "transcribe"
+
+[[nodes]]
+id = "gen"
+kind = "builtin"
+builtin = "llm"
+params = { base_url = "http://127.0.0.1:11434/v1", model = "qwen2.5", output_format = "json" }
+
+[[nodes]]
+id = "check"
+kind = "builtin"
+builtin = "llm"
+params = { base_url = "http://127.0.0.1:11434/v1", model = "qwen2.5" }
+
+[[edges]]
+from = ["input", "output"]
+to = ["extract", "input"]
+
+[[edges]]
+from = ["extract", "output"]
+to = ["asr", "input"]
+
+[[edges]]
+from = ["asr", "output"]
+to = ["gen", "input"]
+
+[[edges]]
+from = ["gen", "output"]
+to = ["check", "input"]
+"#;
+        let pipeline = Pipeline::from_toml_str(toml_str).unwrap();
+        assert!(
+            pipeline.validate().is_ok(),
+            "realistic chain must pass: {:?}",
+            pipeline.validate().unwrap_err()
+        );
+    }
+
+    // ─── §6.8 max_instances（管线级并发上限） ────────────────────────────────
+
+    #[test]
+    fn test_max_instances_toml_parse_and_serialize() {
+        let toml_str = r#"
+[pipeline]
+id = "mi"
+name = "Max instances"
+max_instances = 2
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+"#;
+        let pipeline = Pipeline::from_toml_str(toml_str).unwrap();
+        assert_eq!(pipeline.max_instances, Some(2));
+
+        // 序列化保留该键
+        let out = toml::to_string_pretty(&pipeline).unwrap();
+        assert!(out.contains("max_instances = 2"), "got: {out}");
+
+        // 缺省 → None 且不写出该键
+        let toml_str = r#"
+[pipeline]
+id = "mi-none"
+name = "No max instances"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+"#;
+        let pipeline = Pipeline::from_toml_str(toml_str).unwrap();
+        assert_eq!(pipeline.max_instances, None);
+        let out = toml::to_string_pretty(&pipeline).unwrap();
+        assert!(!out.contains("max_instances"), "got: {out}");
     }
 
     // ─── position 字段与 TOML 序列化（WebUI 桥接依赖） ─────────────────────
