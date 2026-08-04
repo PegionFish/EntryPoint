@@ -132,6 +132,52 @@ async fn execute_pipeline(
             )
             .await
         }
+        // ── Wave 2 B3 新增变体（P2-11 提交前校验 + §5.3 直跑 + §6.5 自动拉起）──
+        Err(execution::SubmitError::InvalidPipeline(detail)) => {
+            err_response(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "apiPipelines.specInvalid",
+                &[("detail", detail)],
+            )
+            .await
+        }
+        Err(execution::SubmitError::ModuleNotFound(id)) => {
+            err_response(
+                &state,
+                StatusCode::NOT_FOUND,
+                "apiCore.module.notFound",
+                &[("id", id)],
+            )
+            .await
+        }
+        Err(execution::SubmitError::CapabilityNotFound(module_id, capability)) => {
+            err_response(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "apiPipelines.execute.capabilityNotFound",
+                &[("moduleId", module_id), ("capability", capability)],
+            )
+            .await
+        }
+        Err(execution::SubmitError::InputMissing(path)) => {
+            err_response(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "apiPipelines.execute.inputMissing",
+                &[("path", path.display().to_string())],
+            )
+            .await
+        }
+        Err(execution::SubmitError::ModuleStartFailed(detail)) => {
+            err_response(
+                &state,
+                StatusCode::BAD_GATEWAY,
+                "apiPipelines.execute.moduleStartFailed",
+                &[("detail", detail)],
+            )
+            .await
+        }
         Err(execution::SubmitError::Internal(msg)) => {
             err_response(
                 &state,

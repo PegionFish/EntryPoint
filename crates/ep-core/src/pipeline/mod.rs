@@ -5,6 +5,7 @@
 pub mod dag;
 pub mod executor;
 pub mod runner;
+pub mod vram; // Wave 2 B3：VRAM 预算（§6.3）
 
 pub use dag::{Edge, NodeKind, Pipeline, PipelineNode, ValidationError};
 pub use executor::{ModuleCallError, NodeState, PipelineTask};
