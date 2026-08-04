@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# §4.3 统一消费：清单校验使用 ep-core 的 model_id（QualifiedId）与 ComputeBackend
+ep-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
