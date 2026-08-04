@@ -1,7 +1,15 @@
-use crate::types::{ComputeBackend, ComputeDevice, DeviceId};
-use std::process::Command;
+//! NVIDIA CUDA 设备检测（nvidia-smi）
+//!
+//! Windows 探测路径（§15.3）：
+//! 1. `EP_NVIDIA_SMI_PATH` 环境变量（显式覆盖，便于真机验证调优）
+//! 2. PATH（新驱动把 nvidia-smi.exe 装入 System32，PATH 命中即可用）
+//! 3. `C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe`（旧版驱动随附路径）
+//!
+//! 所有候选均带子进程超时与畸形输出容错。
 
-use super::DeviceDetector;
+use crate::types::{ComputeBackend, ComputeDevice, DeviceId};
+
+use super::{candidate_is_viable, run_tool, DeviceDetector, TOOL_TIMEOUT};
 
 pub struct CudaDetector;
 
@@ -10,12 +18,31 @@ const SMI_ARGS: &[&str] = &[
     "--format=csv,noheader,nounits",
 ];
 
-fn run_nvidia_smi() -> Option<String> {
-    let output = Command::new("nvidia-smi").args(SMI_ARGS).output().ok()?;
-    if !output.status.success() {
-        return None;
+/// nvidia-smi 候选路径（按尝试顺序）
+pub(crate) fn nvidia_smi_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Ok(p) = std::env::var("EP_NVIDIA_SMI_PATH") {
+        if !p.trim().is_empty() {
+            candidates.push(p.trim().to_string());
+        }
     }
-    String::from_utf8(output.stdout).ok()
+    candidates.push("nvidia-smi".to_string());
+    if cfg!(windows) {
+        candidates.push(r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe".to_string());
+    }
+    candidates
+}
+
+fn run_nvidia_smi() -> Option<String> {
+    for candidate in nvidia_smi_candidates() {
+        if !candidate_is_viable(&candidate) {
+            continue;
+        }
+        if let Some(output) = run_tool(&candidate, SMI_ARGS, TOOL_TIMEOUT) {
+            return Some(output);
+        }
+    }
+    None
 }
 
 fn parse_mib(s: &str) -> Option<u32> {
@@ -132,5 +159,19 @@ mod tests {
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].total_memory_mb, None);
         assert_eq!(devices[0].utilization, None);
+    }
+
+    #[test]
+    fn test_candidates_always_include_path_lookup() {
+        // 无论平台，PATH 探测候选必须存在（nvidia-smi 在 PATH 的用户真机依赖此项）
+        assert!(nvidia_smi_candidates().iter().any(|c| c == "nvidia-smi"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_candidates_include_legacy_driver_path() {
+        assert!(nvidia_smi_candidates()
+            .iter()
+            .any(|c| c.contains("NVSMI")));
     }
 }
