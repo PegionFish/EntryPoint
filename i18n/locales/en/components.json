@@ -4,6 +4,7 @@
   "sidebar.nav.pipeline": "Pipeline",
   "sidebar.nav.tasks": "Tasks",
   "sidebar.nav.models": "Models",
+  "sidebar.nav.packs": "Packs",
   "sidebar.nav.settings": "Settings",
   "header.ws.idle": "Not connected",
   "header.ws.connecting": "Connecting",

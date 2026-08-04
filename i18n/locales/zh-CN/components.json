@@ -4,6 +4,7 @@
   "sidebar.nav.pipeline": "管线",
   "sidebar.nav.tasks": "任务",
   "sidebar.nav.models": "模型",
+  "sidebar.nav.packs": "整合包",
   "sidebar.nav.settings": "设置",
   "header.ws.idle": "未连接",
   "header.ws.connecting": "连接中",
