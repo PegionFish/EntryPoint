@@ -379,6 +379,9 @@ async fn import_model(
                 revision: String::new(),
                 downloaded_at: chrono::Utc::now().to_rfc3339(),
                 total_size_bytes: total_bytes,
+                qualified_id: None,
+                tags: vec![],
+                pack_id: None,
             };
             if let Err(e) = mgr.write_meta(&model_decl.target_dir, &meta) {
                 warn!(error = %e, "failed to write model meta after import");
@@ -935,6 +938,8 @@ mod tests {
             size_estimate_mb: Some(100),
             default: true,
             mirrors: vec![],
+            qualified_id: None,
+            vram_estimate_mb: None,
         }
     }
 
@@ -950,6 +955,8 @@ mod tests {
             size_estimate_mb: None,
             default: false,
             mirrors: vec![],
+            qualified_id: None,
+            vram_estimate_mb: None,
         }
     }
 

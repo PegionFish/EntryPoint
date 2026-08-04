@@ -1201,6 +1201,8 @@ mod tests {
                 size_estimate_mb: None,
                 default: false,
                 mirrors: vec![],
+                qualified_id: None,
+                vram_estimate_mb: None,
             },
             ModelDecl {
                 id: "large".to_string(),
@@ -1213,6 +1215,8 @@ mod tests {
                 size_estimate_mb: None,
                 default: true,
                 mirrors: vec![],
+                qualified_id: None,
+                vram_estimate_mb: None,
             },
         ];
 
