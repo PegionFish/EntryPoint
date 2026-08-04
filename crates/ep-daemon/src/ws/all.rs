@@ -68,9 +68,10 @@ async fn handle_all_socket(mut socket: WebSocket, state: Arc<AppState>) {
             },
             r = progress_rx.recv() => match r {
                 Ok(m) => {
-                    // 旧 ProgressMessage → WsMessage::Progress
+                    // 旧 ProgressMessage → WsMessage::Progress（P2-7：携带 task_id）
                     let msg = WsMessage::Progress {
                         pipeline_id: m.pipeline_id,
+                        task_id: m.task_id,
                         node_id: m.node_id,
                         status: m.status,
                     };
