@@ -69,6 +69,10 @@ pub struct EnvManager {
     uv_path: Option<PathBuf>,
     /// 网络代理环境变量（注入 uv/pip 子进程）
     network_env: Vec<(String, String)>,
+    /// uv 缓存目录（相对应用根，§3.1；空字符串 = 不注入 UV_CACHE_DIR）
+    uv_cache_dir: String,
+    /// 全局 constraints 文件（相对应用根，§3.1；空字符串 = 停用）
+    constraints: String,
 }
 
 impl EnvManager {
@@ -110,6 +114,8 @@ impl EnvManager {
             python_path,
             uv_path,
             network_env: Vec::new(),
+            uv_cache_dir: config.uv_cache_dir.clone(),
+            constraints: config.constraints.clone(),
         }
     }
 
@@ -330,13 +336,15 @@ impl EnvManager {
     /// 确保模块的虚拟环境就绪
     ///
     /// 流程：
-    /// 1. 检查 `runtime/venvs/<module_id>/` 是否存在
-    /// 2. 不存在 → `uv venv --python <version> <path>`
-    /// 3. 计算 requirements.txt 哈希
-    /// 4. 对比 `.ep_deps_hash`
-    /// 5. 不一致 → `uv pip install -r <req> --python <venv_python>`
-    /// 6. 写入新哈希
-    /// 7. 返回 venv 内 python 路径
+    /// 1. 构造 uv 子进程环境变量（网络代理 + `UV_CACHE_DIR`，§3.1 依赖栈统一）
+    /// 2. 检查 `runtime/venvs/<module_id>/` 是否存在
+    /// 3. 不存在 → `uv venv --python <version> <path>`（注入 UV_CACHE_DIR）
+    /// 4. 计算依赖哈希（requirements + constraints + link-mode 标记，P2-18）
+    /// 5. 对比 `.ep_deps_hash`
+    /// 6. 不一致 → `uv pip install -r <req> --python <venv_python> --link-mode hardlink [-c <constraints>]`
+    ///    （constraints 仅当配置非空且文件存在时追加，文件不存在静默跳过）
+    /// 7. 写入新哈希
+    /// 8. 返回 venv 内 python 路径
     pub fn ensure_venv(
         &self,
         module_id: &str,
@@ -350,6 +358,29 @@ impl EnvManager {
 
         let venv_dir = self.venv_dir(module_id);
         let venv_python = self.venv_python_path(module_id);
+
+        // 0. uv 子进程环境变量：网络代理 + UV_CACHE_DIR（§3.1）
+        //    缓存入应用根 → 与 venv 同盘 → 硬链接去重生效；目录不存在先创建
+        let mut uv_env = self.network_env.clone();
+        if let Some(cache_dir) = self.uv_cache_dir_path() {
+            match std::fs::create_dir_all(&cache_dir) {
+                Ok(()) => {
+                    debug!(module = module_id, path = %cache_dir.display(), "using uv cache dir");
+                    uv_env.push((
+                        "UV_CACHE_DIR".to_string(),
+                        cache_dir.to_string_lossy().into_owned(),
+                    ));
+                }
+                Err(e) => {
+                    warn!(
+                        module = module_id,
+                        path = %cache_dir.display(),
+                        error = %e,
+                        "failed to create uv cache dir, falling back to uv default cache"
+                    );
+                }
+            }
+        }
 
         // 1. 创建 venv（如果不存在）
         if !venv_dir.exists() {
@@ -366,7 +397,7 @@ impl EnvManager {
                     python_version,
                     venv_dir.to_str().unwrap_or_default(),
                 ],
-                &self.network_env,
+                &uv_env,
             )
             .with_context(|| format!("failed to create venv for module '{module_id}'"))?;
             debug!(module = module_id, output = %output, "venv created");
@@ -380,10 +411,20 @@ impl EnvManager {
             return Ok(venv_python);
         }
 
+        // constraints：配置非空且文件存在才参与安装与哈希；不存在静默跳过（§3.1）
+        let constraints_file = self.constraints_file();
+        if self.constraints_path().is_some() && constraints_file.is_none() {
+            debug!(
+                module = module_id,
+                path = %self.constraints_path().map(|p| p.display().to_string()).unwrap_or_default(),
+                "constraints file not found, skipping"
+            );
+        }
+
         let current_hash =
-            hash_file(requirements).with_context(|| {
-                format!("failed to hash requirements file: {}", requirements.display())
-            })?;
+            compute_deps_hash(requirements, constraints_file.as_deref()).with_context(
+                || format!("failed to hash dependency stack: {}", requirements.display()),
+            )?;
 
         let hash_file = self.deps_hash_path(module_id);
         let needs_install = if hash_file.exists() {
@@ -393,16 +434,33 @@ impl EnvManager {
             true
         };
 
-        // 3. 安装/更新依赖
+        // 3. 安装/更新依赖（--link-mode hardlink：跨文件系统时 uv 内建自动回退 copy）
         if needs_install {
             info!(module = module_id, "installing dependencies");
             let venv_py_str = venv_python.to_str().unwrap_or_default();
             let req_str = requirements.to_str().unwrap_or_default();
 
+            let mut install_args: Vec<&str> = vec![
+                "pip",
+                "install",
+                "-r",
+                req_str,
+                "--python",
+                venv_py_str,
+                "--link-mode",
+                UV_LINK_MODE,
+            ];
+            let constraints_str;
+            if let Some(c) = &constraints_file {
+                constraints_str = c.to_string_lossy().into_owned();
+                install_args.push("-c");
+                install_args.push(&constraints_str);
+            }
+
             let output = run_command_with_env(
                 uv.to_str().unwrap_or("uv"),
-                &["pip", "install", "-r", req_str, "--python", venv_py_str],
-                &self.network_env,
+                &install_args,
+                &uv_env,
             )
             .with_context(|| format!("failed to install dependencies for module '{module_id}'"))?;
             debug!(module = module_id, output = %output, "dependencies installed");
@@ -420,6 +478,31 @@ impl EnvManager {
         }
 
         Ok(venv_python)
+    }
+
+    /// uv 缓存目录绝对路径（配置为空 → None，即不注入 `UV_CACHE_DIR`）。
+    ///
+    /// 配置为相对路径时基于应用根解析；绝对路径原样返回（`Path::join` 语义）。
+    pub fn uv_cache_dir_path(&self) -> Option<PathBuf> {
+        if self.uv_cache_dir.is_empty() {
+            None
+        } else {
+            Some(self.root.join(&self.uv_cache_dir))
+        }
+    }
+
+    /// constraints 文件配置路径绝对路径（配置为空 → None，即停用 constraints）。
+    pub fn constraints_path(&self) -> Option<PathBuf> {
+        if self.constraints.is_empty() {
+            None
+        } else {
+            Some(self.root.join(&self.constraints))
+        }
+    }
+
+    /// 当前生效的 constraints 文件：仅当配置非空**且文件存在**时返回路径（§3.1）。
+    fn constraints_file(&self) -> Option<PathBuf> {
+        self.constraints_path().filter(|p| p.is_file())
     }
 
     /// 获取模块 venv 内的 python 可执行文件路径
@@ -452,10 +535,12 @@ impl EnvManager {
             return false;
         }
 
-        let current_hash = match hash_file_content(requirements) {
-            Ok(h) => h,
-            Err(_) => return false,
-        };
+        // 与 ensure_venv 保持同一哈希口径（requirements + constraints + link-mode 标记，P2-18）
+        let current_hash =
+            match compute_deps_hash(requirements, self.constraints_file().as_deref()) {
+                Ok(h) => h,
+                Err(_) => return false,
+            };
 
         let stored = std::fs::read_to_string(&hash_file).unwrap_or_default();
         stored.trim() == current_hash
@@ -529,28 +614,68 @@ impl EnvManager {
 
 // ─── 辅助函数 ────────────────────────────────────────────────────────────────
 
-/// 计算文件内容的哈希值（简化实现）
+/// `uv pip install` 的 link-mode（§3.1 依赖栈统一）。
+///
+/// hardlink：缓存与 venv 同盘时硬链接去重；跨文件系统时 uv 内建自动回退 copy。
+pub const UV_LINK_MODE: &str = "hardlink";
+
+/// 依赖哈希版本标记（P2-18）：把 link-mode 策略纳入哈希输入。
+///
+/// 标记或 link-mode 策略变化会使旧 `.ep_deps_hash` 失配，触发全量重装。
+/// 注意：须与 [`UV_LINK_MODE`] 保持一致（`deps_hash_marker_covers_link_mode` 测试把关）。
+const DEPS_HASH_MARKER: &str = "ep-deps-hash:v2,link-mode=hardlink";
+
+/// 计算依赖栈哈希（P2-18 扩展）
+///
+/// 哈希输入 = requirements.txt 字节 + constraints 文件字节（若提供且存在）+ link-mode 版本标记。
+/// 任一输入变化（requirements 变更 / constraints 变更 / constraints 增删 / 策略标记变化）
+/// 都会使 `.ep_deps_hash` 失配，触发依赖重装。
 ///
 /// **注意：** 使用 `DefaultHasher`（SipHash-1-3），非加密安全。
-/// 仅用于检测 requirements.txt 是否变更，不用于安全校验。
+/// 仅用于检测依赖栈是否变更，不用于安全校验。
+/// 输出格式：`hash:<16位十六进制>`
+pub fn compute_deps_hash(requirements: &Path, constraints: Option<&Path>) -> Result<String> {
+    let mut hasher = DefaultHasher::new();
+
+    let req_bytes = std::fs::read(requirements).with_context(|| {
+        format!(
+            "failed to read requirements file for hashing: {}",
+            requirements.display()
+        )
+    })?;
+    req_bytes.hash(&mut hasher);
+
+    // constraints 仅在文件存在时参与哈希；不存在静默跳过（与安装参数口径一致，§3.1）
+    if let Some(path) = constraints {
+        if path.is_file() {
+            let bytes = std::fs::read(path).with_context(|| {
+                format!(
+                    "failed to read constraints file for hashing: {}",
+                    path.display()
+                )
+            })?;
+            bytes.hash(&mut hasher);
+        }
+    }
+
+    DEPS_HASH_MARKER.hash(&mut hasher);
+
+    let hash_value = hasher.finish();
+    Ok(format!("hash:{hash_value:016x}"))
+}
+
+/// 计算单个文件内容的哈希值（简化实现）
+///
+/// **注意：** 使用 `DefaultHasher`（SipHash-1-3），非加密安全。
+/// 仅用于变更检测，不用于安全校验。依赖栈哈希请使用 [`compute_deps_hash`]。
 /// 输出格式：`hash:<16位十六进制>`
 pub fn hash_file(path: &Path) -> Result<String> {
     let content = std::fs::read(path)
         .with_context(|| format!("failed to read file for hashing: {}", path.display()))?;
-    Ok(hash_bytes(&content))
-}
-
-/// 计算文件哈希（同 `hash_file`，用于 `is_venv_ready` 内部调用）
-fn hash_file_content(path: &Path) -> Result<String> {
-    hash_file(path)
-}
-
-/// 对字节内容计算哈希
-fn hash_bytes(data: &[u8]) -> String {
     let mut hasher = DefaultHasher::new();
-    data.hash(&mut hasher);
+    content.hash(&mut hasher);
     let hash_value = hasher.finish();
-    format!("hash:{hash_value:016x}")
+    Ok(format!("hash:{hash_value:016x}"))
 }
 
 /// 执行外部命令，捕获 stdout 输出
@@ -617,6 +742,8 @@ mod tests {
             python_path: None,
             uv_path: None,
             network_env: Vec::new(),
+            uv_cache_dir: String::new(),
+            constraints: String::new(),
         };
 
         let path = mgr.venv_python_path("test-module");
@@ -644,6 +771,8 @@ mod tests {
             python_path: None,
             uv_path: None,
             network_env: Vec::new(),
+            uv_cache_dir: String::new(),
+            constraints: String::new(),
         };
 
         let path = mgr.venv_python_path("faster-whisper");
@@ -668,6 +797,8 @@ mod tests {
             python_path: None,
             uv_path: None,
             network_env: Vec::new(),
+            uv_cache_dir: String::new(),
+            constraints: String::new(),
         };
 
         // venv 不存在时应返回 false
@@ -706,6 +837,218 @@ mod tests {
     fn hash_file_nonexistent_returns_error() {
         let result = hash_file(Path::new("/nonexistent/path/file.txt"));
         assert!(result.is_err(), "should fail for non-existent file");
+    }
+
+    // ── 依赖栈哈希（P2-18）：requirements + constraints + link-mode 标记 ──
+
+    /// 测试夹具：创建临时目录 + requirements + constraints 文件
+    fn deps_hash_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ep_deps_hash_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let req = dir.join("requirements.txt");
+        std::fs::write(&req, "torch\ntorchaudio\n").unwrap();
+
+        let cons = dir.join("constraints.txt");
+        std::fs::write(&cons, "torch==2.13.0\ntorchaudio==2.13.0\n").unwrap();
+
+        (dir, req, cons)
+    }
+
+    #[test]
+    fn deps_hash_deterministic() {
+        let (dir, req, cons) = deps_hash_fixture("det");
+
+        let h1 = compute_deps_hash(&req, Some(&cons)).unwrap();
+        let h2 = compute_deps_hash(&req, Some(&cons)).unwrap();
+        assert_eq!(h1, h2, "same inputs should produce same hash");
+        assert!(h1.starts_with("hash:"), "hash should have prefix");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 变更场景 1：requirements.txt 变更 → 哈希变化（触发重装）
+    #[test]
+    fn deps_hash_requirements_change() {
+        let (dir, req, cons) = deps_hash_fixture("reqchg");
+
+        let h1 = compute_deps_hash(&req, Some(&cons)).unwrap();
+        std::fs::write(&req, "torch\ntorchaudio\nnumpy\n").unwrap();
+        let h2 = compute_deps_hash(&req, Some(&cons)).unwrap();
+        assert_ne!(h1, h2, "requirements change must change the hash");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 变更场景 2：constraints 内容变更 → 哈希变化（触发重装）
+    #[test]
+    fn deps_hash_constraints_change() {
+        let (dir, req, cons) = deps_hash_fixture("conschg");
+
+        let h1 = compute_deps_hash(&req, Some(&cons)).unwrap();
+        std::fs::write(&cons, "torch==2.14.0\ntorchaudio==2.14.0\n").unwrap();
+        let h2 = compute_deps_hash(&req, Some(&cons)).unwrap();
+        assert_ne!(h1, h2, "constraints change must change the hash");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 变更场景 3：constraints 文件增删 → 哈希变化；不存在的 constraints 静默跳过
+    #[test]
+    fn deps_hash_constraints_added_or_removed() {
+        let (dir, req, cons) = deps_hash_fixture("consaddrem");
+
+        let h_none = compute_deps_hash(&req, None).unwrap();
+
+        // 传入不存在的路径 → 静默跳过 → 与无 constraints 等价
+        let absent = dir.join("no-such-constraints.txt");
+        let h_absent = compute_deps_hash(&req, Some(&absent)).unwrap();
+        assert_eq!(h_none, h_absent, "absent constraints file must be skipped silently");
+
+        // constraints 存在 → 哈希不同
+        let h_with = compute_deps_hash(&req, Some(&cons)).unwrap();
+        assert_ne!(h_none, h_with, "adding constraints must change the hash");
+
+        // 删除 constraints → 回到无 constraints 哈希
+        std::fs::remove_file(&cons).unwrap();
+        let h_removed = compute_deps_hash(&req, Some(&cons)).unwrap();
+        assert_eq!(h_none, h_removed, "removing constraints must restore the old hash");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deps_hash_marker_covers_link_mode() {
+        assert_eq!(UV_LINK_MODE, "hardlink");
+        assert!(
+            DEPS_HASH_MARKER.contains(UV_LINK_MODE),
+            "hash marker must embed the link-mode so strategy changes force reinstall"
+        );
+    }
+
+    #[test]
+    fn deps_hash_requirements_missing_returns_error() {
+        let result = compute_deps_hash(Path::new("/nonexistent/requirements.txt"), None);
+        assert!(result.is_err(), "should fail for non-existent requirements");
+    }
+
+    // ── EnvManager 依赖栈配置解析（§3.1）─────────────────────────────────
+
+    #[test]
+    fn env_manager_new_reads_dep_stack_config() {
+        // §8.3 默认值
+        let cfg = PythonConfig::default();
+        assert_eq!(cfg.uv_cache_dir, "runtime/.uv-cache");
+        assert_eq!(cfg.constraints, "config/constraints.txt");
+
+        let root = std::env::temp_dir().join(format!("ep_envmgr_new_{}", std::process::id()));
+        let cfg = PythonConfig {
+            uv_cache_dir: "cache/uv".into(),
+            constraints: "config/cons.txt".into(),
+            ..Default::default()
+        };
+
+        let mgr = EnvManager::new(&root, &cfg);
+        assert_eq!(mgr.uv_cache_dir_path(), Some(root.join("cache").join("uv")));
+        assert_eq!(
+            mgr.constraints_path(),
+            Some(root.join("config").join("cons.txt"))
+        );
+        // constraints 文件不存在 → constraints_file 静默返回 None
+        assert_eq!(mgr.constraints_file(), None);
+    }
+
+    #[test]
+    fn dep_stack_paths_empty_config_disabled() {
+        let mgr = EnvManager {
+            root: PathBuf::from("/fake/root"),
+            python_path: None,
+            uv_path: None,
+            network_env: Vec::new(),
+            uv_cache_dir: String::new(),
+            constraints: String::new(),
+        };
+        assert_eq!(mgr.uv_cache_dir_path(), None, "empty uv_cache_dir = no injection");
+        assert_eq!(mgr.constraints_path(), None, "empty constraints = disabled");
+        assert_eq!(mgr.constraints_file(), None);
+    }
+
+    #[test]
+    fn dep_stack_paths_absolute_passthrough() {
+        let (root_str, abs_str) = if cfg!(windows) {
+            ("G:/EntryPoint", "D:/shared/uv-cache")
+        } else {
+            ("/opt/entrypoint", "/srv/uv-cache")
+        };
+        let mgr = EnvManager {
+            root: PathBuf::from(root_str),
+            python_path: None,
+            uv_path: None,
+            network_env: Vec::new(),
+            uv_cache_dir: abs_str.to_string(),
+            constraints: abs_str.to_string(),
+        };
+        // Path::join 语义：绝对路径原样返回
+        assert_eq!(mgr.uv_cache_dir_path(), Some(PathBuf::from(abs_str)));
+        assert_eq!(mgr.constraints_path(), Some(PathBuf::from(abs_str)));
+    }
+
+    /// 端到端：constraints 变更使 is_venv_ready 失配 → 触发重装判定（P2-18）
+    #[test]
+    fn is_venv_ready_constraints_change_triggers_reinstall() {
+        let root = std::env::temp_dir().join(format!("ep_deps_ready_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // 伪造 venv python
+        let venv_dir = root.join("runtime").join("venvs").join("mod-x");
+        let bin_dir = if cfg!(windows) {
+            venv_dir.join("Scripts")
+        } else {
+            venv_dir.join("bin")
+        };
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let py_name = if cfg!(windows) { "python.exe" } else { "python" };
+        std::fs::write(bin_dir.join(py_name), "fake").unwrap();
+
+        let req = root.join("requirements.txt");
+        std::fs::write(&req, "torch\n").unwrap();
+        let cons = root.join("config").join("constraints.txt");
+        std::fs::create_dir_all(cons.parent().unwrap()).unwrap();
+        std::fs::write(&cons, "torch==2.13.0\n").unwrap();
+
+        let mgr = EnvManager {
+            root: root.clone(),
+            python_path: None,
+            uv_path: None,
+            network_env: Vec::new(),
+            uv_cache_dir: String::new(),
+            constraints: "config/constraints.txt".to_string(),
+        };
+
+        // 写入与安装口径一致的哈希 → 就绪
+        let hash = compute_deps_hash(&req, mgr.constraints_file().as_deref()).unwrap();
+        std::fs::write(mgr.deps_hash_path("mod-x"), &hash).unwrap();
+        assert!(mgr.is_venv_ready("mod-x", &req), "fresh hash should be ready");
+
+        // constraints 内容变更 → 需要重装
+        std::fs::write(&cons, "torch==2.14.0\n").unwrap();
+        assert!(
+            !mgr.is_venv_ready("mod-x", &req),
+            "constraints change must invalidate readiness"
+        );
+
+        // 重装完成（重写哈希）→ 就绪；requirements 变更 → 再次需要重装
+        let hash2 = compute_deps_hash(&req, mgr.constraints_file().as_deref()).unwrap();
+        std::fs::write(mgr.deps_hash_path("mod-x"), &hash2).unwrap();
+        assert!(mgr.is_venv_ready("mod-x", &req));
+        std::fs::write(&req, "torch\nnumpy\n").unwrap();
+        assert!(
+            !mgr.is_venv_ready("mod-x", &req),
+            "requirements change must invalidate readiness"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -774,6 +1117,8 @@ mod tests {
             python_path: None,
             uv_path: None,
             network_env: Vec::new(),
+            uv_cache_dir: String::new(),
+            constraints: String::new(),
         };
 
         assert_eq!(mgr.get_venv_status("nonexistent"), VenvStatus::NotExist);
@@ -808,6 +1153,8 @@ mod tests {
             python_path: None,
             uv_path: None,
             network_env: Vec::new(),
+            uv_cache_dir: String::new(),
+            constraints: String::new(),
         };
 
         assert_eq!(mgr.get_venv_status("test-mod"), VenvStatus::Ready);
@@ -841,6 +1188,8 @@ mod tests {
             python_path: None,
             uv_path: None,
             network_env: Vec::new(),
+            uv_cache_dir: String::new(),
+            constraints: String::new(),
         };
 
         assert_eq!(mgr.get_venv_status("test-mod"), VenvStatus::NeedsUpdate);
@@ -972,6 +1321,8 @@ mod tests {
             python_path: None,
             uv_path: None,
             network_env: Vec::new(),
+            uv_cache_dir: String::new(),
+            constraints: String::new(),
         };
 
         let result = mgr.check_all_modules_env(&modules);
