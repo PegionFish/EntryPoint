@@ -1,6 +1,11 @@
 # 管线规范 (Pipeline Specification)
 
-> 版本：1.0 | 适用于 EntryPoint v0.x
+> 版本：1.1 | 适用于 EntryPoint v0.x
+>
+> v1.1 变更：新增「节点开发指南」章节（§11，决策 5：module/builtin 两条路径全面文档化）；
+> `external_api` 节点更名 `llm`（builtin，旧名保留为别名，§5.8/§11.4，决策 4）；
+> `[pipeline] max_instances` 管线级并发上限（§2.2）；§5 内置节点参考对齐实现
+> （file_input/file_output/ffmpeg 参数修正，未实现节点显式标注）。
 
 本文档定义管线（Pipeline）的 TOML 文件格式、执行语义、内置节点参考和类型系统。
 
@@ -46,6 +51,7 @@ version = "1.0"                   # 管线版本（可选）
 | `description` | string | ❌ | 描述 |
 | `version` | string | ❌ | 管线格式版本 |
 | `default_params` | table | ❌ | 全局默认参数（可被节点覆盖） |
+| `max_instances` | u32 | ❌ | 管线级并发上限（缺省跟随全局 `[pipeline] max_parallel`；GPU 重管线可锁 `1` 防显存打架，见 §11.6） |
 
 ---
 
@@ -103,7 +109,13 @@ label = "提取音频"
 params = { args = "-i {input} -vn -acodec pcm_s16le -ar 16000 -ac 1 {output}" }
 ```
 
-### 3.4 kind = "external_api"
+### 3.4 kind = "external_api"（遗留形状，规范名 `llm`）
+
+> **状态（决策 4）**：该节点种类已改造为 builtin `llm` 节点（§11.4），功能限定为
+> 接入 **OpenAI 兼容 LLM 端点**（chat/completions 单一形状）。`kind = "external_api"`
+> 与 `kind = "llm"` 仍被解析器接受为**别名**（kind 级 `endpoint`/`api_key_env`
+> 并入 params 同名字段），新管线一律写 `kind = "builtin"` + `builtin = "llm"`。
+> 参数表见 §11.4，此处保留旧示例仅供存量文件对照。
 
 调用外部 HTTP API（如 LLM 翻译服务）。
 
@@ -166,6 +178,12 @@ to = ["denoise", "input"]
 
 ## 5. 内置节点参考
 
+> **实现状态**：当前执行器实现的 builtin 节点为 `file_input` / `file_output` /
+> `ffmpeg` / `llm`（§5.8）四个；其余（`srt_export` / `text_concat` /
+> `json_transform` / `delay`）为规范预留形状，**尚未实现**——加载含这些节点的
+> 管线会在执行时报 `unknown builtin node type`。字幕导出等需求请用模块节点的
+> 产物协议替代（MODULE_SPEC.md §5，`params.output_format = "srt"`）。
+
 ### 5.1 `file_input` — 文件输入源
 
 管线的起始节点，接收用户选择的文件。
@@ -175,32 +193,31 @@ to = ["denoise", "input"]
 id = "input"
 kind = "builtin"
 builtin = "file_input"
-params = { accept = "video" }   # 接受的文件类型：audio | video | image | file
+params = { path = "C:/Videos/input.mp4" }
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
+| 参数 | 类型 | 必须 | 说明 |
 |---|---|---|---|
-| `accept` | string | `"file"` | 接受的文件类型 |
-| `multiple` | bool | `false` | 是否允许多文件（批量处理） |
+| `path` | string | ✅ | 服务器本地输入文件路径；`POST /api/pipelines/execute` 的 `inputs` 可按节点覆盖（见 AUTOMATION.md） |
 
 输出端口：`output`（文件路径）
 
 ### 5.2 `file_output` — 文件输出
 
-管线的终止节点，将结果保存到用户指定位置。
+管线的终止节点，将结果保存到指定位置。
 
 ```toml
 [[nodes]]
 id = "save"
 kind = "builtin"
 builtin = "file_output"
-params = { suffix = ".srt" }
+params = { extension = "srt" }
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
+| 参数 | 类型 | 必须 | 说明 |
 |---|---|---|---|
-| `suffix` | string | — | 输出文件后缀 |
-| `output_dir` | string | — | 输出目录（默认 workspace） |
+| `path` | string | ❌ | 输出文件完整路径（显式指定时原样使用） |
+| `extension` | string | ❌ | 缺省 `path` 时按 `<work_dir>/<node_id>_output.<extension>` 派生（默认 `out`）；产物归集自动收录 |
 
 输入端口：`input`
 
@@ -213,21 +230,24 @@ params = { suffix = ".srt" }
 id = "extract"
 kind = "builtin"
 builtin = "ffmpeg"
-params = { args = "-i {input} -vn -acodec pcm_s16le -ar 16000 -ac 1 {output}" }
+params = { args = ["-i", "{input}", "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "{output}"], output_extension = "wav" }
 ```
 
 | 参数 | 类型 | 必须 | 说明 |
 |---|---|---|---|
-| `args` | string | ✅ | FFmpeg 参数模板 |
+| `args` | string[] | ✅ | FFmpeg 参数模板（**契约形状为数组**；历史字符串形状按 shell 词法拆分兼容，见 §8.4 警告语义） |
+| `output` | string | ❌ | 显式输出文件完整路径（优先于派生路径） |
+| `output_extension` | string | ❌ | 派生输出路径的扩展名（ffmpeg 依扩展名推断容器格式，shipped 管线均依赖此参数） |
 
 **模板变量：**
-- `{input}` — 输入文件路径（由上游边提供）
-- `{output}` — 输出文件路径（系统自动生成）
+- `{input}` — 输入文件路径（由上游边提供）；出现后 args 视为已自行声明输入
+- `{output}` — 输出文件路径（`output` 参数或派生路径）；出现后不再在末尾追加输出参数
+- 两个占位符均缺省 → 向后兼容旧行为（上游文件前置为输入，输出追加到末尾）
 
 输入端口：`input`
 输出端口：`output`
 
-### 5.4 `srt_export` — SRT 字幕导出
+### 5.4 `srt_export` — SRT 字幕导出（未实现，预留）
 
 将带时间戳的文本/JSON 转换为 SRT 字幕文件。
 
@@ -259,7 +279,7 @@ params = { max_chars_per_line = 42, max_lines = 2 }
 }
 ```
 
-### 5.5 `text_concat` — 文本拼接
+### 5.5 `text_concat` — 文本拼接（未实现，预留）
 
 合并多个文本输入。
 
@@ -278,7 +298,7 @@ params = { separator = "\n\n" }
 输入端口：`input`（可接收多条边）
 输出端口：`output`
 
-### 5.6 `json_transform` — JSON 变换
+### 5.6 `json_transform` — JSON 变换（未实现，预留）
 
 使用 JSONPath 或简单模板提取/变换 JSON 数据。
 
@@ -296,7 +316,7 @@ params = { extract = "$.segments[*].text", join_with = "\n" }
 | `join_with` | string | — | 数组元素连接符 |
 | `template` | string | — | 输出模板（`{value}` 占位） |
 
-### 5.7 `delay` — 延迟/节流
+### 5.7 `delay` — 延迟/节流（未实现，预留）
 
 在节点间插入等待（用于 API 限流）。
 
@@ -307,6 +327,24 @@ kind = "builtin"
 builtin = "delay"
 params = { seconds = 2 }
 ```
+
+### 5.8 `llm` — OpenAI 兼容 LLM 调用
+
+接入 OpenAI 兼容 chat/completions 端点（翻译、摘要、字幕润色等文本生成）。
+`external_api` 为可执行别名，两者完全等价。**完整参数表与错误语义见 §11.4。**
+
+```toml
+[[nodes]]
+id = "translate"
+kind = "builtin"
+builtin = "llm"
+label = "LLM 翻译"
+params = { base_url = "https://api.openai.com/v1", model = "gpt-4o-mini", api_key_env = "OPENAI_API_KEY", system_prompt = "将以下字幕翻译为中文：{input}", output_format = "text" }
+timeout_secs = 120
+```
+
+输入端口：`input`（text）
+输出端口：`output`（text）
 
 ---
 
@@ -672,3 +710,156 @@ to = ["save", "input"]
 | 10 | 无孤立节点（无边连接） | Warning |
 
 Error = 阻止保存/运行；Warning = 允许保存但运行时可能失败。
+
+---
+
+## 11. 节点开发指南
+
+> 本章是 PACK_UNIFY_PLAN §6.6 **决策 5**（builtin 注册表重构不做、全面文档化）
+> 的落地文档：EntryPoint 中新增"管线节点"有两条路径——**module 节点**（扩展正路，
+> 推荐）与 **builtin 节点**（引擎内建）。选择标准很简单：
+>
+> - 新能力是"调用某个模型/工具处理数据" → 写**模块**，零引擎改动；
+> - 新能力需要引擎级数据流原语（新的产物类型、新的调度语义） → builtin，四处同改。
+
+### 11.1 两条路径总览
+
+| 维度 | module 节点（推荐） | builtin 节点 |
+|---|---|---|
+| 载体 | `modules/<module-id>/`（module.toml + adapter.py） | ep-core / ep-daemon / 前端源码 |
+| 引擎改动 | **零**（能力声明驱动） | 四处清单（§11.3） |
+| 进入编辑器方式 | 自动（`/api/modules` 返回 capabilities，节点库数据驱动渲染） | 手工注册（前端 BUILTIN_DEFS） |
+| 分发 | 模块目录随整合包/仓库分发 | 随 EntryPoint 版本发布 |
+| 典型例子 | faster-whisper `transcribe`、deep-filter `denoise` | `file_input` / `file_output` / `ffmpeg` / `llm` |
+
+### 11.2 module 节点路径（扩展正路）
+
+**新节点 = 新模块**：只要在 `modules/` 下建一个合规模块，它声明的每个 capability
+都会自动成为管线编辑器里可拖拽、可连线、可执行的节点。全程不碰引擎代码。
+
+步骤：
+
+1. **建模块目录** `modules/<module-id>/`，命名规则与目录结构见 MODULE_SPEC.md §1；
+2. **module.toml 声明 capability**（`[[interface.capabilities]]` +
+   `[interface.capabilities.params]` 参数 schema，MODULE_SPEC.md §2.5）：
+
+   ```toml
+   [[interface.capabilities]]
+   name = "transcribe"
+   description = "语音转文字，支持词级时间戳"
+   input_type = "audio"        # 决定编辑器端口类型校验（§7 类型系统）
+   output_type = "json"
+   max_file_size_mb = 2048
+
+   [interface.capabilities.params]
+   language = { type = "string", default = "auto", description = "语言代码或 auto" }
+   beam_size = { type = "integer", default = 5, min = 1, max = 20 }
+   ```
+
+   - `input_type` / `output_type` 直接映射为节点的输入/输出端口数据类型，
+     编辑器连线类型校验（§7.2 兼容矩阵）据此工作；
+   - `params` schema（type/default/min/max/enum）由 UI **自动生成参数表单**
+     （WebUI 节点参数面板、直跑抽屉、桌面端同款），无需写任何前端代码。
+3. **adapter.py 实现 `/predict/<capability>`**（Python HTTP 模块；请求/响应契约见
+   ADAPTER_API.md）：
+
+   ```python
+   @app.post("/predict/transcribe")
+   async def predict_transcribe(file: UploadFile | None, params: str = Form("{}")):
+       ...  # 读取 EP_MODEL_DIR / EP_DEVICE，调用底层模型
+       return {"status": "completed", "output_type": "json", "result": {...}}
+   ```
+
+   产出文件产物（如 SRT）时遵循 MODULE_SPEC.md §5 产物协议（读取注入的
+   `output_path`，返回 `output_type = "file"`）。
+4. **重启 daemon（或刷新模块列表）**：`GET /api/modules` 的 ModuleResponse 会携带
+   `capabilities`（manifest 原样序列化），编辑器节点库即出现新节点——可拖入画布、
+   按类型连线、参数面板自动渲染、执行走统一执行器。
+
+验证清单（本地自测，不依赖 UI）：
+
+```bash
+# 手动起模块（MODULE_SPEC.md §9 环境变量契约）
+curl http://localhost:<EP_PORT>/health
+curl -X POST http://localhost:<EP_PORT>/predict/<capability> \
+  -F "file=@sample.wav" -F 'params={"language": "zh"}'
+```
+
+### 11.3 builtin 节点路径（四处清单）
+
+builtin 节点由引擎直接执行（无模块进程）。当前实现为分派硬编码，**新增一个
+builtin 节点必须同步修改以下四处**，缺一即断：
+
+| # | 位置 | 文件 | 改动内容 |
+|---|---|---|---|
+| 1 | **执行层** | `crates/ep-core/src/pipeline/executor.rs` | `execute_builtin_node` 的 `match builtin` 增加分支 → 新增 `execute_builtin_xxx` 异步函数（消费 `upstream: &[Artifact]`，产物落 `work_dir`，返回 `Artifact`） |
+| 2 | **校验层** | `crates/ep-core/src/pipeline/dag.rs` | 若新节点引入新端口/类型/结构规则，更新 `Pipeline::validate` 与端口类型兼容逻辑（§7/§10）；纯参数型节点可不动 |
+| 3 | **前端定义** | `crates/ep-webui/frontend/src/components/shared/pipeline-node.tsx` | `BuiltinKind` 联合类型 + `BUILTIN_DEFS` 定义表（label/description/端口/参数 ParamSpec，文案走 i18n `components:pipeline.builtin.*`）+ `BUILTIN_LIST` 注册 |
+| 4 | **桥接层** | `crates/ep-daemon/src/pipeline_bridge.rs` | 画布 spec ↔ `Pipeline` 双向转换（`spec_to_pipeline` / `pipeline_to_spec`）确认新 builtin 的 params/端口原样透传；桌面端（ep-desktop）直连 ep-core，不经此桥 |
+
+注意事项：
+
+- builtin 的错误文案若用户可见，走 i18n（`pipeline:error.*` / `pipeline:warn.*`
+  命名空间，规则 8：键需求提交 C8/编排者落盘）；日志（tracing）永远英文字面量。
+- builtin 注册表重构（数据驱动化）**本期不做**（决策 5）；本章即该决策的
+  文档化交付。未来若重构，本节四处清单即重构验收基线。
+- ffmpeg `args` 契约形状为数组；字符串输入走 shell 词法拆分兼容并发
+  `pipeline:warn.ffmpegStringArgs` 警告（§5.3）。
+
+### 11.4 `llm` builtin 节点参数表（决策 4）
+
+规范形状：`kind = "builtin"` + `builtin = "llm"`；`external_api` 保留为可执行别名
+（两种写法执行完全等价；遗留 kind 级 `endpoint`/`api_key_env` 字段并入 params
+同名字段，kind 级非空值优先）。
+
+| 参数 | 类型 | 必须 | 默认 | 说明 |
+|---|---|---|---|---|
+| `base_url` | string | ✅ | — | OpenAI 兼容端点（如 `https://api.openai.com/v1` 或本地服务；请求发往 `<base_url>/chat/completions`，尾部 `/` 自动剥除） |
+| `model` | string | ✅ | — | 模型名（透传给端点） |
+| `api_key_env` | string | ❌ | — | **环境变量名**（如 `OPENAI_API_KEY`），执行时读取；API Key 只从环境变量读取，**不落盘** |
+| `system_prompt` | string | ❌ | — | 系统提示词；支持 `{input}` 占位符（替换为上游文本）。留空 → 仅发 user 消息 |
+| `temperature` | float | ❌ | 端点默认 | 采样温度（越界/非法 → `pipeline:error.llmParamRange`） |
+| `max_tokens` | integer | ❌ | 端点默认 | 最大生成 token 数 |
+| `output_format` | enum | ❌ | `"text"` | `"text"` \| `"json"`；`json` 时响应必须是合法 JSON，否则报 `pipeline:error.llmInvalidJsonOutput` |
+
+I/O 与执行语义：
+
+- 输入端口类型 `text`（上游可接 ASR 的 json→text 转换或任意文本产物），
+  输出端口类型 `text`；
+- 上游为文件时必须是文本类扩展名（否则 `pipeline:error.llmInputNotText`）；
+- 失败语义与模块节点一致：`retry_count` 重试 + `timeout_secs` 超时管辖（§3.1）；
+- 错误文案全部走 i18n `pipeline:error.llm*` 键（缺 base_url/model、环境变量
+  未设置/为空、非 2xx、响应缺 `choices[0].message.content` 等）。
+
+### 11.5 节点 schema 扩展字段（§6.2 冻结契约）
+
+module 节点在 §3.2 基础字段之上支持以下扩展（TOML/编辑器双侧一致）：
+
+```toml
+[[nodes]]
+id = "asr"
+kind = "module"
+module_id = "faster-whisper"
+capability = "transcribe"
+model = "ep.systran.faster-whisper@medium"   # 变体 pin（可选）
+device = "cuda:0"                             # 设备软约束（可选）
+params = { beam_size = 5 }
+timeout_secs = 300                            # 节点超时（默认 600，同 §3.1）
+retry_count = 1                               # 失败重试次数（默认 0，同 §3.1）
+```
+
+| 字段 | 语义 |
+|---|---|
+| `model` | **变体 pin**：全限定模型 ID + `@variant`（§4.3 PACK_UNIFY_PLAN）。缺省 = 跟随该模块当前激活变体（`config/app.toml [active_models]` → manifest `default=true`）。执行前校验：pin 变体与激活变体不一致 → **报错 + 一键切换引导**，不做静默热切换（避免执行中重启模块的复杂交互） |
+| `device` | **设备软约束**：`"auto"` \| `"cuda:0"` \| `"rocm:1"` \| `"openvino:GPU.0"` 等。导入/加载时本机无此设备 → 警告（`pipeline:warn.deviceFallback`）+ 回退 `auto`，**不硬失败** |
+| `timeout_secs` | 节点级超时（秒），覆盖 `[pipeline].default_timeout_secs` |
+| `retry_count` | 失败重试次数（0 = 不重试） |
+
+### 11.6 并发模型速览（与节点开发的关系）
+
+- 提交执行后任务可能进入 `queued` 状态：等待全局 `[pipeline] max_parallel`
+  闸门或管线级 `max_instances`（§2.2）空位；
+- 同一模块的多个节点串行执行（避免并发访问同一服务）——module 节点作者
+  **无需**在 adapter 内做并发防护；
+- 并发管线 pin 同模块不同变体时，后到任务在模块节点前显式报错（§11.5
+  `model` pin 语义），不静默重启模块。

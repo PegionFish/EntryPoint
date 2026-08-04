@@ -114,5 +114,17 @@
   "nodeStatus.waiting": "Waiting",
   "nodeStatus.running": "Running",
   "nodeStatus.done": "Done",
-  "nodeStatus.failed": "Failed"
+  "nodeStatus.failed": "Failed",
+  "error.llmMissingBaseUrl": "LLM node {{node}} is missing required param 'base_url' (OpenAI-compatible endpoint)",
+  "error.llmMissingModel": "LLM node {{node}} is missing required param 'model'",
+  "error.llmApiKeyNotSet": "LLM node {{node}}: environment variable {{env_var}} is not set (API keys are only read from the environment)",
+  "error.llmApiKeyEmpty": "LLM node {{node}}: environment variable {{env_var}} is empty",
+  "error.llmHttpStatus": "LLM node {{node}} request failed (HTTP {{status}}): {{detail}}",
+  "error.llmResponseShape": "LLM node {{node}}: response is missing choices[0].message.content",
+  "error.llmInvalidJsonOutput": "LLM node {{node}}: output_format is 'json' but the response is not valid JSON",
+  "error.llmInvalidOutputFormat": "LLM node {{node}}: output_format must be 'text' or 'json'",
+  "error.llmParamRange": "LLM node {{node}}: invalid value for param {{param}} ({{hint}})",
+  "error.llmInputNotText": "LLM node {{node}}: upstream file is not text (.{{ext}})",
+  "warn.deviceFallback": "Node {{node}}: requested device {{device}} not available; falling back to auto",
+  "warn.ffmpegStringArgs": "ffmpeg node {{node}}: string args split into an array (array is the contract shape)"
 }

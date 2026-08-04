@@ -1,11 +1,15 @@
 # 模块接入规范 (Module Specification)
 
-> 版本：1.1 | 适用于 EntryPoint v0.x
+> 版本：1.2 | 适用于 EntryPoint v0.x
+>
+> v1.2 变更（PACK_UNIFY_PLAN §4.3/§7）：`[[models]]` 新增 `qualified_id` 与
+> 变体级 `vram_estimate_mb`（§2.4）；`[runtime] requirements_by_backend` schema
+> 冻结声明（本期不实现，§2.6）；venv 命名演进方向 `<module>--<backend>`（§3.1）。
+>
+> v1.1 变更：新增 `[[models.mirrors]]` 备用下载源（§2.4）；新增"模块产物协议"章节（§5）；"模型管理"章节更新为三获取路径并修正与实现不符的旧描述（§6）。
 
 本文档是第三方开发者将 AI 工具接入 EntryPoint 平台的完整参考。
 一个模块 = 一个目录 + 一份 `module.toml`，放入 `modules/` 目录即被系统识别。
-
-> v1.1 变更：新增 `[[models.mirrors]]` 备用下载源（§2.4）；新增"模块产物协议"章节（§5）；"模型管理"章节更新为三获取路径并修正与实现不符的旧描述（§6）。
 
 ---
 
@@ -152,6 +156,8 @@ cpu = { TORCH_DEVICE = "cpu" }
 | `revision` | string | ❌ | `"main"` | Git 分支/标签/commit |
 | `size_estimate_mb` | u32 | ❌ | — | 预估大小（用于 UI 显示） |
 | `default` | bool | ❌ | `false` | 是否为默认选中模型 |
+| `qualified_id` | string | ❌ | — | 全限定模型 ID `<publisher>.<vendor>.<model>`（PACK_UNIFY_PLAN §4.3）。缺省时旧式简单 id 自动归一为 `ep.<vendor>.<model>`（向后兼容层）；整合包与管线节点 pin 统一消费 |
+| `vram_estimate_mb` | u64 | ❌ | — | **变体级**显存/内存估算（MB）。VRAM 预算按变体取数：本字段优先，缺省回退模块级 `[compute].vram_estimate_mb`（§2.3） |
 | `mirrors` | array | ❌ | `[]` | 备用下载源列表（见下方 `[[models.mirrors]]`） |
 
 #### `[[models.mirrors]]` — 备用下载源（镜像，可重复）
@@ -268,6 +274,31 @@ vad_filter = { type = "boolean", default = true, description = "启用 VAD 过�
 | `boolean` | — | 布尔 |
 | `select` | `options` (string[]) | 下拉选择 |
 
+### 2.6 `[runtime] requirements_by_backend` — 后端相关依赖（schema 冻结，本期不实现）
+
+> **状态**：PACK_UNIFY_PLAN §7/§4.6 决策——本字段**本次只冻结 schema，不实现**。
+> 清单解析对其保持宽容（出现时忽略不报错）；消费逻辑（按当前后端选择依赖文件、
+> 与 backend 维度的依赖哈希联动）留待后续版本。依赖层现状：venv 按平台重建，
+> 整合包以 `[compute].notes` 给出后端依赖提示。
+
+schema 形状（冻结）：
+
+```toml
+[runtime]
+requirements_by_backend = { cuda = "requirements-cuda.txt", rocm = "requirements-rocm.txt", cpu = "requirements.txt" }
+```
+
+| 约束 | 说明 |
+|---|---|
+| key | 计算后端名（`cuda` / `rocm` / `openvino` / `directml` / `cpu`），与 `[compute].backends` 同一词表 |
+| value | 依赖文件路径（相对于模块目录），语义同 `runtime.requirements` |
+| 回退 | 当前后端无对应条目 → 使用 `runtime.requirements`（默认 `requirements.txt`） |
+
+**venv 命名演进方向**（与 requirements_by_backend 配套，本期同样不实现）：
+多后端依赖分歧后，venv 目录将从现状 `runtime/venvs/<module-id>/` 演进为
+`runtime/venvs/<module>--<backend>/`（每模块每后端一个 venv）。现有单 venv
+布局与 `.ep_deps_hash` / `ep.lock` 语义保持不变，迁移由未来版本处理。
+
 ---
 
 ## 3. 运行时类型详解
@@ -281,7 +312,11 @@ vad_filter = { type = "boolean", default = true, description = "启用 VAD 过�
 
 **生命周期：**
 1. 系统创建独立 venv：`runtime/venvs/<module-id>/`
+   （演进方向：多后端依赖分歧后改为 `<module>--<backend>` 每后端一个 venv，
+   见 §2.6；当前为单 venv）
 2. 安装依赖：`uv pip install -r requirements.txt`
+   （依赖栈统一：注入 `UV_CACHE_DIR` 硬链接去重 + 全局 constraints 锁版本，
+   见 CONFIG_REFERENCE.md §1.5）
 3. 启动：使用 venv 内的 python 执行 `start_command`
 4. 健康检查：轮询 `GET /health` 直到 200
 5. 就绪：标记为 Running

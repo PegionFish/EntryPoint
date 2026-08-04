@@ -18,5 +18,22 @@
   "tasks.taskNotFound": "任务不存在: {{taskId}}",
   "tasks.nodeNotFound": "任务中不存在节点: {{nodeId}}",
   "tasks.noArtifact": "节点 `{{nodeId}}` 没有可下载的产物",
-  "tasks.artifactPathInvalid": "节点 `{{nodeId}}` 的产物路径无效"
+  "tasks.artifactPathInvalid": "节点 `{{nodeId}}` 的产物路径无效",
+  "tasks.cancelAlreadyTerminal": "任务已终结（{{status}}），无法取消",
+  "execute.capabilityNotFound": "模块 {{moduleId}} 不存在能力 {{capability}}",
+  "execute.inputMissing": "输入文件不存在: {{path}}",
+  "execute.moduleStartFailed": "模块自动拉起失败: {{detail}}",
+  "single.missingModuleId": "缺少 module_id 字段",
+  "single.missingCapability": "缺少 capability 字段",
+  "single.missingInputPath": "缺少 input_path 字段",
+  "single.paramsNotObject": "params 必须是对象",
+  "single.capabilityNotFound": "模块 '{{module_id}}' 不存在能力 '{{capability}}'",
+  "single.paramMissing": "缺少必填参数 '{{param}}'",
+  "single.paramTypeInvalid": "参数 '{{param}}' 类型无效（期望 {{expected}}）",
+  "single.paramEnumInvalid": "参数 '{{param}}' 取值不在可选列表内",
+  "single.inputNotFound": "输入文件不存在: {{path}}",
+  "single.autostartTimeout": "模块 '{{module_id}}' 自动拉起后 {{secs}}s 内未就绪",
+  "single.submitFailed": "直跑任务提交失败: {{detail}}",
+  "vramBudget.specEmpty": "VRAM 预算请求缺少节点",
+  "vramBudget.cycleDetected": "管线存在环，无法计算 VRAM 预算"
 }

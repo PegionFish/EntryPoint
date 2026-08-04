@@ -49,5 +49,11 @@
   "archiveUnsafePath": "Archive contains an unsafe path entry (suspected zip-slip): {{entry}}",
   "archiveEntryPathInvalid": "Archive entry path is invalid: {{detail}}",
   "archiveUnsafeLink": "Archive contains an unsafe link target: {{entry}}",
-  "archiveExtractEntryFailed": "Failed to extract an archive entry: {{detail}}"
+  "archiveExtractEntryFailed": "Failed to extract an archive entry: {{detail}}",
+  "variantMismatch": "model_id in path and body do not match (path: {{path_id}}, body: {{body_id}})",
+  "inputUploadMissingFile": "multipart is missing the 'file' field",
+  "inputUploadPlaceFailed": "Failed to place input file: {{detail}}",
+  "tagsNoMeta": "Model has no download metadata (.ep_meta.json); cannot set tags",
+  "tagsWriteFailed": "Failed to write model tags: {{detail}}",
+  "cancelNotActive": "This model has no active download to cancel"
 }
