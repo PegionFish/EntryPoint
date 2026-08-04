@@ -2,9 +2,9 @@
 //!
 //! # 共享契约（冻结，勿单方面修改）
 //!
-//! - 翻译文件目录：`<repo>/i18n/locales/{zh-CN,en}/`，每语言 13 个命名空间文件：
+//! - 翻译文件目录：`<repo>/i18n/locales/{zh-CN,en}/`，每语言 14 个命名空间文件：
 //!   `common, dashboard, modules, models, pipeline, tasks, settings, components,
-//!   desktopPages, desktopApp, apiCore, apiModels, apiPipelines`（`.json`）。
+//!   desktopPages, desktopApp, apiCore, apiModels, apiPipelines, packs`（`.json`）。
 //! - **格式：扁平键**（如 `"upload.title": "上传模型"`），禁止嵌套对象；
 //!   值必须是字符串。zh-CN / en 两语言键集必须完全一致
 //!   （`tests::zh_en_keysets_identical_for_all_namespaces` 是长期门禁）。
@@ -22,14 +22,15 @@
 //!
 //! # 嵌入方式
 //!
-//! 全部 13×2 个 JSON 经 `include_str!` 编译期嵌入二进制（daemon 与桌面端
+//! 全部 14×2 个 JSON 经 `include_str!` 编译期嵌入二进制（daemon 与桌面端
 //! 无需在运行时携带 i18n/ 目录），首次调用时经 `OnceLock` 惰性解析为
 //! `lang → ns → key → String`。
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-/// 契约规定的 13 个命名空间（与 `i18n/locales/*/` 下的文件名一一对应）。
+/// 契约规定的 14 个命名空间（与 `i18n/locales/*/` 下的文件名一一对应）。
+/// `packs` 为 Wave S 新增（整合包管理区，键由 Wave 3 C8 统一落盘）。
 pub const NAMESPACES: &[&str] = &[
     "common",
     "dashboard",
@@ -44,6 +45,7 @@ pub const NAMESPACES: &[&str] = &[
     "apiCore",
     "apiModels",
     "apiPipelines",
+    "packs",
 ];
 
 type KeyMap = HashMap<String, String>;
@@ -96,6 +98,7 @@ fn tables() -> &'static LangMap {
                 ("apiCore", include_str!("../../../i18n/locales/zh-CN/apiCore.json")),
                 ("apiModels", include_str!("../../../i18n/locales/zh-CN/apiModels.json")),
                 ("apiPipelines", include_str!("../../../i18n/locales/zh-CN/apiPipelines.json")),
+                ("packs", include_str!("../../../i18n/locales/zh-CN/packs.json")),
             ]),
         );
         m.insert(
@@ -114,6 +117,7 @@ fn tables() -> &'static LangMap {
                 ("apiCore", include_str!("../../../i18n/locales/en/apiCore.json")),
                 ("apiModels", include_str!("../../../i18n/locales/en/apiModels.json")),
                 ("apiPipelines", include_str!("../../../i18n/locales/en/apiPipelines.json")),
+                ("packs", include_str!("../../../i18n/locales/en/packs.json")),
             ]),
         );
         m
@@ -171,14 +175,14 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    /// 长期门禁：13 个命名空间在 zh-CN / en 下的键集必须完全一致。
+    /// 长期门禁：14 个命名空间在 zh-CN / en 下的键集必须完全一致。
     #[test]
     fn zh_en_keysets_identical_for_all_namespaces() {
         let tables = tables();
         let zh = &tables["zh-CN"];
         let en = &tables["en"];
-        assert_eq!(zh.len(), NAMESPACES.len(), "zh-CN: all 13 namespaces present");
-        assert_eq!(en.len(), NAMESPACES.len(), "en: all 13 namespaces present");
+        assert_eq!(zh.len(), NAMESPACES.len(), "zh-CN: all 14 namespaces present");
+        assert_eq!(en.len(), NAMESPACES.len(), "en: all 14 namespaces present");
         for ns in NAMESPACES {
             let zh_keys: BTreeSet<&String> = zh[*ns].keys().collect();
             let en_keys: BTreeSet<&String> = en[*ns].keys().collect();

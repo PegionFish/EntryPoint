@@ -4,6 +4,7 @@ members = [
     "crates/ep-core",
     "crates/ep-daemon",
     "crates/ep-desktop",
+    "crates/ep-pack",
     "crates/ep-webui",
 ]
 
@@ -49,3 +50,4 @@ rfd = "0.15"
 
 # Internal
 ep-core = { path = "crates/ep-core" }
+ep-pack = { path = "crates/ep-pack" }

@@ -5,6 +5,7 @@ pub mod execute;
 pub mod health;
 pub mod models;
 pub mod modules;
+pub mod packs;
 pub mod pipelines;
 pub mod tasks;
 pub mod upload;
@@ -20,9 +21,9 @@ use crate::state::AppState;
 
 /// Build the full `/api/*` route tree.
 ///
-/// Wave 2 骨架路由已预注册（tasks / upload / execute / models 下载删除等），
-/// 对应 stub handler 统一返回 501 + {"error":"功能即将上线"}，
-/// 各文件头部注释标明接管代理。
+/// Wave S 骨架：packs 路由已预注册（§8.1 共 7 条），stub handler 统一返回
+/// 501 + i18n `common.tip.comingSoon`（{"error":"功能即将上线"}），
+/// 接管代理与契约见 `packs.rs` 文件头注释。
 pub fn api_router() -> Router<Arc<AppState>> {
     Router::new()
         .merge(health::router())
@@ -35,6 +36,7 @@ pub fn api_router() -> Router<Arc<AppState>> {
         .merge(upload::router())
         .merge(tasks::router())
         .merge(deps::router())
+        .merge(packs::router())
         // 未匹配的 /api/* → 404 + JSON，避免落入 SPA 的 HTML fallback
         .fallback(api_not_found)
 }
