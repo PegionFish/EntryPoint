@@ -91,6 +91,9 @@ export interface AppConfig {
     disabled_backends: string[]
     refresh_interval_secs: number
     allow_overcommit: boolean
+    single_device?: string | null
+    /** 共享 CUDA 库目录（§8.3/§3.1，门禁 #38） */
+    cuda_libs_dir?: string
   }
   ports: { range_start: number; range_end: number }
   models: {
@@ -100,7 +103,14 @@ export interface AppConfig {
     max_concurrent_downloads: number
     cache_paths: string[]
   }
-  python: { path: string; uv_path: string }
+  python: {
+    path: string
+    uv_path: string
+    /** uv 缓存目录（§8.3/§3.1，门禁 #38） */
+    uv_cache_dir?: string
+    /** 全局 constraints 文件（空 = 停用，§3.1） */
+    constraints?: string
+  }
   pipeline: {
     max_parallel: number
     default_timeout_secs: number
@@ -108,6 +118,8 @@ export interface AppConfig {
     workspace_dir: string
   }
   network: { http_proxy: string; https_proxy: string; no_proxy: string }
+  /** 整合包配置（§8.3，门禁 #38） */
+  packs?: { staging_dir?: string }
   ui: { scale_factor: number; font_size: number; dashboard_refresh_secs: number }
   /** 每模块激活模型变体（§5.2 单槽位）：module_id → model_id；后端恒返回，旧前端类型缺失故设可选 */
   active_models?: Record<string, string>
@@ -117,8 +129,9 @@ export interface AppConfig {
 /** 模型来源：HuggingFace / ModelScope / 自定义 URL */
 export type ModelSource = 'huggingface' | 'modelscope' | 'url'
 
-/** 模型下载状态机（WS 推送与下载列表共用） */
+/** 模型下载状态机（WS 推送与下载列表共用；queued = 并发闸排队，B6/P2-1，门禁 #32） */
 export type ModelDownloadState =
+  | 'queued'
   | 'downloading'
   | 'completed'
   | 'failed'

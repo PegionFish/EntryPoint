@@ -32,6 +32,9 @@ pub struct TaskSummary {
     pub node_count: usize,
     /// 已完成节点数
     pub completed_nodes: usize,
+    /// 产物列表（node_id, 路径）；门禁 #40 透传（桌面任务页消费）
+    #[serde(default)]
+    pub artifacts: Vec<(String, PathBuf)>,
 }
 
 /// 单个节点的详细状态（用于任务详情展示）
@@ -150,6 +153,7 @@ impl PipelineRunnerImpl {
                     finished_at: task.finished_at.map(|t| t.to_rfc3339()),
                     node_count,
                     completed_nodes,
+                    artifacts: Vec::new(),
                 }
             })
             .collect()
@@ -881,6 +885,7 @@ to = ["bad", "input"]
             finished_at: Some("2026-07-30T10:01:00Z".to_string()),
             node_count: 3,
             completed_nodes: 3,
+            artifacts: Vec::new(),
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"pipeline_name\":\"test-pipe\""));

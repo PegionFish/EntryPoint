@@ -47,6 +47,12 @@ struct ExecuteRequest {
     spec: Option<PipelineSpec>,
     #[serde(default)]
     inputs: Option<HashMap<String, Value>>,
+    /// §6.5 同步模式：阻塞至终态，响应直接带 status + artifacts
+    #[serde(default)]
+    wait: Option<bool>,
+    /// §6.5 完成回调：终态时 POST {task_id, status, artifacts}（best-effort）
+    #[serde(default)]
+    callback_url: Option<String>,
 }
 
 /// POST /api/pipelines/execute — 提交管线执行
@@ -104,11 +110,40 @@ async fn execute_pipeline(
         },
     };
 
-    match execution::submit_pipeline(&state, pipeline, req.inputs).await {
-        Ok(task_id) => (
-            StatusCode::ACCEPTED,
-            Json(json!({ "task_id": task_id })),
-        ),
+    // §6.5：wait 同步模式与 callback_url 经完整选项版提交入口接线
+    let options = execution::SubmitOptions {
+        wait: req.wait.unwrap_or(false),
+        callback_url: req.callback_url,
+    };
+    match execution::submit_pipeline_full(&state, pipeline, req.inputs, options).await {
+        Ok(outcome) => {
+            if let Some(record) = outcome.record {
+                // wait 模式：直接返回终态 + artifacts（§6.5 响应契约）
+                let artifacts: Vec<Value> = record
+                    .artifacts
+                    .iter()
+                    .map(|(node_id, path)| {
+                        json!({
+                            "node_id": node_id,
+                            "path": path.display().to_string(),
+                        })
+                    })
+                    .collect();
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "task_id": outcome.task_id,
+                        "status": record.status.as_str(),
+                        "artifacts": artifacts,
+                    })),
+                )
+            } else {
+                (
+                    StatusCode::ACCEPTED,
+                    Json(json!({ "task_id": outcome.task_id })),
+                )
+            }
+        }
         Err(execution::SubmitError::UnknownInputNode(node_id)) => {
             err_response(
                 &state,
@@ -1046,8 +1081,8 @@ mode = {{ type = "string", default = "fast", enum = ["fast", "slow"] }}
             .unwrap();
         let (status, json) = single_response(resp).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        // 新键待 C8 落盘：缺失时 err_response 回退为键本身（键名即契约）
-        assert_eq!(json["error"], "apiPipelines.single.capabilityNotFound");
+        // C8 已落盘：断言真实 zh 文案（默认语言 zh-CN）
+        assert_eq!(json["error"], "模块 'direct-mod' 不存在能力 'fly'");
     }
 
     // ── 3. 缺必填参数（beam_size 无默认）→ 400 ─────────────────────────────
@@ -1074,7 +1109,7 @@ mode = {{ type = "string", default = "fast", enum = ["fast", "slow"] }}
             .unwrap();
         let (status, json) = single_response(resp).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["error"], "apiPipelines.single.paramMissing");
+        assert_eq!(json["error"], "缺少必填参数 'beam_size'");
     }
 
     // ── 4. 参数类型不符 → 400 ──────────────────────────────────────────────
@@ -1101,7 +1136,7 @@ mode = {{ type = "string", default = "fast", enum = ["fast", "slow"] }}
             .unwrap();
         let (status, json) = single_response(resp).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["error"], "apiPipelines.single.paramTypeInvalid");
+        assert_eq!(json["error"], "参数 'beam_size' 类型无效（期望 integer）");
     }
 
     // ── 5. 枚举越界 → 400 ──────────────────────────────────────────────────
@@ -1128,7 +1163,7 @@ mode = {{ type = "string", default = "fast", enum = ["fast", "slow"] }}
             .unwrap();
         let (status, json) = single_response(resp).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["error"], "apiPipelines.single.paramEnumInvalid");
+        assert_eq!(json["error"], "参数 'mode' 取值不在可选列表内");
     }
 
     // ── 6. 输入文件不存在 → 400 ────────────────────────────────────────────
@@ -1151,7 +1186,7 @@ mode = {{ type = "string", default = "fast", enum = ["fast", "slow"] }}
             .unwrap();
         let (status, json) = single_response(resp).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["error"], "apiPipelines.single.inputNotFound");
+        assert_eq!(json["error"], "输入文件不存在: /definitely/not/here.txt");
     }
 
     // ── 7. 缺字段（空 body / params 非对象）→ 400 ──────────────────────────
@@ -1167,7 +1202,7 @@ mode = {{ type = "string", default = "fast", enum = ["fast", "slow"] }}
         let resp = app.oneshot(single_request(json!({}))).await.unwrap();
         let (status, json) = single_response(resp).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["error"], "apiPipelines.single.missingModuleId");
+        assert_eq!(json["error"], "缺少 module_id 字段");
 
         // 缺 capability
         let app = Router::new()
@@ -1179,7 +1214,7 @@ mode = {{ type = "string", default = "fast", enum = ["fast", "slow"] }}
             .unwrap();
         let (status, json) = single_response(resp).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["error"], "apiPipelines.single.missingCapability");
+        assert_eq!(json["error"], "缺少 capability 字段");
 
         // params 非对象
         let app = Router::new()
@@ -1196,7 +1231,7 @@ mode = {{ type = "string", default = "fast", enum = ["fast", "slow"] }}
             .unwrap();
         let (status, json) = single_response(resp).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["error"], "apiPipelines.single.paramsNotObject");
+        assert_eq!(json["error"], "params 必须是对象");
     }
 
     // ── 8. 自动拉起失败 → 504（等健康超时计入调用方错误语义） ───────────────
@@ -1228,7 +1263,7 @@ mode = {{ type = "string", default = "fast", enum = ["fast", "slow"] }}
         let (status, json) = single_response(resp).await;
 
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "响应: {json}");
-        assert_eq!(json["error"], "apiPipelines.single.autostartTimeout");
+        assert_eq!(json["error"], "模块 'direct-mod' 自动拉起后 1s 内未就绪");
         // 不应久等：预算 1s + 清理余量
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
 
@@ -1313,7 +1348,7 @@ mode = {{ type = "string", default = "fast", enum = ["fast", "slow"] }}
         )
         .await;
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
-        assert_eq!(body.0["error"], "apiPipelines.single.autostartTimeout");
+        assert_eq!(body.0["error"], "模块 'm' 自动拉起后 30s 内未就绪");
 
         let (status, body) = autostart_error_response(
             &state,

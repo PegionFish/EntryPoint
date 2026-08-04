@@ -248,6 +248,12 @@ fn record_to_summary(r: &TaskRecord) -> ep_core::pipeline::runner::TaskSummary {
             .values()
             .filter(|n| n.state == "completed")
             .count(),
+        // 门禁 #40：产物透传（按节点拓扑序稳定排序）
+        artifacts: r
+            .node_order
+            .iter()
+            .filter_map(|nid| r.artifacts.get(nid).map(|p| (nid.clone(), p.clone())))
+            .collect(),
     }
 }
 
@@ -317,6 +323,7 @@ fn build_direct_pipeline(
                 to: ("output".to_string(), "input".to_string()),
             },
         ],
+        max_instances: None,
     }
 }
 
