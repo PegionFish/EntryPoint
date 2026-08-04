@@ -51,15 +51,35 @@ pub enum WsMessage {
         node_id: String,
         status: String,
     },
-    // Wave 2 下载代理（W2-A）才会构造此变体；daemon 侧当前无生产者，
-    // 预置协议形状以免后续代理改动本枚举。
-    #[allow(dead_code)]
+    // 生产者：api/models.rs 下载流程（Wave 2 B6）。
     ModelDownload {
         module_id: String,
         model_id: String,
         percent: f32,
         state: String,
         bytes: u64,
+    },
+    /// 整合包导入进度（§8.2 新增 WS 消息类型 `pack_import`）。
+    ///
+    /// 形状对齐前端 `WsPackImportMessage`（仲裁 #3）：
+    /// `pack_id` 必有，`stage`/`percent`/`state`/`message` 可选。
+    /// 生产者：`api::packs` 导入/构建后台任务（B2）。
+    /// 经 `model_download_tx`（通用 WsMessage 通道）投递到 GET /ws。
+    PackImport {
+        pack_id: String,
+        /// 当前阶段（B1 阶段名 extracting/verifying/manifest/models/pipelines/
+        /// registering 直传；daemon 侧另有 accepted/done/build 包络阶段）
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stage: Option<String>,
+        /// 百分比 0-100；无法估算进度时缺失
+        #[serde(skip_serializing_if = "Option::is_none")]
+        percent: Option<f32>,
+        /// 进度态：running / completed / failed
+        #[serde(skip_serializing_if = "Option::is_none")]
+        state: Option<String>,
+        /// 阶段说明或错误信息
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
     },
 }
 
@@ -93,8 +113,9 @@ pub struct AppState {
     pub port_manager: Arc<RwLock<PortManager>>,
     pub log_tx: broadcast::Sender<LogMessage>,
     pub progress_tx: broadcast::Sender<ProgressMessage>,
-    /// 模型下载进度事件通道（WsMessage::ModelDownload），容量 64。
-    /// 生产者：Wave 2 下载代理（W2-A）；消费者：GET /ws。
+    /// 通用 [`WsMessage`] 事件通道（容量 64）：GET /ws 原样转发其中任意变体。
+    /// 生产者：模型下载（`ModelDownload`，B6）、整合包导入进度
+    /// （`PackImport`，B2）。字段名保留历史名称，勿改名（多代理引用）。
     pub model_download_tx: broadcast::Sender<WsMessage>,
     /// 管线执行器（Wave 2 骨架，真实初始化）。
     /// 所有者：W2-B（任务/管线 API）。handler 通过 `state.runner.lock().await` 获取。
@@ -158,12 +179,23 @@ impl AppState {
             }));
         }
 
+        // P1-8（仲裁 #12）：ProcessManager 注入共享 CUDA 库目录（Linux
+        // LD_LIBRARY_PATH / Windows PATH 前置，平台分支在 process.rs 内部）
+        // 与网络代理环境变量。桌面端同款接线归 C4（ep-desktop main.rs）。
+        let cuda_libs_dir =
+            ep_core::process::resolve_cuda_libs_dir(&root, &config.compute.cuda_libs_dir);
+        let network_env = config.network.env_vars();
+
         Self {
             root,
             config: Arc::new(RwLock::new(config)),
             devices: Arc::new(RwLock::new(devices)),
             modules: Arc::new(RwLock::new(modules)),
-            process_manager: Arc::new(RwLock::new(ProcessManager::new())),
+            process_manager: Arc::new(RwLock::new(
+                ProcessManager::new()
+                    .with_cuda_libs_dir(cuda_libs_dir)
+                    .with_network_env(network_env),
+            )),
             port_manager: Arc::new(RwLock::new(port_manager)),
             log_tx,
             progress_tx,
@@ -231,6 +263,44 @@ mod tests {
         assert_eq!(v["percent"], 42.5);
         assert_eq!(v["state"], "downloading");
         assert_eq!(v["bytes"], 12345);
+    }
+
+    // WS pack_import 形状（§8.2 + 仲裁 #3：对齐前端 WsPackImportMessage）
+    #[test]
+    fn ws_message_serde_pack_import_full() {
+        let msg = WsMessage::PackImport {
+            pack_id: "pigeonfish.subtitle-kit".into(),
+            stage: Some("unpack".into()),
+            percent: Some(42.0),
+            state: Some("running".into()),
+            message: Some("解包中".into()),
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["type"], "pack_import");
+        assert_eq!(v["pack_id"], "pigeonfish.subtitle-kit");
+        assert_eq!(v["stage"], "unpack");
+        assert_eq!(v["percent"], 42.0);
+        assert_eq!(v["state"], "running");
+        assert_eq!(v["message"], "解包中");
+    }
+
+    // pack_import 可选字段缺省时不出现在 JSON 中（前端按 undefined 处理）
+    #[test]
+    fn ws_message_serde_pack_import_minimal() {
+        let msg = WsMessage::PackImport {
+            pack_id: "a.b".into(),
+            stage: None,
+            percent: None,
+            state: None,
+            message: None,
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["type"], "pack_import");
+        assert_eq!(v["pack_id"], "a.b");
+        assert!(v.get("stage").is_none());
+        assert!(v.get("percent").is_none());
+        assert!(v.get("state").is_none());
+        assert!(v.get("message").is_none());
     }
 
     // lang()：读取 config.general.language 并归一化
