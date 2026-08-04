@@ -130,6 +130,18 @@ pub struct ModelDecl {
     pub target_dir: String,
     pub revision: Option<String>,
     pub size_estimate_mb: Option<u32>,
+    /// 全限定模型 ID（`publisher.vendor.model`，§4.3 冻结契约）。
+    ///
+    /// 仓库内置模块可留空，由消费侧经 `model_id::normalize_legacy` 归一
+    /// （`ep.<vendor>.<model>` 向后兼容层）；整合包导入/导出时写入。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualified_id: Option<String>,
+    /// 变体级 VRAM 估算（MB）— §6.3 VRAM 账本的数据源。
+    ///
+    /// 缺省时回退模块级 `[compute].vram_estimate_mb`，
+    /// 见 [`ModuleManifest::resolve_vram_estimate`]（变体优先、模块兜底）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vram_estimate_mb: Option<u64>,
     #[serde(default)]
     pub default: bool,
     /// 备用下载源列表（TOML 中为 `[[models.mirrors]]`）
@@ -253,6 +265,22 @@ impl ModuleManifest {
         let content = std::fs::read_to_string(path)?;
         let manifest: Self = toml::from_str(&content)?;
         Ok(manifest)
+    }
+
+    /// 解析指定变体的 VRAM 估算（MB）— §6.3 管线 VRAM 账本的数据源。
+    ///
+    /// 解析顺序：
+    /// 1. 变体级 `[[models]].vram_estimate_mb`（按 `variant_id` 匹配 `id`）优先；
+    /// 2. 变体未声明、或 `variant_id` 未命中任何变体时，回退模块级
+    ///    `[compute].vram_estimate_mb`（u32 → u64 无损加宽）；
+    /// 3. 两者皆缺返回 `None`（未知，由消费侧决定展示/放行策略）。
+    pub fn resolve_vram_estimate(&self, variant_id: &str) -> Option<u64> {
+        let variant = self
+            .models
+            .iter()
+            .find(|m| m.id == variant_id)
+            .and_then(|m| m.vram_estimate_mb);
+        variant.or_else(|| self.compute.vram_estimate_mb.map(u64::from))
     }
 
     pub fn validate(&self) -> Result<(), Vec<String>> {
@@ -736,5 +764,93 @@ type = "http"
                 vec![ModelSource::Huggingface, ModelSource::Modelscope]
             );
         }
+    }
+
+    // ── 变体级 vram_estimate_mb / qualified_id（§4.3/§6.3）─────────────
+
+    const VRAM_TOML: &str = r#"
+[module]
+id = "faster-whisper"
+name = "Faster-Whisper ASR"
+version = "1.1.0"
+description = "High-speed speech recognition"
+category = "asr"
+genre = "whisper"
+
+[runtime]
+type = "python"
+python_version = ">=3.10,<3.13"
+
+[compute]
+backends = ["cuda", "cpu"]
+vram_estimate_mb = 4096
+
+[[models]]
+id = "large-v3"
+name = "Whisper Large V3"
+source = "huggingface"
+repo_id = "Systran/faster-whisper-large-v3"
+target_dir = "faster-whisper-large-v3"
+qualified_id = "ep.systran.faster-whisper"
+vram_estimate_mb = 8192
+default = true
+
+[[models]]
+id = "medium"
+name = "Whisper Medium"
+source = "huggingface"
+repo_id = "Systran/faster-whisper-medium"
+target_dir = "faster-whisper-medium"
+
+[interface]
+type = "http"
+"#;
+
+    #[test]
+    fn test_parse_variant_vram_and_qualified_id() {
+        let manifest: ModuleManifest = toml::from_str(VRAM_TOML).unwrap();
+        assert_eq!(manifest.models[0].vram_estimate_mb, Some(8192u64));
+        assert_eq!(
+            manifest.models[0].qualified_id.as_deref(),
+            Some("ep.systran.faster-whisper")
+        );
+        // 未声明的变体 → None（serde default，向后兼容）
+        assert_eq!(manifest.models[1].vram_estimate_mb, None);
+        assert_eq!(manifest.models[1].qualified_id, None);
+    }
+
+    #[test]
+    fn test_legacy_manifest_new_fields_default_none() {
+        // 旧格式清单（无 qualified_id / vram_estimate_mb）正常加载
+        let manifest: ModuleManifest = toml::from_str(VALID_TOML).unwrap();
+        assert_eq!(manifest.models[0].qualified_id, None);
+        assert_eq!(manifest.models[0].vram_estimate_mb, None);
+    }
+
+    #[test]
+    fn test_resolve_vram_estimate_variant_priority() {
+        let manifest: ModuleManifest = toml::from_str(VRAM_TOML).unwrap();
+        // 变体级声明优先于模块级兜底
+        assert_eq!(manifest.resolve_vram_estimate("large-v3"), Some(8192));
+    }
+
+    #[test]
+    fn test_resolve_vram_estimate_module_fallback() {
+        let manifest: ModuleManifest = toml::from_str(VRAM_TOML).unwrap();
+        // 变体未声明 → 模块级 [compute].vram_estimate_mb 兜底
+        assert_eq!(manifest.resolve_vram_estimate("medium"), Some(4096));
+        // 未知变体同样回退模块级（防御：管线 pin 的变体可能尚未下载）
+        assert_eq!(manifest.resolve_vram_estimate("no-such-variant"), Some(4096));
+    }
+
+    #[test]
+    fn test_resolve_vram_estimate_none_when_unknown() {
+        let toml_str = VRAM_TOML
+            .replace("vram_estimate_mb = 8192\n", "")
+            .replace("vram_estimate_mb = 4096\n", "");
+        let manifest: ModuleManifest = toml::from_str(&toml_str).unwrap();
+        // 变体与模块均未声明 → None（未知）
+        assert_eq!(manifest.resolve_vram_estimate("large-v3"), None);
+        assert_eq!(manifest.resolve_vram_estimate("medium"), None);
     }
 }

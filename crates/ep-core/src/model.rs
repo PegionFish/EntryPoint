@@ -14,7 +14,7 @@ use tokio::process::Child;
 use tokio::sync::{broadcast, oneshot};
 use tracing::{debug, info, warn};
 
-use crate::config::{ModelsConfig, NetworkConfig};
+use crate::config::{AppConfig, ModelsConfig, NetworkConfig};
 use crate::module::manifest::{ModelDecl, ModelSource, ModuleManifest};
 
 // ─── 常量 ────────────────────────────────────────────────────────────────────
@@ -27,13 +27,19 @@ const META_FILE_NAME: &str = ".ep_meta.json";
 ///
 /// 位于模型缓存目录内每个模型文件夹下。
 /// 用户可安全删除此文件——删除后系统视为手动放置的模型，直接使用。
+///
+/// 新增字段（`qualified_id` / `tags` / `pack_id`）均带 `serde(default)`：
+/// 不含这些字段的旧 meta 文件可正常加载（向后兼容）；字段为空时序列化输出
+/// 不包含对应键，写出格式与旧版一致。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelMeta {
     /// 所属模块 ID
     pub module_id: String,
     /// 模型 ID（对应 module.toml 中 [[models]].id）
     pub model_id: String,
-    /// 下载源（huggingface / modelscope / url）
+    /// 下载来源 — 自由字符串，不强类型化（审计 §6 正面确认）：
+    /// `huggingface` / `modelscope` / `url`（下载）、`local_import`（本地导入）、
+    /// `pack`（整合包导入，§4.4，由 B1 写入）
     pub source: String,
     /// 仓库 ID
     pub repo_id: String,
@@ -43,6 +49,16 @@ pub struct ModelMeta {
     pub downloaded_at: String,
     /// 总大小（字节）
     pub total_size_bytes: u64,
+    /// 全限定模型 ID（`publisher.vendor.model`，§4.3）；
+    /// 整合包导入/导出时写入，普通下载/本地导入为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualified_id: Option<String>,
+    /// 模型标签（统一页筛选 / 整合包圈选，§5.1/§4.5；存 meta 随包流转）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// 来源整合包 ID（§4.4）；非整合包导入为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack_id: Option<String>,
 }
 
 // ─── DownloadedModel ─────────────────────────────────────────────────────────
@@ -54,7 +70,8 @@ pub struct DownloadedModel {
     pub target_dir: String,
     /// 元数据
     pub meta: ModelMeta,
-    /// 目录总大小（字节）。简化实现：当前固定为 0，后续可递归统计。
+    /// 目录总大小（字节）。真实递归累计（P2-10），语义见 [`dir_total_size`]：
+    /// 基于 symlink_metadata，不跟随符号链接、防缓存布局环。
     pub size_bytes: u64,
 }
 
@@ -617,11 +634,13 @@ impl ModelManager {
 
             match self.read_meta(&target_dir) {
                 Some(meta) => {
+                    // P2-10：真实递归累计目录大小
+                    // （dir_total_size 基于 symlink_metadata：不跟随 symlink、防环）
+                    let size_bytes = dir_total_size(&path);
                     models.push(DownloadedModel {
                         target_dir,
                         meta,
-                        // TODO: 递归统计目录大小，当前简化为 0
-                        size_bytes: 0,
+                        size_bytes,
                     });
                 }
                 None => {
@@ -742,6 +761,10 @@ impl ModelManager {
                 .unwrap_or_else(|| default_revision_for(resolved_source).to_string()),
             downloaded_at: chrono::Utc::now().to_rfc3339(),
             total_size_bytes: total_size,
+            // 普通下载不带整合包语义字段（pack 来源由 B1 导入流程写入）
+            qualified_id: None,
+            tags: Vec::new(),
+            pack_id: None,
         };
         if let Err(e) = self.write_meta(&model.target_dir, &meta) {
             warn!(
@@ -822,6 +845,9 @@ impl ModelManager {
                 .unwrap_or_else(|| default_revision_for(resolved_source).to_string()),
             downloaded_at: String::new(), // 完成时填充
             total_size_bytes: 0,           // 完成时填充
+            qualified_id: None,
+            tags: Vec::new(),
+            pack_id: None,
         };
 
         Ok(spawn_tracked_download(
@@ -1037,6 +1063,9 @@ impl ModelManager {
             revision: String::new(),
             downloaded_at: chrono::Utc::now().to_rfc3339(),
             total_size_bytes: stats.1,
+            qualified_id: None,
+            tags: Vec::new(),
+            pack_id: None,
         };
         self.write_meta(target_dir_name, &meta)?;
 
@@ -1134,7 +1163,11 @@ impl ModelManager {
             .collect()
     }
 
-    /// 递归统计目录大小和文件数量
+    /// 递归统计目录大小和文件数量。
+    ///
+    /// 统一使用 symlink_metadata：不跟随符号链接，避免 HF 缓存布局中的
+    /// symlink 造成重复计数或目录环（与 [`dir_total_size`] 语义一致，
+    /// Windows/Linux 行为相同）。
     fn dir_stats(&self, dir: &Path) -> (u64, usize) {
         let mut total_size: u64 = 0;
         let mut file_count: usize = 0;
@@ -1146,13 +1179,17 @@ impl ModelManager {
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
-                let (sub_size, sub_count) = self.dir_stats(&path);
-                total_size += sub_size;
-                file_count += sub_count;
-            } else if let Ok(metadata) = entry.metadata() {
-                total_size += metadata.len();
-                file_count += 1;
+            match fs::symlink_metadata(&path) {
+                Ok(m) if m.file_type().is_dir() => {
+                    let (sub_size, sub_count) = self.dir_stats(&path);
+                    total_size += sub_size;
+                    file_count += sub_count;
+                }
+                Ok(m) => {
+                    total_size += m.len();
+                    file_count += 1;
+                }
+                Err(_) => {}
             }
         }
 
@@ -1212,6 +1249,45 @@ impl ModelManager {
         debug!(count = views.len(), "listed all models across modules");
         views
     }
+}
+
+// ─── active_models 单槽位（§5.2）────────────────────────────────────────────
+
+/// 解析模块当前激活的模型变体 id — 版本单槽位语义（§5.2，冻结）。
+///
+/// 每模块同一时间至多一个激活变体，解析顺序（三级回退）：
+/// 1. `config.active_models[module_id]`（app.toml `[active_models]` 用户显式选择）；
+///    配置的 id 未命中 manifest 任何变体（陈旧配置）时记 warn 并继续回退；
+/// 2. manifest 中 `default = true` 的变体；
+/// 3. manifest 中首个变体。
+///
+/// 模块未声明任何模型变体（如 native 模块）时返回 `None`。
+///
+/// daemon 启动模块（B5）与统一页/桌面端变体展示（C1/C5）应统一消费本
+/// helper，不再"死板取 default"。
+pub fn active_model_for<'a>(config: &AppConfig, manifest: &'a ModuleManifest) -> Option<&'a str> {
+    let module_id = &manifest.module.id;
+
+    // 1. 显式配置（单槽位用户选择）；返回 manifest 侧声明的 id
+    //    （生命周期锚定 manifest，而非 config）
+    if let Some(model_id) = config.active_models.get(module_id) {
+        if let Some(decl) = manifest.models.iter().find(|m| &m.id == model_id) {
+            return Some(decl.id.as_str());
+        }
+        warn!(
+            module_id = %module_id,
+            model_id = %model_id,
+            "active_models entry does not match any variant declared by the manifest, falling back to default variant"
+        );
+    }
+
+    // 2. manifest 声明的 default=true 变体
+    if let Some(model) = manifest.models.iter().find(|m| m.default) {
+        return Some(model.id.as_str());
+    }
+
+    // 3. 回退首个变体
+    manifest.models.first().map(|m| m.id.as_str())
 }
 
 // ─── DownloadHandle 与下载监督任务 ──────────────────────────────────────────
@@ -1475,6 +1551,10 @@ pub const HF_CACHE_DIR_NAMES: &[&str] = &["blobs", "snapshots", "refs", ".cache"
 ///    整个缓存目录跳过不删；
 /// 2. 仅当顶层存在同名真实文件（非 symlink）且大小一致时，
 ///    才删除缓存目录内的对应副本；其余文件一律保留。
+///
+/// 接线点：**B1（整合包导入）在 bundle 模式模型落位后调用**（§4.4）。
+/// pub 签名保持稳定以便接线；Windows/Linux 双平台可用
+/// （symlink 前缀判定在 Windows 下走大小写不敏感分支，见 [`path_under`]）。
 pub fn cleanup_hf_cache(model_dir: &Path) -> Result<u64> {
     if !model_dir.is_dir() {
         anyhow::bail!("model directory does not exist: {}", model_dir.display());
@@ -1532,11 +1612,31 @@ fn top_level_symlink_points_into(model_dir: &Path, cache_dir: &Path) -> bool {
                 Err(_) => continue,
             },
         };
-        if resolved.starts_with(&cache_canonical) {
+        if path_under(&resolved, &cache_canonical) {
             return true;
         }
     }
     false
+}
+
+/// 判断 `path` 是否位于 `base` 之下（按路径分量做前缀比较）。
+///
+/// Windows 文件系统大小写不敏感，且 `fs::canonicalize` 不会归一大小写，
+/// 逐分量严格比较可能漏判（如 `C:\Models` vs `c:\models`），
+/// 故 Windows 走忽略 ASCII 大小写的比较分支；Unix 保持严格 `starts_with`。
+fn path_under(path: &Path, base: &Path) -> bool {
+    if cfg!(windows) {
+        let mut path_comps = path.components();
+        for base_comp in base.components() {
+            match path_comps.next() {
+                Some(c) if c.as_os_str().eq_ignore_ascii_case(base_comp.as_os_str()) => {}
+                _ => return false,
+            }
+        }
+        true
+    } else {
+        path.starts_with(base)
+    }
 }
 
 /// 递归删除缓存目录内"顶层存在同名同大小真实文件"的副本，返回回收字节数
@@ -1795,6 +1895,8 @@ mod tests {
             target_dir: "faster-whisper-large-v3".to_string(),
             revision: Some("main".to_string()),
             size_estimate_mb: Some(3100),
+            qualified_id: None,
+            vram_estimate_mb: None,
             default: true,
             mirrors: vec![],
         }
@@ -1811,6 +1913,8 @@ mod tests {
             target_dir: "qwen3-asr".to_string(),
             revision: None,
             size_estimate_mb: Some(2000),
+            qualified_id: None,
+            vram_estimate_mb: None,
             default: false,
             mirrors: vec![],
         }
@@ -1828,6 +1932,8 @@ mod tests {
             target_dir: "faster-whisper-large-v3".to_string(),
             revision: Some("main".to_string()),
             size_estimate_mb: Some(3100),
+            qualified_id: None,
+            vram_estimate_mb: None,
             default: true,
             mirrors: vec![ModelMirror {
                 source: ModelSource::Modelscope,
@@ -1846,6 +1952,9 @@ mod tests {
             revision: "main".to_string(),
             downloaded_at: "2026-07-20T10:30:00Z".to_string(),
             total_size_bytes: 3_094_850_000,
+            qualified_id: None,
+            tags: Vec::new(),
+            pack_id: None,
         }
     }
 
@@ -2013,8 +2122,82 @@ mod tests {
         assert_eq!(loaded.revision, meta.revision);
         assert_eq!(loaded.downloaded_at, meta.downloaded_at);
         assert_eq!(loaded.total_size_bytes, meta.total_size_bytes);
+        // 新增字段往返
+        assert_eq!(loaded.qualified_id, None);
+        assert!(loaded.tags.is_empty());
+        assert_eq!(loaded.pack_id, None);
 
         cleanup(&dir);
+    }
+
+    #[test]
+    fn test_meta_roundtrip_with_pack_fields() {
+        // 新字段（§4.3 meta 落点）写入→读取往返一致
+        let dir = temp_dir("meta_pack_rt");
+        let config = test_config(dir.to_str().unwrap());
+        let mgr = ModelManager::new(&config, Path::new("."));
+
+        let mut meta = test_meta();
+        meta.source = "pack".to_string(); // 新取值：整合包导入（§4.4）
+        meta.qualified_id = Some("ep.systran.faster-whisper".to_string());
+        meta.tags = vec!["字幕".to_string(), "视频".to_string()];
+        meta.pack_id = Some("subtitle-kit".to_string());
+        mgr.write_meta("faster-whisper-large-v3", &meta).unwrap();
+
+        let loaded = mgr.read_meta("faster-whisper-large-v3").expect("meta should exist");
+        assert_eq!(loaded.source, "pack");
+        assert_eq!(loaded.qualified_id.as_deref(), Some("ep.systran.faster-whisper"));
+        assert_eq!(loaded.tags, vec!["字幕".to_string(), "视频".to_string()]);
+        assert_eq!(loaded.pack_id.as_deref(), Some("subtitle-kit"));
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_meta_legacy_format_compat() {
+        // 旧格式 meta JSON（无 qualified_id/tags/pack_id 字段）必须正常加载
+        let dir = temp_dir("meta_legacy");
+        let model_path = dir.join("legacy-model");
+        fs::create_dir_all(&model_path).unwrap();
+        let legacy_json = r#"{
+            "module_id": "faster-whisper",
+            "model_id": "large-v3",
+            "source": "huggingface",
+            "repo_id": "Systran/faster-whisper-large-v3",
+            "revision": "main",
+            "downloaded_at": "2026-07-01T00:00:00Z",
+            "total_size_bytes": 1234
+        }"#;
+        fs::write(model_path.join(META_FILE_NAME), legacy_json).unwrap();
+
+        let config = test_config(dir.to_str().unwrap());
+        let mgr = ModelManager::new(&config, Path::new("."));
+
+        let meta = mgr.read_meta("legacy-model").expect("legacy meta should load");
+        assert_eq!(meta.model_id, "large-v3");
+        assert_eq!(meta.total_size_bytes, 1234);
+        // 新字段取缺省值
+        assert_eq!(meta.qualified_id, None);
+        assert!(meta.tags.is_empty());
+        assert_eq!(meta.pack_id, None);
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_meta_serialization_stable_without_new_fields() {
+        // 新字段为空时不写入 JSON，输出格式与旧版 meta 保持一致
+        let meta = test_meta();
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(!json.contains("qualified_id"), "json: {json}");
+        assert!(!json.contains("tags"), "json: {json}");
+        assert!(!json.contains("pack_id"), "json: {json}");
+
+        // 有值时正常序列化
+        let mut meta = meta;
+        meta.pack_id = Some("subtitle-kit".to_string());
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains("\"pack_id\":\"subtitle-kit\""), "json: {json}");
     }
 
     #[test]
@@ -2058,6 +2241,8 @@ mod tests {
             target_dir: "deep-filter-df3".to_string(),
             revision: None,
             size_estimate_mb: Some(50),
+            qualified_id: None,
+            vram_estimate_mb: None,
             default: true,
             mirrors: vec![],
         };
@@ -2147,6 +2332,9 @@ mod tests {
             revision: "master".to_string(),
             downloaded_at: "2026-07-21T08:00:00Z".to_string(),
             total_size_bytes: 2_000_000_000,
+            qualified_id: None,
+            tags: Vec::new(),
+            pack_id: None,
         };
         mgr.write_meta("model-b", &meta2).unwrap();
 
@@ -2162,12 +2350,110 @@ mod tests {
         assert!(dirs.contains(&"model-b"));
         assert!(!dirs.contains(&"manual-model"));
 
-        // size_bytes 简化为 0
+        // size_bytes 为真实递归值（P2-10；至少包含 .ep_meta.json 自身）> 0
         for m in &list {
-            assert_eq!(m.size_bytes, 0);
+            assert!(m.size_bytes > 0, "{} size should be > 0", m.target_dir);
         }
 
         cleanup(&dir);
+    }
+
+    #[test]
+    fn test_list_downloaded_models_size_bytes_real() {
+        // P2-10：tempdir 构造已知大小，验证真实递归累计
+        let dir = temp_dir("list_size");
+        let config = test_config(dir.to_str().unwrap());
+        let mgr = ModelManager::new(&config, Path::new("."));
+
+        // 先放模型文件（含嵌套子目录），再写 meta
+        let model_dir = dir.join("sized-model");
+        fs::create_dir_all(model_dir.join("sub")).unwrap();
+        fs::write(model_dir.join("model.bin"), vec![0u8; 4096]).unwrap();
+        fs::write(model_dir.join("sub").join("weights.bin"), vec![1u8; 1024]).unwrap();
+        mgr.write_meta("sized-model", &test_meta()).unwrap();
+
+        let meta_size = fs::metadata(model_dir.join(META_FILE_NAME)).unwrap().len();
+
+        let list = mgr.list_downloaded_models();
+        assert_eq!(list.len(), 1);
+        // 已知大小 = 顶层 4096 + 子目录 1024 + meta 文件自身
+        assert_eq!(list[0].size_bytes, 4096 + 1024 + meta_size);
+
+        cleanup(&dir);
+    }
+
+    // ── active_model_for 三级回退（§5.2）──────────────────────────────
+
+    /// 构造带 active_models 配置的 AppConfig
+    fn config_with_active(module_id: &str, model_id: &str) -> crate::config::AppConfig {
+        let mut config = crate::config::AppConfig::default();
+        config
+            .active_models
+            .insert(module_id.to_string(), model_id.to_string());
+        config
+    }
+
+    /// 双变体 manifest：small（default=true）在前、large 在后
+    fn two_variant_manifest() -> ModuleManifest {
+        let mut small = test_ms_model();
+        small.id = "small".to_string();
+        small.default = true;
+        let mut large = test_hf_model();
+        large.id = "large".to_string();
+        large.default = false;
+        test_manifest("faster-whisper", "Faster-Whisper ASR", vec![small, large])
+    }
+
+    #[test]
+    fn test_active_model_for_config_priority() {
+        let manifest = two_variant_manifest();
+        // 显式配置命中 → 优先于 default=true
+        let config = config_with_active("faster-whisper", "large");
+        assert_eq!(active_model_for(&config, &manifest), Some("large"));
+    }
+
+    #[test]
+    fn test_active_model_for_config_stale_falls_back() {
+        let manifest = two_variant_manifest();
+        // 配置指向 manifest 未声明的变体（陈旧配置）→ 回退 default=true
+        let config = config_with_active("faster-whisper", "ghost-variant");
+        assert_eq!(active_model_for(&config, &manifest), Some("small"));
+    }
+
+    #[test]
+    fn test_active_model_for_default_fallback() {
+        let manifest = two_variant_manifest();
+        // 无 active_models 配置 → default=true 变体
+        let config = crate::config::AppConfig::default();
+        assert_eq!(active_model_for(&config, &manifest), Some("small"));
+    }
+
+    #[test]
+    fn test_active_model_for_first_variant_fallback() {
+        // 无配置且无 default=true → 首个变体
+        let mut m1 = test_ms_model();
+        m1.default = false;
+        let mut m2 = test_hf_model();
+        m2.default = false;
+        let manifest = test_manifest("mod-x", "Mod X", vec![m1, m2]);
+        let config = crate::config::AppConfig::default();
+        assert_eq!(active_model_for(&config, &manifest), Some("qwen3-asr"));
+    }
+
+    #[test]
+    fn test_active_model_for_other_module_config_ignored() {
+        // active_models 中其他模块的配置不影响本模块
+        let manifest = two_variant_manifest();
+        let config = config_with_active("some-other-module", "large");
+        assert_eq!(active_model_for(&config, &manifest), Some("small"));
+    }
+
+    #[test]
+    fn test_active_model_for_no_models() {
+        // native 模块无模型变体 → None
+        let manifest = test_manifest("native-mod", "Native", vec![]);
+        let config = crate::config::AppConfig::default();
+        assert_eq!(active_model_for(&config, &manifest), None);
     }
 
     // ── execute_download / cancel_download tests ─────────────────────────
@@ -2291,6 +2577,8 @@ mod tests {
                     target_dir: "ready-model".to_string(),
                     revision: Some("main".to_string()),
                     size_estimate_mb: Some(100),
+                    qualified_id: None,
+                    vram_estimate_mb: None,
                     default: true,
                     mirrors: vec![],
                 },
@@ -2303,6 +2591,8 @@ mod tests {
                     target_dir: "missing-model".to_string(),
                     revision: None,
                     size_estimate_mb: None,
+                    qualified_id: None,
+                    vram_estimate_mb: None,
                     default: false,
                     mirrors: vec![],
                 },
@@ -2550,6 +2840,49 @@ mod tests {
         cleanup(&dir);
     }
 
+    #[test]
+    fn test_path_under_prefix_check() {
+        if cfg!(windows) {
+            // Windows 大小写不敏感：盘符/目录大小写不一致也必须命中
+            assert!(path_under(
+                Path::new("C:/Models/mymodel/blobs"),
+                Path::new("c:/models/mymodel")
+            ));
+            assert!(!path_under(
+                Path::new("C:/Other/mymodel/blobs"),
+                Path::new("c:/models/mymodel")
+            ));
+        } else {
+            assert!(path_under(
+                Path::new("/opt/models/mymodel/blobs"),
+                Path::new("/opt/models/mymodel")
+            ));
+            // Unix 严格大小写敏感
+            assert!(!path_under(
+                Path::new("/OPT/models/mymodel/blobs"),
+                Path::new("/opt/models/mymodel")
+            ));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_dir_total_size_symlink_loop_safe() {
+        // symlink 指向祖先目录构成环：递归必须安全终止，不重复计数
+        let dir = temp_dir("size_loop");
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(dir.join("a.bin"), vec![0u8; 100]).unwrap();
+        std::os::unix::fs::symlink(&dir, sub.join("loop")).unwrap();
+
+        let size = dir_total_size(&dir);
+        // 至少计入真实文件；且不会因环而指数爆炸
+        assert!(size >= 100, "size: {size}");
+        assert!(size < 100 + 1024 * 1024, "size exploded via symlink loop: {size}");
+
+        cleanup(&dir);
+    }
+
     // ── import_model target_dir 修复 ────────────────────────────────────
 
     #[tokio::test]
@@ -2641,6 +2974,8 @@ mod tests {
             target_dir: "auto-model-dir".to_string(),
             revision: None,
             size_estimate_mb: None,
+            qualified_id: None,
+            vram_estimate_mb: None,
             default: false,
             mirrors: vec![],
         };
@@ -2693,6 +3028,9 @@ mod tests {
             revision: String::new(),
             downloaded_at: String::new(),
             total_size_bytes: 0,
+            qualified_id: None,
+            tags: Vec::new(),
+            pack_id: None,
         };
 
         let handle = spawn_tracked_download(
