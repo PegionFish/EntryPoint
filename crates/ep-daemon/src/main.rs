@@ -103,30 +103,15 @@ async fn run_module_standalone(module_id: &str) -> anyhow::Result<()> {
     let port = port_manager.allocate(module_id)?;
     tracing::info!("Allocated port: {}", port);
 
-    // Build environment variables (root already resolved above)
-    let module_dir = root.join("modules").join(module_id);
-    let model_dir = if let Some(model) = manifest.models.iter().find(|m| m.default) {
-        root.join("models").join(&model.target_dir)
-    } else if let Some(model) = manifest.models.first() {
-        root.join("models").join(&model.target_dir)
-    } else {
-        module_dir.clone()
-    };
+    // Build environment variables (A2/P0-3 修复：公共构建函数产出裸占位符键
+    // —— ROOT/MODULE_DIR/MODEL_DIR/WORKSPACE/MODULE_ID/MODEL_ID/LOG_LEVEL/DEVICE...
+    // EP_ 前缀由 process.rs 统一加一次，{MODULE_DIR}/{venv_python} 占位符替换生效)
+    let env_vars = ep_core::process::build_module_env(&root, module_id, manifest, &device);
 
-    let mut env_vars = HashMap::new();
-    env_vars.insert("EP_ROOT".to_string(), root.to_string_lossy().to_string());
-    env_vars.insert("EP_MODULE_DIR".to_string(), module_dir.to_string_lossy().to_string());
-    env_vars.insert("EP_MODULE_ID".to_string(), module_id.to_string());
-    env_vars.insert("EP_MODEL_DIR".to_string(), model_dir.to_string_lossy().to_string());
-    env_vars.insert("EP_WORKSPACE".to_string(), root.join("workspace").to_string_lossy().to_string());
-    env_vars.insert("EP_LOG_LEVEL".to_string(), "info".to_string());
-
-    if let Some(model) = manifest.models.iter().find(|m| m.default).or(manifest.models.first()) {
-        env_vars.insert("EP_MODEL_ID".to_string(), model.id.clone());
-    }
-
-    // Start the module
-    let mut process_manager = ProcessManager::new();
+    // Start the module（§3.1：注入共享 CUDA 库目录，平台分支在 process.rs 内部）
+    let cuda_libs_dir =
+        ep_core::process::resolve_cuda_libs_dir(&root, &cfg.compute.cuda_libs_dir);
+    let mut process_manager = ProcessManager::new().with_cuda_libs_dir(cuda_libs_dir);
     process_manager
         .start_module(module_id, manifest, device.clone(), port, env_vars)
         .await?;
