@@ -21,3 +21,6 @@ pub mod pipeline;
 pub mod health;
 pub mod deps;
 pub mod deps_install;
+
+// Wave S 骨架（§4.3 全限定模型 ID，签名冻结，实现由 Wave 1 A3 填入）
+pub mod model_id;

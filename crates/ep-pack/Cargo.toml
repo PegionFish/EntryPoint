@@ -1,0 +1,19 @@
+[package]
+name = "ep-pack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+# 整合包归档（.epzip = zip）：依赖写法与 ep-daemon 的 api/upload.rs 解包侧保持一致
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# CHECKSUMS.toml 全量校验（sha256）
+sha2 = "0.11"
+hex = "0.4"
+# 打包时递归枚举源目录文件
+walkdir = "2"
