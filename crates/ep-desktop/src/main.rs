@@ -128,7 +128,11 @@ async fn background_loop(
 
     let (port_range_start, port_range_end) = config.port_range();
     let mut port_manager = ep_core::port::PortManager::new(port_range_start, port_range_end);
-    let mut process_manager = ep_core::process::ProcessManager::new();
+    // A2（§3.1）：模块子进程注入共享 CUDA 库目录（Linux LD_LIBRARY_PATH 前置 /
+    // Windows PATH 前置，平台分支在 process.rs 内部）
+    let mut process_manager = ep_core::process::ProcessManager::new().with_cuda_libs_dir(
+        ep_core::process::resolve_cuda_libs_dir(&root, &config.compute.cuda_libs_dir),
+    );
 
     // Initial device detection
     let disabled = &config.compute.disabled_backends;
@@ -191,13 +195,20 @@ async fn background_loop(
                                         .map(|d| d.id.clone())
                                         .unwrap_or(ep_core::types::DeviceId::Cpu);
 
+                                    // A2（P0-4 前置）：公共构建函数产出标准模板变量
+                                    // （ROOT/MODULE_DIR/...），start_module 统一加 EP_ 前缀
+                                    // 并注入 CUDA 库路径 + compute.env，不再传空 map
+                                    let env_vars = ep_core::process::build_module_env(
+                                        &root, &module_id, &manifest, &device,
+                                    );
+
                                     match process_manager
                                         .start_module(
                                             &module_id,
                                             &manifest,
                                             device.clone(),
                                             port,
-                                            std::collections::HashMap::new(),
+                                            env_vars,
                                         )
                                         .await
                                     {
@@ -253,20 +264,12 @@ async fn background_loop(
                             });
 
                         if let Some(decl) = decl {
-                            // venv python 解释器路径（Windows: Scripts/python.exe，其他: bin/python）
-                            let venv_python = if cfg!(target_os = "windows") {
-                                root.join("runtime")
-                                    .join("venvs")
-                                    .join(&module_id)
-                                    .join("Scripts")
-                                    .join("python.exe")
-                            } else {
-                                root.join("runtime")
-                                    .join("venvs")
-                                    .join(&module_id)
-                                    .join("bin")
-                                    .join("python")
-                            };
+                            // venv python 解释器路径（A2：process.rs 公共平台分支助手，
+                            // 与 start_module/deps 的 venv 路径口径一致）
+                            // 注：下载子进程自身的环境变量（网络代理）由 model.rs 统一注入；
+                            // 下载脚本不 import torch，无需 CUDA 库路径。
+                            let venv_python =
+                                ep_core::process::venv_python_path(&root, &module_id);
 
                             if !venv_python.exists() {
                                 let _ = tx.send(AppMsg::Error(tr(
