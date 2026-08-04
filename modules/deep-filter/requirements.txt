@@ -4,4 +4,14 @@ python-multipart>=0.0.6
 deepfilternet>=0.5.6
 soundfile>=0.12.0
 numpy>=1.24.0
-torch>=2.0.0
+# torch 全家桶与 config/constraints.txt 锁定的版本一致（同 pin 恒不冲突；
+# constraints 存在时以 -c 强制收敛，二者取值相同）。升级须与 constraints
+# 一起成族修改（torch/torchaudio 严格配对）。
+torch==2.13.0
+# torchaudio 是 deepfilternet 的传递依赖；显式 pin 与 torch 同族配对，
+# 防止停用 constraints 时被解析到与 torch 不配对的版本。
+torchaudio==2.13.0
+# scipy：deepfilternet 依赖 + adapter.py 的 fallback 频谱减法路径使用。
+# 保底 1.14.0：与 torch 2.13.0+cu130 栈的 numpy 2.x 运行环境对齐
+# （构建于 numpy 1.x 的旧 scipy 轮子在 numpy 2.x 下会报 dtype size 错误）。
+scipy>=1.14.0
