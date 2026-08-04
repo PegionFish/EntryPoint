@@ -138,6 +138,10 @@ where
         let before = config.clone();
         match config.merge_partial(&patch) {
             Ok(()) => {
+                // #48：merge_partial 经 serde 重建配置，运行期解析缓存
+                // （#[serde(skip)]）被重置 → 基于 root 重新填充。
+                // 序列化字段保持原始形态（相对仍为相对），save() 落盘不绝对化。
+                config.resolve_paths(&state.root);
                 let requires_restart = restart_sensitive_changed(&before, &config);
                 match config.save(&config_dir) {
                     Ok(()) => Outcome::Merged {
@@ -343,6 +347,43 @@ mod tests {
         let loaded = AppConfig::load(state.root.join("config").as_path()).expect("reload");
         assert_eq!(loaded.general.language, "en");
         assert_eq!(loaded.models.hf_endpoint, "https://mirror.example");
+    }
+
+    // #48 回归：启动期 resolve_paths 后再 PUT，落盘保持相对形态（不绝对化）；
+    // 运行期缓存同步刷新，消费方仍拿到绝对路径
+    #[tokio::test]
+    async fn oneshot_put_does_not_persist_absolute_paths() {
+        let state = seq_state("zh-CN");
+        // 模拟 daemon 启动流程：加载配置 → resolve_paths 填充运行期缓存
+        state.config.write().await.resolve_paths(&state.root);
+
+        let (status, _) =
+            route_put(state.clone(), r#"{"general":{"language":"en"}}"#).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // 落盘文件保持出厂相对形态
+        let raw = std::fs::read_to_string(state.root.join("config").join("app.toml"))
+            .expect("config file written");
+        assert!(
+            raw.contains("cache_dir = \"models\""),
+            "PUT 落盘应保持相对 cache_dir，实际:\n{raw}"
+        );
+        assert!(
+            raw.contains("workspace_dir = \"workspace\""),
+            "PUT 落盘应保持相对 workspace_dir，实际:\n{raw}"
+        );
+        assert!(
+            !raw.contains(state.root.to_string_lossy().as_ref()),
+            "PUT 落盘不得包含 root 绝对路径，实际:\n{raw}"
+        );
+
+        // merge 后运行期缓存已重新填充（消费方仍拿到绝对路径）
+        let cfg = state.config.read().await;
+        assert!(cfg.resolved_paths().model_cache_dir.is_absolute());
+        assert!(cfg.resolved_paths().workspace_dir.is_absolute());
+        drop(cfg);
+
+        let _ = std::fs::remove_dir_all(&state.root);
     }
 
     // 显式覆盖 + 嵌套合并：多段 patch 一次提交；未给出的子字段保留
