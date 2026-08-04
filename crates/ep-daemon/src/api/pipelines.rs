@@ -292,8 +292,9 @@ async fn delete_pipeline(
 
 /// GET /api/pipelines/:id/status — 兼容端点（P1-5 修复：改查任务注册表）
 ///
-/// 旧实现查 `state.runner`——该 runner 从未被执行路径使用（每次执行自建
-/// runner），故恒返回 `unknown`。现基于 ep-core 任务注册表按 `pipeline_id`
+/// 旧实现查 `AppState` 预置的共享 runner（`state.runner`）——该 runner
+/// 从未被执行路径使用（每次执行自建 runner），故恒返回 `unknown`；
+/// 该死字段已于 Wave 4 D2 移除。现基于 ep-core 任务注册表按 `pipeline_id`
 /// 聚合：返回该管线**最新一条**任务的状态；无任务记录 → `unknown`。
 ///
 /// 文档化决策（任务 5）：本端点保留为注册表聚合（向后兼容），

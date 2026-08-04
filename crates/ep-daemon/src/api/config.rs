@@ -66,7 +66,7 @@ impl std::ops::Deref for PutConfigResponse {
 /// |---|---|
 /// | `server.host` / `server.port` | main.rs 启动时绑定监听地址 |
 /// | `ports.range_start` / `ports.range_end` | PortManager 构造期固定区间 |
-/// | `pipeline.workspace_dir` | 启动期 resolve_paths + runner 工作区固定 |
+/// | `pipeline.workspace_dir` | 启动期 resolve_paths + 任务产物 ServeDir 根启动期固定（tasks.rs） |
 /// | `compute.refresh_interval_secs` | 设备轮询任务启动期取间隔（不热跟随） |
 /// | `compute.cuda_libs_dir` | AppState 构造期注入 ProcessManager |
 /// | `general.log_level` | tracing subscriber 启动期初始化（接线待 main.rs 仲裁） |

@@ -16,20 +16,23 @@
 //!
 //! 每个任务终结（completed/failed/cancelled）后释放闸门并触发下一轮准入。
 //!
-//! ## 引擎执行（为什么不在 `state.runner` 上直接执行）
+//! ## 引擎执行（每次执行创建独立 runner）
 //!
 //! 以 ep-core 现状为准：
 //! 1. 引擎唯一执行入口 [`ep_core::types::PipelineRunner::execute`] 是**同步阻塞**
-//!    调用，且要求 `&mut self` 覆盖整个执行期（可达数分钟）。`state.runner` 被
-//!    `Arc<tokio::sync::Mutex<_>>` 保护，若执行期间持锁，`GET /api/tasks` 等查询
-//!    将被阻塞到执行结束——任务书明确禁止。
+//!    调用，且要求 `&mut self` 覆盖整个执行期（可达数分钟）。若多任务共享
+//!    同一台 runner（`Arc<tokio::sync::Mutex<_>>` 持锁执行），`GET /api/tasks`
+//!    等查询将被阻塞到执行结束——任务书明确禁止。
 //! 2. `PipelineRunnerImpl` 的任务存储 `tasks` 为**私有字段**，`get_task_detail`
 //!    也**不暴露节点产物**（Artifact），而产物列表/下载接口必须拿到产物路径。
 //!
 //! 因此每次执行创建一台**独立的** [`PipelineRunnerImpl`]（注册运行中模块端口 +
-//! 进度回调），放进 `tokio::task::spawn_blocking` 执行，全程不触碰 `state.runner`，
-//! 任务查询接口永不阻塞；引擎的同步 `execute` 在 blocking 线程上自建 tokio
+//! 进度回调），放进 `tokio::task::spawn_blocking` 执行，任务查询接口永不阻塞；
+//! 引擎的同步 `execute` 在 blocking 线程上自建 tokio
 //! 运行时 block_on（blocking 线程无 Handle，走 `execute` 的非嵌套分支）。
+//!
+//! （历史备注：Wave 2 骨架曾在 `AppState` 预置共享 `runner` 字段，从未被
+//! 执行路径使用，已于 Wave 4 D2 死代码清除中移除。）
 //!
 //! ## 任务注册表（P1-4：下沉 ep-core + 落盘持久化）
 //!
