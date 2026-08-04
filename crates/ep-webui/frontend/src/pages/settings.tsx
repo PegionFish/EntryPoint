@@ -1,4 +1,10 @@
-import { useEffect, useState, type ComponentProps, type ReactNode } from 'react'
+import {
+  useEffect,
+  useRef,
+  useState,
+  type ComponentProps,
+  type ReactNode,
+} from 'react'
 import {
   Cpu,
   Database,
@@ -6,10 +12,13 @@ import {
   Globe,
   Loader2,
   Network,
+  Package,
+  Plus,
   RotateCcw,
   Save,
   Server,
   Settings2,
+  SlidersHorizontal,
   TerminalSquare,
   TriangleAlert,
 } from 'lucide-react'
@@ -17,7 +26,7 @@ import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import type { AppConfig } from '@/api/types'
 import { normalizeLanguage, setAppLanguage } from '@/i18n'
-import { useThemeStore } from '@/store/theme'
+import { adoptTheme, useThemeStore } from '@/store/theme'
 import { PageContainer } from '@/components/layout/page-container'
 import { Button } from '@/components/ui/button'
 import {
@@ -45,7 +54,7 @@ import {
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
-import { useConfig } from '@/hooks/use-config'
+import { useConfig, type AppConfigExt } from '@/hooks/use-config'
 import { cn } from '@/lib/utils'
 
 /* ── 本地表单小组件 ─────────────────────────────────────────── */
@@ -273,16 +282,75 @@ export function SettingsPage() {
   } = useConfig()
   /** 开启「允许公网访问」前的安全确认对话框 */
   const [publicDialogOpen, setPublicDialogOpen] = useState(false)
+  /** active_models 新增行草稿（确认前不进入配置 draft） */
+  const [newActiveModel, setNewActiveModel] = useState<{
+    moduleId: string
+    modelId: string
+  } | null>(null)
   /** 实时字段校验错误（由当前表单内容派生） */
   const errors: ValidationErrors = config ? validateConfig(config, tr) : {}
 
+  /** 主题 store 当前值（作为订阅触发器：顶栏/外部入口切换时驱动草稿同步） */
+  const storeTheme = useThemeStore((s) => s.theme)
+  /** 跟踪 loading 跳变：仅在"加载刚完成"时刻执行服务器优先对齐 */
+  const prevLoadingRef = useRef(loading)
+
+  /**
+   * 主题三端同步（P2-2）——服务器优先：配置加载/重载（首次进入、重置）完成
+   * 的那一刻，本地主题与服务器不一致则以服务器为准（此刻草稿 == 服务器快照，
+   * 方向明确）。adoptTheme 只本地应用不回写，避免把真源值再写回去。
+   */
+  useEffect(() => {
+    const justLoaded = prevLoadingRef.current && !loading
+    prevLoadingRef.current = loading
+    if (!justLoaded || !config) return
+    const serverTheme = config.general.theme
+    if (
+      (serverTheme === 'dark' || serverTheme === 'light') &&
+      useThemeStore.getState().theme !== serverTheme
+    ) {
+      adoptTheme(serverTheme)
+    }
+  }, [loading, config])
+
+  /**
+   * 主题三端同步（P2-2）——草稿跟随 store：设置页打开期间顶栏等其他入口
+   * 切换主题时，同步草稿中的 theme 字段，避免保存按钮把旧值写回服务器。
+   * effect 内读取 getState() 取最新值，规避同批提交中的过期闭包。
+   */
+  useEffect(() => {
+    if (!config) return
+    const current = useThemeStore.getState().theme
+    if (config.general.theme !== current) {
+      setConfig(
+        (prev) =>
+          ({
+            ...prev,
+            general: { ...prev.general, theme: current },
+          }) as AppConfigExt,
+      )
+    }
+  }, [storeTheme, config, setConfig])
+
   /** 局部更新某个配置分区 */
-  function patchSection<K extends keyof AppConfig>(
+  function patchSection<K extends keyof AppConfigExt>(
     key: K,
-    patch: Partial<AppConfig[K]>,
+    patch: Partial<AppConfigExt[K]>,
   ) {
     setConfig(
-      (prev) => ({ ...prev, [key]: { ...prev[key], ...patch } }) as AppConfig,
+      (prev) =>
+        ({ ...prev, [key]: { ...prev[key], ...patch } }) as AppConfigExt,
+    )
+  }
+
+  /** active_models 单键写入（高级区 KV 编辑，§5.2 单槽位） */
+  function setActiveModel(moduleId: string, modelId: string) {
+    setConfig(
+      (prev) =>
+        ({
+          ...prev,
+          active_models: { ...(prev.active_models ?? {}), [moduleId]: modelId },
+        }) as AppConfigExt,
     )
   }
 
@@ -297,11 +365,8 @@ export function SettingsPage() {
     patchSection('general', { language: lang })
     // 2) i18n 立即生效（changeLanguage + localStorage + <html lang> + 标题）
     setAppLanguage(lang)
-    // 3) 立即持久化到服务器（全局唯一真源）
-    const ok = await persistPartial((cfg) => ({
-      ...cfg,
-      general: { ...cfg.general, language: lang },
-    }))
+    // 3) 立即持久化到服务器（全局唯一真源；PUT 合并单键，§8.2）
+    const ok = await persistPartial({ general: { language: lang } })
     if (ok) {
       toast.success(t('toast.languageSaved'))
     } else {
@@ -328,13 +393,17 @@ export function SettingsPage() {
       return
     }
     const toastId = toast.loading(t('toast.saving'))
-    const ok = await save()
-    if (ok) {
-      toast.success(t('toast.saved'), {
-        id: toastId,
-        // P2-51：server.host / port 等改动需重启 daemon 才生效
-        description: t('toast.savedRestartNote'),
-      })
+    const resp = await save()
+    if (resp) {
+      if (resp.requires_restart) {
+        // §8.2：服务端判定本次改动触及重启敏感项（P2-15 重启引导）
+        toast.warning(t('toast.savedRestart'), {
+          id: toastId,
+          description: t('toast.savedRestartDescription'),
+        })
+      } else {
+        toast.success(t('toast.saved'), { id: toastId })
+      }
     } else {
       toast.error(t('toast.saveFailed'), {
         id: toastId,
@@ -475,7 +544,8 @@ export function SettingsPage() {
                 value={config.general.theme}
                 onValueChange={(v) => {
                   patchSection('general', { theme: v })
-                  // 同步本地主题 store：与顶栏切换共享同一视觉状态（W4-B 巡测发现不同步）
+                  // 主题三端同步（P2-2）：store.setTheme 本地应用并即时回写服务器，
+                  // 与顶栏切换共享同一视觉状态与同一持久化路径
                   if (v === 'dark' || v === 'light') {
                     useThemeStore.getState().setTheme(v)
                   }
@@ -495,7 +565,12 @@ export function SettingsPage() {
                 </SelectContent>
               </Select>
             </Field>
-            <Field label={t('general.logLevel')}>
+            <Field
+              label={t('general.logLevel')}
+              // P2-1 处置：daemon tracing 订阅尚未读取本项（接线需 main.rs，
+              // 已提仲裁请求）；说明文案如实标注当前状态，避免误导
+              description={t('general.logLevelDescription')}
+            >
               <Select
                 value={config.general.log_level}
                 onValueChange={(v) =>
@@ -516,7 +591,9 @@ export function SettingsPage() {
             </Field>
             <SwitchRow
               label={t('general.checkUpdates')}
-              description={t('general.checkUpdatesDescription')}
+              // P1-10：daemon 自身更新检查尚无消费者（本期无人认领接线），
+              // 保留开关 + 文案如实标注后端待接，避免误导
+              description={t('general.checkUpdatesPending')}
               checked={config.general.check_updates}
               onCheckedChange={(v) =>
                 patchSection('general', { check_updates: v })
@@ -576,6 +653,21 @@ export function SettingsPage() {
                 patchSection('compute', { allow_overcommit: v })
               }
             />
+            {/* §8.3：共享 CUDA 库目录（Linux LD_LIBRARY_PATH / Windows PATH 注入） */}
+            <Field
+              label={t('compute.cudaLibsDir')}
+              description={t('compute.cudaLibsDirDescription')}
+              className="sm:col-span-2"
+            >
+              <Input
+                value={config.compute.cuda_libs_dir ?? ''}
+                onChange={(e) =>
+                  patchSection('compute', { cuda_libs_dir: e.target.value })
+                }
+                placeholder="runtime/cuda-libs"
+                className="font-mono text-xs"
+              />
+            </Field>
           </Section>
 
           {/* ── 端口 ── */}
@@ -774,6 +866,55 @@ export function SettingsPage() {
                 className="font-mono text-xs"
               />
             </Field>
+            {/* §8.3：依赖栈统一（uv 缓存入应用根 → 与 venv 同盘硬链接去重） */}
+            <Field
+              label={t('python.uvCacheDir')}
+              description={t('python.uvCacheDirDescription')}
+            >
+              <Input
+                value={config.python.uv_cache_dir ?? ''}
+                onChange={(e) =>
+                  patchSection('python', { uv_cache_dir: e.target.value })
+                }
+                placeholder="runtime/.uv-cache"
+                className="font-mono text-xs"
+              />
+            </Field>
+            <Field
+              label={t('python.constraints')}
+              description={t('python.constraintsDescription')}
+            >
+              <Input
+                value={config.python.constraints ?? ''}
+                onChange={(e) =>
+                  patchSection('python', { constraints: e.target.value })
+                }
+                placeholder="config/constraints.txt"
+                className="font-mono text-xs"
+              />
+            </Field>
+          </Section>
+
+          {/* ── 整合包（§8.3）── */}
+          <Section
+            icon={Package}
+            title={t('packs.title')}
+            description={t('packs.description')}
+          >
+            <Field
+              label={t('packs.stagingDir')}
+              description={t('packs.stagingDirDescription')}
+              className="sm:col-span-2"
+            >
+              <Input
+                value={config.packs?.staging_dir ?? ''}
+                onChange={(e) =>
+                  patchSection('packs', { staging_dir: e.target.value })
+                }
+                placeholder=".pack-staging"
+                className="font-mono text-xs"
+              />
+            </Field>
           </Section>
 
           {/* ── 管线 ── */}
@@ -822,12 +963,135 @@ export function SettingsPage() {
             </Field>
             <SwitchRow
               label={t('pipeline.keepWorkspace')}
-              description={t('pipeline.keepWorkspaceDescription')}
+              // P2-1 核查：本项当前无后端消费者（工作区清理未实现），
+              // 标注实验性保留，避免"配置有效"的误导
+              description={`${t('pipeline.keepWorkspaceDescription')} · ${t('pipeline.keepWorkspaceNote')}`}
               checked={config.pipeline.keep_workspace}
               onCheckedChange={(v) =>
                 patchSection('pipeline', { keep_workspace: v })
               }
             />
+          </Section>
+
+          {/* ── 高级（§8.3 active_models 单槽位）── */}
+          <Section
+            icon={SlidersHorizontal}
+            title={t('advanced.title')}
+            description={t('advanced.description')}
+          >
+            <div className="space-y-3 sm:col-span-2">
+              <div>
+                <div className="text-sm font-medium">
+                  {t('advanced.activeModels')}
+                </div>
+                <div className="mt-0.5 text-xs text-muted-foreground">
+                  {t('advanced.activeModelsHint')}
+                </div>
+              </div>
+              {Object.entries(config.active_models ?? {}).length === 0 &&
+                !newActiveModel && (
+                  <div className="rounded-md border border-dashed border-border px-4 py-3 text-xs text-muted-foreground">
+                    {t('advanced.empty')}
+                  </div>
+                )}
+              {Object.entries(config.active_models ?? {}).map(
+                ([moduleId, modelId]) => (
+                  <div
+                    key={moduleId}
+                    className="flex flex-col gap-2 sm:flex-row sm:items-center"
+                  >
+                    <Input
+                      value={moduleId}
+                      readOnly
+                      title={t('advanced.keyReadOnly')}
+                      className="flex-1 font-mono text-xs"
+                    />
+                    <span className="hidden text-xs text-muted-foreground sm:inline">
+                      →
+                    </span>
+                    <Input
+                      value={modelId}
+                      onChange={(e) => setActiveModel(moduleId, e.target.value)}
+                      placeholder="model-id"
+                      aria-label={`${t('advanced.activeModels')} ${moduleId}`}
+                      className="flex-1 font-mono text-xs"
+                    />
+                  </div>
+                ),
+              )}
+              {newActiveModel ? (
+                <div className="space-y-2 rounded-md border border-border px-3 py-3">
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                    <Input
+                      value={newActiveModel.moduleId}
+                      onChange={(e) =>
+                        setNewActiveModel({
+                          moduleId: e.target.value,
+                          modelId: newActiveModel.modelId,
+                        })
+                      }
+                      placeholder={t('advanced.moduleIdPlaceholder')}
+                      aria-label={t('advanced.moduleIdPlaceholder')}
+                      className="flex-1 font-mono text-xs"
+                    />
+                    <span className="hidden text-xs text-muted-foreground sm:inline">
+                      →
+                    </span>
+                    <Input
+                      value={newActiveModel.modelId}
+                      onChange={(e) =>
+                        setNewActiveModel({
+                          moduleId: newActiveModel.moduleId,
+                          modelId: e.target.value,
+                        })
+                      }
+                      placeholder={t('advanced.modelIdPlaceholder')}
+                      aria-label={t('advanced.modelIdPlaceholder')}
+                      className="flex-1 font-mono text-xs"
+                    />
+                  </div>
+                  <div className="flex justify-end gap-2">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setNewActiveModel(null)}
+                    >
+                      {t('common:action.cancel')}
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={
+                        newActiveModel.moduleId.trim() === '' ||
+                        newActiveModel.modelId.trim() === ''
+                      }
+                      onClick={() => {
+                        setActiveModel(
+                          newActiveModel.moduleId.trim(),
+                          newActiveModel.modelId.trim(),
+                        )
+                        setNewActiveModel(null)
+                      }}
+                    >
+                      {t('common:action.confirm')}
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() =>
+                      setNewActiveModel({ moduleId: '', modelId: '' })
+                    }
+                  >
+                    <Plus className="size-3.5" />
+                    {t('advanced.addEntry')}
+                  </Button>
+                </div>
+              )}
+            </div>
           </Section>
         </div>
       )}
