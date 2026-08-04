@@ -36,7 +36,9 @@ use crate::state::AppState;
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/models/{module_id}/upload", post(upload_model))
-        // 模型文件可达数 GB：仅对本路由关闭默认 2MB body 上限
+        // 直跑输入上传（§8.1）：输入文件同样可能很大（音视频），同享 body 上限豁免
+        .route("/upload/input", post(upload_input))
+        // 模型文件可达数 GB：仅对本文件路由关闭默认 2MB body 上限
         .layer(DefaultBodyLimit::disable())
 }
 
@@ -838,6 +840,310 @@ async fn find_module_manifest(state: &AppState, module_id: &str) -> Option<Modul
         .and_then(|m| m.manifest.clone())
 }
 
+// ─── 直跑输入上传（§8.1 POST /api/upload/input，Wave 2 B4 新增段） ──────────
+
+/// Windows 保留设备名（作为文件名主干时非法，清洗时加前缀规避）
+const WINDOWS_RESERVED_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// 清洗浏览器提供的上传文件名（双平台非法字符一律替换/规避）。
+///
+/// 规则：
+/// - 仅取最后一段（剥离浏览器可能携带的目录前缀，防路径注入）；
+/// - 非法字符 `<>:"/\|?*` 与控制字符替换为 `_`；
+/// - Windows 保留设备名（CON/NUL/COM1…，大小写不敏感、含扩展名形态）前缀 `_`；
+/// - 去除 Windows 不允许的结尾 `.` 与空格；
+/// - 主干过长截断（保留扩展名，避开 255 字节文件系统上限）；
+/// - 清洗后为空 → 生成兜底名。
+///
+/// 永不失败：任何输入都产出一个双平台可落盘的文件名。
+fn sanitize_file_name(raw: &str) -> String {
+    // 1. 剥离目录前缀（兼容 `/` 与 `\` 两种分隔）
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or("");
+
+    // 2. 非法字符 → '_'（含控制字符；保留 Unicode 字母/数字/CJK）
+    let mut cleaned: String = base
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+
+    // 3. 去除 Windows 不允许的结尾 '.' 与空格
+    let trimmed = cleaned.trim_end_matches(['.', ' ']);
+    cleaned = trimmed.to_string();
+
+    // 4. Windows 保留设备名：主干命中即前缀 '_'（CON.txt 同样非法）
+    let stem = cleaned.split('.').next().unwrap_or("");
+    if WINDOWS_RESERVED_NAMES
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(stem))
+    {
+        cleaned = format!("_{cleaned}");
+    }
+
+    // 5. 主干截断（保留扩展名）
+    if cleaned.len() > 240 {
+        let (stem, ext) = match cleaned.rsplit_once('.') {
+            Some((s, e)) if !e.is_empty() && e.len() <= 20 => (s.to_string(), Some(e.to_string())),
+            _ => (cleaned.clone(), None),
+        };
+        let truncated: String = stem.chars().take(200).collect();
+        cleaned = match ext {
+            Some(e) => format!("{truncated}.{e}"),
+            None => truncated,
+        };
+    }
+
+    // 6. 兜底
+    if cleaned.is_empty() {
+        format!("input-{}", staging_id())
+    } else {
+        cleaned
+    }
+}
+
+/// POST /api/upload/input — 直跑输入文件上传（§8.1 / §5.3）
+///
+/// multipart/form-data 单文件，字段名 **`file`**（仲裁 #3 统一）。
+/// 流程：流式接收 → tempdir 暂存（不整块进内存）→ 文件名清洗 →
+/// workspace/uploads/ 落盘（重名加序号 `-1`/`-2`…，create_new 竞态安全）→
+/// 200 `{"path": "<服务器本地绝对路径>"}`（对齐 S2 UploadInputResponse）。
+///
+/// 返回的路径可直接作为 `POST /api/execute/single` 的 `input_path`。
+async fn upload_input(
+    State(state): State<Arc<AppState>>,
+    multipart: Result<Multipart, MultipartRejection>,
+) -> (StatusCode, Json<Value>) {
+    let mut multipart = match multipart {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(error = %e, "input upload: multipart rejected");
+            return err_response(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "apiModels.uploadMultipartInvalid",
+                &[],
+            )
+            .await;
+        }
+    };
+
+    // tempdir 暂存：与 workspace 可能不同盘，落盘用 rename + copy 回退
+    let temp_dir = std::env::temp_dir().join(format!("ep-input-{}", staging_id()));
+    if let Err(e) = tokio::fs::create_dir_all(&temp_dir).await {
+        return err_response(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "apiModels.uploadStagingFailed",
+            &[("detail", e.to_string())],
+        )
+        .await;
+    }
+
+    let result = receive_input_file(&mut multipart, &temp_dir).await;
+
+    let staged = match result {
+        Ok(Some(staged)) => staged,
+        Ok(None) => {
+            cleanup_temp_dir(&temp_dir).await;
+            return err_response(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "apiModels.inputUploadMissingFile",
+                &[],
+            )
+            .await;
+        }
+        Err(ue) => {
+            cleanup_temp_dir(&temp_dir).await;
+            return err_response(&state, ue.status, ue.key, &ue.params).await;
+        }
+    };
+    let (temp_path, raw_name) = staged;
+
+    // 落盘到 workspace/uploads/
+    let uploads_dir = {
+        let cfg = state.config.read().await;
+        cfg.resolve_workspace_dir(&state.root).join("uploads")
+    };
+    if let Err(e) = tokio::fs::create_dir_all(&uploads_dir).await {
+        cleanup_temp_dir(&temp_dir).await;
+        return err_response(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "apiModels.uploadStagingFailed",
+            &[("detail", e.to_string())],
+        )
+        .await;
+    }
+
+    let placed = place_input_file(&temp_path, &uploads_dir, &raw_name).await;
+
+    // 无论成败清理 tempdir（落盘成功后其中只剩空壳）
+    cleanup_temp_dir(&temp_dir).await;
+
+    match placed {
+        Ok(final_path) => {
+            info!(path = %final_path.display(), "API: input upload completed");
+            (
+                StatusCode::OK,
+                Json(json!({ "path": final_path.display().to_string() })),
+            )
+        }
+        Err(ue) => err_response(&state, ue.status, ue.key, &ue.params).await,
+    }
+}
+
+/// 清理 tempdir（NotFound 视为成功，其余仅告警）
+async fn cleanup_temp_dir(dir: &Path) {
+    if let Err(e) = tokio::fs::remove_dir_all(dir).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(dir = %dir.display(), error = %e, "input upload: tempdir cleanup failed");
+        }
+    }
+}
+
+/// 从 multipart 流式接收首个 `file` 字段到 tempdir，返回 (暂存路径, 原始文件名)。
+/// 无 file 字段 → Ok(None)；其余字段忽略。
+async fn receive_input_file(
+    multipart: &mut Multipart,
+    temp_dir: &Path,
+) -> Result<Option<(PathBuf, String)>, UploadError> {
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| err_detail(StatusCode::BAD_REQUEST, "apiModels.uploadReadFailed", e))?
+    {
+        let is_file = field.name() == Some("file");
+        if !is_file {
+            continue; // 未知字段跳过（multer 自动丢弃未读内容）
+        }
+
+        let raw_name = field.file_name().unwrap_or("").to_string();
+        let temp_path = temp_dir.join("upload.part");
+        let mut file = tokio::fs::File::create(&temp_path)
+            .await
+            .map_err(|e| {
+                err_detail(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "apiModels.uploadStagingFileFailed",
+                    e,
+                )
+            })?;
+        // 逐 chunk 流式写盘，绝不整块读入内存
+        while let Some(chunk) = field
+            .chunk()
+            .await
+            .map_err(|e| err_detail(StatusCode::BAD_REQUEST, "apiModels.uploadReadFailed", e))?
+        {
+            file.write_all(&chunk).await.map_err(|e| {
+                err_detail(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "apiModels.uploadWriteFailed",
+                    e,
+                )
+            })?;
+        }
+        file.flush()
+            .await
+            .map_err(|e| err_detail(StatusCode::INTERNAL_SERVER_ERROR, "apiModels.uploadWriteFailed", e))?;
+        return Ok(Some((temp_path, raw_name)));
+    }
+    Ok(None)
+}
+
+/// 把暂存文件落位到 uploads_dir：清洗文件名 + 冲突加序号。
+///
+/// 竞态安全：`create_new` 原子占位抢占文件名；POSIX 上 rename 直接原子替换
+/// 占位文件；Windows 上 rename 不覆盖已存在文件，先删占位再 rename——
+/// 删除与 rename 之间被并发抢占时 rename 失败，换序号重试，绝不覆盖他人文件。
+async fn place_input_file(
+    temp_path: &Path,
+    uploads_dir: &Path,
+    raw_name: &str,
+) -> Result<PathBuf, UploadError> {
+    let clean = sanitize_file_name(raw_name);
+    let (stem, ext) = match clean.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() && !e.is_empty() => (s.to_string(), format!(".{e}")),
+        _ => (clean.clone(), String::new()),
+    };
+
+    // 冲突命名：name.ext → name-1.ext → name-2.ext …（上限内未命中即报错）
+    for seq in 0..1000u32 {
+        let candidate = if seq == 0 {
+            uploads_dir.join(format!("{stem}{ext}"))
+        } else {
+            uploads_dir.join(format!("{stem}-{seq}{ext}"))
+        };
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+            .await
+        {
+            Ok(reserved) => {
+                drop(reserved); // 释放句柄后处置 0 字节占位文件
+                if cfg!(target_os = "windows") {
+                    // Windows：rename 拒绝覆盖已存在文件 → 删占位后 rename 抢占
+                    let _ = tokio::fs::remove_file(&candidate).await;
+                    match tokio::fs::rename(temp_path, &candidate).await {
+                        Ok(()) => return Ok(candidate),
+                        Err(_) => {
+                            if tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
+                                continue; // 并发抢占 → 换序号
+                            }
+                            return copy_into_place(temp_path, &candidate).await; // 跨盘等
+                        }
+                    }
+                }
+                // POSIX：rename 原子替换占位文件（同盘）；跨盘回退 copy
+                return move_into_place(temp_path, &candidate).await;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(err_detail(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "apiModels.inputUploadPlaceFailed",
+                    e,
+                ));
+            }
+        }
+    }
+    Err(err_detail(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "apiModels.inputUploadPlaceFailed",
+        "too many file name collisions (>1000)",
+    ))
+}
+
+/// tempdir → uploads 落位（POSIX 路径）：rename 替换占位文件；跨盘回退 copy
+async fn move_into_place(temp_path: &Path, dest: &Path) -> Result<PathBuf, UploadError> {
+    if tokio::fs::rename(temp_path, dest).await.is_ok() {
+        return Ok(dest.to_path_buf());
+    }
+    copy_into_place(temp_path, dest).await
+}
+
+/// 跨盘回退：copy + 删源（调用方已保证 dest 不存在或为本次占位）
+async fn copy_into_place(temp_path: &Path, dest: &Path) -> Result<PathBuf, UploadError> {
+    tokio::fs::copy(temp_path, dest).await.map_err(|e| {
+        err_detail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "apiModels.inputUploadPlaceFailed",
+            e,
+        )
+    })?;
+    let _ = tokio::fs::remove_file(temp_path).await;
+    Ok(dest.to_path_buf())
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1513,6 +1819,175 @@ type = "http"
         .unwrap();
         assert_eq!(meta["source"], "local_import");
         assert_eq!(meta["repo_id"], "org/repo"); // HF 源填清单 repo_id
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ─── 直跑输入上传（/api/upload/input） ───────────────────────────────
+
+    /// 文件名清洗单测：双平台非法字符 / 保留名 / 路径剥离 / 兜底
+    #[test]
+    fn sanitize_file_name_cleans_invalid_characters() {
+        // 非法字符替换
+        assert_eq!(sanitize_file_name("a<b>c:d\"e|f?g*.wav"), "a_b_c_d_e_f_g_.wav");
+        // 路径剥离（含 Windows 盘符路径）
+        assert_eq!(sanitize_file_name("C:\\fake\\dir\\audio.wav"), "audio.wav");
+        assert_eq!(sanitize_file_name("/etc/passwd"), "passwd");
+        // Windows 保留设备名（含带扩展名形态，大小写不敏感）
+        assert_eq!(sanitize_file_name("CON"), "_CON");
+        assert_eq!(sanitize_file_name("con.txt"), "_con.txt");
+        assert_eq!(sanitize_file_name("Nul.wav"), "_Nul.wav");
+        // 结尾点/空格（Windows 不允许）
+        assert_eq!(sanitize_file_name("file. "), "file");
+        assert_eq!(sanitize_file_name("file..."), "file");
+        // 控制字符
+        assert_eq!(sanitize_file_name("bad\u{0}name.txt"), "bad_name.txt");
+        // 正常名原样
+        assert_eq!(sanitize_file_name("语音输入-01.wav"), "语音输入-01.wav");
+    }
+
+    #[test]
+    fn sanitize_file_name_empty_falls_back() {
+        let out = sanitize_file_name("");
+        assert!(out.starts_with("input-"), "got: {out}");
+        // 仅路径分隔符 → basename 为空 → 兜底
+        let out3 = sanitize_file_name("a/b/");
+        assert!(out3.starts_with("input-"), "got: {out3}");
+        // 全非法字符 → 清洗为下划线（仍是合法文件名，无需兜底）
+        assert_eq!(sanitize_file_name("***"), "___");
+    }
+
+    #[test]
+    fn sanitize_file_name_truncates_overlong_stem() {
+        let long_stem = "x".repeat(300);
+        let out = sanitize_file_name(&format!("{long_stem}.wav"));
+        assert!(out.ends_with(".wav"));
+        assert!(out.len() <= 240, "len={}", out.len());
+
+        // 无扩展名同样截断
+        let out2 = sanitize_file_name(&"y".repeat(300));
+        assert!(out2.len() <= 240, "len={}", out2.len());
+    }
+
+    /// 上传往返：文件落盘 workspace/uploads/ + 响应携带服务器本地路径
+    #[tokio::test]
+    async fn upload_input_roundtrip() {
+        let root = unique_root("input-ok");
+        let state = test_state(root.clone());
+        let app = router().with_state(state);
+
+        let mut body = Vec::new();
+        form_part(&mut body, "file", Some("audio.wav"), b"fake-wav-bytes");
+        finish_multipart(&mut body);
+
+        let resp = app
+            .oneshot(upload_request("/upload/input", body))
+            .await
+            .unwrap();
+        let (status, json) = response_json(resp).await;
+
+        assert_eq!(status, StatusCode::OK, "响应: {json}");
+        let path = json["path"].as_str().expect("响应必须带 path").to_string();
+        let expected = root.join("workspace").join("uploads").join("audio.wav");
+        assert_eq!(PathBuf::from(&path), expected);
+        assert_eq!(std::fs::read(&expected).unwrap(), b"fake-wav-bytes");
+        // tempdir 无残留（系统临时目录内 ep-input-* 已清理）
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 文件名冲突 → 加序号（-1/-2），绝不覆盖已上传内容
+    #[tokio::test]
+    async fn upload_input_collision_gets_sequence_suffix() {
+        let root = unique_root("input-collide");
+        let state = test_state(root.clone());
+
+        for (i, content) in [b"first".as_slice(), b"second".as_slice(), b"third".as_slice()]
+            .iter()
+            .enumerate()
+        {
+            let app = router().with_state(state.clone());
+            let mut body = Vec::new();
+            form_part(&mut body, "file", Some("clip.mp4"), content);
+            finish_multipart(&mut body);
+            let resp = app
+                .oneshot(upload_request("/upload/input", body))
+                .await
+                .unwrap();
+            let (status, json) = response_json(resp).await;
+            assert_eq!(status, StatusCode::OK, "第 {} 次上传响应: {json}", i + 1);
+
+            let expected_name = match i {
+                0 => "clip.mp4",
+                1 => "clip-1.mp4",
+                _ => "clip-2.mp4",
+            };
+            let expected = root.join("workspace").join("uploads").join(expected_name);
+            assert_eq!(PathBuf::from(json["path"].as_str().unwrap()), expected);
+            assert_eq!(std::fs::read(&expected).unwrap(), *content);
+        }
+
+        // 三份内容各自独立，无覆盖
+        let uploads = root.join("workspace/uploads");
+        assert_eq!(std::fs::read(uploads.join("clip.mp4")).unwrap(), b"first");
+        assert_eq!(std::fs::read(uploads.join("clip-1.mp4")).unwrap(), b"second");
+        assert_eq!(std::fs::read(uploads.join("clip-2.mp4")).unwrap(), b"third");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 非法文件名上传 → 清洗后可落盘（路径穿越文件名被剥成 basename）
+    #[tokio::test]
+    async fn upload_input_sanitizes_malicious_file_name() {
+        let root = unique_root("input-sanitize");
+        let state = test_state(root.clone());
+        let app = router().with_state(state);
+
+        let mut body = Vec::new();
+        form_part(&mut body, "file", Some("../../evil.sh"), b"payload");
+        finish_multipart(&mut body);
+
+        let resp = app
+            .oneshot(upload_request("/upload/input", body))
+            .await
+            .unwrap();
+        let (status, json) = response_json(resp).await;
+        assert_eq!(status, StatusCode::OK, "响应: {json}");
+
+        // 落点必须在 workspace/uploads 内，绝不越狱
+        let path = PathBuf::from(json["path"].as_str().unwrap());
+        assert!(
+            path.starts_with(root.join("workspace").join("uploads")),
+            "落点越狱: {}",
+            path.display()
+        );
+        assert_eq!(path.file_name().unwrap(), "evil.sh");
+        assert!(!root.join("evil.sh").exists());
+        assert!(!root.join("workspace/evil.sh").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 缺 file 字段 → 400（新键待落盘：回退为键本身）
+    #[tokio::test]
+    async fn upload_input_missing_file_field_400() {
+        let root = unique_root("input-nofile");
+        let state = test_state(root.clone());
+        let app = router().with_state(state);
+
+        let mut body = Vec::new();
+        form_part(&mut body, "not-file", Some("x.bin"), b"data");
+        finish_multipart(&mut body);
+
+        let resp = app
+            .oneshot(upload_request("/upload/input", body))
+            .await
+            .unwrap();
+        let (status, json) = response_json(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "apiModels.inputUploadMissingFile");
+        // uploads 目录不应被创建出任何文件
+        let uploads = root.join("workspace/uploads");
+        let count = std::fs::read_dir(&uploads)
+            .map(|mut e| e.next().is_some())
+            .unwrap_or(false);
+        assert!(!count, "uploads 目录不应有残留文件");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
