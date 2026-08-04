@@ -49,6 +49,9 @@
 | 41 | C3：model pin 双形态（裸变体 vs qualified_id@variant） | **裁决：双形态均合法**（后端 vram.rs rsplit('@') 已兼容；PIPELINE_SPEC 补说明归 C8-revive 文档批）；C2 改产完整 pin 不强制 | C3 |
 | 42 | C3：PipelineToolbar 缺 executeDisabled props（VRAM 超限真禁用） | **接受 MVP 现状**（handleExecute 拦截+toast+账本红点）；工具栏 props 增强列后续 | C3 |
 | 43 | C3 分支已 fast-forward 合入 C2 提交 42d9cb6 | 门禁合并顺序：先 C2 后 C3（或 C3 直接带入 C2），注意勿重复合并 | C2/C3→门禁 |
+| 44 | D3：docs/AUTOMATION.md §4 watcher 文件清单链接待补 | **编排者门禁期补**：链接 scripts/examples/watcher-linux.sh、watcher-windows.ps1、README.md | D3→门禁 |
+| 45 | D3：cuda-libs 入 gui+server 双包 + P2-17 连带修复（service 目录对齐/install 用户创建/PKGBUILD 挂 install） | **追认**（存在性复制无副作用；packaging 自洽必要） | D3 |
+| 46 | D3：scripts/build-desktop.sh 功能已被 build.sh/build.ps1 gui 覆盖 | **保留暂不裁撤**，列 PROGRESS 后续项 | D3 |
 
 ## 待收集（各波代理报告中来）
 

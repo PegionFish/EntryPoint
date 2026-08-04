@@ -86,6 +86,8 @@
 | 前端死件 | placeholder.tsx、status-badge.tsx、client.ts health()/uploadModel()、empty-state 预设、app-store 多数字段 | 无引用 |
 | port.rs `is_available`/`allocated_count` | port.rs | 仅测试用 |
 
+> **勘误（2026-08-04 整合包执行后）**：`state.runner` 已由 Wave 4 D2 清除；`with_network_env` 已由 B2/C4 接线（state.rs / ep-desktop main.rs），不再是死代码；`EnvManager::set_network` 与 `ProcessManager::set_network_env`（setter 变体）已由门禁期删除；`cleanup_hf_cache` 已由 B1 接线（ep-pack import.rs §4.4 钩子）；`ComputeScheduler` 已由 C4 接线（桌面端设备选择）；`ModuleProcess`/`ModuleLifecycle` 按决策 3 保留；`SystemDep::CudaToolkit` 保留为待触发检测分支（未来 CUDA 模块依赖检查预留）；port.rs 两项保留为测试设施。
+
 ## 5. 管线断裂点专题（用户报告症状归因）
 
 纯内置节点链（file_input→file_output、按内置 TOML 执行）**实际是通的**；用户自然路径——拖模块节点、配 ffmpeg——分别命中 P0-1 与 P0-2。桌面端管线页是纯只读查看器（无添加/连线/保存/执行，保存按钮文案"缺少 toml 序列化依赖"已过时——ep-core 的 TOML 序列化早有测试）。
