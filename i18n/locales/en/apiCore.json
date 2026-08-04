@@ -9,5 +9,6 @@
   "module.startFailed": "Failed to start module: {{detail}}",
   "module.notRunning": "Module is not running: {{id}}",
   "module.stopFailed": "Failed to stop module: {{detail}}",
-  "config.saveFailed": "Failed to save configuration: {{detail}}"
+  "config.saveFailed": "Failed to save configuration: {{detail}}",
+  "config.invalidPatch": "Invalid config patch: {{detail}}"
 }
