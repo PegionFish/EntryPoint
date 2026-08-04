@@ -28,6 +28,9 @@ pub fn show(
     let lang = ep_core::i18n::normalize_language(&config.general.language);
     let pal = Palette::new(ui.style().visuals.dark_mode);
 
+    // 发布模块状态权威快照（统一页镜像的运行状态/日志抽屉消费）
+    crate::pages::publish_module_snapshot(ui.ctx(), modules);
+
     // ── 页头 + 汇总 ──
     page_header(ui, &tr(lang, "desktopPages.modules.title", &[]), |ui| {
         let count = modules.len().to_string();

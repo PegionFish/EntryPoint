@@ -1,29 +1,67 @@
-//! 任务中心页 — 管线任务进度 + 运行中的服务 + 全部模块状态。
+//! 任务中心页 — 管线任务进度（含 queued 队列位置）+ 产物列表/打开 +
+//! 运行中的服务 + 全部模块状态。
+//!
+//! 产物目录约定（C4）：任务产物落盘 `{workspace}/tasks/{task_id}/`
+//! （与 ep-core TaskRecord.work_dir 同口径），本页直接扫描该目录展示产物，
+//! 平台分支经 [`crate::pages::open_path`] 打开（Windows `start` / Linux `xdg-open`）。
+//!
+//! queued 语义（§6.8）：S2 骨架的 [`TaskSummary`] 仅携带引擎状态
+//! [`TaskStatus`]，其中 `Pending` = 排队等待闸门；队列位置按列表中
+//! Pending 任务的次序展示（注册表 `queue_position` 的桌面侧接线见 C5 报告）。
 //!
 //! 用户可见文案经 [`crate::i18n::tr`] 查找；状态/类别文案复用
 //! [`crate::pages::modules`] 的本地化 helper，颜色一律取自当前主题色板。
+
+use std::path::{Path, PathBuf};
 
 use eframe::egui;
 use ep_core::config::AppConfig;
 use ep_core::pipeline::runner::TaskSummary;
 use ep_core::types::{ServiceStatus, TaskStatus};
+use tokio::sync::mpsc::UnboundedSender;
 
-use crate::app::ModuleEntry;
+use crate::app::{AppCmd, ModuleEntry};
 use crate::i18n::tr;
 use crate::pages::modules::{category_label, service_label};
-use crate::ui::{badge, card, empty_state, page_header, section_title, service_status, Palette};
+use crate::pages::{format_size, open_path, publish_tasks_snapshot, trfb};
+use crate::ui::{
+    badge, card, empty_state, page_header, section_title, service_status, subtle_button, Palette,
+};
 
+/// 产物目录递归扫描的最大深度（`files/{node_id}/…` 布局足够，防御深目录）
+const ARTIFACT_SCAN_DEPTH: usize = 4;
+
+/// S2 骨架分发入口（app.rs 当前调用形状）。
 pub fn show(
     ui: &mut egui::Ui,
     config: &AppConfig,
     modules: &[ModuleEntry],
     tasks: &[TaskSummary],
 ) {
+    show_full(ui, config, modules, tasks, None);
+}
+
+/// 完整入口：`cmd_tx` 为后台命令通道。门禁期 C4 提供
+/// `AppCmd::CancelTask { task_id }` 后，app.rs 改调本入口并传入
+/// `Some(&self.cmd_tx)`，queued/running 任务即可在卡片内取消。
+pub fn show_full(
+    ui: &mut egui::Ui,
+    config: &AppConfig,
+    modules: &[ModuleEntry],
+    tasks: &[TaskSummary],
+    cmd_tx: Option<&UnboundedSender<AppCmd>>,
+) {
     let lang = ep_core::i18n::normalize_language(&config.general.language);
     let pal = Palette::new(ui.style().visuals.dark_mode);
 
+    // 发布任务快照：管线编辑器的节点状态回显消费
+    publish_tasks_snapshot(ui.ctx(), tasks);
+
     page_header(ui, &tr(lang, "tasks.page.title", &[]), |_| {});
     ui.add_space(8.0);
+
+    // queued（S2 形状下为 Pending）任务的队列位置映射：task_id → 位置（1 起）
+    let queue_positions = compute_queue_positions(tasks);
 
     egui::ScrollArea::vertical().show(ui, |ui| {
         // ── 管线任务 ──
@@ -40,7 +78,7 @@ pub fn show(
             );
         } else {
             for task in tasks {
-                task_card(ui, lang, &pal, task);
+                task_card(ui, lang, &pal, config, task, &queue_positions, cmd_tx);
                 ui.add_space(8.0);
             }
         }
@@ -76,7 +114,10 @@ pub fn show(
         ui.add_space(6.0);
 
         if modules.is_empty() {
-            ui.label(egui::RichText::new(tr(lang, "desktopApp.tasks.noModules", &[])).color(pal.text_dim));
+            ui.label(
+                egui::RichText::new(tr(lang, "desktopApp.tasks.noModules", &[]))
+                    .color(pal.text_dim),
+            );
         } else {
             let all: Vec<&ModuleEntry> = modules.iter().collect();
             card(ui, &pal, |ui| {
@@ -90,16 +131,54 @@ pub fn show(
     });
 }
 
+/// queued（Pending）任务的队列位置：按列表顺序 1 起编号。
+///
+/// S2 的 [`TaskSummary`] 无 `queue_position` 字段（注册表形状才有，§6.8）；
+/// 此处按展示顺序给出位置，注册表接线后由生产侧直接携带（见 C5 报告）。
+fn compute_queue_positions(tasks: &[TaskSummary]) -> std::collections::HashMap<String, usize> {
+    let mut positions = std::collections::HashMap::new();
+    let mut pos = 0usize;
+    for task in tasks {
+        if matches!(task.status, TaskStatus::Pending) {
+            pos += 1;
+            positions.insert(task.id.clone(), pos);
+        }
+    }
+    positions
+}
+
 // ─── 管线任务卡片 ────────────────────────────────────────────────────────────
 
-fn task_card(ui: &mut egui::Ui, lang: &str, pal: &Palette, task: &TaskSummary) {
+fn task_card(
+    ui: &mut egui::Ui,
+    lang: &str,
+    pal: &Palette,
+    config: &AppConfig,
+    task: &TaskSummary,
+    queue_positions: &std::collections::HashMap<String, usize>,
+    cmd_tx: Option<&UnboundedSender<AppCmd>>,
+) {
     let (color, label) = task_status_meta(lang, &task.status, pal);
 
     card(ui, pal, |ui| {
-        // 行1：管线名 + 状态徽章 + 任务 ID（右对齐 mono）
+        // 行1：管线名 + 状态徽章 + 队列位置（queued）+ 任务 ID（右对齐 mono）
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(&task.pipeline_name).strong());
             badge(ui, pal, color, label);
+            if let Some(pos) = queue_positions.get(&task.id) {
+                let pos_s = pos.to_string();
+                badge(
+                    ui,
+                    pal,
+                    pal.warning,
+                    trfb(
+                        lang,
+                        "desktopApp.tasks.queuePosition",
+                        "队列位置 {{pos}}",
+                        &[("pos", &pos_s)],
+                    ),
+                );
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
                     egui::RichText::new(format!("#{}", task.id))
@@ -163,7 +242,183 @@ fn task_card(ui: &mut egui::Ui, lang: &str, pal: &Palette, task: &TaskSummary) {
                     .color(pal.danger),
             );
         }
+
+        // 取消按钮（queued/running）：AppCmd::CancelTask { task_id } 由 C4 在
+        // app.rs 冻结提供；本 worktree 的 app.rs 尚为 S2 形状，接线后启用发送。
+        if matches!(task.status, TaskStatus::Pending | TaskStatus::Running) {
+            if let Some(_tx) = cmd_tx {
+                ui.add_space(4.0);
+                // TODO(门禁接线): 按钮点击处发送
+                //   let _ = _tx.send(AppCmd::CancelTask { task_id: task.id.clone() });
+                // （变体落 app.rs 后将下行占位按钮替换为真实取消）
+                ui.add_enabled(
+                    false,
+                    subtle_button(
+                        pal,
+                        format!(
+                            "✕ {}",
+                            trfb(lang, "desktopApp.tasks.cancelPending", "取消（接线中）", &[])
+                        ),
+                    ),
+                );
+            }
+        }
+
+        // ── 产物区（展开式；queued/运行中同样可查看已落盘的部分产物） ──
+        ui.add_space(6.0);
+        artifacts_section(ui, lang, pal, config, task);
     });
+}
+
+// ─── 产物列表 ────────────────────────────────────────────────────────────────
+
+/// 任务产物区：扫描 `{workspace}/tasks/{task_id}/` 并逐文件提供打开入口。
+fn artifacts_section(
+    ui: &mut egui::Ui,
+    lang: &str,
+    pal: &Palette,
+    config: &AppConfig,
+    task: &TaskSummary,
+) {
+    let header = egui::CollapsingHeader::new(
+        egui::RichText::new(trfb(
+            lang,
+            "desktopApp.tasks.artifacts.title",
+            "输出产物",
+            &[],
+        ))
+        .color(pal.text_dim),
+    )
+    .id_salt(egui::Id::new(("task_artifacts", task.id.clone())))
+    .default_open(false);
+
+    header.show(ui, |ui| {
+        let root = ep_core::config::resolve_root();
+        let task_dir = config
+            .resolve_workspace_dir(&root)
+            .join("tasks")
+            .join(&task.id);
+
+        if !task_dir.is_dir() {
+            ui.label(
+                egui::RichText::new(trfb(
+                    lang,
+                    "desktopApp.tasks.artifacts.dirMissing",
+                    "任务目录不存在（任务可能未在本机执行或产物已清理）",
+                    &[],
+                ))
+                .small()
+                .color(pal.text_faint),
+            );
+            return;
+        }
+
+        let mut files = Vec::new();
+        collect_artifacts(&task_dir, &task_dir, 0, &mut files);
+
+        if files.is_empty() {
+            ui.label(
+                egui::RichText::new(tr(lang, "tasks.artifacts.empty", &[]))
+                    .small()
+                    .color(pal.text_faint),
+            );
+        } else {
+            for artifact in &files {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.label(egui::RichText::new("📄").color(pal.text_faint));
+                    ui.label(
+                        egui::RichText::new(&artifact.rel_display)
+                            .monospace()
+                            .color(pal.text),
+                    )
+                    .on_hover_text(artifact.path.to_string_lossy());
+                    ui.label(
+                        egui::RichText::new(format_size(artifact.size_bytes))
+                            .small()
+                            .color(pal.text_faint),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(subtle_button(
+                                pal,
+                                format!("↗ {}", tr(lang, "common.action.open", &[])),
+                            ))
+                            .clicked()
+                        {
+                            open_path(&artifact.path);
+                        }
+                    });
+                });
+            }
+        }
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add(subtle_button(
+                    pal,
+                    format!(
+                        "📂 {}",
+                        trfb(lang, "desktopApp.tasks.artifacts.openDir", "打开任务目录", &[])
+                    ),
+                ))
+                .clicked()
+            {
+                open_path(&task_dir);
+            }
+        });
+    });
+}
+
+/// 单个产物文件条目
+struct ArtifactEntry {
+    /// 相对任务目录的展示路径（正斜杠统一显示）
+    rel_display: String,
+    /// 绝对路径（打开用）
+    path: PathBuf,
+    size_bytes: u64,
+}
+
+/// 递归收集任务目录下的文件（深度受限，跳过隐藏条目与临时文件）。
+///
+/// 路径拼接一律 `Path::join`（双平台硬约束）；展示名统一正斜杠。
+fn collect_artifacts(base: &Path, dir: &Path, depth: usize, out: &mut Vec<ArtifactEntry>) {
+    if depth >= ARTIFACT_SCAN_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut batch: Vec<ArtifactEntry> = Vec::new();
+    let mut subdirs: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // 跳过隐藏条目与常见临时/元数据文件（仅展示用户关心的产物）
+        if name_str.starts_with('.') || name_str.ends_with(".tmp") {
+            continue;
+        }
+        let path = entry.path();
+        let file_type = entry.file_type().ok();
+        if file_type.map(|t| t.is_dir()).unwrap_or(false) {
+            subdirs.push(path);
+        } else if file_type.map(|t| t.is_file()).unwrap_or(false) {
+            let size_bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let rel = path.strip_prefix(base).unwrap_or(&path);
+            batch.push(ArtifactEntry {
+                rel_display: rel.to_string_lossy().replace('\\', "/"),
+                path,
+                size_bytes,
+            });
+        }
+    }
+    batch.sort_by(|a, b| a.rel_display.cmp(&b.rel_display));
+    out.extend(batch);
+    subdirs.sort();
+    for sub in subdirs {
+        collect_artifacts(base, &sub, depth + 1, out);
+    }
 }
 
 // ─── 模块状态网格（卡片内横向滚动） ──────────────────────────────────────────
@@ -228,11 +483,16 @@ fn module_grid(
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// 任务状态 → (颜色, 本地化文案)。颜色一律取自当前主题色板，禁止硬编码 RGB。
+///
+/// Pending 即 §6.8 的 queued（等待全局/管线闸门），用 warning 色区分于运行中。
 fn task_status_meta(lang: &str, status: &TaskStatus, pal: &Palette) -> (egui::Color32, String) {
     match status {
         TaskStatus::Completed => (pal.success, tr(lang, "common.status.completed", &[])),
         TaskStatus::Running => (pal.info, tr(lang, "common.status.running", &[])),
-        TaskStatus::Pending => (pal.neutral, tr(lang, "common.status.pending", &[])),
+        TaskStatus::Pending => (
+            pal.warning,
+            trfb(lang, "common.status.queued", "排队中", &[]),
+        ),
         TaskStatus::Failed(_) => (pal.danger, tr(lang, "common.status.failed", &[])),
         TaskStatus::Cancelled => (pal.warning, tr(lang, "common.status.cancelled", &[])),
     }
@@ -266,5 +526,106 @@ fn format_uptime(lang: &str, d: std::time::Duration) -> String {
             "desktopPages.modules.uptime.hours",
             &[("h", &h), ("m", &m), ("s", &s)],
         )
+    }
+}
+
+// ─── 测试 ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(id: &str, status: TaskStatus) -> TaskSummary {
+        TaskSummary {
+            id: id.to_string(),
+            pipeline_name: "p".to_string(),
+            status,
+            started_at: None,
+            finished_at: None,
+            node_count: 2,
+            completed_nodes: 0,
+        }
+    }
+
+    #[test]
+    fn queue_positions_number_pending_tasks_in_order() {
+        let tasks = vec![
+            task("run-1", TaskStatus::Running),
+            task("q-1", TaskStatus::Pending),
+            task("done", TaskStatus::Completed),
+            task("q-2", TaskStatus::Pending),
+        ];
+        let positions = compute_queue_positions(&tasks);
+        assert_eq!(positions.len(), 2);
+        assert_eq!(positions["q-1"], 1);
+        assert_eq!(positions["q-2"], 2);
+        assert!(!positions.contains_key("run-1"));
+        assert!(!positions.contains_key("done"));
+    }
+
+    #[test]
+    fn queue_positions_empty_when_no_pending() {
+        let tasks = vec![task("a", TaskStatus::Running)];
+        assert!(compute_queue_positions(&tasks).is_empty());
+    }
+
+    #[test]
+    fn iso_to_secs_truncates_safely() {
+        assert_eq!(iso_to_secs("2026-08-05T12:34:56.789Z"), "2026-08-05T12:34:56");
+        assert_eq!(iso_to_secs("short"), "short");
+        assert_eq!(iso_to_secs(""), "");
+    }
+
+    #[test]
+    fn collect_artifacts_walks_and_sorts() {
+        let base = std::env::temp_dir().join(format!(
+            "ep-c5-artifacts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nested = base.join("files").join("asr");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(base.join("b.txt"), "hello").unwrap();
+        std::fs::write(base.join("a.srt"), "1").unwrap();
+        std::fs::write(nested.join("out.json"), "{}").unwrap();
+        std::fs::write(base.join(".hidden"), "x").unwrap();
+        std::fs::write(base.join("leftover.tmp"), "x").unwrap();
+
+        let mut files = Vec::new();
+        collect_artifacts(&base, &base, 0, &mut files);
+
+        let names: Vec<&str> = files.iter().map(|f| f.rel_display.as_str()).collect();
+        assert_eq!(names, vec!["a.srt", "b.txt", "files/asr/out.json"]);
+        assert_eq!(files[0].size_bytes, 1);
+        assert_eq!(files[1].size_bytes, 5);
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn collect_artifacts_respects_depth_limit() {
+        let base = std::env::temp_dir().join(format!(
+            "ep-c5-artifacts-depth-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // 深度 5：超过 ARTIFACT_SCAN_DEPTH=4，深层文件不应被收集
+        let deep = base.join("d1").join("d2").join("d3").join("d4").join("d5");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("deep.txt"), "x").unwrap();
+        std::fs::write(base.join("top.txt"), "x").unwrap();
+
+        let mut files = Vec::new();
+        collect_artifacts(&base, &base, 0, &mut files);
+        let names: Vec<&str> = files.iter().map(|f| f.rel_display.as_str()).collect();
+        assert_eq!(names, vec!["top.txt"]);
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }
