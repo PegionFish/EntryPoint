@@ -54,7 +54,8 @@ pub struct SpecNode {
     #[serde(default)]
     pub label: String,
     pub kind: SpecNodeKind,
-    /// builtin 节点的工具名（kind=builtin 时必填）
+    /// builtin 节点的工具名（kind=builtin 时必填；LLM 节点为 `llm`，
+    /// `external_api` 为可执行别名，见 §6.7）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub builtin: Option<String>,
     /// module 节点的模块 id（kind=module 时必填）
@@ -63,12 +64,26 @@ pub struct SpecNode {
     /// module 节点的 capability（kind=module 时必填）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability: Option<String>,
+    /// module 节点变体 pin（§6.2 冻结字段 `model`；null = 跟随激活变体）。
+    /// 旧 TOML 键 `model_id` 由 ep-core 反序列化层以 alias 兼容。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// module 节点设备绑定（§6.2 软约束：`"auto"` | `"cuda:0"` | …；
+    /// 加载/导入时本机无此设备 → 警告回退 auto，不硬失败）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
     /// 任意参数（JSON 对象，可含嵌套对象/数组）
     #[serde(default = "default_params")]
     pub params: JsonValue,
     /// React Flow 画布坐标（可选）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<NodePosition>,
+    /// 节点级超时（秒）— P1-11：透传至执行器（不再丢弃）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u32>,
+    /// 节点级重试次数 — P1-11：透传至执行器（不再丢弃）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_count: Option<u32>,
 }
 
 /// 边：`{from: [node_id, port], to: [node_id, port]}`。
@@ -176,6 +191,13 @@ pub fn validate_spec(spec: &PipelineSpec) -> Result<()> {
         if !(node.params.is_object() || node.params.is_null()) {
             bail!("params of node `{}` must be a JSON object", node.id);
         }
+        // §6.2 可选字段：允许缺省；出现则必须非空（空串无语义）
+        if node.model.as_deref().map(str::trim) == Some("") {
+            bail!("model of node `{}` must not be empty when present", node.id);
+        }
+        if node.device.as_deref().map(str::trim) == Some("") {
+            bail!("device of node `{}` must not be empty when present", node.id);
+        }
     }
 
     for edge in &spec.edges {
@@ -193,8 +215,13 @@ pub fn validate_spec(spec: &PipelineSpec) -> Result<()> {
 
 /// ep-core `Pipeline` → spec（load_spec 的转换核心，亦可独立复用）。
 ///
-/// 仅支持 builtin / module 两类节点；external_api 节点不在前端契约内，报错。
-/// `timeout_secs` / `retry_count` 不在前端契约中，转换时丢弃（执行层用默认值）。
+/// 节点种类映射：
+/// - builtin / module 节点按原样转换（module 节点含 §6.2 `model`/`device`）
+/// - 遗留 `external_api` kind 节点（含 `kind = "llm"` 别名形状）转换为
+///   builtin `llm` 节点（§6.7：LLM 是 builtin，旧名保留为 alias），
+///   kind 级 `endpoint`/`api_key_env` 并入 params（`endpoint` → `base_url`）
+///
+/// `timeout_secs` / `retry_count` 全量透传（P1-11，执行器消费）。
 pub fn pipeline_to_spec(pipeline: &Pipeline) -> Result<PipelineSpec> {
     let nodes = pipeline
         .nodes
@@ -216,27 +243,60 @@ pub fn pipeline_to_spec(pipeline: &Pipeline) -> Result<PipelineSpec> {
 // ─── 节点双向转换 ────────────────────────────────────────────────────────────
 
 fn node_to_spec(node: &PipelineNode) -> Result<SpecNode> {
-    let (kind, builtin, module_id, capability) = match &node.kind {
+    let (kind, builtin, module_id, capability, model, device, params) = match &node.kind {
         NodeKind::Builtin { builtin } => (
             SpecNodeKind::Builtin,
             Some(builtin.clone()),
             None,
             None,
+            None,
+            None,
+            node.params.clone(),
         ),
         NodeKind::Module {
             module_id,
             capability,
-            ..
+            model_id,
+            device,
         } => (
             SpecNodeKind::Module,
             None,
             Some(module_id.clone()),
             Some(capability.clone()),
+            model_id.clone(),
+            device.clone(),
+            node.params.clone(),
         ),
-        NodeKind::ExternalApi { .. } => {
-            bail!(
-                "node `{}` is of external_api type, which is not part of the frontend spec contract",
-                node.id
+        // 遗留 external_api/llm kind → builtin llm（§6.7），kind 级字段并入 params
+        NodeKind::ExternalApi {
+            endpoint,
+            api_key_env,
+        } => {
+            let mut params = if node.params.is_null() {
+                default_params()
+            } else {
+                node.params.clone()
+            };
+            if !params.is_object() {
+                params = default_params();
+            }
+            let obj = params
+                .as_object_mut()
+                .expect("params ensured to be an object above");
+            if !endpoint.is_empty() {
+                obj.insert("base_url".to_string(), JsonValue::String(endpoint.clone()));
+            }
+            if let Some(env_name) = api_key_env {
+                obj.insert("api_key_env".to_string(), JsonValue::String(env_name.clone()));
+            }
+            (
+                SpecNodeKind::Builtin,
+                Some("llm".to_string()),
+                None,
+                None,
+                None,
+                None,
+                params,
             )
         }
     };
@@ -248,12 +308,12 @@ fn node_to_spec(node: &PipelineNode) -> Result<SpecNode> {
         builtin,
         module_id,
         capability,
-        params: if node.params.is_null() {
-            default_params()
-        } else {
-            node.params.clone()
-        },
+        model,
+        device,
+        params: if params.is_null() { default_params() } else { params },
         position: node.position.clone(),
+        timeout_secs: node.timeout_secs,
+        retry_count: node.retry_count,
     })
 }
 
@@ -265,7 +325,8 @@ fn node_from_spec(node: &SpecNode) -> Result<PipelineNode> {
         SpecNodeKind::Module => NodeKind::Module {
             module_id: node.module_id.clone().unwrap_or_default(),
             capability: node.capability.clone().unwrap_or_default(),
-            model_id: None,
+            model_id: node.model.clone(),
+            device: node.device.clone(),
         },
     };
 
@@ -279,8 +340,8 @@ fn node_from_spec(node: &SpecNode) -> Result<PipelineNode> {
             node.params.clone()
         },
         position: node.position.clone(),
-        timeout_secs: None,
-        retry_count: None,
+        timeout_secs: node.timeout_secs,
+        retry_count: node.retry_count,
     })
 }
 
@@ -319,6 +380,13 @@ fn spec_to_toml(spec: &PipelineSpec) -> Result<String> {
                     "capability = {}\n",
                     toml_string(node.capability.as_deref().unwrap_or_default())
                 ));
+                // §6.2 变体 pin / 设备绑定（对外契约键名 `model` / `device`）
+                if let Some(model) = &node.model {
+                    out.push_str(&format!("model = {}\n", toml_string(model)));
+                }
+                if let Some(device) = &node.device {
+                    out.push_str(&format!("device = {}\n", toml_string(device)));
+                }
             }
         }
         if !node.label.is_empty() {
@@ -329,6 +397,13 @@ fn spec_to_toml(spec: &PipelineSpec) -> Result<String> {
             let v = serde_json::to_value(position)
                 .expect("NodePosition serialization cannot fail");
             out.push_str(&format!("position = {}\n", toml_value(&v)?));
+        }
+        // 节点级超时/重试（P1-11 透传，执行器消费）
+        if let Some(t) = node.timeout_secs {
+            out.push_str(&format!("timeout_secs = {t}\n"));
+        }
+        if let Some(r) = node.retry_count {
+            out.push_str(&format!("retry_count = {r}\n"));
         }
         if let Some(obj) = node.params.as_object() {
             if !obj.is_empty() {
@@ -476,8 +551,12 @@ mod tests {
                     builtin: Some("file_input".into()),
                     module_id: None,
                     capability: None,
+                    model: None,
+                    device: None,
                     params: json!({}),
                     position: Some(NodePosition { x: 10.0, y: 20.0 }),
+                    timeout_secs: None,
+                    retry_count: None,
                 },
                 SpecNode {
                     id: "asr".into(),
@@ -486,8 +565,12 @@ mod tests {
                     builtin: None,
                     module_id: Some("faster-whisper".into()),
                     capability: Some("transcribe".into()),
+                    model: None,
+                    device: None,
                     params: json!({ "language": "zh", "nested": {"a": [1, 2.5, true], "s": "文本 \"引号\"" } }),
                     position: None,
+                    timeout_secs: None,
+                    retry_count: None,
                 },
             ],
             edges: vec![Edge {
@@ -550,12 +633,162 @@ mod tests {
                 module_id: "faster-whisper".into(),
                 capability: "transcribe".into(),
                 model_id: None,
+                device: None,
             }
         );
         assert_eq!(
             pipeline.nodes[0].position,
             Some(NodePosition { x: 10.0, y: 20.0 })
         );
+    }
+
+    // ── §6.2 model/device + P1-11 timeout/retry 透传 ────────────────────────
+
+    #[test]
+    fn test_model_device_timeout_retry_roundtrip() {
+        let mut spec = sample_spec_body("schema-pipe");
+        // module 节点带 model/device/timeout/retry；builtin 节点带 timeout/retry
+        spec.nodes[1].model = Some("ep.systran.faster-whisper@medium".into());
+        spec.nodes[1].device = Some("cuda:0".into());
+        spec.nodes[1].timeout_secs = Some(600);
+        spec.nodes[1].retry_count = Some(2);
+        spec.nodes[0].timeout_secs = Some(60);
+
+        // spec → Pipeline：字段全量透传
+        let pipeline = spec_to_pipeline(&spec).expect("schema spec should convert");
+        assert_eq!(
+            pipeline.nodes[1].kind,
+            NodeKind::Module {
+                module_id: "faster-whisper".into(),
+                capability: "transcribe".into(),
+                model_id: Some("ep.systran.faster-whisper@medium".into()),
+                device: Some("cuda:0".into()),
+            }
+        );
+        assert_eq!(pipeline.nodes[1].timeout_secs, Some(600));
+        assert_eq!(pipeline.nodes[1].retry_count, Some(2));
+        assert_eq!(pipeline.nodes[0].timeout_secs, Some(60));
+        assert_eq!(pipeline.nodes[0].retry_count, None);
+
+        // spec → TOML 文本：新契约键落盘（model/device，而非 model_id）
+        let toml_text = spec_to_toml(&spec).unwrap();
+        assert!(toml_text.contains("model = \"ep.systran.faster-whisper@medium\""));
+        assert!(toml_text.contains("device = \"cuda:0\""));
+        assert!(toml_text.contains("timeout_secs = 600"));
+        assert!(toml_text.contains("retry_count = 2"));
+        assert!(!toml_text.contains("model_id ="));
+
+        // TOML → 磁盘 → load_spec 往返等价
+        let dir = temp_dir("schema");
+        let out = dir.join("schema.toml");
+        save_spec(&spec, &out).expect("save with schema fields");
+        let back = load_spec(&out).expect("reload schema toml");
+        assert_eq!(spec, back, "model/device/timeout/retry must roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_legacy_model_id_toml_loads_as_model() {
+        // 旧 TOML 键 model_id 经 ep-core alias 读取，在 spec 契约中呈现为 model
+        let dir = temp_dir("legacy-model");
+        let path = dir.join("legacy.toml");
+        std::fs::write(
+            &path,
+            r#"
+[pipeline]
+id = "legacy"
+name = "Legacy"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+
+[[nodes]]
+id = "asr"
+kind = "module"
+module_id = "faster-whisper"
+capability = "transcribe"
+model_id = "large-v3"
+"#,
+        )
+        .unwrap();
+
+        let spec = load_spec(&path).expect("legacy model_id toml should load");
+        assert_eq!(spec.nodes[1].model.as_deref(), Some("large-v3"));
+
+        // 保存后统一为新契约键 model
+        let out = dir.join("migrated.toml");
+        save_spec(&spec, &out).unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains("model = \"large-v3\""));
+        assert!(!text.contains("model_id"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_external_api_kind_loads_as_builtin_llm() {
+        // 遗留 kind = external_api（P2-13 清理后仅剩 endpoint/api_key_env）
+        // 在 spec 契约中呈现为 builtin llm，kind 级字段并入 params
+        let dir = temp_dir("extapi");
+        let path = dir.join("extapi.toml");
+        std::fs::write(
+            &path,
+            r#"
+[pipeline]
+id = "extapi"
+name = "Legacy external_api"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+
+[[nodes]]
+id = "translate"
+kind = "external_api"
+endpoint = "https://api.openai.com/v1"
+api_type = "openai"
+api_key_env = "OPENAI_API_KEY"
+
+[nodes.params]
+model = "gpt-4o-mini"
+system_prompt = "翻译：{input}"
+"#,
+        )
+        .unwrap();
+
+        let spec = load_spec(&path).expect("legacy external_api toml should load");
+        let node = &spec.nodes[1];
+        assert_eq!(node.kind, SpecNodeKind::Builtin);
+        assert_eq!(node.builtin.as_deref(), Some("llm"));
+        // kind 级字段并入 params（endpoint → base_url）
+        assert_eq!(node.params["base_url"], "https://api.openai.com/v1");
+        assert_eq!(node.params["api_key_env"], "OPENAI_API_KEY");
+        assert_eq!(node.params["model"], "gpt-4o-mini");
+
+        // 保存 → 再加载等价（此后一律 builtin llm 形状）
+        let out = dir.join("migrated.toml");
+        save_spec(&spec, &out).unwrap();
+        let back = load_spec(&out).unwrap();
+        assert_eq!(spec, back);
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains("kind = \"builtin\""));
+        assert!(text.contains("builtin = \"llm\""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_model_or_device() {
+        let mut spec = sample_spec_body("empty-model");
+        spec.nodes[1].model = Some("   ".into());
+        let err = spec_to_pipeline(&spec).unwrap_err().to_string();
+        assert!(err.contains("model") && err.contains("empty"), "got: {err}");
+
+        let mut spec = sample_spec_body("empty-device");
+        spec.nodes[1].device = Some("".into());
+        let err = spec_to_pipeline(&spec).unwrap_err().to_string();
+        assert!(err.contains("device") && err.contains("empty"), "got: {err}");
     }
 
     #[test]
