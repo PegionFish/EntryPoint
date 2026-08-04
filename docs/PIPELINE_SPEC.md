@@ -850,10 +850,29 @@ retry_count = 1                               # 失败重试次数（默认 0，
 
 | 字段 | 语义 |
 |---|---|
-| `model` | **变体 pin**：全限定模型 ID + `@variant`（§4.3 PACK_UNIFY_PLAN）。缺省 = 跟随该模块当前激活变体（`config/app.toml [active_models]` → manifest `default=true`）。执行前校验：pin 变体与激活变体不一致 → **报错 + 一键切换引导**，不做静默热切换（避免执行中重启模块的复杂交互） |
+| `model` | **变体 pin**：两种形态均合法——裸变体 id（如 `"medium"`）或全限定 pin `<qualified_id>@<variant>`（如 `"ep.systran.faster-whisper@medium"`，§4.3 PACK_UNIFY_PLAN）。缺省 = 跟随该模块当前激活变体（`config/app.toml [active_models]` → manifest `default=true`）。执行前校验：pin 变体与激活变体不一致 → **报错 + 一键切换引导**，不做静默热切换（避免执行中重启模块的复杂交互） |
 | `device` | **设备软约束**：`"auto"` \| `"cuda:0"` \| `"rocm:1"` \| `"openvino:GPU.0"` 等。导入/加载时本机无此设备 → 警告（`pipeline:warn.deviceFallback`）+ 回退 `auto`，**不硬失败** |
 | `timeout_secs` | 节点级超时（秒），覆盖 `[pipeline].default_timeout_secs` |
 | `retry_count` | 失败重试次数（0 = 不重试） |
+
+#### `model` pin 双形态（后端兼容口径）
+
+```toml
+# 形态一：裸变体 id（旧管线常见，等价于"该模块的这个变体"）
+model = "medium"
+
+# 形态二：全限定 pin（新契约，含发布者/厂商/模型命名，跨机器无歧义）
+model = "ep.systran.faster-whisper@medium"
+```
+
+- 后端解析按 `rsplit('@')` 取变体段：含 `@` → 取最后一段为变体；不含 `@` →
+  整体即变体 id。VRAM 预算（`POST /api/pipelines/vram-budget`）、变体一致性
+  校验、激活变体回退三条消费路径均按此口径兼容两种形态；
+- 序列化回写不改动原形态（TOML 往返保留作者写法）；
+- 新管线推荐全限定 pin：导入他人管线/整合包时，缺失模型提示
+  （`pipeline:io.missingVariant`）能给出完整 qualified_id 以便直接去统一页下载；
+- 语法非法的 pin（如含非法字符的 qualified 段）在导入/加载时报
+  `pipeline:io.invalidPin`（Warning 级，不阻断注册）。
 
 ### 11.6 并发模型速览（与节点开发的关系）
 
