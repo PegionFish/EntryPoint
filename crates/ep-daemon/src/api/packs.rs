@@ -18,7 +18,9 @@
 //!   [`ep_pack::import::import_pack`]（B1 编排核心，§4.4 全流程）；
 //!   daemon 侧负责来源解析（local/url/upload）、URL 下载（curl +
 //!   config.network 代理注入）、模块解析回调（查模块 manifest）、
-//!   进度回调 → WS、reference 模型后台下载驱动。
+//!   进度回调 → WS、reference 模型后台下载驱动（下载完成后回填 meta
+//!   的 pack_id/qualified_id/合并 tags，使 DELETE 的 meta.pack_id
+//!   扫描覆盖 reference 后下载模型）。
 //! - **注册表**（§4.4）：`runtime/packs/<pack-id>.json`，B1 的
 //!   [`ep_pack::import::InstalledPack`] 为唯一持久形状（原子写、
 //!   `list_installed_packs` 读取）——本文件不再维护内存镜像，
@@ -954,9 +956,9 @@ async fn spawn_peek(archive: &Path) -> Result<String, PackTaskError> {
         .map_err(|e| PackTaskError::detail("packs:errorInternal", e))?
 }
 
-/// 快读 zip 内 `ep-pack.toml`：解出单条目到临时目录 → 解析 + 校验 +
-/// min_ep_version 门禁 → 返回 pack.id（202 响应携带，后台任务前置拦截）。
-fn peek_pack_id(archive: &Path) -> Result<String, PackTaskError> {
+/// 从 zip 归档读取 `ep-pack.toml` 并解析为清单（解出单条目到临时目录，
+/// 经 ep-pack 解析器解析；ep-daemon 无 toml 依赖）。
+fn read_manifest_from_archive(archive: &Path) -> Result<PackManifest, PackTaskError> {
     let file = std::fs::File::open(archive).map_err(|e| {
         PackTaskError::detail(
             "packs:errorArchiveOpen",
@@ -974,7 +976,7 @@ fn peek_pack_id(archive: &Path) -> Result<String, PackTaskError> {
     drop(entry);
     drop(zip);
 
-    // 临时落盘后经 from_file 解析（ep-daemon 无 toml 依赖，复用 ep-pack 解析）
+    // 临时落盘后经 from_file 解析（复用 ep-pack 解析器）
     let peek_dir = std::env::temp_dir().join(format!("ep-pack-peek-{}", unique_id()));
     let manifest_path = peek_dir.join(ep_pack::extract::MANIFEST_FILE_NAME);
     let parsed = (|| -> Result<PackManifest, PackTaskError> {
@@ -986,7 +988,13 @@ fn peek_pack_id(archive: &Path) -> Result<String, PackTaskError> {
             .map_err(|e| PackTaskError::detail("packs:errorManifestInvalid", e))
     })();
     let _ = std::fs::remove_dir_all(&peek_dir);
-    let manifest = parsed?;
+    parsed
+}
+
+/// 快读 zip 内 `ep-pack.toml`：解析 + 校验 + min_ep_version 门禁 →
+/// 返回 pack.id（202 响应携带，后台任务前置拦截）。
+fn peek_pack_id(archive: &Path) -> Result<String, PackTaskError> {
+    let manifest = read_manifest_from_archive(archive)?;
 
     if let Err(errors) = manifest.validate() {
         return Err(PackTaskError::with_params(
@@ -1295,8 +1303,29 @@ fn run_import(state: Arc<AppState>, archive: PathBuf, remove_archive: bool, pack
             let downloads_count = report.pending_downloads.len().to_string();
             let pipelines_count = report.pipelines_installed.len().to_string();
 
-            // reference 模型 → 后台下载（复用 DownloadHandle 进度设施）
-            start_pending_downloads(&state, report.pending_downloads);
+            // reference 模型 → 后台下载（复用 DownloadHandle 进度设施）。
+            // 附 meta 补丁上下文（仲裁返工）：下载终态 completed 后回填
+            // pack_id/qualified_id/tags，使 DELETE 的 meta.pack_id 扫描覆盖
+            // reference 后下载模型。tags 取条目 tags ∪ 包级 tags（B1
+            // merge_tags 同款语义），故需重读一次归档清单；读失败仅降级为
+            // 空 tags（pack_id/qualified_id 补丁不受影响）。
+            let tag_manifest = match read_manifest_from_archive(&archive) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    warn!(
+                        pack_id = %pack_id,
+                        error_key = e.key,
+                        "re-read manifest for reference meta tags failed; patch tags empty"
+                    );
+                    None
+                }
+            };
+            let patches: Vec<RefMetaPatch> = report
+                .pending_downloads
+                .iter()
+                .map(|req| ref_meta_patch(tag_manifest.as_ref(), pack_id, req))
+                .collect();
+            start_pending_downloads(&state, report.pending_downloads, patches);
 
             let message = ep_core::i18n::t(
                 &lang,
@@ -1342,19 +1371,76 @@ fn run_import(state: Arc<AppState>, archive: PathBuf, remove_archive: bool, pack
 
 // ─── reference 模型后台下载驱动（复用 DownloadHandle 进度设施，§4.4）──────
 
+/// reference 模型下载完成后的 meta 补丁上下文（仲裁返工）：
+/// 下载终态 completed 后回填 `pack_id`/`qualified_id`/合并 tags，
+/// 使 `DELETE /api/packs/{id}` 按 `meta.pack_id` 的扫描能覆盖
+/// reference 后下载模型（否则仅 bundle 落位模型可被卸载删除）。
+#[derive(Debug, Clone)]
+struct RefMetaPatch {
+    pack_id: String,
+    qualified_id: String,
+    /// 条目 tags ∪ 包级 tags，去重保序（B1 merge_tags 同款语义）
+    tags: Vec<String>,
+}
+
+/// 合并 tags（B1 `merge_tags` 同款）：条目 tags 在前、包级 tags 在后，去重保序。
+fn merge_pack_tags(entry_tags: &[String], pack_tags: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for tag in entry_tags.iter().chain(pack_tags.iter()) {
+        if !out.contains(tag) {
+            out.push(tag.clone());
+        }
+    }
+    out
+}
+
+/// 由待下载请求 + 归档清单构造 meta 补丁上下文。
+/// 清单缺失（理论不可达：导入刚从同一归档成功）→ tags 降级为空。
+fn ref_meta_patch(
+    manifest: Option<&PackManifest>,
+    pack_id: &str,
+    req: &PendingDownloadRequest,
+) -> RefMetaPatch {
+    let (entry_tags, pack_tags) = match manifest {
+        Some(m) => {
+            let entry_tags = m
+                .models
+                .iter()
+                .find(|e| e.qualified_id == req.qualified_id && e.variant == req.variant)
+                .map(|e| e.tags.clone())
+                .unwrap_or_default();
+            (entry_tags, m.pack.tags.clone())
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+    RefMetaPatch {
+        pack_id: pack_id.to_string(),
+        qualified_id: req.qualified_id.clone(),
+        tags: merge_pack_tags(&entry_tags, &pack_tags),
+    }
+}
+
 /// 逐条启动 reference 模型下载（每条独立 async 任务；失败仅 warn 不阻断）
-fn start_pending_downloads(state: &Arc<AppState>, pending: Vec<PendingDownloadRequest>) {
-    for req in pending {
+fn start_pending_downloads(
+    state: &Arc<AppState>,
+    pending: Vec<PendingDownloadRequest>,
+    patches: Vec<RefMetaPatch>,
+) {
+    for (req, patch) in pending.into_iter().zip(patches) {
         let st = state.clone();
         tokio::spawn(async move {
-            start_one_pending_download(st, req).await;
+            start_one_pending_download(st, req, patch).await;
         });
     }
 }
 
 /// 单个 reference 模型下载：manifest 查找 → venv 准备 → 启动 → 监督中继。
 /// 与 api/models.rs 下载端点同语义（downloads 表 + WS model_download）。
-async fn start_one_pending_download(state: Arc<AppState>, req: PendingDownloadRequest) {
+async fn start_one_pending_download(
+    state: Arc<AppState>,
+    req: PendingDownloadRequest,
+    patch: RefMetaPatch,
+) {
     // 1. 模块清单与模型声明
     let modules = state.modules.read().await;
     let manifest = modules
@@ -1487,18 +1573,23 @@ async fn start_one_pending_download(state: Arc<AppState>, req: PendingDownloadRe
 
     let downloads = state.downloads.clone();
     let ws_tx = state.model_download_tx.clone();
+    let target_dir = req.target_dir.clone();
     tokio::spawn(async move {
-        monitor_pack_download(handle, downloads, ws_tx, key).await;
+        monitor_pack_download(handle, downloads, ws_tx, key, state, target_dir, patch).await;
     });
 }
 
 /// 中继下载进度直到结束（模式同 models.rs monitor_download 的精简版）：
 /// 每条进度更新 downloads 表并广播 WS model_download；结束落终态。
+/// 终态 completed 后追加 reference meta 补丁（仲裁返工）。
 async fn monitor_pack_download(
     handle: DownloadHandle,
     downloads: Arc<std::sync::Mutex<std::collections::HashMap<String, DownloadEntry>>>,
     ws_tx: tokio::sync::broadcast::Sender<WsMessage>,
     key: String,
+    state: Arc<AppState>,
+    target_dir: String,
+    patch: RefMetaPatch,
 ) {
     let module_id = handle.module_id().to_string();
     let model_id = handle.model_id().to_string();
@@ -1559,9 +1650,52 @@ async fn monitor_pack_download(
         module_id,
         model_id,
         percent: final_percent,
-        state: state_str,
+        state: state_str.clone(),
         bytes: final_bytes,
     });
+
+    // 仲裁返工：下载终态 completed 后回填 meta（pack_id/qualified_id/合并 tags）。
+    // 时序安全：ep-core 监督任务在发送 done(Ok) 前已写入 .ep_meta.json。
+    // best-effort：失败仅 warn，绝不影响导入成功语义。
+    if state_str == "completed" {
+        patch_reference_meta(&state, &target_dir, &patch).await;
+    }
+}
+
+/// reference 模型下载完成后的 meta 补丁（仲裁返工）：读现有 `.ep_meta.json`
+/// → 设置 `pack_id`/`qualified_id`、覆盖为合并 tags（条目 ∪ 包级，B1
+/// merge_tags 同款）→ 写回。使 `DELETE /api/packs/{id}` 按 `meta.pack_id`
+/// 的扫描能覆盖 reference 后下载模型。
+///
+/// best-effort：meta 不存在 / 写回失败均仅 warn，不向上传播（下载本身已成功，
+/// 导入语义不受影响）。
+async fn patch_reference_meta(state: &Arc<AppState>, target_dir: &str, patch: &RefMetaPatch) {
+    let mgr = build_model_manager(state).await;
+    let Some(mut meta) = mgr.read_meta(target_dir) else {
+        warn!(
+            target_dir = %target_dir,
+            pack_id = %patch.pack_id,
+            "reference meta patch skipped: meta not found (non-fatal)"
+        );
+        return;
+    };
+    meta.pack_id = Some(patch.pack_id.clone());
+    meta.qualified_id = Some(patch.qualified_id.clone());
+    meta.tags = patch.tags.clone();
+    if let Err(e) = mgr.write_meta(target_dir, &meta) {
+        warn!(
+            target_dir = %target_dir,
+            error = %e,
+            "reference meta patch write failed (non-fatal)"
+        );
+    } else {
+        info!(
+            target_dir = %target_dir,
+            pack_id = %patch.pack_id,
+            qualified_id = %patch.qualified_id,
+            "reference model meta patched with pack identity"
+        );
+    }
 }
 
 fn relay_pack_download(
@@ -3052,5 +3186,128 @@ type = "http"
         assert_eq!(v["percent"], 35.0);
         assert_eq!(v["state"], "running");
         assert!(v.get("message").is_none());
+    }
+
+    // ── 15. reference 下载完成 meta 补丁（仲裁返工）─────────────────────
+
+    /// tags 合并：条目在前、包级在后、去重保序（B1 merge_tags 同款）
+    #[test]
+    fn merge_pack_tags_dedup_and_order() {
+        let entry = vec!["字幕".to_string(), "共享".to_string()];
+        let pack = vec!["共享".to_string(), "视频".to_string()];
+        assert_eq!(
+            merge_pack_tags(&entry, &pack),
+            vec!["字幕".to_string(), "共享".to_string(), "视频".to_string()]
+        );
+        // 两侧均空
+        assert!(merge_pack_tags(&[], &[]).is_empty());
+        // 仅一侧
+        assert_eq!(merge_pack_tags(&[], &pack), pack);
+    }
+
+    /// 补丁上下文构造：条目 tags ∪ 包级 tags；清单缺失降级空 tags
+    #[test]
+    fn ref_meta_patch_builds_from_manifest() {
+        let manifest: PackManifest = toml::from_str(
+            r#"
+[pack]
+id = "test.pack"
+version = "1.0.0"
+name = "n"
+description = "d"
+tags = ["包级", "共享"]
+
+[compute]
+backends = ["cpu"]
+
+[[models]]
+qualified_id = "ep.test.model"
+variant = "large-v3"
+mode = "reference"
+tags = ["条目", "共享"]
+"#,
+        )
+        .unwrap();
+        let req = ep_pack::import::PendingDownloadRequest {
+            qualified_id: "ep.test.model".to_string(),
+            variant: "large-v3".to_string(),
+            module_id: "test-module".to_string(),
+            model_id: "large-v3".to_string(),
+            target_dir: "td".to_string(),
+            download: ep_pack::import::PendingDownload {
+                source: "huggingface".to_string(),
+                location: "org/repo".to_string(),
+                revision: None,
+            },
+        };
+
+        let patch = ref_meta_patch(Some(&manifest), "test.pack", &req);
+        assert_eq!(patch.pack_id, "test.pack");
+        assert_eq!(patch.qualified_id, "ep.test.model");
+        assert_eq!(
+            patch.tags,
+            vec!["条目".to_string(), "共享".to_string(), "包级".to_string()]
+        );
+
+        // 清单缺失 → tags 空，但 pack_id/qualified_id 仍在
+        let patch_no_manifest = ref_meta_patch(None, "test.pack", &req);
+        assert_eq!(patch_no_manifest.pack_id, "test.pack");
+        assert!(patch_no_manifest.tags.is_empty());
+    }
+
+    /// 下载完成后补丁：meta 带上 pack_id/qualified_id/合并 tags，其余字段保留
+    #[tokio::test]
+    async fn reference_meta_patch_sets_pack_id() {
+        use ep_core::model::ModelMeta;
+
+        let root = unique_root("ref-meta-patch");
+        let state = test_state(root.clone());
+        let mgr = build_model_manager(&state).await;
+
+        // 预置 ep-core 下载监督任务产出的 meta 形状（pack_id/qualified_id 为 None）
+        let target_dir = "ref-model-dir";
+        std::fs::create_dir_all(mgr.model_dir(target_dir)).unwrap();
+        let base = ModelMeta {
+            module_id: "test-module".to_string(),
+            model_id: "large-v3".to_string(),
+            source: "huggingface".to_string(),
+            repo_id: "org/repo".to_string(),
+            revision: "main".to_string(),
+            downloaded_at: "2026-08-05T00:00:00Z".to_string(),
+            total_size_bytes: 1234,
+            qualified_id: None,
+            tags: vec![],
+            pack_id: None,
+        };
+        mgr.write_meta(target_dir, &base).unwrap();
+
+        let patch = RefMetaPatch {
+            pack_id: "test.pack".to_string(),
+            qualified_id: "ep.test.model".to_string(),
+            tags: vec!["条目".to_string(), "包级".to_string()],
+        };
+        patch_reference_meta(&state, target_dir, &patch).await;
+
+        let meta = mgr.read_meta(target_dir).expect("meta 应存在");
+        assert_eq!(meta.pack_id.as_deref(), Some("test.pack"));
+        assert_eq!(meta.qualified_id.as_deref(), Some("ep.test.model"));
+        assert_eq!(meta.tags, vec!["条目".to_string(), "包级".to_string()]);
+        // 监督任务写入的其余字段保留
+        assert_eq!(meta.source, "huggingface");
+        assert_eq!(meta.repo_id, "org/repo");
+        assert_eq!(meta.total_size_bytes, 1234);
+    }
+
+    /// meta 不存在：仅 warn 不 panic（best-effort 语义）
+    #[tokio::test]
+    async fn reference_meta_patch_missing_meta_is_noop() {
+        let state = test_state(unique_root("ref-meta-missing"));
+        let patch = RefMetaPatch {
+            pack_id: "test.pack".to_string(),
+            qualified_id: "ep.test.model".to_string(),
+            tags: vec![],
+        };
+        // 不应 panic；目录不存在同样安全
+        patch_reference_meta(&state, "ghost-model-dir", &patch).await;
     }
 }
