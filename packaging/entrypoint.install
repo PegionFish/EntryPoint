@@ -1,15 +1,39 @@
+# 服务用户（entrypoint.service 以 User=entrypoint 运行）
+pre_install() {
+    getent group entrypoint >/dev/null 2>&1 || groupadd --system entrypoint
+    getent passwd entrypoint >/dev/null 2>&1 || \
+        useradd --system -g entrypoint -d /opt/entrypoint -s /usr/bin/nologin entrypoint
+}
+
+pre_upgrade() {
+    pre_install
+}
+
 post_install() {
+    # 包内文件属主为 root；运行期可写目录移交服务用户
+    chown -R entrypoint:entrypoint \
+        /opt/entrypoint/workspace /opt/entrypoint/runtime /opt/entrypoint/models \
+        2>/dev/null || true
+
     echo "=== EntryPoint 安装完成 ==="
+    echo ""
+    echo "安装布局 (/opt/entrypoint):"
+    echo "    bin/ep-daemon   守护进程（命令行入口 /usr/bin/ep-daemon 自动注入 EP_ROOT）"
+    echo "    bin/ep-pack     整合包作者 CLI（ep-pack new/validate/build/import/info/export）"
+    echo "    webui/          WebUI 静态资源"
+    echo "    config/         配置文件（app.toml + pipelines/）"
+    echo "    modules/        模块目录"
+    echo "    workspace/ runtime/ models/  运行期目录（首次运行自动初始化）"
     echo ""
     echo "启动守护进程:  systemctl start entrypoint"
     echo "开机自启:      systemctl enable entrypoint"
-    echo "桌面启动:      在应用菜单中搜索 EntryPoint"
+    echo "查看日志:      journalctl -u entrypoint -f"
     echo ""
-    echo "WebUI 默认地址: http://localhost:18080"
-    echo "配置文件:       /etc/entrypoint/"
-    echo "模块目录:       /usr/share/entrypoint/modules/"
+    echo "WebUI 默认地址: http://localhost:9800"
+    echo "配置文件:       /opt/entrypoint/config/"
+    echo "模块目录:       /opt/entrypoint/modules/"
     echo ""
-    echo "首次使用请运行 'entrypoint-daemon' 初始化运行时环境。"
+    echo "首次使用请运行 'ep-daemon' 初始化运行时环境。"
 }
 
 post_upgrade() {
@@ -19,6 +43,6 @@ post_upgrade() {
 
 post_remove() {
     echo "=== EntryPoint 已卸载 ==="
-    echo "配置和模型文件保留在 /etc/entrypoint/ 和 /var/lib/entrypoint/"
+    echo "配置和模型文件保留在 /opt/entrypoint/ 下（config/、models/、runtime/）"
     echo "如需完全清理，请手动删除上述目录。"
 }

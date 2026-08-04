@@ -10,7 +10,10 @@ ExecStart=/server/EntryPoint/target/release/ep-daemon
 Restart=on-failure
 RestartSec=5
 Environment=RUST_LOG=ep_daemon=info,ep_core=info
-Environment=LD_LIBRARY_PATH=/usr/local/cuda/lib64
+# 共享 CUDA 库目录（§3.1）：前置 checkout 内 runtime/cuda-libs（可选目录，缺失时
+# 动态链接器忽略该条目，无副作用）；模块子进程注入另由 daemon 代码负责。
+# systemd 环境无继承值可前置，此行为完整列表写法。
+Environment=LD_LIBRARY_PATH=/server/EntryPoint/runtime/cuda-libs:/usr/local/cuda/lib64
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=entrypoint

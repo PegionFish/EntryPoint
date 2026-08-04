@@ -6,17 +6,30 @@ After=network.target
 Type=simple
 User=entrypoint
 Group=entrypoint
-WorkingDirectory=/var/lib/entrypoint
-ExecStart=/usr/bin/entrypoint-daemon
+# 与 PKGBUILD 产物布局对齐：EP_ROOT=/opt/entrypoint
+# （bin/ep-daemon + webui/ + config/ + modules/ + workspace/，修复 P2-17）
+WorkingDirectory=/opt/entrypoint
+# /usr/bin/ep-daemon 为 PKGBUILD 安装的包装器（注入 EP_ROOT=/opt/entrypoint 后转发，
+# 与 PKGBUILD 产物名一致，修复 P2-17 旧名 entrypoint-daemon）
+ExecStart=/usr/bin/ep-daemon
 Restart=on-failure
 RestartSec=5
 Environment=RUST_LOG=info
+# 共享 CUDA 库目录（PACK_UNIFY_PLAN §3.1）：
+# - 目录为可选资产（.gitignore 忽略 runtime/，按存在性随包附带）；不存在时动态链接器
+#   忽略缺失路径条目，无副作用。
+# - 模块子进程的 LD_LIBRARY_PATH 前置注入由 daemon 代码负责（ep-core process.rs，
+#   Linux 分支），本行额外覆盖 daemon 进程自身派生的检测类子进程（如 check_torch_cuda）。
+# - systemd 无继承环境可前置，需叠加系统 CUDA 库路径时请改写为完整列表（冒号分隔）：
+#   Environment=LD_LIBRARY_PATH=/opt/entrypoint/runtime/cuda-libs:/usr/local/cuda/lib64
+Environment=LD_LIBRARY_PATH=/opt/entrypoint/runtime/cuda-libs
 
-# 安全加固
+# 安全加固（EP_ROOT 需可写：config/ 会被 PUT /api/config 更新，
+# workspace/ runtime/ models/ 为运行期产物）
 NoNewPrivileges=true
 ProtectHome=read-only
 ProtectSystem=strict
-ReadWritePaths=/var/lib/entrypoint
+ReadWritePaths=/opt/entrypoint
 
 [Install]
 WantedBy=multi-user.target
