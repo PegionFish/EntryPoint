@@ -398,6 +398,11 @@ mod tests {
         ))
     }
 
+    /// 路径转义为 TOML basic string（Windows 路径含 `\`，不转义会被解析为转义序列）
+    fn toml_path(p: &std::path::Path) -> String {
+        p.display().to_string().replace('\\', "\\\\").replace('"', "\\\"")
+    }
+
     /// 提交 file_input→file_output 纯 builtin 管线并等待终结
     async fn run_copy_task(
         state: &Arc<AppState>,
@@ -427,8 +432,8 @@ params = {{ path = "{}" }}
 from = ["input", "output"]
 to = ["output", "input"]
 "#,
-            src.display(),
-            dest.display(),
+            toml_path(src),
+            toml_path(dest),
         );
         let pipeline = Pipeline::from_toml_str(&toml).unwrap();
         let task_id = execution::submit_pipeline(state, pipeline, None)

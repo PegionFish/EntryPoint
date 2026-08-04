@@ -2499,12 +2499,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_cleanup_hf_cache_skips_when_top_symlink() {
-        // symlink 测试仅在 Unix 上有意义
-        if cfg!(windows) {
-            return;
-        }
-
         let dir = temp_dir("cleanup_symlink");
         let model_dir = dir.join("linked-model");
         fs::create_dir_all(&model_dir).unwrap();

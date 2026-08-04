@@ -548,6 +548,11 @@ mod tests {
 
     static SEQ: AtomicUsize = AtomicUsize::new(0);
 
+    /// 路径转义为 TOML basic string（Windows 路径含 `\`，不转义会被解析为转义序列）
+    fn toml_path(p: &std::path::Path) -> String {
+        p.display().to_string().replace('\\', "\\\\").replace('"', "\\\"")
+    }
+
     fn unique_root(tag: &str) -> PathBuf {
         let seq = SEQ.fetch_add(1, Ordering::SeqCst);
         let root = std::env::temp_dir().join(format!(
@@ -644,8 +649,8 @@ params = {{ path = "{}" }}
 from = ["input", "output"]
 to = ["output", "input"]
 "#,
-            src.display(),
-            dest.display(),
+            toml_path(&src),
+            toml_path(&dest),
         );
         let pipeline = Pipeline::from_toml_str(&toml).unwrap();
 
@@ -710,7 +715,7 @@ params = {{ path = "{}" }}
 from = ["input", "output"]
 to = ["output", "input"]
 "#,
-            dest.display(),
+            toml_path(&dest),
         );
         let pipeline = Pipeline::from_toml_str(&toml).unwrap();
 
@@ -892,8 +897,8 @@ params = {{ path = "{}" }}
 from = ["input", "output"]
 to = ["output", "input"]
 "#,
-            src.display(),
-            dest.display(),
+            toml_path(&src),
+            toml_path(&dest),
         );
         let pipeline = Pipeline::from_toml_str(&toml).unwrap();
         let task_id = submit_pipeline(&state, pipeline, None).await.unwrap();
@@ -950,8 +955,8 @@ params = {{ path = "{}" }}
 from = ["input", "output"]
 to = ["output", "input"]
 "#,
-            src.display(),
-            dest.display(),
+            toml_path(&src),
+            toml_path(&dest),
         );
         let pipeline = Pipeline::from_toml_str(&toml).unwrap();
         let task_id = submit_pipeline(&state, pipeline, None).await.unwrap();
