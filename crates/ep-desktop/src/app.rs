@@ -900,14 +900,15 @@ impl eframe::App for App {
                 self.packs_page(ui, lang, &pal);
             }
             Page::PipelineEditor => {
-                pages::pipeline_editor::show(ui, &self.state.config);
+                pages::pipeline_editor::show_full(ui, &self.state.config, Some(&self.cmd_tx));
             }
             Page::Tasks => {
-                pages::tasks::show(
+                pages::tasks::show_full(
                     ui,
                     &self.state.config,
                     &self.state.modules,
                     &self.state.tasks,
+                    Some(&self.cmd_tx),
                 );
             }
             Page::Settings => {

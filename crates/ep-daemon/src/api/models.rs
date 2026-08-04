@@ -307,6 +307,7 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {
                     "qualified_id": qualified_id,
                     "pack_id": pack_id,
                     "tags": tags,
+                    "vram_estimate_mb": model.vram_estimate_mb,
                 })
             })
             .collect();
@@ -384,6 +385,7 @@ async fn module_models(
                 "qualified_id": qualified_id,
                 "pack_id": pack_id,
                 "tags": tags,
+                "vram_estimate_mb": decl.vram_estimate_mb,
             })
         })
         .collect();
@@ -2098,8 +2100,8 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let body = body_json(resp).await;
-        // i18n 键由编排者 Wave 3 落盘（规则 8），键未落盘前兜底返回键本身
-        assert_eq!(body["error"], "apiModels.tagsNoMeta");
+        // C8 已落盘：断言真实 zh 文案（默认语言 zh-CN）
+        assert_eq!(body["error"], "模型没有下载元数据（.ep_meta.json），无法设置标签");
     }
 
     #[tokio::test]
@@ -2195,7 +2197,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         let body = body_json(resp).await;
-        assert_eq!(body["error"], "apiModels.cancelNotActive");
+        assert_eq!(body["error"], "该模型没有进行中的下载，无需取消");
 
         // 终态记录（completed）同样视为"无进行中下载" → 409
         seed_entry(&state, "completed", "2026-08-04T00:00:00+00:00");

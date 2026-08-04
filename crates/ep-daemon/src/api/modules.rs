@@ -54,6 +54,9 @@ pub(crate) struct ModuleResponse {
     capabilities: Vec<CapabilityDecl>,
     /// 当前绑定设备（如 "cuda:0"；未运行为 null）—— P2-4 设备列的真实数据源（§8.2）
     device: Option<String>,
+    /// 解析后的激活变体 id（门禁 #33：config.active_models → default → 首变体；
+    /// 无模型模块为 null）—— 前端统一页"激活变体"投影的权威数据源
+    active_model_id: Option<String>,
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -119,6 +122,7 @@ pub async fn list_modules(
 ) -> Json<Vec<ModuleResponse>> {
     let modules = state.modules.read().await;
     let pm = state.process_manager.read().await;
+    let cfg = state.config.read().await;
 
     let resp: Vec<ModuleResponse> = modules
         .iter()
@@ -166,6 +170,12 @@ pub async fn list_modules(
                 .get_instance(&id)
                 .and_then(|inst| inst.device.as_ref().map(|d| d.to_string()));
 
+            // 激活变体（门禁 #33）：三级回退解析结果透传，前端不再启发式推断
+            let active_model_id = m
+                .manifest
+                .as_ref()
+                .and_then(|manifest| active_model_for(&cfg, manifest).map(|s| s.to_string()));
+
             ModuleResponse {
                 id,
                 name,
@@ -177,6 +187,7 @@ pub async fn list_modules(
                 service_status,
                 capabilities,
                 device,
+                active_model_id,
             }
         })
         .collect();

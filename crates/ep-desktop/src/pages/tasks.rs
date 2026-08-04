@@ -243,24 +243,24 @@ fn task_card(
             );
         }
 
-        // 取消按钮（queued/running）：AppCmd::CancelTask { task_id } 由 C4 在
-        // app.rs 冻结提供；本 worktree 的 app.rs 尚为 S2 形状，接线后启用发送。
+        // 取消按钮（queued/running）：门禁接线完成（C4 冻结入口）
         if matches!(task.status, TaskStatus::Pending | TaskStatus::Running) {
-            if let Some(_tx) = cmd_tx {
+            if let Some(tx) = cmd_tx {
                 ui.add_space(4.0);
-                // TODO(门禁接线): 按钮点击处发送
-                //   let _ = _tx.send(AppCmd::CancelTask { task_id: task.id.clone() });
-                // （变体落 app.rs 后将下行占位按钮替换为真实取消）
-                ui.add_enabled(
-                    false,
-                    subtle_button(
+                if ui
+                    .add(subtle_button(
                         pal,
                         format!(
                             "✕ {}",
-                            trfb(lang, "desktopApp.tasks.cancelPending", "取消（接线中）", &[])
+                            trfb(lang, "desktopApp.tasks.cancel", "取消", &[])
                         ),
-                    ),
-                );
+                    ))
+                    .clicked()
+                {
+                    let _ = tx.send(AppCmd::CancelTask {
+                        task_id: task.id.clone(),
+                    });
+                }
             }
         }
 
@@ -544,6 +544,7 @@ mod tests {
             finished_at: None,
             node_count: 2,
             completed_nodes: 0,
+            artifacts: Vec::new(),
         }
     }
 

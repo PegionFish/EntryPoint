@@ -2743,6 +2743,7 @@ fn new_pipeline(st: &mut VizState) {
         description: String::new(),
         nodes: vec![input, output],
         edges: vec![edge],
+        max_instances: None,
     });
     st.positions.clear();
     st.drafts.clear();
@@ -2802,16 +2803,25 @@ fn execute_pipeline(
         st.exec_input = Some(file);
     }
     match cmd_tx {
-        Some(_tx) => {
-            // TODO(门禁接线): let _ = _tx.send(AppCmd::ExecutePipeline { pipeline });
-            // （C4 已冻结入口；变体落 app.rs 后替换下行提示）
-            st.validation_msg = Some(trfb(
-                lang,
-                "desktopApp.pipeline.execPendingWire",
-                "已就绪：等待执行通道接线（AppCmd::ExecutePipeline）",
-                &[],
-            ));
-            st.validation_ok = true;
+        Some(tx) => {
+            // 门禁接线完成（C4 冻结入口）：提交内存管线对象执行，进度见任务页
+            if tx.send(AppCmd::ExecutePipeline { pipeline }).is_ok() {
+                st.validation_msg = Some(trfb(
+                    lang,
+                    "desktopApp.pipeline.execSubmitted",
+                    "已提交执行，进度见任务页",
+                    &[],
+                ));
+                st.validation_ok = true;
+            } else {
+                st.validation_msg = Some(trfb(
+                    lang,
+                    "desktopApp.pipeline.execChannelClosed",
+                    "执行通道不可用（后台循环已退出）",
+                    &[],
+                ));
+                st.validation_ok = false;
+            }
         }
         None => {
             st.validation_msg = Some(trfb(

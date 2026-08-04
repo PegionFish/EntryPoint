@@ -1981,7 +1981,7 @@ type = "http"
             .unwrap();
         let (status, json) = response_json(resp).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["error"], "apiModels.inputUploadMissingFile");
+        assert_eq!(json["error"], "multipart 缺少 'file' 文件字段");
         // uploads 目录不应被创建出任何文件
         let uploads = root.join("workspace/uploads");
         let count = std::fs::read_dir(&uploads)
