@@ -40,7 +40,20 @@ impl DepReport {
     /// 便捷方法：聚合 ffmpeg + 所有模块 venv 的 torch CUDA 检测
     ///
     /// 自动扫描 `runtime/venvs/` 下的所有模块 venv 目录。
+    /// torch 检测使用默认共享 CUDA 库目录（`runtime/cuda-libs`）；
+    /// 需要自定义 `[compute].cuda_libs_dir` 时用 [`Self::check_all_with_cuda_libs`]。
     pub fn check_all(root: &Path) -> Self {
+        Self::check_all_with_cuda_libs(root, None)
+    }
+
+    /// 同 [`Self::check_all`]，但允许指定共享 CUDA 库目录（传 `[compute].cuda_libs_dir` 解析值）。
+    ///
+    /// `cuda_libs_dir` 为 None 时使用默认 `runtime/cuda-libs`（相对 root 解析）。
+    pub fn check_all_with_cuda_libs(root: &Path, cuda_libs_dir: Option<&Path>) -> Self {
+        let cuda_dir = cuda_libs_dir.map(Path::to_path_buf).unwrap_or_else(|| {
+            crate::process::resolve_cuda_libs_dir(root, crate::process::DEFAULT_CUDA_LIBS_DIR)
+        });
+
         let ffmpeg = check_ffmpeg(root);
 
         // 扫描 runtime/venvs/ 下的所有子目录作为模块 ID
@@ -64,7 +77,7 @@ impl DepReport {
                     venv_dir.join("bin").join("python")
                 };
                 if python.is_file() {
-                    Some(check_torch_cuda(id, &python))
+                    Some(check_torch_cuda(id, &python, Some(&cuda_dir)))
                 } else {
                     None
                 }
@@ -201,13 +214,29 @@ pub fn check_ffmpeg(root: &Path) -> DepStatus {
 }
 
 /// 检测指定 venv 中 torch CUDA 是否可用
-pub fn check_torch_cuda(module_id: &str, venv_python: &Path) -> TorchCudaStatus {
-    let output = Command::new(venv_python)
-        .args([
-            "-c",
-            "import torch; print(f'{torch.__version__}|{torch.cuda.is_available()}')",
-        ])
-        .output();
+///
+/// `cuda_libs_dir`：共享 CUDA 库目录（§3.1）。提供且目录存在时，按平台注入
+/// 动态库搜索路径（Linux `LD_LIBRARY_PATH` 前置 / Windows `PATH` 前置），
+/// 与 start_module 同路径——修复 torch 因找不到 libcublas 等共享库导致的
+/// CUDA 误报（P1 误报）。
+pub fn check_torch_cuda(
+    module_id: &str,
+    venv_python: &Path,
+    cuda_libs_dir: Option<&Path>,
+) -> TorchCudaStatus {
+    let mut cmd = Command::new(venv_python);
+    cmd.args([
+        "-c",
+        "import torch; print(f'{torch.__version__}|{torch.cuda.is_available()}')",
+    ]);
+    if let Some(dir) = cuda_libs_dir {
+        if dir.is_dir() {
+            if let Some((key, value)) = crate::process::cuda_lib_path_env(dir) {
+                cmd.env(key, value);
+            }
+        }
+    }
+    let output = cmd.output();
 
     match output {
         Ok(o) if o.status.success() => {
@@ -280,8 +309,13 @@ pub fn check_torch_cuda(module_id: &str, venv_python: &Path) -> TorchCudaStatus 
 }
 
 /// 扫描所有模块 venv，生成完整依赖报告
+///
+/// torch 检测注入默认共享 CUDA 库目录（`runtime/cuda-libs`，§3.1），
+/// 与 start_module 同路径，避免 CUDA 误报。
 pub fn check_all_deps(root: &Path, module_ids: &[&str]) -> DepReport {
     let ffmpeg = check_ffmpeg(root);
+    let cuda_dir =
+        crate::process::resolve_cuda_libs_dir(root, crate::process::DEFAULT_CUDA_LIBS_DIR);
 
     let torch_cuda: Vec<TorchCudaStatus> = module_ids
         .iter()
@@ -293,7 +327,7 @@ pub fn check_all_deps(root: &Path, module_ids: &[&str]) -> DepReport {
                 venv_dir.join("bin").join("python")
             };
             if python.is_file() {
-                Some(check_torch_cuda(id, &python))
+                Some(check_torch_cuda(id, &python, Some(&cuda_dir)))
             } else {
                 None
             }
@@ -370,9 +404,39 @@ mod tests {
 
     #[test]
     fn test_check_torch_cuda_nonexistent_venv() {
-        let status = check_torch_cuda("test", Path::new("/nonexistent/python.exe"));
+        let status = check_torch_cuda("test", Path::new("/nonexistent/python.exe"), None);
         assert!(!status.cuda_available);
         assert!(status.guidance.is_some());
+    }
+
+    #[test]
+    fn test_check_torch_cuda_with_cuda_libs_dir_variants() {
+        // cuda_libs_dir 不存在 → 跳过注入，不 panic，检测正常降级
+        let status = check_torch_cuda(
+            "test",
+            Path::new("/nonexistent/python.exe"),
+            Some(Path::new("/nonexistent/cuda-libs")),
+        );
+        assert!(!status.cuda_available);
+        assert!(status.guidance.is_some());
+
+        // cuda_libs_dir 存在（tempdir）→ 注入路径可达（进程仍因 python 不存在而失败）
+        let dir = std::env::temp_dir().join(format!(
+            "ep_deps_cuda_libs_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let status2 = check_torch_cuda(
+            "test",
+            Path::new("/nonexistent/python.exe"),
+            Some(&dir),
+        );
+        assert!(!status2.cuda_available);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
