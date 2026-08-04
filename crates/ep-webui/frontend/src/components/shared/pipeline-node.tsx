@@ -12,18 +12,27 @@ import {
   Languages,
   Mic,
   Package,
+  Plus,
   Sparkles,
+  Trash2,
   Type,
   type LucideIcon,
 } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import { cn } from '@/lib/utils'
 import { categoryLabel } from '@/lib/constants'
 import i18n from '@/i18n'
+import type { CapabilityDecl, CapabilityParamSchema, DeviceResponse } from '@/api/types'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Switch } from '@/components/ui/switch'
 
 /**
  * 模块级翻译助手：静态元数据（常量/工厂函数）无法使用 React Hook，
  * 在读取时按当前语言即时解析，保证语言切换后重渲染即可生效。
  * 键位于 components 命名空间，跨命名空间用 "common:xxx" 全限定键。
+ * 新增键统一携带 defaultValue 兜底（键集由 C8 统一落盘）。
  */
 function t(key: string, options?: Record<string, unknown>): string {
   return i18n.t(key, options) as string
@@ -61,6 +70,29 @@ export interface Port {
   id: string
   label: string
   dataType: DataType
+}
+
+/**
+ * 后端能力 input_type/output_type（manifest DataType，audio/video/image/
+ * text/json/file…）→ 端口数据类型（null 安全；未知类型回退 any）。
+ * json 归一为 text：结构化文本（如 ASR 分段 JSON）可被文本消费方直接接收。
+ */
+export function normalizeDataType(raw: string | null | undefined): DataType {
+  switch ((raw ?? '').trim().toLowerCase()) {
+    case 'audio':
+      return 'audio'
+    case 'video':
+      return 'video'
+    case 'image':
+      return 'image'
+    case 'text':
+    case 'json':
+      return 'text'
+    case 'file':
+      return 'file'
+    default:
+      return 'any'
+  }
 }
 
 // ============================================================
@@ -129,36 +161,208 @@ export function normalizeNodeStatus(status: string | null | undefined): NodeStat
 }
 
 // ============================================================
-// 参数表单（由能力参数模式自动生成）
+// 参数表单类型
 // ============================================================
 
-export type ParamValue = string | number | boolean
+/** 参数值；string[] 为 ffmpeg args 数组化编辑形状（P0-2，序列化恒数组） */
+export type ParamValue = string | number | boolean | string[]
 export type NodeParams = Record<string, ParamValue>
 
 export interface ParamSpec {
   name: string
   label: string
-  type: 'string' | 'number' | 'boolean' | 'select'
+  /**
+   * 字段类型。textarea = 多行文本（llm.system_prompt）；
+   * string_array = 逐条增删改的字符串数组（ffmpeg.args，P0-2）。
+   * 渲染由 ParamSpecField 统一承接（C3 NodeParamsPanel 可整体委托）。
+   */
+  type: 'string' | 'number' | 'boolean' | 'select' | 'textarea' | 'string_array'
   options?: string[]
   defaultValue?: ParamValue
   placeholder?: string
   hint?: string
   required?: boolean
+  /** 数值约束（manifest schema min/max/step 透传，渲染与校验消费） */
+  min?: number
+  max?: number
+  step?: number
 }
 
 export function defaultParams(specs: ParamSpec[]): NodeParams {
   const out: NodeParams = {}
   for (const spec of specs) {
-    if (spec.defaultValue !== undefined) out[spec.name] = spec.defaultValue
+    if (spec.defaultValue === undefined) continue
+    // 数组默认值拷贝一份，避免多个节点共享同一引用被串改
+    out[spec.name] = Array.isArray(spec.defaultValue)
+      ? [...spec.defaultValue]
+      : spec.defaultValue
   }
   return out
+}
+
+// ============================================================
+// 能力数据驱动（P0-1 收口：能力来自 ModuleResponse.capabilities，裸名契约）
+// ============================================================
+
+export interface CapabilityDef {
+  /**
+   * 能力**裸名**（§6.2 契约：executor 拼 `/predict/{capability}`，
+   * adapter 只认裸名，如 `transcribe`；不含分类前缀）。
+   */
+  id: string
+  label: string
+  /** manifest 原样描述（展示用，可空） */
+  description?: string
+  inputs: Port[]
+  outputs: Port[]
+  /** 参数表单（manifest params schema 数据驱动渲染） */
+  params: ParamSpec[]
+}
+
+function isFiniteNumber(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v)
+}
+
+/**
+ * manifest 单条参数 schema → ParamSpec（null 安全）。
+ * type/default/min/max/step/enum/options 均按存在性消费；未知 type 回退 string。
+ */
+export function capabilityParamSpec(
+  name: string,
+  schema: CapabilityParamSchema | null | undefined,
+): ParamSpec {
+  const s: Partial<CapabilityParamSchema> = schema ?? {}
+  const options = (s.enum ?? s.options ?? []).filter(
+    (o): o is string => typeof o === 'string' && o.length > 0,
+  )
+  const rawType = (typeof s.type === 'string' ? s.type : '').trim().toLowerCase()
+
+  let type: ParamSpec['type']
+  if (options.length > 0 || rawType === 'enum' || rawType === 'select') {
+    type = 'select'
+  } else if (['int', 'integer', 'float', 'double', 'number'].includes(rawType)) {
+    type = 'number'
+  } else if (['bool', 'boolean'].includes(rawType)) {
+    type = 'boolean'
+  } else {
+    type = 'string'
+  }
+
+  const def = s.default
+  let defaultValue: ParamValue | undefined =
+    typeof def === 'string' || typeof def === 'boolean' || isFiniteNumber(def)
+      ? def
+      : undefined
+  // select 默认值不在可选项内时丢弃（避免渲染出悬空选中项）
+  if (type === 'select' && typeof defaultValue === 'string' && !options.includes(defaultValue)) {
+    defaultValue = undefined
+  }
+
+  const hint = typeof s.description === 'string' && s.description.trim() ? s.description : undefined
+
+  return {
+    name,
+    label: name,
+    type,
+    ...(options.length > 0 ? { options } : {}),
+    ...(defaultValue !== undefined ? { defaultValue } : {}),
+    ...(hint ? { hint } : {}),
+    ...(isFiniteNumber(s.min) ? { min: s.min } : {}),
+    ...(isFiniteNumber(s.max) ? { max: s.max } : {}),
+    ...(isFiniteNumber(s.step) ? { step: s.step } : {}),
+  }
+}
+
+/** capability 参数表（键 = 参数名）→ ParamSpec 列表（null 安全，跳过空条目） */
+export function capabilityParamsFromSchema(
+  params: Record<string, CapabilityParamSchema> | null | undefined,
+): ParamSpec[] {
+  if (!params) return []
+  return Object.entries(params)
+    .filter(([, schema]) => schema != null)
+    .map(([name, schema]) => capabilityParamSpec(name, schema))
+}
+
+/**
+ * CapabilityDecl（ep-core manifest 原样序列化）→ CapabilityDef。
+ * 裸名、输入输出类型与参数 schema 全部来自 manifest（修 P0-1 猜测式映射）。
+ * decl 无效（null / 空名）返回 null。
+ */
+export function capabilityFromDecl(decl: CapabilityDecl | null | undefined): CapabilityDef | null {
+  if (!decl) return null
+  const id = (typeof decl.name === 'string' ? decl.name : '').trim()
+  if (!id) return null
+  return {
+    id,
+    label: id,
+    description: typeof decl.description === 'string' ? decl.description : '',
+    inputs: [
+      { id: 'in', label: t('components:pipeline.port.input'), dataType: normalizeDataType(decl.input_type) },
+    ],
+    outputs: [
+      { id: 'out', label: t('components:pipeline.port.output'), dataType: normalizeDataType(decl.output_type) },
+    ],
+    params: capabilityParamsFromSchema(decl.params),
+  }
+}
+
+/**
+ * ModuleResponse.capabilities → CapabilityDef[]（null 安全）。
+ * B5 过渡期 / 无能力模块：返回空数组，消费方展示兜底空态（不崩）。
+ */
+export function capabilitiesFromModule(
+  caps: CapabilityDecl[] | null | undefined,
+): CapabilityDef[] {
+  if (!Array.isArray(caps)) return []
+  const out: CapabilityDef[] = []
+  const seen = new Set<string>()
+  for (const decl of caps) {
+    const def = capabilityFromDecl(decl)
+    if (def && !seen.has(def.id)) {
+      seen.add(def.id)
+      out.push(def)
+    }
+  }
+  return out
+}
+
+/**
+ * 模块节点当前选中的能力。
+ * - 未声明任何能力（capabilities 缺失/空）→ null（消费方展示兜底空态）；
+ * - capabilityId 未命中（陈旧数据 / 未选择）→ 回退第一项，保证渲染与校验可用。
+ */
+export function selectedCapability(data: ModuleNodeData): CapabilityDef | null {
+  const caps = data.capabilities ?? []
+  if (caps.length === 0) return null
+  return caps.find((c) => c.id === data.capabilityId) ?? caps[0] ?? null
+}
+
+/**
+ * @deprecated P0-1 数据驱动迁移兼容垫片：硬编码「分类 → capability」映射已删除，
+ * 模块能力一律来自 ModuleResponse.capabilities（capabilitiesFromModule /
+ * capabilityFromDecl，裸名）。本函数仅为旧调用点（pipeline.tsx 的
+ * examplePipeline / fromSpec，C3 将接线数据驱动）提供通用兜底能力，
+ * 不再携带任何猜测的参数表。
+ */
+export function moduleCapability(_category: string): CapabilityDef {
+  return {
+    id: 'process',
+    get label() { return t('components:pipeline.capability.other') },
+    inputs: [
+      { id: 'in', get label() { return t('components:pipeline.port.input') }, dataType: 'file' },
+    ],
+    outputs: [
+      { id: 'out', get label() { return t('components:pipeline.port.output') }, dataType: 'file' },
+    ],
+    params: [],
+  }
 }
 
 // ============================================================
 // 内置节点定义
 // ============================================================
 
-export type BuiltinKind = 'file_input' | 'file_output' | 'ffmpeg'
+export type BuiltinKind = 'file_input' | 'file_output' | 'ffmpeg' | 'llm'
 
 export interface BuiltinDef {
   kind: BuiltinKind
@@ -180,9 +384,9 @@ export const BUILTIN_DEFS: Record<BuiltinKind, BuiltinDef> = {
     accent: 'bg-node-file-input/15 text-node-file-input',
     inputs: [],
     outputs: [{ id: 'out', get label() { return t('components:pipeline.port.output') }, dataType: 'file' }],
+    // §6.1：`pattern` 后端不读，已从 UI 移除（参数面保持最小）
     params: [
       { name: 'path', get label() { return t('components:pipeline.param.filePath') }, type: 'string', required: true, placeholder: '/workspace/input/audio.wav' },
-      { name: 'pattern', get label() { return t('components:pipeline.param.pattern') }, type: 'string', get placeholder() { return t('components:pipeline.param.pattern.placeholder') } },
     ],
   },
   file_output: {
@@ -193,9 +397,9 @@ export const BUILTIN_DEFS: Record<BuiltinKind, BuiltinDef> = {
     accent: 'bg-node-file-output/15 text-node-file-output',
     inputs: [{ id: 'in', get label() { return t('components:pipeline.port.input') }, dataType: 'file' }],
     outputs: [],
+    // §6.1：`overwrite` 后端不读（ffmpeg 恒 -y 覆盖），已从 UI 移除
     params: [
       { name: 'path', get label() { return t('components:pipeline.param.outputPath') }, type: 'string', required: true, placeholder: '/workspace/output/result.txt' },
-      { name: 'overwrite', get label() { return t('components:pipeline.param.overwrite') }, type: 'boolean', defaultValue: true },
     ],
   },
   ffmpeg: {
@@ -208,13 +412,89 @@ export const BUILTIN_DEFS: Record<BuiltinKind, BuiltinDef> = {
     outputs: [{ id: 'out', get label() { return t('components:pipeline.port.output') }, dataType: 'file' }],
     params: [
       {
+        // P0-2：args 数组化编辑（逐条增删改），序列化恒数组（后端契约形状）
         name: 'args',
         get label() { return t('components:pipeline.param.args') },
-        type: 'string',
-        placeholder: '-i {input} -c:v libx264 {output}',
-        get hint() { return t('components:pipeline.param.args.hint') },
+        type: 'string_array',
+        defaultValue: ['-i', '{input}', '{output}'],
+        get placeholder() { return t('components:pipeline.param.args.itemPlaceholder', { defaultValue: '单个参数，如 -c:v libx264' }) },
+        get hint() { return t('components:pipeline.param.args.hintArray', { defaultValue: '每行一个参数（数组）；{input}/{output} 为占位符' }) },
       },
-      { name: 'timeout_secs', get label() { return t('components:pipeline.param.timeoutSecs') }, type: 'number', defaultValue: 600 },
+      {
+        // P0-2：补 output_extension（决定本节点中间产物扩展名，executor 消费）
+        name: 'output_extension',
+        get label() { return t('components:pipeline.param.outputExtension', { defaultValue: '输出扩展名 (output_extension)' }) },
+        type: 'string',
+        placeholder: 'mp4 / wav / srt',
+        get hint() { return t('components:pipeline.param.outputExtension.hint', { defaultValue: '本节点输出产物的扩展名' }) },
+      },
+    ],
+  },
+  llm: {
+    // §6.7：OpenAI 兼容 LLM builtin（chat/completions 单一形状）。
+    // 规范 TOML 形状 = kind="builtin" + builtin="llm"；external_api 不进 palette。
+    kind: 'llm',
+    get label() { return t('components:pipeline.builtin.llm.label', { defaultValue: 'LLM（OpenAI 兼容）' }) },
+    get description() { return t('components:pipeline.builtin.llm.description', { defaultValue: '翻译 / 摘要 / 润色（chat/completions）' }) },
+    icon: Brain,
+    accent: 'bg-cat-llm/15 text-cat-llm',
+    inputs: [{ id: 'in', get label() { return t('components:pipeline.port.input') }, dataType: 'text' }],
+    outputs: [{ id: 'out', get label() { return t('components:pipeline.port.output') }, dataType: 'text' }],
+    params: [
+      {
+        name: 'base_url',
+        get label() { return t('components:pipeline.param.baseUrl', { defaultValue: '接口地址 (base_url)' }) },
+        type: 'string',
+        required: true,
+        placeholder: 'https://api.openai.com/v1',
+      },
+      {
+        name: 'model',
+        get label() { return t('components:pipeline.param.llmModel', { defaultValue: '模型名称 (model)' }) },
+        type: 'string',
+        required: true,
+        placeholder: 'gpt-4o-mini / qwen-plus',
+      },
+      {
+        // 存环境变量名而非明文密钥：执行时由后端读取环境变量，绝不收集/落盘密钥
+        name: 'api_key_env',
+        get label() { return t('components:pipeline.param.apiKeyEnv', { defaultValue: 'API Key 环境变量名' }) },
+        type: 'string',
+        placeholder: 'OPENAI_API_KEY',
+        get hint() { return t('components:pipeline.param.apiKeyEnv.hint', { defaultValue: '只填环境变量名，切勿填写密钥本身；执行时从环境读取，绝不收集或落盘明文密钥' }) },
+      },
+      {
+        name: 'system_prompt',
+        get label() { return t('components:pipeline.param.systemPrompt', { defaultValue: '系统提示词' }) },
+        type: 'textarea',
+        get placeholder() { return t('components:pipeline.param.systemPrompt.placeholder', { defaultValue: '把 {input} 翻译成中文（{input} 占位符引用上游输入）' }) },
+      },
+      {
+        name: 'temperature',
+        get label() { return t('components:pipeline.param.temperature', { defaultValue: '温度 (temperature)' }) },
+        type: 'number',
+        defaultValue: 0.7,
+        min: 0,
+        max: 2,
+        step: 0.1,
+        hint: '0 – 2',
+      },
+      {
+        name: 'max_tokens',
+        get label() { return t('components:pipeline.param.maxTokens') },
+        type: 'number',
+        defaultValue: 2048,
+        min: 1,
+        step: 1,
+        hint: '≥ 1',
+      },
+      {
+        name: 'output_format',
+        get label() { return t('components:pipeline.param.outputFormat', { defaultValue: '输出格式' }) },
+        type: 'select',
+        options: ['text', 'json'],
+        defaultValue: 'text',
+      },
     ],
   },
 }
@@ -223,158 +503,18 @@ export const BUILTIN_LIST: BuiltinDef[] = [
   BUILTIN_DEFS.file_input,
   BUILTIN_DEFS.file_output,
   BUILTIN_DEFS.ffmpeg,
+  BUILTIN_DEFS.llm,
 ]
 
 // ============================================================
-// 外部 API 节点
+// 外部 API 节点（遗留：§6.7 起由 llm builtin 取代，不进 palette、
+// 保存/执行均已拦截。参数全部不被后端读取，故置空 —— §6.1 决策）
 // ============================================================
 
-export const EXTERNAL_PARAMS: ParamSpec[] = [
-  { name: 'endpoint', get label() { return t('components:pipeline.param.endpoint') }, type: 'string', required: true, placeholder: 'https://api.example.com/v1/process' },
-  { name: 'method', get label() { return t('components:pipeline.param.method') }, type: 'select', options: ['GET', 'POST', 'PUT'], defaultValue: 'POST' },
-  { name: 'api_key', label: 'API Key', type: 'string', get placeholder() { return t('components:pipeline.param.apiKey.placeholder') } },
-  { name: 'timeout_secs', get label() { return t('components:pipeline.param.timeoutSecs') }, type: 'number', defaultValue: 60 },
-]
+export const EXTERNAL_PARAMS: ParamSpec[] = []
 
 // ============================================================
-// 模块能力（按分类推导输入输出与参数模式）
-// ============================================================
-
-export interface CapabilityDef {
-  id: string
-  label: string
-  inputs: Port[]
-  outputs: Port[]
-  params: ParamSpec[]
-}
-
-const DEVICE_PARAM: ParamSpec = {
-  name: 'device',
-  get label() { return t('components:pipeline.param.device') },
-  type: 'select',
-  options: ['auto', 'cuda', 'cpu'],
-  defaultValue: 'auto',
-}
-
-/** 工厂函数在渲染期调用，标签直接按当前语言解析 */
-export function moduleCapability(category: string): CapabilityDef {
-  const io = (input: DataType, output: DataType): Pick<CapabilityDef, 'inputs' | 'outputs'> => ({
-    inputs: [{ id: 'in', label: t('components:pipeline.port.input'), dataType: input }],
-    outputs: [{ id: 'out', label: t('components:pipeline.port.output'), dataType: output }],
-  })
-
-  switch (category.toLowerCase()) {
-    case 'asr':
-      return {
-        id: 'asr.transcribe',
-        label: t('components:pipeline.capability.asr'),
-        ...io('audio', 'text'),
-        params: [
-          { name: 'language', label: t('common:label.language'), type: 'select', options: ['zh', 'en', 'ja', 'yue'], defaultValue: 'zh' },
-          { name: 'model', label: t('common:label.model'), type: 'string', defaultValue: 'paraformer-v2', hint: t('components:pipeline.param.modelId.hint') },
-          DEVICE_PARAM,
-        ],
-      }
-    case 'tts':
-      return {
-        id: 'tts.synthesize',
-        label: t('components:pipeline.capability.tts'),
-        ...io('text', 'audio'),
-        params: [
-          { name: 'voice', label: t('components:pipeline.param.voice'), type: 'select', options: ['xiaoyun', 'xiaoxiao', 'alex'], defaultValue: 'xiaoyun' },
-          { name: 'speed', label: t('components:pipeline.param.speed'), type: 'number', defaultValue: 1.0, hint: '0.5 – 2.0' },
-          { name: 'format', label: t('components:pipeline.param.format'), type: 'select', options: ['wav', 'mp3', 'flac'], defaultValue: 'wav' },
-        ],
-      }
-    case 'denoise':
-      return {
-        id: 'denoise.enhance',
-        label: t('components:pipeline.capability.denoise'),
-        ...io('audio', 'audio'),
-        params: [
-          { name: 'strength', label: t('components:pipeline.param.strength'), type: 'number', defaultValue: 0.7, hint: '0 – 1' },
-          { name: 'model', label: t('common:label.model'), type: 'string', defaultValue: 'deepfilternet3' },
-        ],
-      }
-    case 'ocr':
-      return {
-        id: 'ocr.recognize',
-        label: t('components:pipeline.capability.ocr'),
-        ...io('image', 'text'),
-        params: [
-          { name: 'language', label: t('common:label.language'), type: 'select', options: ['zh', 'en', 'multi'], defaultValue: 'zh' },
-          { name: 'threshold', label: t('components:pipeline.param.threshold'), type: 'number', defaultValue: 0.5, hint: '0 – 1' },
-        ],
-      }
-    case 'image':
-      return {
-        id: 'image.process',
-        label: t('components:pipeline.capability.image'),
-        ...io('image', 'image'),
-        params: [
-          { name: 'operation', label: t('components:pipeline.param.operation'), type: 'select', options: ['resize', 'crop', 'rotate', 'watermark'], defaultValue: 'resize' },
-          { name: 'quality', label: t('components:pipeline.param.quality'), type: 'number', defaultValue: 90, hint: '1 – 100' },
-        ],
-      }
-    case 'video':
-      return {
-        id: 'video.transcode',
-        label: t('components:pipeline.capability.video'),
-        ...io('video', 'video'),
-        params: [
-          { name: 'codec', label: t('components:pipeline.param.codec'), type: 'select', options: ['libx264', 'libx265', 'copy'], defaultValue: 'libx264' },
-          { name: 'fps', label: t('components:pipeline.param.fps'), type: 'number', defaultValue: 30 },
-          { name: 'resolution', label: t('components:pipeline.param.resolution'), type: 'string', placeholder: t('components:pipeline.param.resolution.placeholder') },
-        ],
-      }
-    case 'audio':
-      return {
-        id: 'audio.convert',
-        label: t('components:pipeline.capability.audio'),
-        ...io('audio', 'audio'),
-        params: [
-          { name: 'sample_rate', label: t('components:pipeline.param.sampleRate'), type: 'select', options: ['8000', '16000', '44100', '48000'], defaultValue: '16000' },
-          { name: 'channels', label: t('components:pipeline.param.channels'), type: 'select', options: ['1', '2'], defaultValue: '1' },
-        ],
-      }
-    case 'translate':
-      return {
-        id: 'translate.translate',
-        label: t('components:pipeline.capability.translate'),
-        ...io('text', 'text'),
-        params: [
-          { name: 'source_lang', label: t('components:pipeline.param.sourceLang'), type: 'select', options: ['auto', 'zh', 'en', 'ja'], defaultValue: 'auto' },
-          { name: 'target_lang', label: t('components:pipeline.param.targetLang'), type: 'select', options: ['zh', 'en', 'ja'], defaultValue: 'en' },
-          { name: 'model', label: t('common:label.model'), type: 'string', defaultValue: 'nllb-200' },
-        ],
-      }
-    case 'llm':
-      return {
-        id: 'llm.generate',
-        label: t('components:pipeline.capability.llm'),
-        ...io('text', 'text'),
-        params: [
-          { name: 'model', label: t('common:label.model'), type: 'string', defaultValue: 'qwen2.5-7b-instruct' },
-          { name: 'temperature', label: 'Temperature', type: 'number', defaultValue: 0.7, hint: '0 – 2' },
-          { name: 'max_tokens', label: t('components:pipeline.param.maxTokens'), type: 'number', defaultValue: 2048 },
-        ],
-      }
-    default:
-      return {
-        id: 'other.process',
-        label: t('components:pipeline.capability.other'),
-        ...io('file', 'file'),
-        params: [
-          { name: 'input_path', label: t('components:pipeline.param.inputPath'), type: 'string', placeholder: '/workspace/input' },
-          { name: 'output_path', label: t('components:pipeline.param.outputPath'), type: 'string', placeholder: '/workspace/output' },
-          { name: 'extra_args', label: t('components:pipeline.param.extraArgs'), type: 'string', placeholder: '--flag value' },
-        ],
-      }
-  }
-}
-
-// ============================================================
-// 分类视觉（图标 + 强调色）
+// 分类视觉（图标 + 强调色；仅视觉用途，不再参与能力推导）
 // ============================================================
 
 const CATEGORY_ICONS: Record<string, LucideIcon> = {
@@ -425,9 +565,20 @@ export type ModuleNodeData = NodeDataBase & {
   kind: 'module'
   moduleId: string
   moduleVersion: string
+  /** 模块分类（仅视觉：图标/配色；能力不再由分类推导） */
   category: string
+  /**
+   * 模块能力声明（ModuleResponse.capabilities 数据驱动转换）。
+   * undefined/空 = B5 过渡期或无能力模块 → 卡片展示兜底空态（不崩）。
+   */
+  capabilities?: CapabilityDef[]
+  /** 当前选中能力裸名（§6.2 节点 capability 字段） */
   capabilityId: string
   capabilityLabel: string
+  /** 变体 pin（§6.2 节点 model 字段；空/undefined = 跟随激活变体，执行前校验） */
+  model?: string
+  /** 设备软约束（§6.2 节点 device 字段；空/'auto' = 自动分配；未知设备仅警告回退，不阻断） */
+  device?: string
 }
 
 export type BuiltinNodeData = NodeDataBase & {
@@ -451,8 +602,10 @@ export type PipelineFlowNode = ModuleFlowNode | BuiltinFlowNode | ExternalFlowNo
 export function getNodePorts(data: PipelineNodeData): { inputs: Port[]; outputs: Port[] } {
   switch (data.kind) {
     case 'module': {
-      const cap = moduleCapability(data.category)
-      return { inputs: cap.inputs, outputs: cap.outputs }
+      const cap = selectedCapability(data)
+      if (cap) return { inputs: cap.inputs, outputs: cap.outputs }
+      const fallback = moduleCapability(data.category)
+      return { inputs: fallback.inputs, outputs: fallback.outputs }
     }
     case 'builtin': {
       const def = BUILTIN_DEFS[data.builtin]
@@ -469,7 +622,8 @@ export function getNodePorts(data: PipelineNodeData): { inputs: Port[]; outputs:
 export function getParamSpecs(data: PipelineNodeData): ParamSpec[] {
   switch (data.kind) {
     case 'module':
-      return moduleCapability(data.category).params
+      // 数据驱动：按所选能力的 manifest params schema 渲染；无能力 → 空表
+      return selectedCapability(data)?.params ?? []
     case 'builtin':
       return BUILTIN_DEFS[data.builtin].params
     case 'external':
@@ -489,7 +643,7 @@ export function nodeKindLabel(data: PipelineNodeData): string {
 }
 
 // ============================================================
-// 拖拽载荷与管线序列化格式
+// 拖拽载荷与节点创建
 // ============================================================
 
 export const DRAG_MIME = 'application/reactflow'
@@ -500,6 +654,8 @@ export interface DragPayload {
   moduleName?: string
   moduleVersion?: string
   category?: string
+  /** 模块能力声明（ModuleResponse.capabilities 原样透传；B5 过渡期可缺失/为 null） */
+  capabilities?: CapabilityDecl[] | null
   builtin?: BuiltinKind
 }
 
@@ -525,24 +681,26 @@ function uid(prefix: string): string {
   return `${prefix}-${crypto.randomUUID().slice(0, 8)}`
 }
 
-/** 由拖拽载荷创建节点（含默认参数快照） */
+/** 由拖拽载荷创建节点（含默认参数快照；模块节点能力数据驱动） */
 export function createPipelineNode(
   payload: DragPayload,
   position: { x: number; y: number },
 ): PipelineFlowNode {
   if (payload.nodeType === 'module') {
     const category = payload.category ?? 'other'
-    const cap = moduleCapability(category)
+    const caps = capabilitiesFromModule(payload.capabilities)
+    const first = caps[0] ?? null
     const data: ModuleNodeData = {
       kind: 'module',
       label: payload.moduleName ?? payload.moduleId ?? t('components:pipeline.unnamedModule'),
       moduleId: payload.moduleId ?? 'unknown',
       moduleVersion: payload.moduleVersion ?? '0.1.0',
       category,
-      capabilityId: cap.id,
-      capabilityLabel: cap.label,
+      capabilities: caps,
+      capabilityId: first?.id ?? '',
+      capabilityLabel: first?.label ?? '',
       status: 'waiting',
-      params: defaultParams(cap.params),
+      params: first ? defaultParams(first.params) : {},
     }
     return { id: uid('module'), type: 'module', position, data }
   }
@@ -568,6 +726,358 @@ export function createPipelineNode(
     params: defaultParams(EXTERNAL_PARAMS),
   }
   return { id: uid('external'), type: 'external', position, data }
+}
+
+// ============================================================
+// §6.2 契约序列化辅助（C3 toSpec/fromSpec 消费）
+// ============================================================
+
+/**
+ * ffmpeg args 归一为数组（null 安全）。遗留字符串形状按空白拆词
+ * （与后端 B7 防御性拆分的语义一致；编辑态保真，不做 trim/过滤）。
+ */
+export function normalizeStringArrayParam(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.filter((v): v is string => typeof v === 'string')
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    return trimmed ? trimmed.split(/\s+/) : []
+  }
+  return []
+}
+
+/** ffmpeg args 写入 spec 前的序列化：恒数组，剔除空白条目（P0-2） */
+export function serializeArgsParam(value: unknown): string[] {
+  return normalizeStringArrayParam(value)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+}
+
+/**
+ * 模块节点 → §6.2 契约字段（toSpec 时展开进 PipelineNodeSpec）。
+ * capability 为裸名；model/device 仅在设置时写出（TOML 无 null，
+ * 后端 Option skip_serializing_if；device='auto' 等价缺省，不写）。
+ */
+export function moduleNodeSpecFields(data: ModuleNodeData): {
+  capability: string
+  model?: string
+  device?: string
+} {
+  const out: { capability: string; model?: string; device?: string } = {
+    capability: data.capabilityId,
+  }
+  const model = (data.model ?? '').trim()
+  if (model) out.model = model
+  const device = (data.device ?? '').trim()
+  if (device && device !== 'auto') out.device = device
+  return out
+}
+
+/** moduleNodeSpecFields 的逆操作（fromSpec 时恢复 ModuleNodeData 字段） */
+export function moduleNodeFieldsFromSpec(spec: {
+  capability?: string | null
+  model?: string | null
+  device?: string | null
+}): { capabilityId: string; model?: string; device?: string } {
+  const capabilityId = (spec.capability ?? '').trim()
+  const model = (spec.model ?? '').trim()
+  const device = (spec.device ?? '').trim()
+  return {
+    capabilityId,
+    ...(model ? { model } : {}),
+    ...(device ? { device } : {}),
+  }
+}
+
+// ============================================================
+// 参数字段渲染（ParamSpec 全类型；C3 NodeParamsPanel 可整体委托）
+// ============================================================
+
+export interface StringArrayFieldProps {
+  /** 当前值（数组；兼容遗留字符串形状，自动归一） */
+  value: ParamValue | undefined
+  onChange: (value: string[]) => void
+  /** 单条参数输入框占位提示 */
+  placeholder?: string
+}
+
+/** ffmpeg args 数组化编辑器（P0-2）：逐条增删改，值恒为 string[] */
+export function StringArrayField({ value, onChange, placeholder }: StringArrayFieldProps) {
+  const { t: tc } = useTranslation('components')
+  const items = normalizeStringArrayParam(value)
+  const updateAt = (index: number, next: string) => {
+    onChange(items.map((v, i) => (i === index ? next : v)))
+  }
+  const removeAt = (index: number) => {
+    onChange(items.filter((_, i) => i !== index))
+  }
+  return (
+    <div className="space-y-1.5">
+      {items.length === 0 && (
+        <p className="rounded-md border border-dashed border-border px-2.5 py-2 text-[11px] text-muted-foreground">
+          {tc('pipeline.param.args.empty', { defaultValue: '尚无参数，点击下方按钮逐条添加' })}
+        </p>
+      )}
+      {items.map((item, index) => (
+        <div key={index} className="flex items-center gap-1.5">
+          <Input
+            className="h-7 flex-1 font-mono text-xs"
+            value={item}
+            placeholder={placeholder}
+            onChange={(e) => updateAt(index, e.target.value)}
+          />
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            onClick={() => removeAt(index)}
+            aria-label={tc('pipeline.param.args.removeAria', { defaultValue: '删除该参数' })}
+            title={tc('pipeline.param.args.removeAria', { defaultValue: '删除该参数' })}
+          >
+            <Trash2 className="h-3 w-3" />
+          </Button>
+        </div>
+      ))}
+      <Button variant="outline" size="xs" onClick={() => onChange([...items, ''])}>
+        <Plus className="h-3 w-3" />
+        {tc('pipeline.param.args.add', { defaultValue: '添加参数' })}
+      </Button>
+    </div>
+  )
+}
+
+export interface ParamSpecFieldProps {
+  spec: ParamSpec
+  value: ParamValue | undefined
+  onChange: (value: ParamValue) => void
+}
+
+/**
+ * 通用参数字段渲染：string / textarea / number(min/max/step) / boolean /
+ * select / string_array 全类型覆盖（manifest schema 与 llm builtin 共用）。
+ */
+export function ParamSpecField({ spec, value, onChange }: ParamSpecFieldProps) {
+  const { t: tc } = useTranslation('components')
+  const numberValue = typeof value === 'number' && Number.isFinite(value) ? value : ''
+  const stringValue = typeof value === 'string' ? value : value === undefined ? '' : String(value)
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="text-xs font-medium">
+          {spec.label}
+          {spec.required && (
+            <span className="ml-0.5 text-status-error" aria-hidden>
+              *
+            </span>
+          )}
+        </span>
+        {spec.hint && <span className="text-[10px] text-muted-foreground">{spec.hint}</span>}
+      </div>
+      {spec.type === 'string' && (
+        <Input
+          className="h-8 font-mono text-xs"
+          value={stringValue}
+          placeholder={spec.placeholder}
+          onChange={(e) => onChange(e.target.value)}
+        />
+      )}
+      {spec.type === 'textarea' && (
+        <textarea
+          className="min-h-20 w-full resize-y rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs outline-none transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+          rows={4}
+          value={stringValue}
+          placeholder={spec.placeholder}
+          onChange={(e) => onChange(e.target.value)}
+        />
+      )}
+      {spec.type === 'number' && (
+        <Input
+          type="number"
+          step={spec.step ?? 'any'}
+          min={spec.min}
+          max={spec.max}
+          className="h-8 font-mono text-xs"
+          value={numberValue}
+          placeholder={spec.placeholder}
+          onChange={(e) => onChange(e.target.value === '' ? '' : Number(e.target.value))}
+        />
+      )}
+      {spec.type === 'boolean' && (
+        <div className="flex items-center justify-between rounded-md border border-border bg-muted/30 px-3 py-2">
+          <span className="text-xs text-muted-foreground">
+            {spec.placeholder ?? tc('pipeline:params.enable', { defaultValue: '启用' })}
+          </span>
+          <Switch checked={value === true} onCheckedChange={(checked) => onChange(checked)} />
+        </div>
+      )}
+      {spec.type === 'select' && (
+        <Select value={stringValue} onValueChange={(v) => onChange(v)}>
+          <SelectTrigger className="h-8 w-full text-xs">
+            <SelectValue placeholder={tc('pipeline:params.selectPlaceholder', { defaultValue: '请选择' })} />
+          </SelectTrigger>
+          <SelectContent>
+            {spec.options?.map((option) => (
+              <SelectItem key={option} value={option} className="text-xs">
+                {option}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      )}
+      {spec.type === 'string_array' && (
+        <StringArrayField value={value} onChange={onChange} placeholder={spec.placeholder} />
+      )}
+    </div>
+  )
+}
+
+// ============================================================
+// 模块节点：能力选择 + 变体 pin / 设备软约束编辑器
+// （C3 NodeParamsPanel 挂载；数据经 props 传入，本组件不自行拉取）
+// ============================================================
+
+export interface CapabilitySelectProps {
+  data: ModuleNodeData
+  /** 切换能力：调用方应同时按新能力的 params 重建默认参数 */
+  onChange: (capabilityId: string) => void
+}
+
+/** 模块节点能力选择（裸名列表来自 manifest）。无能力 → 兜底空态提示。 */
+export function CapabilitySelect({ data, onChange }: CapabilitySelectProps) {
+  const { t: tc } = useTranslation('components')
+  const caps = data.capabilities ?? []
+  if (caps.length === 0) {
+    return (
+      <p className="rounded-md border border-dashed border-border px-2.5 py-2 text-[11px] text-muted-foreground">
+        {tc('pipeline.module.noCapabilities', { defaultValue: '该模块未声明任何能力（manifest capabilities 缺失）' })}
+      </p>
+    )
+  }
+  if (caps.length === 1) {
+    const only = caps[0]!
+    return (
+      <div className="space-y-1.5">
+        <span className="text-xs font-medium">
+          {tc('pipeline.module.capabilityLabel', { defaultValue: '能力' })}
+        </span>
+        <p className="rounded-md border border-border bg-muted/30 px-3 py-2 font-mono text-xs">
+          {only.id}
+        </p>
+        {only.description && (
+          <p className="text-[10px] text-muted-foreground">{only.description}</p>
+        )}
+      </div>
+    )
+  }
+  const value = caps.some((c) => c.id === data.capabilityId) ? data.capabilityId : caps[0]!.id
+  return (
+    <div className="space-y-1.5">
+      <span className="text-xs font-medium">
+        {tc('pipeline.module.capabilityLabel', { defaultValue: '能力' })}
+      </span>
+      <Select value={value} onValueChange={onChange}>
+        <SelectTrigger className="h-8 w-full text-xs">
+          <SelectValue placeholder={tc('pipeline.module.pickCapability', { defaultValue: '选择能力' })} />
+        </SelectTrigger>
+        <SelectContent>
+          {caps.map((cap) => (
+            <SelectItem key={cap.id} value={cap.id} className="text-xs" title={cap.description}>
+              <span className="font-mono">{cap.id}</span>
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  )
+}
+
+/** 变体 pin 下拉中表示「跟随激活变体」的哨兵值（Radix Select 不接受空串 value） */
+export const VARIANT_FOLLOW_ACTIVE = '__follow_active__'
+
+export interface ModuleBindingEditorProps {
+  /** 当前 pin 的变体（§6.2 node.model；空 = 跟随激活变体） */
+  model?: string
+  /** 当前设备软约束（§6.2 node.device；空/'auto' = 自动分配） */
+  device?: string
+  /** 该模块的变体列表（model_id，来自 models API / use-models） */
+  variants: string[]
+  /** 本机设备列表（/api/devices，如 useDevices().devices ?? []） */
+  devices: DeviceResponse[]
+  onChange: (patch: { model?: string; device?: string }) => void
+}
+
+/**
+ * 模块节点执行绑定编辑器：变体 pin（缺省 = 跟随激活变体）+ device 软约束
+ * （auto + 本机设备列表）。未知设备仅警告提示，不阻断（§6.2 软约束语义）。
+ */
+export function ModuleBindingEditor({ model, device, variants, devices, onChange }: ModuleBindingEditorProps) {
+  const { t: tc } = useTranslation('components')
+  const modelValue = model && model.trim() ? model : VARIANT_FOLLOW_ACTIVE
+  const deviceValue = device && device.trim() ? device : 'auto'
+  const deviceIds = devices.map((d) => d.id)
+  const deviceKnown = deviceValue === 'auto' || deviceIds.includes(deviceValue)
+  // 未知设备仍列入选项（软约束：展示 + 警告，不回写清空）
+  const deviceOptions = deviceKnown ? deviceIds : [...deviceIds, deviceValue]
+
+  return (
+    <div className="space-y-3">
+      <div className="space-y-1.5">
+        <span className="text-xs font-medium">
+          {tc('pipeline.module.variantPin', { defaultValue: '变体 pin (model)' })}
+        </span>
+        <Select
+          value={modelValue}
+          onValueChange={(v) => onChange({ model: v === VARIANT_FOLLOW_ACTIVE ? '' : v })}
+        >
+          <SelectTrigger className="h-8 w-full text-xs">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={VARIANT_FOLLOW_ACTIVE} className="text-xs">
+              {tc('pipeline.module.variantFollowActive', { defaultValue: '跟随激活变体' })}
+            </SelectItem>
+            {variants.map((v) => (
+              <SelectItem key={v} value={v} className="text-xs">
+                <span className="font-mono">{v}</span>
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <p className="text-[10px] text-muted-foreground">
+          {tc('pipeline.module.variantPin.hint', { defaultValue: '缺省跟随激活变体；执行前校验 pin 与激活是否一致' })}
+        </p>
+      </div>
+
+      <div className="space-y-1.5">
+        <span className="text-xs font-medium">{t('components:pipeline.param.device')}</span>
+        <Select
+          value={deviceValue}
+          onValueChange={(v) => onChange({ device: v === 'auto' ? '' : v })}
+        >
+          <SelectTrigger className="h-8 w-full text-xs">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="auto" className="text-xs">
+              {tc('pipeline.module.deviceAuto', { defaultValue: 'auto（调度器自动分配）' })}
+            </SelectItem>
+            {deviceOptions.map((d) => (
+              <SelectItem key={d} value={d} className="text-xs">
+                <span className="font-mono">{d}</span>
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {!deviceKnown && (
+          <p className="text-[11px] text-status-starting">
+            {tc('pipeline.module.deviceUnknown', {
+              defaultValue: '本机未检测到该设备；执行时将警告并回退 auto（软约束，不阻断）',
+            })}
+          </p>
+        )}
+      </div>
+    </div>
+  )
 }
 
 // ============================================================
@@ -656,11 +1166,23 @@ function PortLabel({ port, side }: { port: Port; side: 'in' | 'out' }) {
   )
 }
 
-/** 模块节点：模块名 + 能力 + 分类，状态色边框 */
+/** 模块节点：模块名 + 数据驱动能力 + 变体/设备绑定徽标，状态色边框 */
 export function ModuleNode({ data, selected }: NodeProps<ModuleFlowNode>) {
-  const cap = moduleCapability(data.category)
+  const cap = selectedCapability(data)
+  const fallback = moduleCapability(data.category)
   const visual = categoryVisual(data.category)
   const Icon = visual.icon
+  const hasCapabilities = (data.capabilities ?? []).length > 0
+
+  const subtitle = cap
+    ? `${cap.label} · ${categoryLabel(data.category)}`
+    : hasCapabilities
+      ? t('components:pipeline.module.noCapabilitySelected', { defaultValue: '未选择能力' })
+      : t('components:pipeline.module.noCapabilities', { defaultValue: '未声明能力' })
+
+  const deviceChip = data.device && data.device !== 'auto' ? data.device : null
+  const bindingChips = [data.model || null, deviceChip].filter((v): v is string => !!v)
+
   return (
     <NodeCard status={data.status} selected={selected}>
       <div className="flex items-center gap-2 px-3 pb-2 pt-2.5">
@@ -674,32 +1196,48 @@ export function ModuleNode({ data, selected }: NodeProps<ModuleFlowNode>) {
         </span>
         <div className="min-w-0 flex-1">
           <p className="truncate text-[13px] font-semibold leading-tight">{data.label}</p>
-          <p className="truncate text-[10px] text-muted-foreground">
-            {cap.label} · {categoryLabel(data.category)}
+          <p
+            className={cn(
+              'truncate text-[10px]',
+              cap ? 'text-muted-foreground' : 'text-status-starting',
+            )}
+            title={subtitle}
+          >
+            {subtitle}
           </p>
         </div>
         <StatusDot status={data.status} />
       </div>
       <div className="truncate border-t border-border/70 px-3 py-1 font-mono text-[10px] text-muted-foreground">
         {data.moduleId}@{data.moduleVersion}
+        {bindingChips.length > 0 && (
+          <span className="ml-1.5 text-primary" title={bindingChips.join(' · ')}>
+            {bindingChips.join(' · ')}
+          </span>
+        )}
       </div>
-      <PortRow inputs={cap.inputs} outputs={cap.outputs} />
+      <PortRow
+        inputs={cap?.inputs ?? fallback.inputs}
+        outputs={cap?.outputs ?? fallback.outputs}
+      />
     </NodeCard>
   )
 }
 
-/** 内置节点：file_input / file_output / ffmpeg */
+/** 内置节点：file_input / file_output / ffmpeg / llm */
 export function BuiltinNode({ data, selected }: NodeProps<BuiltinFlowNode>) {
   const def = BUILTIN_DEFS[data.builtin]
   const Icon = def.icon
-  const preview =
-    data.builtin === 'ffmpeg'
-      ? typeof data.params.args === 'string' && data.params.args
-        ? data.params.args
-        : null
-      : typeof data.params.path === 'string' && data.params.path
-        ? data.params.path
-        : null
+  let preview: string | null = null
+  if (data.builtin === 'ffmpeg') {
+    // P0-2：args 数组形状（兼容遗留字符串）
+    const args = normalizeStringArrayParam(data.params.args)
+    preview = args.length > 0 ? args.join(' ') : null
+  } else if (data.builtin === 'llm') {
+    preview = typeof data.params.model === 'string' && data.params.model ? data.params.model : null
+  } else {
+    preview = typeof data.params.path === 'string' && data.params.path ? data.params.path : null
+  }
   return (
     <NodeCard status={data.status} selected={selected}>
       <div className="flex items-center gap-2 px-3 pb-2 pt-2.5">
@@ -736,7 +1274,7 @@ const METHOD_BADGES: Record<ExternalNodeData['method'], string> = {
   PUT: 'bg-http-put/15 text-http-put',
 }
 
-/** 外部 API 节点：展示接口地址与请求方法 */
+/** 外部 API 节点（遗留画布展示；§6.7 起已由 llm builtin 取代，不可新建） */
 export function ExternalApiNode({ data, selected }: NodeProps<ExternalFlowNode>) {
   const endpoint =
     typeof data.params.endpoint === 'string' && data.params.endpoint
