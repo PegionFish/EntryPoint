@@ -1341,6 +1341,7 @@ pub fn build_direct_pipeline(
                 to: ("output".to_string(), "input".to_string()),
             },
         ],
+        max_instances: None,
     }
 }
 
