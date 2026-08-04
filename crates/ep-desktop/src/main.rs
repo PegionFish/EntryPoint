@@ -537,6 +537,26 @@ async fn background_loop(
                         let report = ep_core::deps::DepReport::check_all(&root);
                         let _ = tx.send(AppMsg::DepReportRefreshed(report));
                     }
+                    // ── Wave S S2 骨架占位分支（注册点预登记；Wave 3 C4 填实现） ──
+                    Some(AppCmd::RefreshPacks) => {
+                        // TODO(C4): ep-pack 注册表查询（runtime/packs/*.json）→ AppMsg::PacksRefreshed
+                        tracing::debug!("RefreshPacks: skeleton stub, C4 implements");
+                    }
+                    Some(AppCmd::ImportPack { .. }) => {
+                        // TODO(C4): ep-pack 导入编排（§4.4：暂存/校验/落位/注册），
+                        // 进度经 AppMsg::PackImportProgress / PackImportFinished 上报
+                        tracing::debug!("ImportPack: skeleton stub, C4 implements");
+                    }
+                    Some(AppCmd::ExecuteSingle { .. }) => {
+                        // TODO(C4): ep-core 直连 submit_direct（§5.3 退化三节点 DAG），
+                        // 成功后发 AppMsg::DirectExecSubmitted(task_id)
+                        tracing::debug!("ExecuteSingle: skeleton stub, C4 implements");
+                    }
+                    Some(AppCmd::RefreshPipelineTasks { .. }) => {
+                        // TODO(C4): ep-core 任务注册表按 pipeline_id 查询（§6.8）
+                        // → AppMsg::PipelineTasksRefreshed
+                        tracing::debug!("RefreshPipelineTasks: skeleton stub, C4 implements");
+                    }
                     Some(AppCmd::Shutdown) => break,
                     None => break,
                 }
