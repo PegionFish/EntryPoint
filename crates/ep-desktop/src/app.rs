@@ -51,6 +51,24 @@ pub enum AppMsg {
     DepReportRefreshed(DepReport),
     /// 管线任务列表刷新
     TasksRefreshed(Vec<TaskSummary>),
+    /// 整合包列表刷新（Wave S S2 骨架注册；C4 实现生产侧：ep-pack 注册表查询）
+    PacksRefreshed(Vec<PackEntry>),
+    /// 整合包导入进度（§4.4；Wave S S2 骨架注册，C4 生产侧）。
+    /// percent 为 None 表示无法估算进度，UI 仅显示阶段文案
+    PackImportProgress {
+        pack_id: String,
+        stage: String,
+        percent: Option<f32>,
+    },
+    /// 整合包导入终态 (pack_id, success)（Wave S S2 骨架注册，C4 生产侧）
+    PackImportFinished { pack_id: String, success: bool },
+    /// 单模型直跑已提交（§5.3；Wave S S2 骨架注册，C4 生产侧），携带 task_id
+    DirectExecSubmitted(String),
+    /// 管线级任务列表刷新（§6.8；Wave S S2 骨架注册，C4 生产侧）
+    PipelineTasksRefreshed {
+        pipeline_id: String,
+        tasks: Vec<TaskSummary>,
+    },
 }
 
 // ─── Commands: UI → background ──────────────────────────────────────────────
@@ -84,6 +102,22 @@ pub enum AppCmd {
     RefreshModels,
     /// 刷新依赖检测
     RefreshDeps,
+    /// 刷新已安装整合包列表（Wave S S2 骨架注册；C4 实现：ep-pack 注册表查询）
+    RefreshPacks,
+    /// 从本地路径导入整合包（§4.4；Wave S S2 骨架注册，C4 实现导入编排）。
+    /// URL/上传来源走 daemon HTTP API；桌面端仅本地路径（C5 用 rfd 选文件）
+    ImportPack { path: std::path::PathBuf },
+    /// 单模型直跑（§5.3；Wave S S2 骨架注册，C4 实现：ep-core 直连 submit_direct）。
+    /// params 为表单产出的 (参数名, 原始字符串值) 序列，
+    /// 由 C4 按模块 manifest CapabilityDecl.params schema 强制类型化
+    ExecuteSingle {
+        module_id: String,
+        capability: String,
+        params: Vec<(String, String)>,
+        input_path: std::path::PathBuf,
+    },
+    /// 拉取指定管线的任务列表（§6.8；Wave S S2 骨架注册，C4 实现：ep-core 任务注册表查询）
+    RefreshPipelineTasks { pipeline_id: String },
 }
 
 // ─── UI-side module entry ───────────────────────────────────────────────────
@@ -149,6 +183,31 @@ impl ModuleEntry {
     }
 }
 
+// ─── UI-side pack entry（Wave S S2 骨架；生产/消费见 C4/C5）────────────────
+
+/// 已安装整合包的 UI 侧视图（字段对齐 §4.4 注册表 runtime/packs/<pack-id>.json）。
+/// C4 填充（AppMsg::PacksRefreshed），C5 整合包页消费。
+#[derive(Debug, Clone)]
+pub struct PackEntry {
+    /// 全局唯一 `<publisher>.<pack-name>`
+    pub id: String,
+    pub version: String,
+    pub name: String,
+    pub description: String,
+    pub tags: Vec<String>,
+    /// 安装时间（ISO-8601 字符串，仅展示用）
+    pub installed_at: Option<String>,
+}
+
+/// 单个整合包的导入进度 UI 状态（对照 DownloadUiState；C4/C5 消费）
+#[derive(Debug, Clone)]
+pub struct PackImportUiState {
+    /// 当前阶段描述（解包/checksum/模型落位/管线注册…）
+    pub stage: String,
+    /// 百分比 0.0~100.0；None = 无法估算进度（仅显示阶段文案）
+    pub percent: Option<f32>,
+}
+
 // ─── Page enum ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,19 +215,23 @@ pub enum Page {
     Dashboard,
     Modules,
     Models,
+    /// 整合包管理（Wave S S2 骨架注册；页面实现见 Wave 3 C5）
+    Packs,
     PipelineEditor,
     Tasks,
     Settings,
 }
 
-/// (页面, 图标, 标题文案的 i18n 键) — 文案渲染时按当前语言查表
-const NAV_ITEMS: &[(Page, &str, &str)] = &[
-    (Page::Dashboard, "📊", "desktopApp.nav.dashboard"),
-    (Page::Modules, "🧩", "desktopApp.nav.modules"),
-    (Page::Models, "📦", "desktopApp.nav.models"),
-    (Page::PipelineEditor, "🔗", "desktopApp.nav.pipeline"),
-    (Page::Tasks, "📋", "desktopApp.nav.tasks"),
-    (Page::Settings, "⚙", "desktopApp.nav.settings"),
+/// (页面, 图标, 标题文案的 i18n 键, 键缺失时的兜底文案) — 文案渲染时按当前语言查表；
+/// 兜底仅在 i18n 键尚未落盘（C8 之前）的过渡期生效
+const NAV_ITEMS: &[(Page, &str, &str, &str)] = &[
+    (Page::Dashboard, "📊", "desktopApp.nav.dashboard", "仪表盘"),
+    (Page::Modules, "🧩", "desktopApp.nav.modules", "模块"),
+    (Page::Models, "📦", "desktopApp.nav.models", "模型"),
+    (Page::Packs, "🎁", "desktopApp.nav.packs", "整合包"),
+    (Page::PipelineEditor, "🔗", "desktopApp.nav.pipeline", "管线"),
+    (Page::Tasks, "📋", "desktopApp.nav.tasks", "任务"),
+    (Page::Settings, "⚙", "desktopApp.nav.settings", "设置"),
 ];
 
 /// 侧栏导航行高
@@ -228,6 +291,12 @@ pub struct AppState {
     pub updates: HashMap<String, UpdateCheckResult>,
     /// 每个模型最近一次下载使用的来源（供"重新下载"复用原 source）
     pub download_sources: HashMap<String, Option<ModelSource>>,
+    /// 已安装整合包列表（Wave S S2 骨架槽位；C4 经 AppMsg::PacksRefreshed 填充）
+    pub packs: Vec<PackEntry>,
+    /// 进行中的整合包导入（pack_id → 进度；Wave S S2 骨架槽位，C4 填充）
+    pub pack_imports: HashMap<String, PackImportUiState>,
+    /// 管线级任务列表（§6.8；pipeline_id → tasks；Wave S S2 骨架槽位，C4 填充）
+    pub pipeline_tasks: HashMap<String, Vec<TaskSummary>>,
 }
 
 impl App {
@@ -253,6 +322,9 @@ impl App {
                 downloads: HashMap::new(),
                 updates: HashMap::new(),
                 download_sources: HashMap::new(),
+                packs: Vec::new(),
+                pack_imports: HashMap::new(),
+                pipeline_tasks: HashMap::new(),
             },
             selected_module: None,
             rx,
@@ -407,6 +479,37 @@ impl App {
                 AppMsg::TasksRefreshed(tasks) => {
                     self.state.tasks = tasks;
                 }
+                AppMsg::PacksRefreshed(packs) => {
+                    self.state.packs = packs;
+                }
+                AppMsg::PackImportProgress {
+                    pack_id,
+                    stage,
+                    percent,
+                } => {
+                    self.state
+                        .pack_imports
+                        .insert(pack_id, PackImportUiState { stage, percent });
+                }
+                AppMsg::PackImportFinished { pack_id, .. } => {
+                    // 骨架阶段不弹 Toast（文案 i18n 键待 C8 落盘，见 S2 键需求清单）；
+                    // 清理进度状态并请求刷新列表。C4 可在此补成功/失败提示
+                    self.state.pack_imports.remove(&pack_id);
+                    let _ = self.cmd_tx.send(AppCmd::RefreshPacks);
+                }
+                AppMsg::DirectExecSubmitted(task_id) => {
+                    // 骨架占位（C4 接线任务视图联动 / Toast，文案键待 C8）
+                    tracing::debug!(
+                        task_id = %task_id,
+                        "direct exec submitted (UI wiring pending, C4)"
+                    );
+                }
+                AppMsg::PipelineTasksRefreshed {
+                    pipeline_id,
+                    tasks,
+                } => {
+                    self.state.pipeline_tasks.insert(pipeline_id, tasks);
+                }
             }
         }
     }
@@ -513,9 +616,16 @@ impl eframe::App for App {
                 ui.add_space(4.0);
 
                 // 导航项（文案按当前语言查表）
-                for &(page, icon, label_key) in NAV_ITEMS {
+                for &(page, icon, label_key, fallback) in NAV_ITEMS {
                     let active = self.current_page == page;
-                    let label = tr(lang, label_key, &[]);
+                    let translated = tr(lang, label_key, &[]);
+                    // i18n 键缺失时 tr 原样返回键本身（ep-core 约定）：
+                    // 回退到兜底文案（键由 C8 落盘后自动失效）
+                    let label = if translated == label_key {
+                        fallback.to_string()
+                    } else {
+                        translated
+                    };
                     if nav_item(ui, &pal, compact, icon, &label, active).clicked() {
                         self.current_page = page;
                     }
@@ -588,6 +698,29 @@ impl eframe::App for App {
                     &mut self.state.download_sources,
                     &self.cmd_tx,
                 );
+            }
+            Page::Packs => {
+                // Wave S S2 骨架占位页：整合包管理页由 Wave 3 C5 实现
+                // （消费 AppState.packs / pack_imports，入口经 AppCmd::RefreshPacks /
+                // ImportPack / ExecuteSingle；见 app.rs 各变体注释）
+                let key = "desktopApp.nav.packs";
+                let translated = tr(lang, key, &[]);
+                let label = if translated == key {
+                    "整合包".to_string()
+                } else {
+                    translated
+                };
+                ui.vertical_centered(|ui| {
+                    ui.add_space(48.0);
+                    ui.label(egui::RichText::new("🎁").size(28.0));
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(label).size(16.0).color(pal.text_dim));
+                    ui.label(
+                        egui::RichText::new("TODO: Wave 3 / C5")
+                            .small()
+                            .color(pal.text_faint),
+                    );
+                });
             }
             Page::PipelineEditor => {
                 pages::pipeline_editor::show(ui, &self.state.config);

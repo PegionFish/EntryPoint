@@ -15,6 +15,7 @@ import ModuleDetailPage from '@/pages/module-detail'
 import { PipelinePage } from '@/pages/pipeline'
 import { TasksPage } from '@/pages/tasks'
 import { ModelsPage } from '@/pages/models'
+import { PacksPage } from '@/pages/packs'
 import { SettingsPage } from '@/pages/settings'
 import { NotFoundPage } from '@/pages/not-found'
 
@@ -53,6 +54,7 @@ export default function App() {
               <Route path="/pipeline" element={<PipelinePage />} />
               <Route path="/tasks" element={<TasksPage />} />
               <Route path="/models" element={<ModelsPage />} />
+              <Route path="/packs" element={<PacksPage />} />
               <Route path="/settings" element={<SettingsPage />} />
               <Route path="*" element={<NotFoundPage />} />
             </Routes>
