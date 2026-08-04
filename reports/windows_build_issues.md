@@ -53,3 +53,12 @@
 ```
 
 该路径只执行 release 编译 + 打包，不受上述问题影响。
+
+---
+
+## 环境限制 3（记录于整合包执行期间）：Linux target 交叉 check 被 openssl-sys 阻断
+
+- **现象**: 在 Windows 主机上 `cargo check --workspace --all-targets --target x86_64-unknown-linux-gnu` 失败于 `openssl-sys` build script。
+- **原因**: Linux target 下 reqwest 默认 native-tls → openssl-sys 需要系统 OpenSSL 头文件/库与交叉 C 工具链，Windows 主机两者皆无。
+- **结论**: workspace 级 Linux 交叉编译验证在本机不可行；双平台保障改为：①代理开发提示词内置 cfg 分支纪律（Unix-only/Windows-only API 必须 #[cfg] 守卫）；②新增依赖纪律（优先纯 Rust，避免引入新的 native 系统依赖）；③纯 Rust crate（如 ep-pack）可单独交叉 check；④最终 Linux 侧验证留待 Linux 环境。
+- **备选方案（未采用）**: reqwest 换 rustls 可解除 openssl 依赖，但涉及证书库语义变化（webpki-roots vs 系统 CA，影响企业镜像源/代理场景），属设计决策，本次不做。
