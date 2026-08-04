@@ -302,7 +302,8 @@ const UPLOAD_ABORTED = '__ep_upload_aborted__'
  * 以 XMLHttpRequest 上传模型文件，换取真实的上传进度事件
  * （fetch 无法获取上传进度；模型动辄数 GB，进度反馈是必需的）。
  *
- * 表单结构与 `api.uploadModel` 保持一致：model_id + files[] + paths[]。
+ * 表单结构与后端 `POST /api/models/{id}/upload` 契约一致：
+ * model_id + files[] + paths[]。
  */
 function uploadModelWithProgress(
   moduleId: string,

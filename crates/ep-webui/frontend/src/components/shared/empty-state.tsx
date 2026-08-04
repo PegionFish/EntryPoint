@@ -1,5 +1,5 @@
 import type { LucideIcon } from 'lucide-react'
-import { Database, GitBranch, ListTodo, Puzzle } from 'lucide-react'
+import { Puzzle } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import { Button } from '@/components/ui/button'
@@ -73,48 +73,6 @@ export function NoModulesState({ description, action, className }: EmptyStatePre
       icon={Puzzle}
       title={t('emptyState.noModules.title')}
       description={description ?? t('emptyState.noModules.description')}
-      action={action}
-      className={className}
-    />
-  )
-}
-
-/** 任务队列为空 */
-export function NoTasksState({ description, action, className }: EmptyStatePresetProps) {
-  const { t } = useTranslation('components')
-  return (
-    <EmptyState
-      icon={ListTodo}
-      title={t('emptyState.noTasks.title')}
-      description={description ?? t('emptyState.noTasks.description')}
-      action={action}
-      className={className}
-    />
-  )
-}
-
-/** 模型列表为空 */
-export function NoModelsState({ description, action, className }: EmptyStatePresetProps) {
-  const { t } = useTranslation('components')
-  return (
-    <EmptyState
-      icon={Database}
-      title={t('emptyState.noModels.title')}
-      description={description ?? t('emptyState.noModels.description')}
-      action={action}
-      className={className}
-    />
-  )
-}
-
-/** 管线列表为空 */
-export function NoPipelinesState({ description, action, className }: EmptyStatePresetProps) {
-  const { t } = useTranslation('components')
-  return (
-    <EmptyState
-      icon={GitBranch}
-      title={t('emptyState.noPipelines.title')}
-      description={description ?? t('emptyState.noPipelines.description')}
       action={action}
       className={className}
     />

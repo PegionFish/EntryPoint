@@ -2,16 +2,12 @@ import type {
   AppConfig,
   DepReport,
   DeviceResponse,
-  DirectExecRequest,
-  DirectExecResponse,
   ExecutePipelineRequest,
   ExecutePipelineResponse,
-  HealthResponse,
   ImportRequest,
   ImportResponse,
   ModelDetailResponse,
   ModelDownloadStatus,
-  ModelInfo,
   ModelListResponse,
   ModelSource,
   ModelTagsRequest,
@@ -52,9 +48,6 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  // Health
-  health: () => apiFetch<HealthResponse>('/health'),
-
   // Devices
   devices: () => apiFetch<DeviceResponse[]>('/devices'),
 
@@ -71,11 +64,6 @@ export const api = {
 
   // Config
   getConfig: () => apiFetch<AppConfig>('/config'),
-  putConfig: (cfg: AppConfig) =>
-    apiFetch<AppConfig>('/config', {
-      method: 'PUT',
-      body: JSON.stringify(cfg),
-    }),
 
   // Models
   models: () => apiFetch<ModelListResponse>('/models'),
@@ -139,28 +127,6 @@ export const api = {
       `/models/${moduleId}/${encodeURIComponent(modelId)}/variant`,
       { method: 'PUT', body: JSON.stringify(body) },
     ),
-
-  /**
-   * 上传本地模型文件（multipart/form-data）。
-   * 表单字段：model_id + 每个文件一条 'files'，并按序附 'paths' 记录相对路径。
-   */
-  uploadModel: (
-    moduleId: string,
-    modelId: string,
-    files: File[],
-    paths: string[],
-  ) => {
-    const form = new FormData()
-    form.append('model_id', modelId)
-    files.forEach((file, i) => {
-      form.append('files', file)
-      form.append('paths', paths[i] || file.webkitRelativePath || file.name)
-    })
-    return apiFetch<ModelInfo>(`/models/${moduleId}/upload`, {
-      method: 'POST',
-      body: form,
-    })
-  },
 
   // Tasks
   listTasks: () => apiFetch<TaskSummary[]>('/tasks'),
@@ -254,12 +220,8 @@ export const api = {
   packExportUrl: (id: string) => `/api/packs/${encodeURIComponent(id)}/export`,
 
   // 直跑（§5.3 / §8.1）
-  /** 单模型直跑（202；模块未运行时后端自动拉起并等健康） */
-  executeSingle: (body: DirectExecRequest) =>
-    apiFetch<DirectExecResponse>('/execute/single', {
-      method: 'POST',
-      body: JSON.stringify(body),
-    }),
+  // 提交走 hooks/use-direct-exec.ts 的 postExecuteSingle（需 AbortController
+  // 长超时语义，不复用 apiFetch）；此处仅保留输入文件上传。
 
   /** 上传输入文件到 workspace/uploads（浏览器端直跑输入；multipart 单文件） */
   uploadInput: (file: File) => {

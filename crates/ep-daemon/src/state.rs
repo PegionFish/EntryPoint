@@ -5,11 +5,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::Serialize;
-use tokio::sync::{broadcast, Mutex as TokioMutex, RwLock};
+use tokio::sync::{broadcast, RwLock};
 
 use ep_core::config::AppConfig;
 use ep_core::module::discovery::DiscoveredModule;
-use ep_core::pipeline::PipelineRunnerImpl;
 use ep_core::port::PortManager;
 use ep_core::process::ProcessManager;
 use ep_core::types::ComputeDevice;
@@ -18,7 +17,8 @@ use ep_core::types::ComputeDevice;
 
 /// A log line emitted by a running module service.
 ///
-/// 仅供旧端点 /ws/logs 使用（保持兼容，不删除）。新端点 /ws 统一使用 [`WsMessage`]。
+/// 旧端点 /ws/logs 直接转发；统一端点 /ws 由 `ws/all.rs` 映射为
+/// [`WsMessage::Log`] 后转发（两端共用本通道，保持兼容，不删除）。
 #[derive(Debug, Clone, Serialize)]
 pub struct LogMessage {
     pub module_id: String,
@@ -27,7 +27,8 @@ pub struct LogMessage {
 
 /// A progress event for a pipeline node execution.
 ///
-/// 仅供旧端点 /ws/progress 使用（保持兼容，不删除）。新端点 /ws 统一使用 [`WsMessage`]。
+/// 旧端点 /ws/progress 直接转发；统一端点 /ws 由 `ws/all.rs` 映射为
+/// [`WsMessage::Progress`] 后转发（两端共用本通道，保持兼容，不删除）。
 ///
 /// `task_id`（P2-7，Wave 2 B3）：并发任务的进度按 task_id 过滤，
 /// 修画布状态串染；旧消费者忽略该新增字段不受影响。
@@ -123,15 +124,10 @@ pub struct AppState {
     /// 生产者：模型下载（`ModelDownload`，B6）、整合包导入进度
     /// （`PackImport`，B2）。字段名保留历史名称，勿改名（多代理引用）。
     pub model_download_tx: broadcast::Sender<WsMessage>,
-    /// 管线执行器（Wave 2 骨架，真实初始化）。
-    /// 所有者：W2-B（任务/管线 API）。handler 通过 `state.runner.lock().await` 获取。
-    /// `#[allow(dead_code)]`：Wave 2 接管前 daemon 内暂无读取方，属预置骨架字段。
-    #[allow(dead_code)]
-    pub runner: Arc<TokioMutex<PipelineRunnerImpl>>,
     /// 进行中的模型下载表。键约定：`"{module_id}:{model_id}"`。
-    /// 所有者：W2-A（模型下载 API）。
-    /// `#[allow(dead_code)]`：同上，Wave 2 接管前的预置骨架字段。
-    #[allow(dead_code)]
+    ///
+    /// 生产消费方：`api/models.rs`（模型下载）与 `api/packs.rs`（整合包内
+    /// 模型下载，B2）；`GET /api/models/downloads` 直接读取本表。
     pub downloads: Arc<std::sync::Mutex<HashMap<String, DownloadEntry>>>,
 }
 
@@ -148,45 +144,8 @@ impl AppState {
         let (progress_tx, _) = broadcast::channel(256);
         let (model_download_tx, _) = broadcast::channel(64);
 
-        // 管线执行器：用 config 解析后的 workspace 目录真实初始化
-        // （main.rs 启动时已调用 resolve_paths，workspace_dir 为绝对路径；
-        //  resolve_workspace_dir 对相对路径同样安全）。
-        let workspace_dir = config.resolve_workspace_dir(&root);
-        let _ = std::fs::create_dir_all(&workspace_dir);
-        let mut runner = PipelineRunnerImpl::new(workspace_dir);
-
-        // 进度回调骨架接线：节点事件 → progress_tx。
-        // pipeline_id 暂为空占位（runner 回调签名只带 node_id），
-        // W2-B 实现执行/任务 API 时替换为真实管线上下文。
-        {
-            let tx = progress_tx.clone();
-            runner.on_node_start = Some(Arc::new(move |node_id| {
-                let _ = tx.send(ProgressMessage {
-                    pipeline_id: String::new(),
-                    task_id: String::new(),
-                    node_id: node_id.to_string(),
-                    status: "running".to_string(),
-                });
-            }));
-            let tx = progress_tx.clone();
-            runner.on_node_complete = Some(Arc::new(move |node_id, _artifact| {
-                let _ = tx.send(ProgressMessage {
-                    pipeline_id: String::new(),
-                    task_id: String::new(),
-                    node_id: node_id.to_string(),
-                    status: "completed".to_string(),
-                });
-            }));
-            let tx = progress_tx.clone();
-            runner.on_node_error = Some(Arc::new(move |node_id, err| {
-                let _ = tx.send(ProgressMessage {
-                    pipeline_id: String::new(),
-                    task_id: String::new(),
-                    node_id: node_id.to_string(),
-                    status: format!("error: {err}"),
-                });
-            }));
-        }
+        // 进度事件生产方在 execution.rs：每次执行自建独立 PipelineRunnerImpl，
+        // 节点回调携带真实 pipeline_id/task_id 发送到 progress_tx（P2-7）。
 
         // P1-8（仲裁 #12）：ProcessManager 注入共享 CUDA 库目录（Linux
         // LD_LIBRARY_PATH / Windows PATH 前置，平台分支在 process.rs 内部）
@@ -214,7 +173,6 @@ impl AppState {
             log_tx,
             progress_tx,
             model_download_tx,
-            runner: Arc::new(TokioMutex::new(runner)),
             downloads: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
