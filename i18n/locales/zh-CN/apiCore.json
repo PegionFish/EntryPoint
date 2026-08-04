@@ -9,5 +9,6 @@
   "module.startFailed": "启动模块失败：{{detail}}",
   "module.notRunning": "模块未在运行：{{id}}",
   "module.stopFailed": "停止模块失败：{{detail}}",
-  "config.saveFailed": "保存配置失败：{{detail}}"
+  "config.saveFailed": "保存配置失败：{{detail}}",
+  "config.invalidPatch": "配置补丁无效：{{detail}}"
 }

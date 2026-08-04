@@ -74,5 +74,8 @@
   "tip.comingSoon": "Coming soon",
   "tip.confirmDelete": "Delete? This action cannot be undone",
   "tip.confirmDeleteNamed": "Delete {{name}}? This action cannot be undone",
-  "tip.unsavedChanges": "You have unsaved changes"
+  "tip.unsavedChanges": "You have unsaved changes",
+  "status.queued": "Queued",
+  "label.name2": "Name:",
+  "label.description2": "Description:"
 }
