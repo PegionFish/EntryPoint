@@ -338,6 +338,37 @@ pub async fn submit_pipeline(
     Ok(task_id)
 }
 
+/// 提交单模型直跑（§5.3 / §8.1 `POST /api/execute/single`）。
+///
+/// 目标语义：校验模块 + capability（manifest CapabilityDecl）→ 模块未运行则
+/// 自动拉起并等健康（与 B4 的自动拉起公共件共用）→ 内部编译为退化三节点
+/// DAG（file_input → module → file_output）提交现有执行器，任务/产物/WS 全套复用。
+///
+/// **Wave S 骨架（S1 预注册）：签名冻结，实现由 Wave 2 B3 (ExecEngine) 填入**；
+/// API 接线（`POST /api/execute/single`）由 B4 在 `api/execute.rs` 经
+/// `crate::api::execute::execution::submit_direct` 完成。
+///
+/// 参数（与 §8.1 请求体字段一一对应）：
+/// - `module_id` / `capability`：直跑目标；
+/// - `params`：capability 参数对象（按 manifest schema 渲染提交）；
+/// - `input_path`：输入文件（本地路径，或浏览器上传暂存于 workspace/uploads 的路径）。
+///
+/// 返回任务 ID（与 [`submit_pipeline`] 同注册表）。
+#[allow(dead_code)] // Wave 2 B4 接线 API 前的骨架 stub，勿删
+pub async fn submit_direct(
+    state: &Arc<AppState>,
+    module_id: &str,
+    capability: &str,
+    params: Value,
+    input_path: PathBuf,
+) -> Result<String, SubmitError> {
+    let _ = (state, module_id, capability, params, input_path);
+    // 返回 TODO 错误而非 panic：接线前若被误调用仅映射为 500，不崩连接。
+    Err(SubmitError::Internal(
+        "submit_direct not implemented yet (Wave 2 B3: degenerate DAG compilation + module autostart)".to_string(),
+    ))
+}
+
 // ─── 后台执行（spawn_blocking 线程内） ───────────────────────────────────────
 
 /// 在独立 `PipelineRunnerImpl` 上同步执行管线并收尾。
