@@ -49,5 +49,11 @@
   "archiveUnsafePath": "压缩包包含非法路径条目（疑似 zip-slip）: {{entry}}",
   "archiveEntryPathInvalid": "条目路径无效: {{detail}}",
   "archiveUnsafeLink": "压缩包包含非法链接目标: {{entry}}",
-  "archiveExtractEntryFailed": "解压条目失败: {{detail}}"
+  "archiveExtractEntryFailed": "解压条目失败: {{detail}}",
+  "variantMismatch": "路径与请求体的模型 ID 不一致（路径：{{path_id}}，请求体：{{body_id}}）",
+  "inputUploadMissingFile": "multipart 缺少 'file' 文件字段",
+  "inputUploadPlaceFailed": "输入文件落盘失败: {{detail}}",
+  "tagsNoMeta": "模型没有下载元数据（.ep_meta.json），无法设置标签",
+  "tagsWriteFailed": "写入模型标签失败：{{detail}}",
+  "cancelNotActive": "该模型没有进行中的下载，无需取消"
 }
