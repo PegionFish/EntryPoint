@@ -1,0 +1,40 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# EntryPoint 全局依赖约束文件（pip constraints）— PACK_UNIFY_PLAN §3.1 依赖栈统一
+#
+# 【机制】
+# - EnvManager 对每个模块的依赖安装（uv pip install）追加 `-c <本文件>`，
+#   由 config/app.toml [python].constraints 指向（默认 config/constraints.txt）。
+# - 作用：把各模块 requirements.txt 的公共重依赖（torch 全家桶）强制解析到
+#   同一版本。多模块同版本 → 应用内 uv 缓存（UV_CACHE_DIR，默认
+#   runtime/.uv-cache）+ `--link-mode hardlink` 的跨 venv 硬链接去重生效：
+#   同一份 wheel 内容在磁盘上只占一份物理空间，各 venv 内是硬链接薄壳。
+# - Windows / Linux 共用本文件：constraints 只声明版本约束，CUDA 等具体
+#   wheel 由 uv 按当前平台与 Python 版本自动解析，无需分平台文件。
+#
+# 【停用 / 自定义】
+# - 停用：config/app.toml 将 [python].constraints 置空（constraints = ""）
+#   或直接删除本文件（文件不存在时安装与哈希均静默跳过）。
+# - 自定义：直接编辑本文件增删版本行即可（用户可编辑面，风险表已预留）。
+# - 注意：本文件字节计入每个模块的依赖哈希 .ep_deps_hash（P2-18）。
+#   任何修改/增删都会使各模块哈希失配 → 下次启动模块时自动一次性重装依赖，
+#   属预期行为（一次性迁移说明见 docs/DEPENDENCY_MIGRATION.md）。
+#
+# 【wheel 索引提示（不写入本文件）】
+# - pip/uv 的 constraints 文件只接受依赖约束行，--index-url /
+#   --extra-index-url 等索引选项不能写在这里。
+# - torch 的 CUDA 13.0 变体 wheel 索引：https://download.pytorch.org/whl/cu130
+#   索引来源由以下任一方式承担：
+#     a) 模块 requirements.txt 自带 --extra-index-url 行；
+#     b) uv 侧配置（UV_EXTRA_INDEX_URL 环境变量 / uv.toml / pip.conf）。
+#   平台默认 PyPI 索引提供的 torch 为 CPU/默认 CUDA 构建；需要特定 CUDA
+#   版本 wheel 时请通过上述途径补充索引。
+#
+# 【torch 全家桶】
+# 统一锁定同族版本（对齐 deep-filter venv 现行基线 torch 2.13.0+cu130，
+# PACK_UNIFY_PLAN §3.2 实测基准）。torch / torchvision / torchaudio 三者
+# 必须成族同版本升级，单独升其中一个会因 ABI 配对断裂导致解析失败或
+# 运行时错误；升级时三行一起改。
+# ─────────────────────────────────────────────────────────────────────────────
+torch==2.13.0
+torchvision==2.13.0
+torchaudio==2.13.0
