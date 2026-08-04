@@ -199,7 +199,7 @@ async fn background_loop(
                                     // （ROOT/MODULE_DIR/...），start_module 统一加 EP_ 前缀
                                     // 并注入 CUDA 库路径 + compute.env，不再传空 map
                                     let env_vars = ep_core::process::build_module_env(
-                                        &root, &module_id, &manifest, &device,
+                                        &root, &config, &module_id, &manifest, &device,
                                     );
 
                                     match process_manager

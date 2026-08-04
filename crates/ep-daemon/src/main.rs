@@ -106,7 +106,7 @@ async fn run_module_standalone(module_id: &str) -> anyhow::Result<()> {
     // Build environment variables (A2/P0-3 修复：公共构建函数产出裸占位符键
     // —— ROOT/MODULE_DIR/MODEL_DIR/WORKSPACE/MODULE_ID/MODEL_ID/LOG_LEVEL/DEVICE...
     // EP_ 前缀由 process.rs 统一加一次，{MODULE_DIR}/{venv_python} 占位符替换生效)
-    let env_vars = ep_core::process::build_module_env(&root, module_id, manifest, &device);
+    let env_vars = ep_core::process::build_module_env(&root, &cfg, module_id, manifest, &device);
 
     // Start the module（§3.1：注入共享 CUDA 库目录，平台分支在 process.rs 内部）
     let cuda_libs_dir =

@@ -664,24 +664,29 @@ fn node_kind_info(lang: &str, kind: &NodeKind) -> (String, String) {
             module_id,
             capability,
             model_id,
+            device,
         } => (
             tr(lang, "common.label.module", &[]),
             format!(
-                "{}::{}{}",
+                "{}::{}{}{}",
                 module_id,
                 capability,
                 model_id
                     .as_ref()
                     .map(|m| format!(" (model: {m})"))
+                    .unwrap_or_default(),
+                device
+                    .as_ref()
+                    .map(|d| format!(" [device: {d}]"))
                     .unwrap_or_default()
             ),
         ),
         NodeKind::Builtin { builtin } => {
             (tr(lang, "desktopApp.pipeline.kindBuiltin", &[]), builtin.clone())
         }
-        NodeKind::ExternalApi {
-            endpoint, api_type, ..
-        } => ("API".to_string(), format!("{api_type}: {endpoint}")),
+        NodeKind::ExternalApi { endpoint, .. } => {
+            ("API".to_string(), format!("llm: {endpoint}"))
+        }
     }
 }
 

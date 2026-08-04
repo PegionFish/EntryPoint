@@ -19,6 +19,21 @@
 | 11 | A6 字段扩展后 ep-daemon 字面量缺字段（规则 6 预期断裂） | **编排者门禁期机械补齐**：`api/upload.rs:385`(ModelMeta)、`api/models.rs:374/:927/:942`——补 `qualified_id: None, tags: vec![], pack_id: None` / `qualified_id: None, vram_estimate_mb: None` | A6→门禁 |
 | 12 | A2：daemon ProcessManager 补注入（state.rs） | **B2 负责**：`.with_cuda_libs_dir(process::resolve_cuda_libs_dir(&root, &cfg.compute.cuda_libs_dir))` 连同 `with_network_env(cfg.network)`（P1-8 单点） | A2→B2 |
 | 13 | A2：桌面端 ProcessManager 缺 with_network_env | **归 C4**（桌面端 main.rs 所有权），随 P0-4/调度器接线一并补 | A2→C4 |
+| 14 | B5 发现：ep-core `process::build_module_env` 残留 find(default)+硬编码 models 路径 | **编排者门禁期修复**（ep-core process.rs 本波无主；给 build_module_env 注入 config/激活变体参数，修 --run-module 与桌面路径的变体选择） | B5→门禁 |
+| 15 | B1 适配条目形状 vs S2 PackAdaptationEntry | **B2 API 层映射**：`ok = verdict != unsupported`、device 直传、note = i18n(packs:adaptDevice/adaptCpuFallback/adaptUnsupported) | B1→B2 |
+| 16 | B1 InstalledPack 缺 name/description | **B1 追加字段返工中**（编排者裁：注册表是唯一持久数据源，Option 字段向后兼容），B2 按字段存在编码、缺失回退 id | B1/B2 |
+| 17 | B1 重复导入语义 | **追认硬失败 PackAlreadyInstalled**（先卸载再导入，与"绝不合并"冻结规则自洽） | B1 |
+| 18 | B7：runner.rs 层 ffmpeg/任务级 wall-clock 超时+取消（P0-6）归属 | **归 B3**（与 task_registry/超时治理同源）；B7 节点级 HTTP 超时已就位，runner 用 tokio::time::timeout 包裹 execute_node；保留 ModuleCallError downcast | B7→B3 |
+| 19 | B7 越界 api/execute.rs 两处测试字面量机械补齐 | **追认**（仲裁 #11 同款） | B7 |
+| 20 | B7 schema 变更后 ep-desktop pipeline_editor.rs 预期断裂 | **编排者门禁期机械修复**：:663-679 `NodeKind::Module` 解构补 `device`（或 `..`）；:682-684 `NodeKind::ExternalApi` 去掉已删除的 `api_type`（详情文案改 "llm: {endpoint}"） | B7→门禁 |
+| 21 | B2 仲裁：reference 下载 meta 缺 pack_id | **B2 返工中**：packs.rs 内下载完成后补丁 meta（pack_id/qualified_id/tags），不动 ep-core | B2 |
+| 22 | B2 仲裁：build 圈选 qualified_id 仅包导入模型有值 | **接受现状**：tags 圈选为通用面（§4.5 tag 组装闭环）；下载/上传路径写 qualified_id 列后续改进项 | B2 |
+| 23 | B2 WS 通道选择 | **追认**：pack_import 走 model_download_tx（通用 WsMessage 通道），progress_tx 类型不符 | B2 |
+| 24 | B2 build 请求扩展字段 id/name/version/description | **追认**（可选，缺省自动生成身份）；C1 构建向导可直接使用 | B2→C1 |
+| 25 | B3/B4 autostart 双实现归一 | **门禁期处理**：B4 `api/autostart.rs` 为权威实现（含失败清理），B3 execution.rs 内同名实现改为委托调用（保留函数壳避免改调用点） | B3/B4→门禁 |
+| 26 | B3 越界机械改动（state.rs task_id/bind_persistence、ws/all.rs、execute.rs match 臂、Cargo.toml reqwest） | **追认**（均为编译必需最小改动；B2 合并 state.rs 时注意与 B3 两处共存） | B3 |
+| 27 | B3：dag validate 补漏（孤儿/重复边/端口类型）+ PipelineMeta.max_instances + bridge spec_to_toml 保留 max_instances | **B7 返工**（dag.rs/bridge 所有权）；B3 现走 TOML 原文扫描兜底，B7 落地后可切换 | B3→B7 |
+| 28 | B3 vram-budget 形状 `device_id`/`items[]`/`unassigned[]` vs S2 types.ts `device` | **B3 形状为契约**（已冗余输出兼容字段）；**C3 消费 device_id**，types.ts 由 C3 对齐 | B3→C3 |
 
 ## 待收集（各波代理报告中来）
 
