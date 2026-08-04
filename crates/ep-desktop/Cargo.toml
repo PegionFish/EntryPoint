@@ -10,6 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 ep-core.workspace = true
+# Wave 3 C4：整合包注册表读取 + 导入编排直调（§4.4 桌面侧）
+ep-pack.workspace = true
 eframe.workspace = true
 egui.workspace = true
 egui_extras.workspace = true
@@ -18,3 +20,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 rfd.workspace = true
+# Wave 3 C4：直跑参数类型化（serde_json::Value）+ 任务记录时间戳（TaskRecord）
+serde_json.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+# 测试构造 ModuleManifest fixture
+toml.workspace = true
