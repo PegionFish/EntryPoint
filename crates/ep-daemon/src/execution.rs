@@ -1,28 +1,62 @@
-//! 管线执行调度与任务注册表 — Wave 2 执行代理（W2-D）
+//! 管线执行调度与任务注册表 — Wave 2 B3 ExecEngine
 //!
-//! ## 并发方案（为什么不在 `state.runner` 上直接执行）
+//! ## 并发模型（§6.8：全局闸门 + 管线级闸门 + 排队可见性）
+//!
+//! 提交路径不再无限 spawn（修 P1-3），改为两级准入：
+//!
+//! 1. **提交即入队**：任务以 `queued` 状态写入注册表并进入 FIFO 队列；
+//!    若闸门有空位则在同一 await 内立即提升为 `running`（快路径无排队感）。
+//! 2. **全局闸门**：同时运行的任务数 ≤ `config.pipeline.max_parallel`。
+//! 3. **管线级闸门**：同一管线同时运行的任务数 ≤ 管线 TOML
+//!    `[pipeline] max_instances`（缺省跟随全局上限；GPU 重管线可锁 1 防显存打架）。
+//! 4. **公平 FIFO**：准入按入队顺序扫描，取第一个两级闸门均放行的任务
+//!    （避免单管线闸门满时阻塞其他管线任务的队头阻塞问题）。
+//! 5. **排队可见性**：`queued` 任务的队列位置（1 起）经注册表快照对外暴露
+//!    （`GET /api/pipelines/{id}/tasks` 等）。
+//!
+//! 每个任务终结（completed/failed/cancelled）后释放闸门并触发下一轮准入。
+//!
+//! ## 引擎执行（为什么不在 `state.runner` 上直接执行）
 //!
 //! 以 ep-core 现状为准：
-//! 1. 引擎唯一执行入口 [`ep_core::types::PipelineRunner::execute`] 是**同步阻塞**调用，
-//!    且要求 `&mut self` 覆盖整个执行期（可达数分钟）。`state.runner` 被
+//! 1. 引擎唯一执行入口 [`ep_core::types::PipelineRunner::execute`] 是**同步阻塞**
+//!    调用，且要求 `&mut self` 覆盖整个执行期（可达数分钟）。`state.runner` 被
 //!    `Arc<tokio::sync::Mutex<_>>` 保护，若执行期间持锁，`GET /api/tasks` 等查询
 //!    将被阻塞到执行结束——任务书明确禁止。
-//! 2. `PipelineRunnerImpl` 的任务存储 `tasks` 为**私有字段**，没有任何公开 API
-//!    可以把外部执行的任务注回；`get_task_detail` 也**不暴露节点产物**（Artifact），
-//!    而产物列表/下载接口必须拿到产物路径。
+//! 2. `PipelineRunnerImpl` 的任务存储 `tasks` 为**私有字段**，`get_task_detail`
+//!    也**不暴露节点产物**（Artifact），而产物列表/下载接口必须拿到产物路径。
 //!
-//! 因此本模块的实现是：
-//! - 每次提交创建一台**独立的** [`PipelineRunnerImpl`]（注册运行中模块端口 +
-//!   进度回调），放进 `tokio::task::spawn_blocking` 执行，全程不触碰 `state.runner`，
-//!   任务查询接口永不阻塞；引擎的同步 `execute` 在 blocking 线程上自建 tokio
-//!   运行时 block_on（blocking 线程无 Handle，走 `execute` 的非嵌套分支）。
-//! - 任务状态由进程级 [`TASK_REGISTRY`] 注册表维护：
-//!   * 提交时写入 running 记录（所有节点 pending）；
-//!   * 执行中由引擎 `on_node_*` 回调实时更新节点状态，并向 `state.progress_tx`
-//!     发送 `ProgressMessage`（`/ws` 聚合端点包装成 `{"type":"progress",...}` 推送）；
-//!   * 执行结束后以引擎自身的 `list_tasks`/`get_task_detail` 为权威校正终态
-//!     （补上回调不会触发的 skipped 节点），并把文件产物硬链接/复制到任务目录的
-//!     `files/{node_id}/` 下，供 `GET /api/tasks/:id/artifacts/:node_id` 流式下载。
+//! 因此每次执行创建一台**独立的** [`PipelineRunnerImpl`]（注册运行中模块端口 +
+//! 进度回调），放进 `tokio::task::spawn_blocking` 执行，全程不触碰 `state.runner`，
+//! 任务查询接口永不阻塞；引擎的同步 `execute` 在 blocking 线程上自建 tokio
+//! 运行时 block_on（blocking 线程无 Handle，走 `execute` 的非嵌套分支）。
+//!
+//! ## 任务注册表（P1-4：下沉 ep-core + 落盘持久化）
+//!
+//! 任务记录统一存于进程级 [`TaskRegistry`]（`ep_core::task_registry`，
+//! daemon/桌面共用）：
+//! - 持久化目录 `{root}/runtime/tasks/{task_id}.json`（原子写），
+//!   [`AppState::new`](crate::state::AppState::new) 启动时经 [`bind_persistence`]
+//!   绑定并回读，daemon 重启不丢索引（遗留 running/queued 加载时改判 failed）；
+//! - 节点回调实时更新内存记录（高频路径不落盘），终态收尾时统一持久化。
+//!
+//! ## 超时与取消（P0-6/P1-11 执行层部分）
+//!
+//! - **任务级超时**：`config.pipeline.default_timeout_secs` 的看门狗在任务
+//!   开始运行时启动，超时后任务被判 `failed`（错误注明超时）。
+//! - **取消**：[`request_cancel`]（`POST /api/tasks/{id}/cancel`）——排队中取消
+//!   立即终结且不执行；运行中取消立即判 `cancelled`（逻辑终态）。
+//! - **边界（诚实声明）**：引擎 `execute` 无法从外部中断（executor.rs 归
+//!   Wave 2 B7 所有），超时/取消后引擎线程仍在后台收尾，其后续状态写入因
+//!   记录已终态而被忽略；节点级 `timeout_secs` 的真正生效需要执行器支持
+//!   （已提仲裁请求 → B7：HTTP/子进程超时参数 + 层间取消检查点）。
+//!
+//! ## wait 同步模式 + callback_url（§6.5）
+//!
+//! - `wait: true`：提交后阻塞至终态，[`SubmitOutcome::record`] 直接携带
+//!   status + artifacts（内部超时上限取管线超时配置）；
+//! - `callback_url`：终态时 POST `{task_id, status, artifacts}`，best-effort
+//!   （失败仅 warn，不影响任务本身）。
 //!
 //! ## 模块声明
 //!
@@ -31,90 +65,180 @@
 //! **请勿在 main.rs 中追加 `mod execution;`** —— 同一文件被声明两次会把
 //! 静态注册表分裂成两份，执行与查询将互不可见。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
-use chrono::{DateTime, Utc};
-use serde_json::Value;
+use chrono::Utc;
+use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
-use ep_core::pipeline::dag::Pipeline;
+use ep_core::pipeline::dag::{NodeKind, Pipeline, PipelineNode, ValidationError};
 use ep_core::pipeline::runner::TaskDetail;
+use ep_core::pipeline::vram;
 use ep_core::pipeline::PipelineRunnerImpl;
-use ep_core::types::{Artifact, PipelineRunner};
+use ep_core::task_registry::TaskRegistry;
+use ep_core::types::{Artifact, PipelineRunner, ServiceStatus};
 
 use crate::state::{AppState, ProgressMessage};
 
-// ─── 任务注册表 ──────────────────────────────────────────────────────────────
+// 类型下沉 ep-core 后对既有消费方（tasks.rs / execute.rs）保持原路径可用
+pub use ep_core::task_registry::{NodeRecord, TaskRecord, TaskState};
 
-/// 任务整体状态（API 序列化为小写字符串）
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TaskState {
-    Running,
-    Completed,
-    Failed(String),
+// ─── 进程级状态：注册表 / 调度器 / 待执行载荷 / 运行时标志 ──────────────────
+
+static REGISTRY: OnceLock<Mutex<TaskRegistry>> = OnceLock::new();
+
+fn registry() -> &'static Mutex<TaskRegistry> {
+    REGISTRY.get_or_init(|| Mutex::new(TaskRegistry::new()))
 }
 
-impl TaskState {
-    /// 前端契约：小写状态字符串
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Running => "running",
-            Self::Completed => "completed",
-            Self::Failed(_) => "failed",
+/// 绑定任务注册表的落盘持久化目录（`{root}/runtime/tasks/`）。
+///
+/// 幂等（同目录重复绑定无操作）。生产路径由 [`crate::state::AppState::new`]
+/// 启动时调用；提交路径亦兜底调用（测试/桌面直连场景）。
+///
+/// 单进程单 root 语义：注册表**非空**（有在案任务）时拒绝切换目录——
+/// 生产环境 daemon 只有一个 root；测试环境多个 AppState 并发创建时，
+/// 防止后来者的 root 把在先任务的落盘点拐走（测试经
+/// `clear_registry_for_tests` 重置后即可重新绑定自己的目录）。
+pub fn bind_persistence(root: &Path) {
+    let dir = root.join("runtime").join("tasks");
+    let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+    if reg.persist_dir() == Some(dir.as_path()) {
+        return;
+    }
+    // 已绑定其他目录、或在案任务存在 → 拒绝漂移（见文档）。
+    // 重新绑定的唯一途径是 clear_registry_for_tests / reset_and_bind 的整体重置。
+    if reg.persist_dir().is_some() || !reg.is_empty() {
+        return;
+    }
+    match reg.enable_persistence(&dir) {
+        Ok(loaded) if loaded > 0 => {
+            info!(dir = %dir.display(), loaded, "task registry persistence bound, index restored");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!(dir = %dir.display(), error = %e, "failed to bind task registry persistence; tasks will be memory-only");
         }
     }
 }
 
-/// 单节点状态记录
+/// 调度器：FIFO 队列 + 两级闸门计数（§6.8）
+#[derive(Debug, Default)]
+struct Scheduler {
+    /// 等待闸门的任务（FIFO）
+    queue: VecDeque<QueuedEntry>,
+    /// 全局运行中任务数（≤ max_parallel）
+    running_count: usize,
+    /// 每管线运行中任务数（≤ 该管线 max_instances，缺省跟随全局）
+    running_by_pipeline: HashMap<String, usize>,
+    /// 每管线并发上限缓存（提交时从管线 TOML 解析刷新）
+    pipeline_limits: HashMap<String, Option<u32>>,
+}
+
 #[derive(Debug, Clone)]
-pub struct NodeRecord {
-    /// pending / running / completed / failed / skipped
-    pub state: String,
-    pub error: Option<String>,
+struct QueuedEntry {
+    task_id: String,
+    pipeline_id: String,
 }
 
-/// 一条管线任务记录（注册表值）
-#[derive(Debug, Clone)]
-pub struct TaskRecord {
-    /// 提交时生成的任务 ID（对外唯一标识）
-    pub id: String,
-    /// 管线 ID（= ProgressMessage.pipeline_id = API 输出中的 pipeline_name，
-    /// 与引擎 TaskSummary.pipeline_name 取值语义一致）
-    pub pipeline_id: String,
-    pub status: TaskState,
-    pub started_at: DateTime<Utc>,
-    pub finished_at: Option<DateTime<Utc>>,
-    /// 节点定义顺序（保证详情/产物输出顺序稳定）
-    pub node_order: Vec<String>,
-    pub nodes: HashMap<String, NodeRecord>,
-    /// node_id → 引擎输出的原始产物文件路径
-    pub artifacts: HashMap<String, PathBuf>,
-    /// node_id → 归集到任务目录 `files/{node_id}/` 下的产物路径（ServeDir 根内，可下载）
-    pub served_artifacts: HashMap<String, PathBuf>,
-    /// 任务工作目录（{workspace}/tasks/{task_id}）
-    pub work_dir: PathBuf,
+static SCHEDULER: OnceLock<Mutex<Scheduler>> = OnceLock::new();
+
+fn scheduler() -> &'static Mutex<Scheduler> {
+    SCHEDULER.get_or_init(|| Mutex::new(Scheduler::default()))
 }
 
-static TASK_REGISTRY: OnceLock<Mutex<HashMap<String, TaskRecord>>> = OnceLock::new();
-
-fn registry() -> &'static Mutex<HashMap<String, TaskRecord>> {
-    TASK_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+/// 已提交未执行任务的载荷（队列持有；执行启动时取出）
+struct PendingTask {
+    pipeline: Pipeline,
+    task_dir: PathBuf,
+    callback_url: Option<String>,
 }
 
-/// 所有任务快照（新任务在前），供 `GET /api/tasks` 使用
+static PENDING: OnceLock<Mutex<HashMap<String, PendingTask>>> = OnceLock::new();
+
+fn pending() -> &'static Mutex<HashMap<String, PendingTask>> {
+    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 运行中任务的协作标志与回调配置
+#[derive(Clone)]
+struct TaskExtras {
+    /// 取消请求标志（执行器层取消检查点预留，当前供后台收尾判重）
+    cancel: Arc<AtomicBool>,
+    /// 终结 CAS：超时看门狗 / 用户取消 / 引擎收尾三方竞争，唯一赢家
+    /// 写终态 + 释放闸门 + 触发回调
+    finalize_done: Arc<AtomicBool>,
+    callback_url: Option<String>,
+}
+
+static EXTRAS: OnceLock<Mutex<HashMap<String, TaskExtras>>> = OnceLock::new();
+
+fn extras() -> &'static Mutex<HashMap<String, TaskExtras>> {
+    EXTRAS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// ─── 快照查询（永不阻塞：注册表锁内全是短临界区） ───────────────────────────
+
+/// 所有任务快照（新任务在前；queued 任务带实时队列位置），供 `GET /api/tasks`
 pub fn snapshot_all() -> Vec<TaskRecord> {
-    let mut list: Vec<TaskRecord> = registry().lock().unwrap().values().cloned().collect();
-    list.sort_by(|a, b| b.started_at.cmp(&a.started_at).then_with(|| b.id.cmp(&a.id)));
+    let mut list = registry().lock().unwrap_or_else(|e| e.into_inner()).all();
+    annotate_queue_positions(&mut list);
     list
 }
 
-/// 单个任务快照，供 `GET /api/tasks/:id` 等使用
+/// 单个任务快照（queued 任务带实时队列位置），供 `GET /api/tasks/:id` 等
 pub fn snapshot(task_id: &str) -> Option<TaskRecord> {
-    registry().lock().unwrap().get(task_id).cloned()
+    let mut record = registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(task_id)?
+        .clone();
+    if record.status == TaskState::Queued {
+        record.queue_position = live_queue_position(task_id);
+    } else {
+        record.queue_position = None;
+    }
+    Some(record)
+}
+
+/// 按 pipeline_id 的任务快照（新任务在前），供 `GET /api/pipelines/{id}/tasks`
+pub fn snapshot_by_pipeline(pipeline_id: &str) -> Vec<TaskRecord> {
+    let mut list = registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .by_pipeline(pipeline_id);
+    annotate_queue_positions(&mut list);
+    list
+}
+
+fn live_queue_position(task_id: &str) -> Option<usize> {
+    scheduler()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .queue
+        .iter()
+        .position(|e| e.task_id == task_id)
+        .map(|p| p + 1)
+}
+
+fn annotate_queue_positions(list: &mut [TaskRecord]) {
+    let sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
+    for record in list.iter_mut() {
+        record.queue_position = if record.status == TaskState::Queued {
+            sched
+                .queue
+                .iter()
+                .position(|e| e.task_id == record.id)
+                .map(|p| p + 1)
+        } else {
+            None
+        };
+    }
 }
 
 /// 获取节点可下载产物路径（位于 ServeDir 根内）。
@@ -124,7 +248,7 @@ pub fn ensure_served_artifact(task_id: &str, node_id: &str) -> Option<PathBuf> {
     // 已有归集路径且文件仍在 → 直接返回
     let existing = registry()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(task_id)
         .and_then(|r| r.served_artifacts.get(node_id).cloned());
     if let Some(path) = existing {
@@ -135,7 +259,7 @@ pub fn ensure_served_artifact(task_id: &str, node_id: &str) -> Option<PathBuf> {
 
     // 惰性补归集（收尾阶段链接失败 / 产物后来才可用）
     let (src, task_dir) = {
-        let reg = registry().lock().unwrap();
+        let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
         let record = reg.get(task_id)?;
         (
             record.artifacts.get(node_id).cloned()?,
@@ -157,7 +281,7 @@ pub fn ensure_served_artifact(task_id: &str, node_id: &str) -> Option<PathBuf> {
     }
     registry()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get_mut(task_id)
         .map(|r| r.served_artifacts.insert(node_id.to_string(), dest.clone()));
     Some(dest)
@@ -177,6 +301,20 @@ pub enum SubmitError {
     InputsNotObject(String),
     /// 管线图中存在环 → 400（管线 id）
     CycleDetected(String),
+    /// DAG 校验失败（重复节点 id / 边引用缺失节点 / 缺 file_input 等，P2-11）→ 400
+    InvalidPipeline(String),
+    /// 直跑：模块不存在 → 404（module_id）
+    ModuleNotFound(String),
+    /// 直跑：capability 不在模块 manifest → 400（module_id, capability）
+    CapabilityNotFound(String, String),
+    /// 直跑：输入文件不存在 → 400（路径）
+    InputMissing(PathBuf),
+    /// 模块自动拉起失败（§6.5；含模型未就绪/端口分配失败/健康超时）→ 502。
+    /// `#[allow(dead_code)]`：运行期拉起失败当前计入任务错误
+    /// （start_task → TerminalCause::Engine）；本变体预留给提交期预检
+    /// （B4 接线 /api/execute/single 时可按需构造），保持映射面完整。
+    #[allow(dead_code)]
+    ModuleStartFailed(String),
     /// 内部错误（工作目录创建失败等）→ 500（英文技术细节）
     Internal(String),
 }
@@ -192,6 +330,19 @@ impl std::fmt::Display for SubmitError {
             }
             Self::CycleDetected(id) => {
                 write!(f, "pipeline `{id}` contains a cycle and cannot be executed")
+            }
+            Self::InvalidPipeline(detail) => {
+                write!(f, "pipeline failed DAG validation: {detail}")
+            }
+            Self::ModuleNotFound(id) => write!(f, "module not found: {id}"),
+            Self::CapabilityNotFound(module_id, capability) => {
+                write!(f, "module `{module_id}` has no capability `{capability}`")
+            }
+            Self::InputMissing(path) => {
+                write!(f, "input file does not exist: {}", path.display())
+            }
+            Self::ModuleStartFailed(detail) => {
+                write!(f, "failed to auto-start module: {detail}")
             }
             Self::Internal(msg) => f.write_str(msg),
         }
@@ -241,26 +392,75 @@ fn apply_inputs(
     Ok(())
 }
 
+// ─── 提交选项与结果（§6.5） ─────────────────────────────────────────────────
+
+/// 提交选项（§6.5 无人值守三件套之同步模式与完成回调）
+#[derive(Debug, Clone, Default)]
+pub struct SubmitOptions {
+    /// 同步模式：阻塞至终态，[`SubmitOutcome::record`] 携带 status + artifacts
+    pub wait: bool,
+    /// 完成回调：终态时 POST `{task_id, status, artifacts}`（best-effort）
+    pub callback_url: Option<String>,
+}
+
+/// 提交结果
+#[derive(Debug)]
+pub struct SubmitOutcome {
+    pub task_id: String,
+    /// wait=true 时为终态（或超时上限时刻的）任务快照；wait=false 时为 None。
+    /// `#[allow(dead_code)]`：由 B4 接线的 execute handler（§6.5 wait 响应
+    /// 组装）消费；本波测试经 execution 层直接验证。
+    #[allow(dead_code)]
+    pub record: Option<TaskRecord>,
+}
+
 // ─── 提交入口 ────────────────────────────────────────────────────────────────
 
 /// 提交管线执行（立即返回 task_id，执行在后台进行）。
 ///
-/// 流程：校验/合并 inputs → 解析任务工作目录 → 收集运行中模块端口 →
-/// 写入 running 记录 → spawn_blocking 中用独立 `PipelineRunnerImpl` 执行。
+/// **签名冻结**（Wave S 契约；execute.rs 依赖）。等价于
+/// `submit_pipeline_full(…, SubmitOptions::default())`。
 pub async fn submit_pipeline(
+    state: &Arc<AppState>,
+    pipeline: Pipeline,
+    inputs: Option<HashMap<String, Value>>,
+) -> Result<String, SubmitError> {
+    submit_pipeline_full(state, pipeline, inputs, SubmitOptions::default())
+        .await
+        .map(|outcome| outcome.task_id)
+}
+
+/// 提交管线执行（完整选项版，§6.5）。
+///
+/// 流程：校验/合并 inputs → DAG 校验（P2-11）→ 注册 `queued` 记录 →
+/// 入队 + 立即尝试准入 → wait 模式阻塞至终态。
+pub async fn submit_pipeline_full(
     state: &Arc<AppState>,
     mut pipeline: Pipeline,
     inputs: Option<HashMap<String, Value>>,
-) -> Result<String, SubmitError> {
+    options: SubmitOptions,
+) -> Result<SubmitOutcome, SubmitError> {
     if let Some(inputs) = inputs.as_ref() {
         apply_inputs(&mut pipeline, inputs)?;
     }
 
-    // 环检测：引擎执行前会做拓扑分层，有环的管线在此直接 400，
-    // 避免提交一个注定失败的任务
-    if pipeline.topological_layers().is_err() {
-        return Err(SubmitError::CycleDetected(pipeline.id.clone()));
+    // P2-11：提交前调用 dag validate（环 + 重复节点 + 孤儿边 + 缺 file_input）。
+    // validate 本体在 dag.rs（B7 所有），此处只消费；环单独映射为既有错误变体。
+    if let Err(errors) = pipeline.validate() {
+        return Err(if errors.iter().any(|e| matches!(e, ValidationError::CycleDetected)) {
+            SubmitError::CycleDetected(pipeline.id.clone())
+        } else {
+            let detail = errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
+            SubmitError::InvalidPipeline(detail)
+        });
     }
+
+    // 持久化兜底绑定（生产路径已在 AppState::new 绑定；此处覆盖测试/直连）
+    bind_persistence(&state.root);
 
     let workspace = state
         .config
@@ -276,19 +476,22 @@ pub async fn submit_pipeline(
         ))
     })?;
 
-    // 注册正在运行（Running/Starting）的模块端口
-    let module_ports: HashMap<String, u16> = {
-        let pm = state.process_manager.read().await;
-        pm.list_running()
-            .iter()
-            .filter_map(|inst| inst.port.map(|port| (inst.module_id.clone(), port)))
-            .collect()
-    };
+    let pipeline_id = pipeline.id.clone();
+    // §6.8：管线级并发上限（TOML `[pipeline] max_instances`，缺省跟随全局）
+    let max_instances = resolve_max_instances(&state.root, &pipeline_id);
 
-    // 写入初始记录：任务 running、所有节点 pending
-    {
-        let mut reg = registry().lock().unwrap();
-        let nodes = pipeline
+    // 注册初始记录：queued + 所有节点 pending
+    let record = TaskRecord {
+        id: task_id.clone(),
+        pipeline_id: pipeline_id.clone(),
+        status: TaskState::Queued,
+        error: None,
+        queue_position: None,
+        started_at: Utc::now(),
+        started_running_at: None,
+        finished_at: None,
+        node_order: pipeline.nodes.iter().map(|n| n.id.clone()).collect(),
+        nodes: pipeline
             .nodes
             .iter()
             .map(|n| {
@@ -300,61 +503,880 @@ pub async fn submit_pipeline(
                     },
                 )
             })
-            .collect();
-        reg.insert(
-            task_id.clone(),
-            TaskRecord {
-                id: task_id.clone(),
-                pipeline_id: pipeline.id.clone(),
-                status: TaskState::Running,
-                started_at: Utc::now(),
-                finished_at: None,
-                node_order: pipeline.nodes.iter().map(|n| n.id.clone()).collect(),
-                nodes,
-                artifacts: HashMap::new(),
-                served_artifacts: HashMap::new(),
-                work_dir: task_dir.clone(),
-            },
-        );
+            .collect(),
+        artifacts: HashMap::new(),
+        served_artifacts: HashMap::new(),
+        work_dir: task_dir.clone(),
+    };
+    registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(record)
+        .map_err(|e| SubmitError::Internal(format!("failed to persist task record: {e}")))?;
+
+    // 入队（FIFO）+ 载荷寄存
+    {
+        let mut sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
+        sched.pipeline_limits.insert(pipeline_id.clone(), max_instances);
+        sched.queue.push_back(QueuedEntry {
+            task_id: task_id.clone(),
+            pipeline_id: pipeline_id.clone(),
+        });
     }
+    pending().lock().unwrap_or_else(|e| e.into_inner()).insert(
+        task_id.clone(),
+        PendingTask {
+            pipeline,
+            task_dir,
+            callback_url: options.callback_url.clone(),
+        },
+    );
 
-    let progress_tx = state.progress_tx.clone();
-    let pipeline_ref = format!("{}/{}", pipeline.id, pipeline.name);
-    let task_id_bg = task_id.clone();
-    let task_id_watch = task_id.clone();
-    tokio::spawn(async move {
-        let joined = tokio::task::spawn_blocking(move || {
-            run_task(task_id_bg, task_dir, pipeline, module_ports, progress_tx)
+    // 立即尝试准入：闸门有空位时同一 await 内提升 running（快路径）
+    try_promote(state.clone()).await;
+
+    if options.wait {
+        let record = wait_until_terminal(state, &task_id).await;
+        Ok(SubmitOutcome {
+            task_id,
+            record: Some(record),
         })
-        .await;
-        if let Err(e) = joined {
-            // 执行线程 panic/被取消——注册表记录不能永远停在 running
-            warn!(task_id = %task_id_watch, error = %e, "pipeline execution thread exited abnormally");
-            finalize_aborted(&task_id_watch, &e.to_string());
-        }
-    });
-
-    info!(task_id = %task_id, pipeline = %pipeline_ref, "pipeline task submitted");
-    Ok(task_id)
+    } else {
+        Ok(SubmitOutcome {
+            task_id,
+            record: None,
+        })
+    }
 }
 
-/// 提交单模型直跑（§5.3 / §8.1 `POST /api/execute/single`）。
+/// §6.8：从 `config/pipelines/*.toml` 中按 `[pipeline].id` 匹配，读取
+/// `max_instances`（None = 缺省跟随全局）。
+fn resolve_max_instances(root: &Path, pipeline_id: &str) -> Option<u32> {
+    let dir = root.join("config").join("pipelines");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Ok(p) = Pipeline::from_toml_str(&text) {
+            if p.id == pipeline_id {
+                return vram::parse_max_instances(&text);
+            }
+        }
+    }
+    None
+}
+
+// ─── 准入调度（两级闸门 + 公平 FIFO） ───────────────────────────────────────
+
+/// 尝试把队列中的任务提升为 running：全局闸门 + 管线闸门均放行才准入。
 ///
-/// 目标语义：校验模块 + capability（manifest CapabilityDecl）→ 模块未运行则
-/// 自动拉起并等健康（与 B4 的自动拉起公共件共用）→ 内部编译为退化三节点
-/// DAG（file_input → module → file_output）提交现有执行器，任务/产物/WS 全套复用。
+/// 公平性：按 FIFO 顺序取**第一个**可准入的任务（跳过管线闸门已满的，
+/// 避免队头阻塞）；循环准入直到无可准入任务或全局闸门满。
+async fn try_promote(state: Arc<AppState>) {
+    let (max_parallel, timeout_secs) = {
+        let cfg = state.config.read().await;
+        (
+            (cfg.pipeline.max_parallel as usize).max(1),
+            cfg.pipeline.default_timeout_secs,
+        )
+    };
+
+    loop {
+        let admitted = {
+            let mut sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
+            if sched.running_count >= max_parallel {
+                break;
+            }
+            let pick = sched.queue.iter().position(|entry| {
+                let limit = sched
+                    .pipeline_limits
+                    .get(&entry.pipeline_id)
+                    .copied()
+                    .flatten()
+                    .map(|v| (v as usize).max(1))
+                    .unwrap_or(max_parallel);
+                let running = sched
+                    .running_by_pipeline
+                    .get(&entry.pipeline_id)
+                    .copied()
+                    .unwrap_or(0);
+                running < limit
+            });
+            match pick {
+                Some(idx) => {
+                    let entry = sched.queue.remove(idx).expect("idx just located");
+                    sched.running_count += 1;
+                    *sched
+                        .running_by_pipeline
+                        .entry(entry.pipeline_id.clone())
+                        .or_insert(0) += 1;
+                    Some(entry)
+                }
+                None => break,
+            }
+        };
+
+        let Some(entry) = admitted else { break };
+        start_task(state.clone(), entry.task_id, timeout_secs).await;
+    }
+}
+
+/// 启动已准入任务：extras 注册 → 模块自动拉起（§6.5/P1-2）→ running →
+/// 看门狗 → 引擎执行。
 ///
-/// **Wave S 骨架（S1 预注册）：签名冻结，实现由 Wave 2 B3 (ExecEngine) 填入**；
-/// API 接线（`POST /api/execute/single`）由 B4 在 `api/execute.rs` 经
-/// `crate::api::execute::execution::submit_direct` 完成。
+/// 竞态处理：extras（含终结 CAS）在任何 await 之前注册，排队→运行的窗口内
+/// 到达的取消经 [`request_cancel`] 走 extras 路径赢得 CAS；本函数在每个
+/// await 点之后检查 CAS，输家不启动引擎、不重复释放闸门。
 ///
-/// 参数（与 §8.1 请求体字段一一对应）：
-/// - `module_id` / `capability`：直跑目标；
-/// - `params`：capability 参数对象（按 manifest schema 渲染提交）；
-/// - `input_path`：输入文件（本地路径，或浏览器上传暂存于 workspace/uploads 的路径）。
+/// 返回类型为显式 boxed future：本函数与 finalize_task → try_promote →
+/// start_task 构成递归调用环，async fn 的不透明类型 Send 推断在该环上
+/// 不收敛（rustc 已知限制），以 `dyn Future + Send` 显式断言断开推断环。
+fn start_task(
+    state: Arc<AppState>,
+    task_id: String,
+    timeout_secs: u32,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+    // 注意：锁守卫必须先落地为 owned 值再进入 let-else，
+    // 否则守卫临时量存活到 else 分支的 await，future 将失去 Send
+    let task_opt = pending()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&task_id);
+    let Some(task) = task_opt else {
+        // 不应发生（队列与载荷同源）：释放闸门，任务判内部错误
+        warn!(task_id = %task_id, "admitted task lost its pending payload");
+        let pipeline_id = registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&task_id)
+            .map(|r| r.pipeline_id.clone())
+            .unwrap_or_default();
+        finalize_task(
+            &state,
+            &task_id,
+            &pipeline_id,
+            TerminalCause::Engine(Some("internal error: pending payload lost".to_string())),
+            None,
+            None,
+        )
+        .await;
+        return;
+    };
+
+    // 运行时标志 + 回调配置：先于任何 await 注册（消除排队→运行窗口的取消竞态）
+    let task_extras = TaskExtras {
+        cancel: Arc::new(AtomicBool::new(false)),
+        finalize_done: Arc::new(AtomicBool::new(false)),
+        callback_url: task.callback_url.clone(),
+    };
+    extras()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(task_id.clone(), task_extras.clone());
+
+    // §6.5 模块自动拉起（修 P1-2 两个消费面）：引用模块未运行 → 拉起并等健康。
+    // 失败计入任务错误（闸门随之释放，不阻塞后续任务）。
+    if let Err(e) = ensure_pipeline_modules(&state, &task.pipeline).await {
+        warn!(task_id = %task_id, error = %e, "module auto-start failed; task fails");
+        finalize_task(
+            &state,
+            &task_id,
+            &task.pipeline.id,
+            TerminalCause::Engine(Some(e.to_string())),
+            None,
+            task.callback_url.clone(),
+        )
+        .await;
+        return;
+    }
+    // 自动拉起期间被取消 → CAS 输家不执行引擎（闸门已由取消方释放）
+    if task_extras.finalize_done.load(Ordering::SeqCst) {
+        return;
+    }
+
+    // 自动拉起后收集运行中模块端口（含新启动的）
+    let module_ports = collect_module_ports(&state).await;
+
+    // queued → running（记录已终态则不覆盖）
+    {
+        let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(Err(e)) = reg.update(&task_id, |r| {
+            if r.status == TaskState::Queued {
+                r.status = TaskState::Running;
+                r.started_running_at = Some(Utc::now());
+            }
+            r.queue_position = None;
+        }) {
+            warn!(task_id = %task_id, error = %e, "failed to persist running transition");
+        }
+    }
+    // 状态回读：转换前被取消（CAS 已输）→ 不执行引擎，闸门已由取消方释放
+    {
+        let is_running = registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&task_id)
+            .map(|r| r.status == TaskState::Running)
+            .unwrap_or(false);
+        if !is_running {
+            extras()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&task_id);
+            return;
+        }
+    }
+
+    // 任务级超时看门狗（default_timeout_secs；0 = 停用）
+    if timeout_secs > 0 {
+        let state_w = state.clone();
+        let extras_w = task_extras.clone();
+        let task_id_w = task_id.clone();
+        let pipeline_id_w = task.pipeline.id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(timeout_secs as u64)).await;
+            let still_running = registry()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&task_id_w)
+                .map(|r| r.status == TaskState::Running)
+                .unwrap_or(false);
+            if !still_running {
+                return;
+            }
+            warn!(task_id = %task_id_w, timeout_secs, "task timed out; marking failed (engine thread may finish in background)");
+            extras_w.cancel.store(true, Ordering::SeqCst);
+            finalize_task(
+                &state_w,
+                &task_id_w,
+                &pipeline_id_w,
+                TerminalCause::Timeout(timeout_secs),
+                None,
+                extras_w.callback_url.clone(),
+            )
+            .await;
+        });
+    }
+
+    // 引擎执行（blocking 线程）
+    let state_bg = state.clone();
+    let extras_bg = task_extras.clone();
+    let pipeline_id = task.pipeline.id.clone();
+    // 节点级 wall-clock 超时缺省值（P0-6：任务级 default_timeout_secs 下沉为
+    // 节点默认超时，经 runner 包裹 execute_node；节点自身 timeout_secs 优先）
+    let default_node_timeout = if timeout_secs > 0 {
+        Some(Duration::from_secs(timeout_secs as u64))
+    } else {
+        None
+    };
+    tokio::spawn(async move {
+        let PendingTask {
+            pipeline, task_dir, ..
+        } = task;
+        let progress_tx = state_bg.progress_tx.clone();
+        let task_id_bg = task_id.clone();
+        let cancel_flag = extras_bg.cancel.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            run_task(
+                task_id_bg,
+                task_dir,
+                pipeline,
+                module_ports,
+                progress_tx,
+                cancel_flag,
+                default_node_timeout,
+            )
+        })
+        .await;
+
+        let (result, detail) = match joined {
+            Ok(pair) => pair,
+            Err(e) => {
+                // 执行线程 panic/被取消——注册表记录不能永远停在 running
+                warn!(task_id = %task_id, error = %e, "pipeline execution thread exited abnormally");
+                (
+                    Err(anyhow::anyhow!("execution thread exited abnormally: {e}")),
+                    None,
+                )
+            }
+        };
+
+        finalize_task(
+            &state_bg,
+            &task_id,
+            &pipeline_id,
+            TerminalCause::Engine(result.err().map(|e| e.to_string())),
+            detail.as_ref(),
+            extras_bg.callback_url.clone(),
+        )
+        .await;
+    });
+    })
+}
+
+// ─── 终结（唯一终态写入点：CAS 竞争 + 闸门释放 + 回调） ─────────────────────
+
+/// 终结原因
+enum TerminalCause {
+    /// 引擎自然收尾：None = 成功，Some = 失败原因
+    Engine(Option<String>),
+    /// 任务级超时（§6.5/P0-6）
+    Timeout(u32),
+    /// 用户取消（P1-11）
+    Cancelled,
+}
+
+/// 写入终态 + 释放闸门 + 触发完成回调。
 ///
-/// 返回任务 ID（与 [`submit_pipeline`] 同注册表）。
-#[allow(dead_code)] // Wave 2 B4 接线 API 前的骨架 stub，勿删
+/// 三方（引擎收尾 / 超时看门狗 / 用户取消）可能并发调用，`finalize_done`
+/// CAS 保证唯一赢家；输家直接返回（不重复释放闸门、不重复回调）。
+/// 返回实际写入的终态（输家返回 None）。
+async fn finalize_task(
+    state: &Arc<AppState>,
+    task_id: &str,
+    pipeline_id: &str,
+    cause: TerminalCause,
+    detail: Option<&TaskDetail>,
+    callback_url: Option<String>,
+) -> Option<TaskState> {
+    // CAS：唯一终结者
+    let won = {
+        let map = extras().lock().unwrap_or_else(|e| e.into_inner());
+        match map.get(task_id) {
+            Some(e) => !e.finalize_done.swap(true, Ordering::SeqCst),
+            // 无 extras（如排队中取消走 request_cancel 专用路径）也允许一次性终结
+            None => true,
+        }
+    };
+    if !won {
+        return None;
+    }
+
+    let terminal = match &cause {
+        TerminalCause::Engine(None) => TaskState::Completed,
+        TerminalCause::Engine(Some(_)) => TaskState::Failed,
+        TerminalCause::Timeout(_) => TaskState::Failed,
+        TerminalCause::Cancelled => TaskState::Cancelled,
+    };
+
+    // 写终态（含引擎 detail 校正节点状态 + 产物归集）。
+    // 记录缺失（测试清表 / 重启丢失）时 update 返回 None——闸门仍需照常释放。
+    {
+        let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(Err(e)) = reg.update(task_id, |record| {
+            if record.status.is_terminal() {
+                return; // 已被其他路径终结（如重启加载标记），不覆盖
+            }
+            if let Some(detail) = detail {
+                for node in &detail.nodes {
+                    record.nodes.insert(
+                        node.node_id.clone(),
+                        NodeRecord {
+                            state: node.state.clone(),
+                            error: node.error.clone(),
+                        },
+                    );
+                }
+            }
+            record.status = terminal;
+            record.error = match &cause {
+                TerminalCause::Engine(Some(msg)) => Some(msg.clone()),
+                TerminalCause::Timeout(secs) => Some(format!(
+                    "task timed out after {secs}s (cancelled by watchdog)"
+                )),
+                _ => None,
+            };
+            record.finished_at = Some(Utc::now());
+            record.queue_position = None;
+
+            // 产物归集：硬链接（跨文件系统退化为复制）到 files/{node_id}/，
+            // 使产物都落在 ServeDir 根内可下载
+            if matches!(cause, TerminalCause::Engine(_)) {
+                let task_dir = record.work_dir.clone();
+                let artifacts = record.artifacts.clone();
+                for (node_id, src) in artifacts {
+                    if !src.is_file() {
+                        continue;
+                    }
+                    let Some(name) = src.file_name() else {
+                        continue;
+                    };
+                    let dest_dir = task_dir.join("files").join(&node_id);
+                    if std::fs::create_dir_all(&dest_dir).is_err() {
+                        continue;
+                    }
+                    let dest = dest_dir.join(name);
+                    if dest.exists()
+                        || std::fs::hard_link(&src, &dest).is_ok()
+                        || std::fs::copy(&src, &dest).is_ok()
+                    {
+                        record.served_artifacts.insert(node_id.clone(), dest);
+                    } else {
+                        warn!(task_id, node_id = %node_id, "artifact collection failed; node artifact will not be downloadable");
+                    }
+                }
+            }
+        }) {
+            warn!(task_id, error = %e, "failed to persist terminal task state");
+        }
+    }
+
+    // 清理运行时标志
+    extras()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(task_id);
+
+    // 释放闸门并触发下一轮准入
+    {
+        let mut sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
+        sched.running_count = sched.running_count.saturating_sub(1);
+        if let Some(n) = sched.running_by_pipeline.get_mut(pipeline_id) {
+            *n = n.saturating_sub(1);
+        }
+    }
+    try_promote(state.clone()).await;
+
+    // 完成回调（§6.5，best-effort）
+    if let Some(url) = callback_url {
+        fire_callback(task_id, &url);
+    }
+
+    match terminal {
+        TaskState::Completed => info!(task_id, "pipeline task finished"),
+        TaskState::Cancelled => info!(task_id, "pipeline task cancelled"),
+        TaskState::Failed => {
+            let error = snapshot(task_id).and_then(|r| r.error).unwrap_or_default();
+            warn!(task_id, error = %error, "pipeline task failed");
+        }
+        _ => {}
+    }
+    Some(terminal)
+}
+
+// ─── 取消（P1-11：TaskStatus::Cancelled 产生路径） ──────────────────────────
+
+/// 取消结果
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// 已取消（排队中 = 不再执行；运行中 = 逻辑终态）
+    Cancelled,
+    /// 任务已是终态，无法取消（附带终态）
+    AlreadyTerminal(TaskState),
+    /// 任务不存在
+    NotFound,
+}
+
+/// 请求取消任务（`POST /api/tasks/{id}/cancel`）。
+///
+/// - 排队中：移出队列，立即 `cancelled`，引擎从不启动；
+/// - 运行中：立即 `cancelled`（逻辑终态；引擎线程无外部中断点，
+///   后台收尾时的状态写入因记录已终态而被忽略，见模块文档）。
+pub async fn request_cancel(state: &Arc<AppState>, task_id: &str) -> CancelOutcome {
+    // 1) 排队中 → 出队 + 终态（不占闸门，无需 finalize CAS）
+    let was_queued = {
+        let mut sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
+        match sched.queue.iter().position(|e| e.task_id == task_id) {
+            Some(pos) => {
+                sched.queue.remove(pos);
+                true
+            }
+            None => false,
+        }
+    };
+    if was_queued {
+        let callback_url = pending()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(task_id)
+            .and_then(|t| t.callback_url);
+        let persisted = {
+            let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+            reg.update(task_id, |r| {
+                if !r.status.is_terminal() {
+                    r.status = TaskState::Cancelled;
+                    r.finished_at = Some(Utc::now());
+                }
+                r.queue_position = None;
+            })
+        };
+        match persisted {
+            Some(Ok(())) => {}
+            Some(Err(e)) => warn!(task_id, error = %e, "failed to persist cancelled state"),
+            None => return CancelOutcome::NotFound,
+        }
+        info!(task_id, "queued task cancelled");
+        if let Some(url) = callback_url {
+            fire_callback(task_id, &url);
+        }
+        return CancelOutcome::Cancelled;
+    }
+
+    // 2) 运行中 → 协作取消 + CAS 终结
+    let task_extras = extras()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(task_id)
+        .cloned();
+    let Some(task_extras) = task_extras else {
+        return match registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(task_id)
+        {
+            None => CancelOutcome::NotFound,
+            Some(r) if r.status.is_terminal() => CancelOutcome::AlreadyTerminal(r.status),
+            // 有记录但无 extras（重启加载的残留记录已是终态，上方已覆盖；
+            // 防御性兜底按未找到处理）
+            Some(_) => CancelOutcome::NotFound,
+        };
+    };
+
+    task_extras.cancel.store(true, Ordering::SeqCst);
+    let pipeline_id = registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(task_id)
+        .map(|r| r.pipeline_id.clone());
+    let Some(pipeline_id) = pipeline_id else {
+        return CancelOutcome::NotFound;
+    };
+
+    match finalize_task(
+        state,
+        task_id,
+        &pipeline_id,
+        TerminalCause::Cancelled,
+        None,
+        task_extras.callback_url.clone(),
+    )
+    .await
+    {
+        Some(terminal) => {
+            if terminal == TaskState::Cancelled {
+                CancelOutcome::Cancelled
+            } else {
+                CancelOutcome::AlreadyTerminal(terminal)
+            }
+        }
+        // CAS 输给超时看门狗等 → 以记录实际终态为准
+        None => match snapshot(task_id) {
+            Some(r) if r.status.is_terminal() => CancelOutcome::AlreadyTerminal(r.status),
+            Some(_) => CancelOutcome::NotFound,
+            None => CancelOutcome::NotFound,
+        },
+    }
+}
+
+// ─── wait 同步模式（§6.5） ───────────────────────────────────────────────────
+
+/// 阻塞至任务终态（内部超时上限 = 管线超时配置 + 看门狗落位缓冲）。
+///
+/// 超时上限到达仍未终态时返回当前快照（看门狗正常情况会在上限前落终态；
+/// `default_timeout_secs = 0` 表示停用看门狗，此时无上限、阻塞至终态）。
+async fn wait_until_terminal(state: &Arc<AppState>, task_id: &str) -> TaskRecord {
+    let timeout_secs = state.config.read().await.pipeline.default_timeout_secs;
+    let deadline = if timeout_secs > 0 {
+        Some(std::time::Instant::now() + Duration::from_secs(timeout_secs as u64 + 30))
+    } else {
+        None
+    };
+    loop {
+        if let Some(record) = snapshot(task_id) {
+            if record.status.is_terminal() {
+                return record;
+            }
+        }
+        if let Some(dl) = deadline {
+            if std::time::Instant::now() >= dl {
+                // 看门狗应已落终态；兜底返回当前快照（status 仍为运行态）
+                warn!(task_id, "wait mode reached timeout upper bound before terminal state");
+                return snapshot(task_id).unwrap_or_else(|| TaskRecord {
+                    id: task_id.to_string(),
+                    pipeline_id: String::new(),
+                    status: TaskState::Running,
+                    error: None,
+                    queue_position: None,
+                    started_at: Utc::now(),
+                    started_running_at: None,
+                    finished_at: None,
+                    node_order: Vec::new(),
+                    nodes: HashMap::new(),
+                    artifacts: HashMap::new(),
+                    served_artifacts: HashMap::new(),
+                    work_dir: PathBuf::new(),
+                });
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+// ─── 完成回调（§6.5，best-effort） ──────────────────────────────────────────
+
+/// 终态时 POST `{task_id, status, artifacts}` 到 callback_url；失败仅 warn。
+fn fire_callback(task_id: &str, url: &str) {
+    let Some(record) = registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(task_id)
+        .cloned()
+    else {
+        return;
+    };
+    let artifacts: Vec<Value> = record
+        .node_order
+        .iter()
+        .filter_map(|node_id| {
+            let path = record.artifacts.get(node_id)?;
+            let meta = std::fs::metadata(path).ok()?;
+            Some(json!({
+                "node_id": node_id,
+                "name": path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                "size": meta.len(),
+            }))
+        })
+        .collect();
+    let body = json!({
+        "task_id": task_id,
+        "status": record.status.as_str(),
+        "artifacts": artifacts,
+    });
+    let url = url.to_string();
+    let task_id = task_id.to_string();
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        match client
+            .post(&url)
+            .json(&body)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                info!(task_id = %task_id, url = %url, "completion callback delivered");
+            }
+            Ok(resp) => {
+                warn!(task_id = %task_id, url = %url, status = %resp.status(), "completion callback rejected by endpoint (best-effort)");
+            }
+            Err(e) => {
+                warn!(task_id = %task_id, url = %url, error = %e, "completion callback failed (best-effort)");
+            }
+        }
+    });
+}
+
+// ─── 模块自动拉起（§6.5 公共件；接口契约供 B4 autostart.rs 对齐） ───────────
+
+/// 确保管线引用的全部 module 节点都在运行（未运行则拉起并等健康）。
+///
+/// §6.5「execute/single 提交时，引用模块未运行 → 自动启动并等健康
+/// （超时计入任务错误）」——在闸门准入后、引擎执行前执行，修 P1-2
+/// （管线侧 + 直跑侧两个消费面）。
+async fn ensure_pipeline_modules(state: &Arc<AppState>, pipeline: &Pipeline) -> anyhow::Result<()> {
+    let mut module_ids: Vec<&str> = Vec::new();
+    for node in &pipeline.nodes {
+        if let NodeKind::Module { module_id, .. } = &node.kind {
+            if !module_ids.contains(&module_id.as_str()) {
+                module_ids.push(module_id.as_str());
+            }
+        }
+    }
+    for module_id in module_ids {
+        ensure_module_running(state, module_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("module `{module_id}`: {e}"))?;
+    }
+    Ok(())
+}
+
+/// 确保模块运行中：已运行直接返回；未运行则启动并等待健康检查通过。
+///
+/// **Wave 2 接口契约（B3/B4 互写）**：`ensure_module_running(state, module_id)
+/// -> Result<()>`。本实现位于 execution.rs；B4 的 `api/autostart.rs` 公共件
+/// 按同签名提供（合并期二选一，建议保留本实现并由 autostart.rs 转发，
+/// 因 execute/single 两路提交均经此进入执行层）。
+pub async fn ensure_module_running(state: &Arc<AppState>, module_id: &str) -> anyhow::Result<()> {
+    // 已运行 → 直接返回；启动中/准备中 → 仅等健康
+    let current = state
+        .process_manager
+        .read()
+        .await
+        .get_status(module_id)
+        .cloned();
+    match current {
+        Some(ServiceStatus::Running) => return Ok(()),
+        Some(ServiceStatus::Starting) | Some(ServiceStatus::Preparing) => {
+            return wait_module_healthy(state, module_id).await;
+        }
+        _ => {}
+    }
+
+    // 模块 + manifest
+    let (manifest, ready_timeout_secs) = {
+        let modules = state.modules.read().await;
+        let module = modules
+            .iter()
+            .find(|m| {
+                m.manifest
+                    .as_ref()
+                    .map(|mf| mf.module.id == module_id)
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| anyhow::anyhow!("module not found: {module_id}"))?;
+        let manifest = module
+            .manifest
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("module `{module_id}` has an invalid manifest"))?;
+        (
+            manifest.clone(),
+            manifest.interface.ready_timeout_secs.unwrap_or(30),
+        )
+    };
+
+    // 模型前置检查（§5.2：active_models 优先，回退 default/首个变体）
+    if !manifest.models.is_empty() {
+        let active_variant = state
+            .config
+            .read()
+            .await
+            .active_models
+            .get(module_id)
+            .cloned();
+        let chosen = active_variant
+            .as_deref()
+            .filter(|id| manifest.models.iter().any(|m| m.id == *id))
+            .map(str::to_string)
+            .or_else(|| {
+                manifest
+                    .models
+                    .iter()
+                    .find(|m| m.default)
+                    .or(manifest.models.first())
+                    .map(|m| m.id.clone())
+            });
+        let config = state.config.read().await;
+        let mgr = ep_core::model::ModelManager::new(&config.models, &state.root);
+        let statuses = mgr.check_model_status(module_id, &manifest);
+        if let Some(variant) = chosen {
+            if matches!(
+                statuses.get(&variant),
+                Some(ep_core::model::ModelStatus::Missing)
+            ) {
+                anyhow::bail!("model `{variant}` is not ready (missing); download it first");
+            }
+        }
+    }
+
+    // 端口分配
+    let port = {
+        let mut pm = state.port_manager.write().await;
+        pm.allocate(module_id)
+            .map_err(|e| anyhow::anyhow!("port allocation failed: {e}"))?
+    };
+
+    // 设备选择：manifest 声明后端 ∩ 本机设备，回退 CPU
+    let device = {
+        let devices = state.devices.read().await;
+        devices
+            .iter()
+            .find(|d| manifest.compute.backends.contains(&d.backend))
+            .map(|d| d.id.clone())
+            .unwrap_or(ep_core::types::DeviceId::Cpu)
+    };
+
+    // 环境变量（A2 公共构建函数：EP_ 前缀归一 + 占位符替换）
+    let env_vars = ep_core::process::build_module_env(&state.root, module_id, &manifest, &device);
+
+    info!(module_id, %port, %device, "auto-starting module for task submission");
+    let start_result = {
+        let mut pm = state.process_manager.write().await;
+        pm.start_module(module_id, &manifest, device, port, env_vars)
+            .await
+    };
+    if let Err(e) = start_result {
+        state.port_manager.write().await.release(module_id);
+        // “already running/starting” 竞态 → 转为等健康
+        if e.to_string().contains("already running") {
+            return wait_module_healthy(state, module_id).await;
+        }
+        return Err(e);
+    }
+
+    wait_module_healthy(state, module_id).await.map_err(|e| {
+        anyhow::anyhow!("module started but failed to become healthy within {ready_timeout_secs}s(+margin): {e}")
+    })
+}
+
+/// 轮询健康检查直至 Running；Error/Stopped/超时 → 错误。
+async fn wait_module_healthy(state: &Arc<AppState>, module_id: &str) -> anyhow::Result<()> {
+    // 上限：manifest ready_timeout + 15s 启动余量
+    let timeout_secs = {
+        let modules = state.modules.read().await;
+        modules
+            .iter()
+            .find_map(|m| m.manifest.as_ref())
+            .filter(|mf| mf.module.id == module_id)
+            .and_then(|mf| mf.interface.ready_timeout_secs)
+            .unwrap_or(30)
+            + 15
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs as u64);
+    loop {
+        {
+            let mut pm = state.process_manager.write().await;
+            let _ = pm.monitor_process(module_id).await;
+            match pm.get_status(module_id) {
+                Some(ServiceStatus::Running) => return Ok(()),
+                Some(ServiceStatus::Error(e)) => {
+                    anyhow::bail!("module entered error state: {e}")
+                }
+                Some(ServiceStatus::Stopped) | Some(ServiceStatus::NotReady) => {
+                    anyhow::bail!("module stopped while starting")
+                }
+                _ => {}
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("timed out after {timeout_secs}s waiting for module health");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn collect_module_ports(state: &Arc<AppState>) -> HashMap<String, u16> {
+    let pm = state.process_manager.read().await;
+    pm.list_running()
+        .iter()
+        .filter_map(|inst| inst.port.map(|port| (inst.module_id.clone(), port)))
+        .collect()
+}
+
+// ─── 单模型直跑（§5.3 / §8.1 `POST /api/execute/single`） ───────────────────
+
+/// 提交单模型直跑：校验模块 + capability → 编译退化三节点 DAG
+/// （file_input → module → file_output）→ 走同一闸门提交。
+///
+/// **B4 接口契约（Wave 2 已对齐）**：`/api/execute/single` handler 在调用
+/// 本函数**之前**已经 `ensure_module_running`（模块 Running、端口已注册），
+/// 故本函数内**不做** autostart。闸门准入后 [`start_task`] 的
+/// [`ensure_pipeline_modules`] 仍会经过幂等快速路径（已 Running 立即返回），
+/// 作为排队期间模块退出的安全网，不重复拉起。
+///
+/// 直跑任务的 `pipeline_id` 采用 `direct/<module_id>`（B4 建议形状，供前端
+/// 任务列表过滤；与配置管线 id 命名空间天然隔离）。
+///
+/// **Wave S 冻结签名**；API 接线（`POST /api/execute/single`）由 B4 在
+/// `api/execute.rs` 完成。
+#[allow(dead_code)] // B4 接线 /api/execute/single 前的骨架保留，勿删
 pub async fn submit_direct(
     state: &Arc<AppState>,
     module_id: &str,
@@ -362,41 +1384,146 @@ pub async fn submit_direct(
     params: Value,
     input_path: PathBuf,
 ) -> Result<String, SubmitError> {
-    let _ = (state, module_id, capability, params, input_path);
-    // 返回 TODO 错误而非 panic：接线前若被误调用仅映射为 500，不崩连接。
-    Err(SubmitError::Internal(
-        "submit_direct not implemented yet (Wave 2 B3: degenerate DAG compilation + module autostart)".to_string(),
-    ))
+    // 1. 模块 + manifest capability 校验（快速失败，不占闸门）
+    let has_capability = {
+        let modules = state.modules.read().await;
+        let module = modules
+            .iter()
+            .find(|m| {
+                m.manifest
+                    .as_ref()
+                    .map(|mf| mf.module.id == module_id)
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| SubmitError::ModuleNotFound(module_id.to_string()))?;
+        let manifest = module.manifest.as_ref().expect("matched by manifest presence");
+        manifest
+            .interface
+            .capabilities
+            .iter()
+            .any(|c| c.name == capability)
+    };
+    if !has_capability {
+        return Err(SubmitError::CapabilityNotFound(
+            module_id.to_string(),
+            capability.to_string(),
+        ));
+    }
+
+    // 2. 输入文件存在性
+    if !input_path.is_file() {
+        return Err(SubmitError::InputMissing(input_path));
+    }
+
+    // 3. 退化三节点 DAG → 同一提交路径（闸门/注册表/WS/产物全套复用）
+    let pipeline = build_direct_pipeline(module_id, capability, params, &input_path);
+    submit_pipeline(state, pipeline, None).await
+}
+
+/// 编译直跑退化 DAG：`input(file_input) → run(module) → output(file_output)`。
+///
+/// 输出节点不带 `path` 参数 → 引擎派生 `{work_dir}/output_output.out`，
+/// 随产物归集进入任务目录可下载（§5.3 结果预览/下载）。
+#[allow(dead_code)] // 经 submit_direct 消费（B4 接线前测试直接调用）
+pub fn build_direct_pipeline(
+    module_id: &str,
+    capability: &str,
+    params: Value,
+    input_path: &Path,
+) -> Pipeline {
+    let make_node = |id: &str, kind: NodeKind, label: &str, params: Value| PipelineNode {
+        id: id.to_string(),
+        kind,
+        label: label.to_string(),
+        params,
+        position: None,
+        timeout_secs: None,
+        retry_count: None,
+    };
+    Pipeline {
+        // B4 契约：direct/<module_id> 形状（同模块直跑任务聚合，前端可过滤）
+        id: format!("direct/{module_id}"),
+        name: format!("直跑 {module_id}/{capability}"),
+        description: "单模型直跑任务（§5.3 退化三节点 DAG）".to_string(),
+        nodes: vec![
+            make_node(
+                "input",
+                NodeKind::Builtin {
+                    builtin: "file_input".to_string(),
+                },
+                "输入文件",
+                json!({ "path": input_path.display().to_string() }),
+            ),
+            make_node(
+                "run",
+                NodeKind::Module {
+                    module_id: module_id.to_string(),
+                    capability: capability.to_string(),
+                    model_id: None,
+                },
+                "模块执行",
+                params,
+            ),
+            make_node(
+                "output",
+                NodeKind::Builtin {
+                    builtin: "file_output".to_string(),
+                },
+                "结果输出",
+                json!({}),
+            ),
+        ],
+        edges: vec![
+            ep_core::pipeline::dag::Edge {
+                from: ("input".to_string(), "output".to_string()),
+                to: ("run".to_string(), "input".to_string()),
+            },
+            ep_core::pipeline::dag::Edge {
+                from: ("run".to_string(), "output".to_string()),
+                to: ("output".to_string(), "input".to_string()),
+            },
+        ],
+    }
 }
 
 // ─── 后台执行（spawn_blocking 线程内） ───────────────────────────────────────
 
-/// 在独立 `PipelineRunnerImpl` 上同步执行管线并收尾。
+/// 在独立 `PipelineRunnerImpl` 上同步执行管线，返回引擎结果与任务详情
+/// （终态写入统一由 [`finalize_task`] 完成）。
 ///
-/// 本函数运行于 blocking 线程（无 tokio Handle），引擎 `execute` 会走
-/// 「自建运行时 block_on」分支，不会嵌套 panic，也不占用主运行时线程。
+/// - `cancel_flag`：协作取消标志（与 [`TaskExtras::cancel`] 共享），
+///   runner 在节点边界检查 → 引擎产生 `TaskStatus::Cancelled`（P0-6）；
+/// - `default_node_timeout`：节点级 wall-clock 超时缺省值（P0-6/P1-11，
+///   节点自身 `timeout_secs` 优先；B7 的执行器客户端级超时互补）。
+#[allow(clippy::too_many_arguments)]
 fn run_task(
     task_id: String,
     task_dir: PathBuf,
     pipeline: Pipeline,
     module_ports: HashMap<String, u16>,
     progress_tx: broadcast::Sender<ProgressMessage>,
-) {
+    cancel_flag: Arc<AtomicBool>,
+    default_node_timeout: Option<Duration>,
+) -> (anyhow::Result<()>, Option<TaskDetail>) {
+    #[cfg(test)]
+    run_test_hook(&task_id);
+
     let pipeline_id = pipeline.id.clone();
-    let node_count = pipeline.nodes.len();
 
     let mut runner = PipelineRunnerImpl::new(task_dir.clone());
     runner.set_module_ports(module_ports);
+    runner.set_cancel_flag(cancel_flag);
+    runner.set_default_node_timeout(default_node_timeout);
 
-    // 回调：节点开始 → running
+    // 回调：节点开始 → running（P2-7：携带 task_id）
     {
         let tx = progress_tx.clone();
         let pid = pipeline_id.clone();
         let tid = task_id.clone();
         runner.on_node_start = Some(Arc::new(move |node_id| {
-            // 广播发送失败（无订阅者）忽略
             let _ = tx.send(ProgressMessage {
                 pipeline_id: pid.clone(),
+                task_id: tid.clone(),
                 node_id: node_id.to_string(),
                 status: "running".to_string(),
             });
@@ -411,6 +1538,7 @@ fn run_task(
         runner.on_node_complete = Some(Arc::new(move |node_id, artifact| {
             let _ = tx.send(ProgressMessage {
                 pipeline_id: pid.clone(),
+                task_id: tid.clone(),
                 node_id: node_id.to_string(),
                 status: "completed".to_string(),
             });
@@ -428,6 +1556,7 @@ fn run_task(
         runner.on_node_error = Some(Arc::new(move |node_id, error| {
             let _ = tx.send(ProgressMessage {
                 pipeline_id: pid.clone(),
+                task_id: tid.clone(),
                 node_id: node_id.to_string(),
                 status: "failed".to_string(),
             });
@@ -438,24 +1567,18 @@ fn run_task(
     // 引擎同步执行（内部自建运行时；整个调用阻塞本 blocking 线程）
     let result = PipelineRunner::execute(&mut runner, &pipeline, &task_dir);
 
-    // 以引擎自身任务详情为权威校正终态（含回调不覆盖的 skipped 节点）
+    // 引擎自身任务详情（权威节点终态，含回调不覆盖的 skipped 节点）
     let detail = runner
         .list_tasks()
         .pop()
         .and_then(|summary| runner.get_task_detail(&summary.id));
-    let error_msg = result.as_ref().err().map(|e| e.to_string());
-    finalize_task(&task_id, &task_dir, error_msg, detail.as_ref());
-
-    match result {
-        Ok(()) => info!(task_id = %task_id, nodes = node_count, "pipeline task finished"),
-        Err(e) => warn!(task_id = %task_id, error = %e, "pipeline task failed"),
-    }
+    (result, detail)
 }
 
 // ─── 注册表内部操作（记录缺失时一律 no-op，避免测试清表后被后台回调复活） ────
 
 fn set_node_state(task_id: &str, node_id: &str, state: &str, error: Option<String>) {
-    let mut reg = registry().lock().unwrap();
+    let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(record) = reg.get_mut(task_id) {
         record.nodes.insert(
             node_id.to_string(),
@@ -468,7 +1591,7 @@ fn set_node_state(task_id: &str, node_id: &str, state: &str, error: Option<Strin
 }
 
 fn record_artifact(task_id: &str, node_id: &str, path: &Path) {
-    let mut reg = registry().lock().unwrap();
+    let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(record) = reg.get_mut(task_id) {
         record
             .artifacts
@@ -476,79 +1599,9 @@ fn record_artifact(task_id: &str, node_id: &str, path: &Path) {
     }
 }
 
-/// 执行结束收尾：引擎 detail 校正节点终态、写任务状态/完成时间、归集产物。
-fn finalize_task(
-    task_id: &str,
-    task_dir: &Path,
-    error_msg: Option<String>,
-    detail: Option<&TaskDetail>,
-) {
-    let mut reg = registry().lock().unwrap();
-    let Some(record) = reg.get_mut(task_id) else {
-        return;
-    };
-
-    if let Some(detail) = detail {
-        for node in &detail.nodes {
-            record.nodes.insert(
-                node.node_id.clone(),
-                NodeRecord {
-                    state: node.state.clone(),
-                    error: node.error.clone(),
-                },
-            );
-        }
-    }
-
-    record.status = match error_msg {
-        None => TaskState::Completed,
-        Some(msg) => TaskState::Failed(msg),
-    };
-    record.finished_at = Some(Utc::now());
-
-    // 产物归集：硬链接（跨文件系统时退化为复制）到 files/{node_id}/ 下，
-    // 使所有产物都落在 ServeDir 根内可下载；清理不在本期范围
-    let artifacts = record.artifacts.clone();
-    for (node_id, src) in artifacts {
-        if !src.is_file() {
-            continue;
-        }
-        let Some(name) = src.file_name() else {
-            continue;
-        };
-        let dest_dir = task_dir.join("files").join(&node_id);
-        if std::fs::create_dir_all(&dest_dir).is_err() {
-            continue;
-        }
-        let dest = dest_dir.join(name);
-        if dest.exists()
-            || std::fs::hard_link(&src, &dest).is_ok()
-            || std::fs::copy(&src, &dest).is_ok()
-        {
-            record
-                .served_artifacts
-                .insert(node_id.clone(), dest.clone());
-        } else {
-            warn!(task_id, node_id = %node_id, "artifact collection failed; node artifact will not be downloadable");
-        }
-    }
-}
-
-/// spawn_blocking 线程异常退出的兜底收尾
-fn finalize_aborted(task_id: &str, error: &str) {
-    let mut reg = registry().lock().unwrap();
-    if let Some(record) = reg.get_mut(task_id) {
-        if record.status == TaskState::Running {
-            record.status =
-                TaskState::Failed(format!("execution thread exited abnormally: {error}"));
-            record.finished_at = Some(Utc::now());
-        }
-    }
-}
-
 // ─── 测试专用 ────────────────────────────────────────────────────────────────
 
-/// 串行化所有触碰注册表的测试（注册表是进程级静态）
+/// 串行化所有触碰进程级静态（注册表/调度器）的测试
 #[cfg(test)]
 pub static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -558,9 +1611,72 @@ pub fn lock_for_tests() -> std::sync::MutexGuard<'static, ()> {
     TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 重置全部进程级状态（注册表 + 调度器 + 待执行载荷 + 运行时标志）。
+/// 测试之间必须调用，避免计数残留串染。
 #[cfg(test)]
 pub fn clear_registry_for_tests() {
-    registry().lock().unwrap().clear();
+    *registry().lock().unwrap_or_else(|e| e.into_inner()) = TaskRegistry::new();
+    *scheduler().lock().unwrap_or_else(|e| e.into_inner()) = Scheduler::default();
+    pending().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    extras().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    set_test_run_hook(None);
+}
+
+/// 重置 + 原子绑定持久化目录（持注册表锁完成，杜绝并发 AppState::new
+/// 在 clear 与 bind 之间拐走落盘点的竞态）。持久化敏感测试专用。
+#[cfg(test)]
+pub fn reset_and_bind_for_tests(root: &Path) {
+    clear_registry_for_tests();
+    let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+    let dir = root.join("runtime").join("tasks");
+    let _ = reg.enable_persistence(dir);
+}
+
+/// 测试钩子：任务在 blocking 线程开始执行引擎前调用（可阻塞以占用闸门）。
+#[cfg(test)]
+type TestRunHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+#[cfg(test)]
+static TEST_RUN_HOOK: OnceLock<Mutex<Option<TestRunHook>>> = OnceLock::new();
+
+#[cfg(test)]
+fn set_test_run_hook(hook: Option<TestRunHook>) {
+    *TEST_RUN_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = hook;
+}
+
+#[cfg(test)]
+fn run_test_hook(task_id: &str) {
+    let hook = TEST_RUN_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook(task_id);
+    }
+}
+
+/// 跨模块测试（pipelines.rs）用的持闸钩子：阻塞执行直至
+/// [`release_test_run_hook_for_pipelines_test`] 被调用（用于制造排队场景）。
+#[cfg(test)]
+static TEST_HOLD_FLAG: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub fn set_test_run_hook_for_pipelines_test() {
+    TEST_HOLD_FLAG.store(false, Ordering::SeqCst);
+    set_test_run_hook(Some(Arc::new(|_task_id| {
+        while !TEST_HOLD_FLAG.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    })));
+}
+
+#[cfg(test)]
+pub fn release_test_run_hook_for_pipelines_test() {
+    TEST_HOLD_FLAG.store(true, Ordering::SeqCst);
 }
 
 // ─── 测试 ────────────────────────────────────────────────────────────────────
@@ -631,11 +1747,41 @@ to = ["output", "input"]
         Pipeline::from_toml_str(&toml).unwrap()
     }
 
-    /// 轮询等待任务终结（completed/failed），超时返回 None
+    /// file_input → file_output 复制管线（真实可执行）
+    fn copy_pipeline(id: &str, src: &Path, dest: &Path) -> Pipeline {
+        let toml = format!(
+            r#"
+[pipeline]
+id = "{id}"
+name = "复制测试"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = {{ path = "{}" }}
+
+[[nodes]]
+id = "output"
+kind = "builtin"
+builtin = "file_output"
+params = {{ path = "{}" }}
+
+[[edges]]
+from = ["input", "output"]
+to = ["output", "input"]
+"#,
+            toml_path(src),
+            toml_path(dest),
+        );
+        Pipeline::from_toml_str(&toml).unwrap()
+    }
+
+    /// 轮询等待任务终结（终态判定：completed/failed/cancelled）
     async fn wait_terminal(task_id: &str) -> Option<TaskRecord> {
-        for _ in 0..300 {
+        for _ in 0..600 {
             if let Some(record) = snapshot(task_id) {
-                if !matches!(record.status, TaskState::Running) {
+                if record.status.is_terminal() {
                     return Some(record);
                 }
             }
@@ -658,33 +1804,7 @@ to = ["output", "input"]
         let dest = root.join("delivered.txt");
         std::fs::write(&src, "引擎直调测试内容").unwrap();
 
-        let toml = format!(
-            r#"
-[pipeline]
-id = "direct-run"
-name = "直调测试"
-
-[[nodes]]
-id = "input"
-kind = "builtin"
-builtin = "file_input"
-params = {{ path = "{}" }}
-
-[[nodes]]
-id = "output"
-kind = "builtin"
-builtin = "file_output"
-params = {{ path = "{}" }}
-
-[[edges]]
-from = ["input", "output"]
-to = ["output", "input"]
-"#,
-            toml_path(&src),
-            toml_path(&dest),
-        );
-        let pipeline = Pipeline::from_toml_str(&toml).unwrap();
-
+        let pipeline = copy_pipeline("direct-run", &src, &dest);
         let task_id = submit_pipeline(&state, pipeline, None).await.unwrap();
         let record = wait_terminal(&task_id)
             .await
@@ -692,6 +1812,7 @@ to = ["output", "input"]
 
         assert_eq!(record.status, TaskState::Completed);
         assert!(record.finished_at.is_some());
+        assert!(record.started_running_at.is_some(), "应记录实际开始时间");
         assert_eq!(record.pipeline_id, "direct-run");
         // 引擎真实执行：目标文件被写出且内容一致
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "引擎直调测试内容");
@@ -709,6 +1830,8 @@ to = ["output", "input"]
                 "归集产物必须位于任务工作目录内"
             );
         }
+        // 持久化落盘（runtime/tasks/{id}.json，P1-4）
+        assert!(root.join("runtime/tasks").join(format!("{task_id}.json")).exists());
     }
 
     // ── 2. inputs 覆盖节点 params（file_input 的 path） ─────────────────────
@@ -807,7 +1930,7 @@ to = ["output", "input"]
         assert!(err.to_string().contains("must be a parameter object"));
     }
 
-    // ── 5. 失败管线：缺输入文件 → failed + 空产物 ───────────────────────────
+    // ── 5. 失败管线：failed + 节点 failed/skipped ──────────────────────────
 
     #[tokio::test]
     async fn test_submit_failed_pipeline_records_failure() {
@@ -842,7 +1965,8 @@ to = ["output", "input"]
         let task_id = submit_pipeline(&state, pipeline, None).await.unwrap();
         let record = wait_terminal(&task_id).await.expect("任务应终结");
 
-        assert!(matches!(record.status, TaskState::Failed(_)));
+        assert_eq!(record.status, TaskState::Failed);
+        assert!(record.error.is_some());
         assert_eq!(record.nodes["input"].state, "failed");
         assert!(record.nodes["input"].error.is_some());
         // 下游被引擎标记 skipped
@@ -892,10 +2016,37 @@ to = ["input", "input"]
         assert!(err.to_string().contains("contains a cycle"));
     }
 
-    // ── 7. 进度回调 → progress_tx（WS 链路的数据源） ────────────────────────
+    // ── 6b. P2-11：提交路径调用 dag validate（缺 file_input → 400 类错误） ──
 
     #[tokio::test]
-    async fn test_progress_messages_sent_to_broadcast() {
+    async fn test_submit_validate_rejects_missing_file_input() {
+        let _guard = lock_for_tests();
+        clear_registry_for_tests();
+
+        let root = unique_root("noinput");
+        let state = test_state(root);
+        let toml = r#"
+[pipeline]
+id = "no-file-input"
+name = "缺 file_input"
+
+[[nodes]]
+id = "output"
+kind = "builtin"
+builtin = "file_output"
+"#;
+        let pipeline = Pipeline::from_toml_str(toml).unwrap();
+        let err = submit_pipeline(&state, pipeline, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SubmitError::InvalidPipeline(_)));
+        assert!(err.to_string().contains("file_input"));
+    }
+
+    // ── 7. 进度回调 → progress_tx（WS 链路数据源，P2-7：携带 task_id） ──────
+
+    #[tokio::test]
+    async fn test_progress_messages_carry_task_id() {
         let _guard = lock_for_tests();
         clear_registry_for_tests();
 
@@ -906,32 +2057,7 @@ to = ["input", "input"]
         let src = root.join("ws-src.txt");
         let dest = root.join("ws-out.txt");
         std::fs::write(&src, "ws").unwrap();
-        let toml = format!(
-            r#"
-[pipeline]
-id = "ws-test"
-name = "WS 测试"
-
-[[nodes]]
-id = "input"
-kind = "builtin"
-builtin = "file_input"
-params = {{ path = "{}" }}
-
-[[nodes]]
-id = "output"
-kind = "builtin"
-builtin = "file_output"
-params = {{ path = "{}" }}
-
-[[edges]]
-from = ["input", "output"]
-to = ["output", "input"]
-"#,
-            toml_path(&src),
-            toml_path(&dest),
-        );
-        let pipeline = Pipeline::from_toml_str(&toml).unwrap();
+        let pipeline = copy_pipeline("ws-test", &src, &dest);
         let task_id = submit_pipeline(&state, pipeline, None).await.unwrap();
         wait_terminal(&task_id).await.expect("任务应终结");
 
@@ -942,6 +2068,8 @@ to = ["output", "input"]
         }
         assert!(got.len() >= 4, "至少 4 条进度消息，got {}", got.len());
         assert!(got.iter().all(|m| m.pipeline_id == "ws-test"));
+        // P2-7：全部消息携带真实 task_id（并发串染修复）
+        assert!(got.iter().all(|m| m.task_id == task_id));
         let statuses: Vec<&str> = got.iter().map(|m| m.status.as_str()).collect();
         assert!(statuses.iter().filter(|s| **s == "running").count() >= 2);
         assert!(statuses.iter().filter(|s| **s == "completed").count() >= 2);
@@ -964,32 +2092,7 @@ to = ["output", "input"]
         let src = root.join("lazy-src.txt");
         let dest = root.join("lazy-out.txt");
         std::fs::write(&src, "lazy").unwrap();
-        let toml = format!(
-            r#"
-[pipeline]
-id = "lazy-test"
-name = "惰性归集测试"
-
-[[nodes]]
-id = "input"
-kind = "builtin"
-builtin = "file_input"
-params = {{ path = "{}" }}
-
-[[nodes]]
-id = "output"
-kind = "builtin"
-builtin = "file_output"
-params = {{ path = "{}" }}
-
-[[edges]]
-from = ["input", "output"]
-to = ["output", "input"]
-"#,
-            toml_path(&src),
-            toml_path(&dest),
-        );
-        let pipeline = Pipeline::from_toml_str(&toml).unwrap();
+        let pipeline = copy_pipeline("lazy-test", &src, &dest);
         let task_id = submit_pipeline(&state, pipeline, None).await.unwrap();
         wait_terminal(&task_id).await.expect("任务应终结");
 
@@ -1002,9 +2105,7 @@ to = ["output", "input"]
             .served_artifacts
             .clear();
         // 归集目录也删掉，验证完整重建路径
-        let _ = std::fs::remove_dir_all(
-            snapshot(&task_id).unwrap().work_dir.join("files"),
-        );
+        let _ = std::fs::remove_dir_all(snapshot(&task_id).unwrap().work_dir.join("files"));
 
         let served = ensure_served_artifact(&task_id, "output").expect("应惰性归集成功");
         assert!(served.is_file());
@@ -1013,5 +2114,688 @@ to = ["output", "input"]
         assert!(ensure_served_artifact(&task_id, "ghost").is_none());
         // 未知任务 → None
         assert!(ensure_served_artifact("task-ghost", "output").is_none());
+    }
+
+    // ── 9. 全局闸门并发上限（P1-3：spawn N 断言同时运行 ≤ max） ─────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_global_gate_limits_concurrency() {
+        let _guard = lock_for_tests();
+        clear_registry_for_tests();
+
+        let root = unique_root("gate");
+        let mut config = AppConfig::default();
+        config.pipeline.max_parallel = 2;
+        config.pipeline.default_timeout_secs = 120;
+        let state = Arc::new(AppState::new(
+            root.clone(),
+            config,
+            vec![],
+            vec![],
+            PortManager::new(18000, 19000),
+        ));
+
+        // 并发观测：钩子在 blocking 线程内计数 + 停留 300ms 制造重叠窗口
+        static CONCURRENT: AtomicUsize = AtomicUsize::new(0);
+        static MAX_CONCURRENT: AtomicUsize = AtomicUsize::new(0);
+        CONCURRENT.store(0, Ordering::SeqCst);
+        MAX_CONCURRENT.store(0, Ordering::SeqCst);
+        set_test_run_hook(Some(Arc::new(|_task_id| {
+            let now = CONCURRENT.fetch_add(1, Ordering::SeqCst) + 1;
+            MAX_CONCURRENT.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(300));
+            CONCURRENT.fetch_sub(1, Ordering::SeqCst);
+        })));
+
+        // 提交 5 个任务 → 全局上限 2，同时运行数必须 ≤ 2 且确实达到 2
+        let mut task_ids = Vec::new();
+        for i in 0..5 {
+            let src = root.join(format!("gate-src-{i}.txt"));
+            let dest = root.join(format!("gate-out-{i}.txt"));
+            std::fs::write(&src, format!("gate {i}")).unwrap();
+            let pipeline = copy_pipeline(&format!("gate-{i}"), &src, &dest);
+            task_ids.push(submit_pipeline(&state, pipeline, None).await.unwrap());
+        }
+        for id in &task_ids {
+            wait_terminal(id).await.expect("任务应终结");
+        }
+        assert!(
+            MAX_CONCURRENT.load(Ordering::SeqCst) <= 2,
+            "全局闸门失效：同时运行数超过 max_parallel=2"
+        );
+        assert_eq!(
+            MAX_CONCURRENT.load(Ordering::SeqCst),
+            2,
+            "5 个任务上限 2 时应达到满并发"
+        );
+        set_test_run_hook(None);
+    }
+
+    // ── 10. queued 状态与队列位置 + FIFO 顺序 ───────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_queued_state_and_positions() {
+        let _guard = lock_for_tests();
+        clear_registry_for_tests();
+
+        let root = unique_root("queued");
+        let mut config = AppConfig::default();
+        config.pipeline.max_parallel = 1;
+        config.pipeline.default_timeout_secs = 120;
+        let state = Arc::new(AppState::new(
+            root.clone(),
+            config,
+            vec![],
+            vec![],
+            PortManager::new(18000, 19000),
+        ));
+
+        // 钩子：第一个任务阻塞直到 RELEASE 置位，其余任务排队可见
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        RELEASE.store(false, Ordering::SeqCst);
+        static HOOK_COUNT: AtomicUsize = AtomicUsize::new(0);
+        HOOK_COUNT.store(0, Ordering::SeqCst);
+        set_test_run_hook(Some(Arc::new(|_task_id| {
+            let n = HOOK_COUNT.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // 首个任务持闸，直到测试释放
+                while !RELEASE.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        })));
+
+        let mut task_ids = Vec::new();
+        for i in 0..3 {
+            let src = root.join(format!("q-src-{i}.txt"));
+            let dest = root.join(format!("q-out-{i}.txt"));
+            std::fs::write(&src, format!("q {i}")).unwrap();
+            let pipeline = copy_pipeline(&format!("q-{i}"), &src, &dest);
+            task_ids.push(submit_pipeline(&state, pipeline, None).await.unwrap());
+        }
+
+        // 等首个任务进入 running（钩子内阻塞），其余应为 queued + 位置 1、2
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let r0 = snapshot(&task_ids[0]).unwrap();
+        assert_eq!(r0.status, TaskState::Running);
+        let r1 = snapshot(&task_ids[1]).unwrap();
+        let r2 = snapshot(&task_ids[2]).unwrap();
+        assert_eq!(r1.status, TaskState::Queued);
+        assert_eq!(r1.queue_position, Some(1));
+        assert_eq!(r2.status, TaskState::Queued);
+        assert_eq!(r2.queue_position, Some(2));
+
+        // 释放 → 全部按 FIFO 完成
+        RELEASE.store(true, Ordering::SeqCst);
+        for id in &task_ids {
+            let record = wait_terminal(id).await.expect("任务应终结");
+            assert_eq!(record.status, TaskState::Completed);
+            assert!(record.queue_position.is_none(), "终态不携带队列位置");
+        }
+        set_test_run_hook(None);
+    }
+
+    // ── 11. 管线级 max_instances（§6.8） ────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_pipeline_max_instances_gate() {
+        let _guard = lock_for_tests();
+        clear_registry_for_tests();
+
+        let root = unique_root("maxinst");
+        let mut config = AppConfig::default();
+        config.pipeline.max_parallel = 4; // 全局宽松
+        config.pipeline.default_timeout_secs = 120;
+        let state = Arc::new(AppState::new(
+            root.clone(),
+            config,
+            vec![],
+            vec![],
+            PortManager::new(18000, 19000),
+        ));
+
+        // 管线 TOML 声明 max_instances = 1（GPU 重管线锁 1）
+        let dir = root.join("config").join("pipelines");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("locked.toml"),
+            "[pipeline]\nid = \"locked-pipe\"\nname = \"锁 1 管线\"\nmax_instances = 1\n",
+        )
+        .unwrap();
+
+        // 每管线并发观测（钩子内按 pipeline_id 计数）
+        static PER_PIPE: AtomicUsize = AtomicUsize::new(0);
+        static PER_PIPE_MAX: AtomicUsize = AtomicUsize::new(0);
+        PER_PIPE.store(0, Ordering::SeqCst);
+        PER_PIPE_MAX.store(0, Ordering::SeqCst);
+        set_test_run_hook(Some(Arc::new(|task_id| {
+            if let Some(r) = snapshot(task_id) {
+                if r.pipeline_id == "locked-pipe" {
+                    let now = PER_PIPE.fetch_add(1, Ordering::SeqCst) + 1;
+                    PER_PIPE_MAX.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(200));
+                    PER_PIPE.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+        })));
+
+        // 同一管线 3 个任务 → max_instances=1 串行
+        let mut task_ids = Vec::new();
+        for i in 0..3 {
+            let src = root.join(format!("mi-src-{i}.txt"));
+            let dest = root.join(format!("mi-out-{i}.txt"));
+            std::fs::write(&src, format!("mi {i}")).unwrap();
+            let pipeline = copy_pipeline("locked-pipe", &src, &dest);
+            task_ids.push(submit_pipeline(&state, pipeline, None).await.unwrap());
+        }
+        for id in &task_ids {
+            wait_terminal(id).await.expect("任务应终结");
+        }
+        assert_eq!(
+            PER_PIPE_MAX.load(Ordering::SeqCst),
+            1,
+            "max_instances=1 的管线不允许并发执行"
+        );
+        set_test_run_hook(None);
+    }
+
+    // ── 12. 持久化往返：daemon 重启（新注册表 load）不丢索引（P1-4） ────────
+
+    #[tokio::test]
+    async fn test_registry_persistence_across_restart() {
+        let _guard = lock_for_tests();
+
+        let root = unique_root("persist");
+        // 原子重置 + 绑定，防止并发 AppState::new 拐走落盘点
+        reset_and_bind_for_tests(&root);
+        let state = test_state(root.clone());
+        let src = root.join("p-src.txt");
+        let dest = root.join("p-out.txt");
+        std::fs::write(&src, "persist").unwrap();
+        let pipeline = copy_pipeline("persist-pipe", &src, &dest);
+        let task_id = submit_pipeline(&state, pipeline, None).await.unwrap();
+        wait_terminal(&task_id).await.expect("任务应终结");
+
+        // 模拟 daemon 重启：全新注册表从 runtime/tasks/ 回读
+        let restored = TaskRegistry::load(root.join("runtime").join("tasks"));
+        let record = restored.get(&task_id).expect("重启后索引应恢复");
+        assert_eq!(record.pipeline_id, "persist-pipe");
+        assert_eq!(record.status, TaskState::Completed);
+        assert_eq!(record.artifacts.len(), 2);
+        assert_eq!(record.work_dir, snapshot(&task_id).unwrap().work_dir);
+    }
+
+    // ── 13. 取消排队中任务（P1-11：Cancelled 产生路径） ─────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_cancel_queued_task() {
+        let _guard = lock_for_tests();
+        clear_registry_for_tests();
+
+        let root = unique_root("cancel-q");
+        let mut config = AppConfig::default();
+        config.pipeline.max_parallel = 1;
+        config.pipeline.default_timeout_secs = 120;
+        let state = Arc::new(AppState::new(
+            root.clone(),
+            config,
+            vec![],
+            vec![],
+            PortManager::new(18000, 19000),
+        ));
+
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        RELEASE.store(false, Ordering::SeqCst);
+        static RAN: AtomicUsize = AtomicUsize::new(0);
+        RAN.store(0, Ordering::SeqCst);
+        set_test_run_hook(Some(Arc::new(|_task_id| {
+            RAN.fetch_add(1, Ordering::SeqCst);
+            while !RELEASE.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })));
+
+        let src = root.join("cq-src.txt");
+        let dest1 = root.join("cq-out-1.txt");
+        let dest2 = root.join("cq-out-2.txt");
+        std::fs::write(&src, "cancel queued").unwrap();
+        let t1 = submit_pipeline(&state, copy_pipeline("cq-1", &src, &dest1), None)
+            .await
+            .unwrap();
+        let t2 = submit_pipeline(&state, copy_pipeline("cq-2", &src, &dest2), None)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(snapshot(&t2).unwrap().status, TaskState::Queued);
+
+        // 取消排队中的 t2
+        let outcome = request_cancel(&state, &t2).await;
+        assert_eq!(outcome, CancelOutcome::Cancelled);
+        let r2 = snapshot(&t2).unwrap();
+        assert_eq!(r2.status, TaskState::Cancelled);
+        assert!(r2.finished_at.is_some());
+
+        // 重复取消 → AlreadyTerminal
+        assert_eq!(
+            request_cancel(&state, &t2).await,
+            CancelOutcome::AlreadyTerminal(TaskState::Cancelled)
+        );
+        // 未知任务 → NotFound
+        assert_eq!(
+            request_cancel(&state, "task-ghost").await,
+            CancelOutcome::NotFound
+        );
+
+        // 释放首个任务；被取消的 t2 绝不应执行
+        RELEASE.store(true, Ordering::SeqCst);
+        wait_terminal(&t1).await.expect("任务应终结");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(RAN.load(Ordering::SeqCst), 1, "被取消的排队任务不得执行");
+        assert!(!dest2.exists(), "被取消任务的输出不得产生");
+        set_test_run_hook(None);
+    }
+
+    // ── 14. 取消运行中任务 → Cancelled（引擎后台收尾被忽略） ────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_cancel_running_task() {
+        let _guard = lock_for_tests();
+        clear_registry_for_tests();
+
+        let root = unique_root("cancel-r");
+        let mut config = AppConfig::default();
+        config.pipeline.default_timeout_secs = 120;
+        let state = Arc::new(AppState::new(
+            root.clone(),
+            config,
+            vec![],
+            vec![],
+            PortManager::new(18000, 19000),
+        ));
+
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        RELEASE.store(false, Ordering::SeqCst);
+        set_test_run_hook(Some(Arc::new(move |_task_id| {
+            while !RELEASE.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })));
+
+        let src = root.join("cr-src.txt");
+        let dest = root.join("cr-out.txt");
+        std::fs::write(&src, "cancel running").unwrap();
+        let task_id = submit_pipeline(&state, copy_pipeline("cr-1", &src, &dest), None)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(snapshot(&task_id).unwrap().status, TaskState::Running);
+
+        assert_eq!(
+            request_cancel(&state, &task_id).await,
+            CancelOutcome::Cancelled
+        );
+        let record = snapshot(&task_id).unwrap();
+        assert_eq!(record.status, TaskState::Cancelled);
+        assert!(record.finished_at.is_some());
+
+        // 释放引擎线程：后台收尾不得覆盖 Cancelled 终态
+        RELEASE.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(snapshot(&task_id).unwrap().status, TaskState::Cancelled);
+        set_test_run_hook(None);
+    }
+
+    // ── 15. 任务级超时（default_timeout_secs 看门狗） ───────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_task_timeout_watchdog() {
+        let _guard = lock_for_tests();
+        clear_registry_for_tests();
+
+        let root = unique_root("timeout");
+        let mut config = AppConfig::default();
+        config.pipeline.default_timeout_secs = 1; // 1s 超时
+        let state = Arc::new(AppState::new(
+            root.clone(),
+            config,
+            vec![],
+            vec![],
+            PortManager::new(18000, 19000),
+        ));
+
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        RELEASE.store(false, Ordering::SeqCst);
+        set_test_run_hook(Some(Arc::new(move |_task_id| {
+            // 持锁 8s >> 1s 超时（测试总时长由释放控制，超时判定后即刻收尾）
+            let deadline = std::time::Instant::now() + Duration::from_secs(8);
+            while !RELEASE.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })));
+
+        let src = root.join("to-src.txt");
+        let dest = root.join("to-out.txt");
+        std::fs::write(&src, "timeout").unwrap();
+        let task_id = submit_pipeline(&state, copy_pipeline("to-1", &src, &dest), None)
+            .await
+            .unwrap();
+
+        let record = wait_terminal(&task_id).await.expect("看门狗应落终态");
+        assert_eq!(record.status, TaskState::Failed);
+        assert!(
+            record.error.as_deref().unwrap_or("").contains("timed out"),
+            "错误应注明超时: {:?}",
+            record.error
+        );
+
+        // 释放引擎线程：收尾不得覆盖超时终态，闸门正常释放（后续任务可运行）
+        RELEASE.store(true, Ordering::SeqCst);
+        let src2 = root.join("to-src-2.txt");
+        let dest2 = root.join("to-out-2.txt");
+        std::fs::write(&src2, "after timeout").unwrap();
+        let t2 = submit_pipeline(&state, copy_pipeline("to-2", &src2, &dest2), None)
+            .await
+            .unwrap();
+        let r2 = wait_terminal(&t2).await.expect("后续任务应正常执行");
+        assert_eq!(r2.status, TaskState::Completed, "超时任务释放闸门后新任务可运行");
+        set_test_run_hook(None);
+    }
+
+    // ── 16. wait 同步模式（§6.5） ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_wait_mode_returns_terminal_record() {
+        let _guard = lock_for_tests();
+        clear_registry_for_tests();
+
+        let root = unique_root("wait");
+        let state = test_state(root.clone());
+        let src = root.join("wait-src.txt");
+        let dest = root.join("wait-out.txt");
+        std::fs::write(&src, "wait mode").unwrap();
+
+        let outcome = submit_pipeline_full(
+            &state,
+            copy_pipeline("wait-pipe", &src, &dest),
+            None,
+            SubmitOptions {
+                wait: true,
+                callback_url: None,
+            },
+        )
+        .await
+        .unwrap();
+        let record = outcome.record.expect("wait 模式必须携带记录");
+        assert_eq!(record.status, TaskState::Completed);
+        assert_eq!(record.id, outcome.task_id);
+        assert_eq!(record.artifacts.len(), 2);
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "wait mode");
+
+        // wait=false 不携带记录（异步语义）
+        let src2 = root.join("wait-src-2.txt");
+        let dest2 = root.join("wait-out-2.txt");
+        std::fs::write(&src2, "async").unwrap();
+        let outcome2 = submit_pipeline_full(
+            &state,
+            copy_pipeline("wait-pipe-2", &src2, &dest2),
+            None,
+            SubmitOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(outcome2.record.is_none());
+        wait_terminal(&outcome2.task_id).await.expect("任务应终结");
+    }
+
+    // ── 17. callback_url 完成回调（本地 mock 端点，§6.5） ───────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_callback_url_posted_on_terminal() {
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use axum::Router;
+
+        let _guard = lock_for_tests();
+        clear_registry_for_tests();
+
+        let root = unique_root("callback");
+        let state = test_state(root.clone());
+
+        // 本地 mock 回调端点：捕获请求体
+        static CAPTURED: std::sync::OnceLock<std::sync::Mutex<Vec<Value>>> =
+            std::sync::OnceLock::new();
+        CAPTURED
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .unwrap()
+            .clear();
+        let app = Router::new().route(
+            "/cb",
+            post(|axum::Json(body): axum::Json<Value>| async move {
+                CAPTURED
+                    .get()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .push(body);
+                StatusCode::OK
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let src = root.join("cb-src.txt");
+        let dest = root.join("cb-out.txt");
+        std::fs::write(&src, "callback").unwrap();
+        let outcome = submit_pipeline_full(
+            &state,
+            copy_pipeline("cb-pipe", &src, &dest),
+            None,
+            SubmitOptions {
+                wait: true,
+                callback_url: Some(format!("http://{addr}/cb")),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.record.unwrap().status, TaskState::Completed);
+
+        // 回调是 spawn 异步投递，轮询等待
+        let mut body: Option<Value> = None;
+        for _ in 0..100 {
+            let captured = CAPTURED.get().unwrap().lock().unwrap();
+            if let Some(v) = captured.first() {
+                body = Some(v.clone());
+                break;
+            }
+            drop(captured);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let body = body.expect("回调应已投递");
+        assert_eq!(body["task_id"], outcome.task_id);
+        assert_eq!(body["status"], "completed");
+        let artifacts = body["artifacts"].as_array().expect("artifacts 数组");
+        assert_eq!(artifacts.len(), 2);
+        assert!(artifacts.iter().all(|a| a["size"].as_u64().unwrap_or(0) > 0));
+    }
+
+    // ── 18. 直跑 DAG 编译形状（§5.3 退化三节点） ────────────────────────────
+
+    #[test]
+    fn test_build_direct_pipeline_shape() {
+        let pipeline = build_direct_pipeline(
+            "deep-filter",
+            "denoise",
+            serde_json::json!({ "atten_lim_db": 60 }),
+            Path::new("/tmp/in.wav"),
+        );
+        assert_eq!(pipeline.id, "direct/deep-filter", "B4 契约 id 形状");
+        assert_eq!(pipeline.nodes.len(), 3);
+        assert_eq!(pipeline.edges.len(), 2);
+        // 通过 dag validate（含 file_input 检查）
+        assert!(pipeline.validate().is_ok());
+        // 节点内容
+        assert_eq!(
+            pipeline.nodes[0].kind,
+            NodeKind::Builtin {
+                builtin: "file_input".to_string()
+            }
+        );
+        assert_eq!(
+            pipeline.nodes[0].params["path"],
+            "/tmp/in.wav"
+        );
+        assert_eq!(
+            pipeline.nodes[1].kind,
+            NodeKind::Module {
+                module_id: "deep-filter".to_string(),
+                capability: "denoise".to_string(),
+                model_id: None,
+            }
+        );
+        assert_eq!(pipeline.nodes[1].params["atten_lim_db"], 60);
+        assert_eq!(
+            pipeline.nodes[2].kind,
+            NodeKind::Builtin {
+                builtin: "file_output".to_string()
+            }
+        );
+        // 边：input → run → output
+        assert_eq!(pipeline.edges[0].from, ("input".to_string(), "output".to_string()));
+        assert_eq!(pipeline.edges[0].to, ("run".to_string(), "input".to_string()));
+        assert_eq!(pipeline.edges[1].from, ("run".to_string(), "output".to_string()));
+        assert_eq!(pipeline.edges[1].to, ("output".to_string(), "input".to_string()));
+    }
+
+    // ── 19. 直跑错误路径：模块不存在 / capability 不存在 / 输入缺失 ─────────
+
+    #[tokio::test]
+    async fn test_submit_direct_error_paths() {
+        use ep_core::module::manifest::ModuleManifest;
+
+        let _guard = lock_for_tests();
+        clear_registry_for_tests();
+
+        let root = unique_root("direct-err");
+        // 带一个真实 manifest 的模块（capability = transcribe）
+        let manifest: ModuleManifest = toml::from_str(
+            r#"
+[module]
+id = "mock-asr"
+name = "Mock ASR"
+version = "0.1.0"
+description = "test"
+category = "asr"
+genre = "test"
+license = "MIT"
+
+[runtime]
+type = "python"
+
+[compute]
+backends = ["cpu"]
+
+[interface]
+type = "http"
+
+[[interface.capabilities]]
+name = "transcribe"
+description = "转写"
+input_type = "audio"
+output_type = "json"
+"#,
+        )
+        .unwrap();
+        let module = ep_core::module::discovery::DiscoveredModule {
+            manifest: Some(manifest),
+            path: root.join("modules/mock-asr"),
+            status: ep_core::module::discovery::DiscoveryStatus::Valid,
+        };
+        let state = Arc::new(AppState::new(
+            root.clone(),
+            AppConfig::default(),
+            vec![],
+            vec![module],
+            PortManager::new(18000, 19000),
+        ));
+
+        let input = root.join("direct-in.txt");
+        std::fs::write(&input, "direct").unwrap();
+
+        // 模块不存在
+        let err = submit_direct(
+            &state,
+            "ghost-module",
+            "transcribe",
+            json!({}),
+            input.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SubmitError::ModuleNotFound(_)));
+
+        // capability 不存在
+        let err = submit_direct(
+            &state,
+            "mock-asr",
+            "ghost-capability",
+            json!({}),
+            input.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SubmitError::CapabilityNotFound(_, _)));
+        assert!(err.to_string().contains("ghost-capability"));
+
+        // 输入文件缺失
+        let err = submit_direct(
+            &state,
+            "mock-asr",
+            "transcribe",
+            json!({}),
+            root.join("no-such-file.txt"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SubmitError::InputMissing(_)));
+    }
+
+    // ── 20. snapshot_by_pipeline + 队列位置标注 ─────────────────────────────
+
+    #[tokio::test]
+    async fn test_snapshot_by_pipeline() {
+        let _guard = lock_for_tests();
+        clear_registry_for_tests();
+
+        let root = unique_root("bypipe");
+        let state = test_state(root.clone());
+        let src = root.join("bp-src.txt");
+        let dest_a = root.join("bp-out-a.txt");
+        let dest_b = root.join("bp-out-b.txt");
+        let dest_c = root.join("bp-out-c.txt");
+        std::fs::write(&src, "by pipeline").unwrap();
+
+        let ta = submit_pipeline(&state, copy_pipeline("pipe-a", &src, &dest_a), None)
+            .await
+            .unwrap();
+        let tb = submit_pipeline(&state, copy_pipeline("pipe-b", &src, &dest_b), None)
+            .await
+            .unwrap();
+        let tc = submit_pipeline(&state, copy_pipeline("pipe-a", &src, &dest_c), None)
+            .await
+            .unwrap();
+        for id in [&ta, &tb, &tc] {
+            wait_terminal(id).await.expect("任务应终结");
+        }
+
+        let a_tasks = snapshot_by_pipeline("pipe-a");
+        assert_eq!(a_tasks.len(), 2);
+        assert!(a_tasks.iter().all(|r| r.pipeline_id == "pipe-a"));
+        assert_eq!(a_tasks[0].id, tc, "新任务在前");
+        assert_eq!(snapshot_by_pipeline("pipe-b").len(), 1);
+        assert!(snapshot_by_pipeline("ghost").is_empty());
     }
 }

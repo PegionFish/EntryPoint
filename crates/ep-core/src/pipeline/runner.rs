@@ -80,6 +80,15 @@ pub struct PipelineRunnerImpl {
     /// 节点失败时回调
     #[allow(clippy::type_complexity)]
     pub on_node_error: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
+    /// 协作取消标志（P0-6/B3）：执行层置位后，下一个节点开始前任务终结为
+    /// `Cancelled`。节点内部无中断点（进行中的节点会先完成其客户端级超时），
+    /// 标志检查粒度 = 节点边界。
+    cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// 默认节点 wall-clock 超时（P0-6/B3）：节点未声明 `timeout_secs` 时使用；
+    /// None = 无默认（仅受节点自身 timeout_secs 与执行器客户端级超时约束）。
+    /// 与执行器的 HTTP 客户端超时互补（B7：executor `node_timeout_secs`）：
+    /// 此处包裹整个 `execute_node` future，覆盖 ffmpeg 子进程等非 HTTP 节点。
+    default_node_timeout: Option<std::time::Duration>,
 }
 
 impl PipelineRunnerImpl {
@@ -92,6 +101,8 @@ impl PipelineRunnerImpl {
             on_node_start: None,
             on_node_complete: None,
             on_node_error: None,
+            cancel_flag: None,
+            default_node_timeout: None,
         }
     }
 
@@ -105,6 +116,16 @@ impl PipelineRunnerImpl {
     /// 批量注册模块端口
     pub fn set_module_ports(&mut self, ports: HashMap<String, u16>) {
         self.module_ports.extend(ports);
+    }
+
+    /// 设置协作取消标志（执行层与运行器共享同一 `AtomicBool`）
+    pub fn set_cancel_flag(&mut self, flag: Arc<std::sync::atomic::AtomicBool>) {
+        self.cancel_flag = Some(flag);
+    }
+
+    /// 设置默认节点 wall-clock 超时（节点自身 `timeout_secs` 优先）
+    pub fn set_default_node_timeout(&mut self, timeout: Option<std::time::Duration>) {
+        self.default_node_timeout = timeout;
     }
 
     // ─── 任务列表 API（GUI 展示用） ─────────────────────────────────────
@@ -197,6 +218,25 @@ impl PipelineRunnerImpl {
                     continue;
                 }
 
+                // 取消检查点（P0-6/B3）：节点边界检查协作取消标志，
+                // 置位 → 任务终结为 Cancelled（进行中的节点不会被中断，
+                // 其自身受执行器客户端级超时约束 — B7 executor）
+                if self
+                    .cancel_flag
+                    .as_ref()
+                    .is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst))
+                {
+                    let err_msg = "task cancelled".to_string();
+                    if let Some(ref cb) = self.on_node_error {
+                        cb(node_id, &err_msg);
+                    }
+                    task.mark_failed_with_pipeline(node_id, err_msg, false, pipeline);
+                    task.status = TaskStatus::Cancelled;
+                    self.tasks.insert(task.id.clone(), task.clone());
+                    self.task = Some(task);
+                    return Err(anyhow::anyhow!("pipeline execution cancelled"));
+                }
+
                 // 回调：节点开始
                 if let Some(ref cb) = self.on_node_start {
                     cb(node_id);
@@ -208,7 +248,34 @@ impl PipelineRunnerImpl {
                     .find(|n| &n.id == node_id)
                     .ok_or_else(|| anyhow::anyhow!("node '{node_id}' not found in pipeline"))?;
 
-                match execute_node(node, pipeline, &task, work_dir, &self.module_ports).await {
+                // Wall-clock 超时包裹（P0-6/B3）：节点 `timeout_secs` 优先，
+                // 缺省用 `default_node_timeout`；覆盖 ffmpeg 子进程等非 HTTP
+                // 节点（HTTP 节点另有执行器客户端级超时，两者互补取先到者）。
+                let timeout_secs = node
+                    .timeout_secs
+                    .map(u64::from)
+                    .or_else(|| self.default_node_timeout.map(|d| d.as_secs()))
+                    .filter(|&secs| secs > 0);
+                let exec_result = match timeout_secs {
+                    Some(secs) => {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(secs),
+                            execute_node(node, pipeline, &task, work_dir, &self.module_ports),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_elapsed) => Err(anyhow::anyhow!(
+                                "node '{node_id}' timed out after {secs}s"
+                            )),
+                        }
+                    }
+                    None => {
+                        execute_node(node, pipeline, &task, work_dir, &self.module_ports).await
+                    }
+                };
+
+                match exec_result {
                     Ok(artifact) => {
                         // 回调：节点完成
                         if let Some(ref cb) = self.on_node_complete {
@@ -218,7 +285,7 @@ impl PipelineRunnerImpl {
                     }
                     Err(e) => {
                         let err_msg = e.to_string();
-                        // 从 ModuleCallError 提取可重试标志
+                        // 从 ModuleCallError 提取可重试标志（B7 契约：保留 downcast）
                         let retryable = e
                             .downcast_ref::<ModuleCallError>()
                             .map(|mce| mce.retryable)
@@ -266,6 +333,8 @@ impl PipelineRunner for PipelineRunnerImpl {
                 let on_complete = self.on_node_complete.take();
                 let on_error = self.on_node_error.take();
                 let module_ports = self.module_ports.clone();
+                let cancel_flag = self.cancel_flag.clone();
+                let default_node_timeout = self.default_node_timeout;
 
                 let mut temp_runner = PipelineRunnerImpl {
                     task: None,
@@ -275,6 +344,8 @@ impl PipelineRunner for PipelineRunnerImpl {
                     on_node_start: on_start,
                     on_node_complete: on_complete,
                     on_node_error: on_error,
+                    cancel_flag,
+                    default_node_timeout,
                 };
 
                 let (result, returned_runner) = std::thread::spawn(move || {
@@ -292,6 +363,8 @@ impl PipelineRunner for PipelineRunnerImpl {
                 self.on_node_start = returned_runner.on_node_start;
                 self.on_node_complete = returned_runner.on_node_complete;
                 self.on_node_error = returned_runner.on_node_error;
+                self.cancel_flag = returned_runner.cancel_flag;
+                self.default_node_timeout = returned_runner.default_node_timeout;
                 result
             }
             Err(_) => {
@@ -812,5 +885,254 @@ to = ["bad", "input"]
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"pipeline_name\":\"test-pipe\""));
         assert!(json.contains("\"node_count\":3"));
+    }
+
+    // ─── B3（P0-6）：协作取消 — 节点边界检查点 ──────────────────────────────
+
+    /// 取消标志预置位 → 首个节点边界即终结为 Cancelled
+    #[tokio::test]
+    async fn test_cancel_flag_terminates_task_as_cancelled() {
+        let work_dir = temp_work_dir("cancel");
+        let input_file = work_dir.join("source.txt");
+        let output_file = work_dir.join("out.txt");
+        std::fs::write(&input_file, "cancel me").unwrap();
+
+        let toml_str = format!(
+            r#"
+[pipeline]
+id = "test-cancel"
+name = "Cancel Test"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = {{ path = "{}" }}
+
+[[nodes]]
+id = "output"
+kind = "builtin"
+builtin = "file_output"
+params = {{ path = "{}" }}
+
+[[edges]]
+from = ["input", "output"]
+to = ["output", "input"]
+"#,
+            input_file.to_string_lossy().replace('\\', "/"),
+            output_file.to_string_lossy().replace('\\', "/"),
+        );
+        let pipeline = Pipeline::from_toml_str(&toml_str).unwrap();
+        let mut runner = PipelineRunnerImpl::new(work_dir.clone());
+
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        runner.set_cancel_flag(flag);
+
+        let result = runner.execute_async(&pipeline, &work_dir).await;
+        let err = result.expect_err("预置取消标志应使执行失败").to_string();
+        assert!(err.contains("cancelled"), "got: {err}");
+
+        // 引擎任务状态为 Cancelled（TaskStatus::Cancelled 产生路径）
+        assert_eq!(*runner.task_status(), TaskStatus::Cancelled);
+        let tasks = runner.list_tasks();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].status, TaskStatus::Cancelled);
+        // 未产生输出（首节点未执行）
+        assert!(!output_file.exists());
+
+        cleanup_dir(&work_dir);
+    }
+
+    /// 执行中置位取消 → 当前节点完成后、下一节点边界终结
+    #[tokio::test]
+    async fn test_cancel_flag_mid_execution_at_next_boundary() {
+        let work_dir = temp_work_dir("cancel-mid");
+        let input_file = work_dir.join("source.txt");
+        let mid_file = work_dir.join("mid.txt");
+        let final_file = work_dir.join("final.txt");
+        std::fs::write(&input_file, "mid cancel").unwrap();
+
+        let toml_str = format!(
+            r#"
+[pipeline]
+id = "test-cancel-mid"
+name = "Mid Cancel Test"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = {{ path = "{}" }}
+
+[[nodes]]
+id = "mid"
+kind = "builtin"
+builtin = "file_output"
+params = {{ path = "{}" }}
+
+[[nodes]]
+id = "final"
+kind = "builtin"
+builtin = "file_output"
+params = {{ path = "{}" }}
+
+[[edges]]
+from = ["input", "output"]
+to = ["mid", "input"]
+
+[[edges]]
+from = ["mid", "output"]
+to = ["final", "input"]
+"#,
+            input_file.to_string_lossy().replace('\\', "/"),
+            mid_file.to_string_lossy().replace('\\', "/"),
+            final_file.to_string_lossy().replace('\\', "/"),
+        );
+        let pipeline = Pipeline::from_toml_str(&toml_str).unwrap();
+        let mut runner = PipelineRunnerImpl::new(work_dir.clone());
+
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        runner.set_cancel_flag(flag.clone());
+        // 首节点开始时置位 → 第二节点边界触发取消
+        let flag_for_cb = flag.clone();
+        runner.on_node_start = Some(Arc::new(move |_node_id| {
+            flag_for_cb.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+
+        let result = runner.execute_async(&pipeline, &work_dir).await;
+        assert!(result.is_err());
+        assert_eq!(*runner.task_status(), TaskStatus::Cancelled);
+        // 取消在 mid 边界触发：input（置位前开始的节点）已完成，
+        // mid/final 不再执行
+        assert!(!mid_file.exists(), "取消边界起的节点不应执行");
+        assert!(!final_file.exists(), "取消后的节点不应执行");
+        let detail = runner.get_task_detail(&runner.list_tasks()[0].id).unwrap();
+        let input = detail.nodes.iter().find(|n| n.node_id == "input").unwrap();
+        assert_eq!(input.state, "completed", "取消前进行中的节点应完成");
+        let mid = detail.nodes.iter().find(|n| n.node_id == "mid").unwrap();
+        assert_eq!(mid.state, "failed");
+        assert!(mid.error.as_deref().unwrap().contains("cancelled"));
+        let final_node = detail.nodes.iter().find(|n| n.node_id == "final").unwrap();
+        assert_eq!(final_node.state, "skipped");
+
+        cleanup_dir(&work_dir);
+    }
+
+    // ─── B3（P0-6）：节点级 wall-clock 超时（timeout_secs / 默认值） ────────
+
+    /// ffmpeg `-re` 以实时速度生成 5s 音频；节点 timeout_secs=1 → 超时失败
+    #[tokio::test]
+    async fn test_node_timeout_secs_wraps_execution() {
+        if !ffmpeg_available() {
+            eprintln!("SKIP: ffmpeg not available");
+            return;
+        }
+
+        let work_dir = temp_work_dir("node-timeout");
+        let dummy_input = work_dir.join("dummy.txt");
+        std::fs::write(&dummy_input, "dummy").unwrap();
+        let output_file = work_dir.join("slow.wav");
+
+        let toml_str = format!(
+            r#"
+[pipeline]
+id = "test-node-timeout"
+name = "Node Timeout Test"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = {{ path = "{}" }}
+
+[[nodes]]
+id = "slow"
+kind = "builtin"
+builtin = "ffmpeg"
+timeout_secs = 1
+params = {{ args = ["-re", "-f", "lavfi", "-i", "sine=frequency=440:duration=5", "-f", "wav", "-y"], output = "{}" }}
+
+[[edges]]
+from = ["input", "output"]
+to = ["slow", "input"]
+"#,
+            dummy_input.to_string_lossy().replace('\\', "/"),
+            output_file.to_string_lossy().replace('\\', "/"),
+        );
+        let pipeline = Pipeline::from_toml_str(&toml_str).unwrap();
+        let mut runner = PipelineRunnerImpl::new(work_dir.clone());
+
+        let started = std::time::Instant::now();
+        let result = runner.execute_async(&pipeline, &work_dir).await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "超时节点应使管线失败");
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "超时应在 1s 附近生效，而不是等满 5s（elapsed: {elapsed:?}）"
+        );
+        let detail = runner.get_task_detail(&runner.list_tasks()[0].id).unwrap();
+        let slow = detail.nodes.iter().find(|n| n.node_id == "slow").unwrap();
+        assert_eq!(slow.state, "failed");
+        assert!(
+            slow.error.as_deref().unwrap_or("").contains("timed out"),
+            "错误应注明超时: {:?}",
+            slow.error
+        );
+
+        cleanup_dir(&work_dir);
+    }
+
+    /// default_node_timeout 对未声明 timeout_secs 的节点生效
+    #[tokio::test]
+    async fn test_default_node_timeout_applies() {
+        if !ffmpeg_available() {
+            eprintln!("SKIP: ffmpeg not available");
+            return;
+        }
+
+        let work_dir = temp_work_dir("default-timeout");
+        let dummy_input = work_dir.join("dummy.txt");
+        std::fs::write(&dummy_input, "dummy").unwrap();
+        let output_file = work_dir.join("slow2.wav");
+
+        let toml_str = format!(
+            r#"
+[pipeline]
+id = "test-default-timeout"
+name = "Default Timeout Test"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = {{ path = "{}" }}
+
+[[nodes]]
+id = "slow"
+kind = "builtin"
+builtin = "ffmpeg"
+params = {{ args = ["-re", "-f", "lavfi", "-i", "sine=frequency=440:duration=5", "-f", "wav", "-y"], output = "{}" }}
+
+[[edges]]
+from = ["input", "output"]
+to = ["slow", "input"]
+"#,
+            dummy_input.to_string_lossy().replace('\\', "/"),
+            output_file.to_string_lossy().replace('\\', "/"),
+        );
+        let pipeline = Pipeline::from_toml_str(&toml_str).unwrap();
+        let mut runner = PipelineRunnerImpl::new(work_dir.clone());
+        runner.set_default_node_timeout(Some(std::time::Duration::from_secs(1)));
+
+        let started = std::time::Instant::now();
+        let result = runner.execute_async(&pipeline, &work_dir).await;
+        assert!(result.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+        let detail = runner.get_task_detail(&runner.list_tasks()[0].id).unwrap();
+        let slow = detail.nodes.iter().find(|n| n.node_id == "slow").unwrap();
+        assert!(slow.error.as_deref().unwrap_or("").contains("timed out"));
+
+        cleanup_dir(&work_dir);
     }
 }

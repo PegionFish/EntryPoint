@@ -28,9 +28,13 @@ pub struct LogMessage {
 /// A progress event for a pipeline node execution.
 ///
 /// 仅供旧端点 /ws/progress 使用（保持兼容，不删除）。新端点 /ws 统一使用 [`WsMessage`]。
+///
+/// `task_id`（P2-7，Wave 2 B3）：并发任务的进度按 task_id 过滤，
+/// 修画布状态串染；旧消费者忽略该新增字段不受影响。
 #[derive(Debug, Clone, Serialize)]
 pub struct ProgressMessage {
     pub pipeline_id: String,
+    pub task_id: String,
     pub node_id: String,
     pub status: String,
 }
@@ -48,6 +52,8 @@ pub enum WsMessage {
     },
     Progress {
         pipeline_id: String,
+        /// 任务 ID（P2-7：并发任务进度过滤，Wave 2 B3）
+        task_id: String,
         node_id: String,
         status: String,
     },
@@ -157,6 +163,7 @@ impl AppState {
             runner.on_node_start = Some(Arc::new(move |node_id| {
                 let _ = tx.send(ProgressMessage {
                     pipeline_id: String::new(),
+                    task_id: String::new(),
                     node_id: node_id.to_string(),
                     status: "running".to_string(),
                 });
@@ -165,6 +172,7 @@ impl AppState {
             runner.on_node_complete = Some(Arc::new(move |node_id, _artifact| {
                 let _ = tx.send(ProgressMessage {
                     pipeline_id: String::new(),
+                    task_id: String::new(),
                     node_id: node_id.to_string(),
                     status: "completed".to_string(),
                 });
@@ -173,6 +181,7 @@ impl AppState {
             runner.on_node_error = Some(Arc::new(move |node_id, err| {
                 let _ = tx.send(ProgressMessage {
                     pipeline_id: String::new(),
+                    task_id: String::new(),
                     node_id: node_id.to_string(),
                     status: format!("error: {err}"),
                 });
@@ -185,6 +194,11 @@ impl AppState {
         let cuda_libs_dir =
             ep_core::process::resolve_cuda_libs_dir(&root, &config.compute.cuda_libs_dir);
         let network_env = config.network.env_vars();
+
+        // Wave 2 B3（P1-4）：任务注册表落盘持久化目录绑定（runtime/tasks/）。
+        // 幂等：同目录重复绑定无操作；进程级注册表首次绑定时回读既有索引，
+        // daemon 重启后 GET /api/tasks 立即可见历史任务。
+        crate::api::execute::execution::bind_persistence(&root);
 
         Self {
             root,
@@ -237,12 +251,14 @@ mod tests {
     fn ws_message_serde_progress() {
         let msg = WsMessage::Progress {
             pipeline_id: "p1".into(),
+            task_id: "task-1".into(),
             node_id: "n1".into(),
             status: "running".into(),
         };
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "progress");
         assert_eq!(v["pipeline_id"], "p1");
+        assert_eq!(v["task_id"], "task-1");
         assert_eq!(v["node_id"], "n1");
         assert_eq!(v["status"], "running");
     }
