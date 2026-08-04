@@ -139,8 +139,11 @@ multipart 单文件（字段名 `file`）→ 暂存 `workspace/uploads`，响应
   watcher 按业务策略决定是否重提。
 
 **示例脚本**：`scripts/examples/`（Wave 4 D3 交付：Linux bash + inotifywait 与
-Windows PowerShell + FileSystemWatcher 双版本，含提交与回调接收骨架）。本节
-链接届时补充具体文件清单。
+Windows PowerShell + FileSystemWatcher 双版本，含提交与回调接收骨架）：
+
+- `scripts/examples/watcher-linux.sh` — bash + inotifywait 版（Linux）
+- `scripts/examples/watcher-windows.ps1` — PowerShell + FileSystemWatcher 版（Windows）
+- `scripts/examples/README.md` — 快速上手与配置对照表
 
 ---
 

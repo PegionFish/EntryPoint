@@ -306,11 +306,6 @@ impl ProcessManager {
         self
     }
 
-    /// 设置网络代理环境变量
-    pub fn set_network_env(&mut self, env_vars: Vec<(String, String)>) {
-        self.network_env = env_vars;
-    }
-
     /// 设置共享 CUDA 库目录（链式调用，§3.1）。
     ///
     /// 模块服务子进程启动时注入平台动态库搜索路径：

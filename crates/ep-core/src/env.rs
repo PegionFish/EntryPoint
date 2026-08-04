@@ -127,11 +127,6 @@ impl EnvManager {
         self
     }
 
-    /// 设置网络代理环境变量
-    pub fn set_network(&mut self, network: &crate::config::NetworkConfig) {
-        self.network_env = network.env_vars();
-    }
-
     /// 检测系统 PATH 中的 python（优先 python3，其次 python）
     /// 若 PATH 中无兼容版本，则借助 uv python find 查找 uv 管理的 Python
     fn detect_python(uv: Option<&Path>) -> Option<PathBuf> {
