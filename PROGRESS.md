@@ -306,20 +306,52 @@ Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平�
 
 ---
 
+## 整合包计划执行 — ✅ 完成（2026-08-04 → 08-05）
+
+按 `docs/PACK_UNIFY_PLAN.md` v2 六波次执行完毕（27 代理 + 骨架 2 + 返工 2，峰值并行 8，worktree 隔离 + 波次门禁合并）。
+
+### 波次与提交
+- [x] 准备：Windows 门禁阻塞修复（symlink 测试 #[cfg(unix)]、TOML 反斜杠转义、build.ps1 错误过滤器）+ Node/镜像环境 + §8.3 配置预接线
+- [x] Wave S：ep-pack crate 骨架 + model_id + i18n packs 命名空间 + 前端/桌面注册点（`37eebc9`/`0b69016`）
+- [x] Wave 1（A1-A6）：依赖栈统一（UV_CACHE_DIR/constraints/hardlink/哈希扩展）、CUDA 库+compute.env 注入（P0-3/P0-4 前置）、包 schema+全限定 ID、包 IO+zip-slip 防护、ROCm/OpenVINO/DirectML 检测器+CPU refresh、模型 meta+变体 vram+active_models+size_bytes
+- [x] Wave 2（B1-B7）：导入编排+适配报告+注册表、daemon packs 7 路由+WS、执行引擎（全局/管线闸门+queued+注册表持久化+超时取消+VRAM 预算+wait/callback）、直跑+输入上传+autostart、模块 capabilities（P0-1 根治）、模型 tags/取消/并发闸、LLM 节点+model/device schema 对齐
+- [x] Wave 3（C1-C8）：统一页+直跑抽屉+packs 页、管线节点数据驱动（P0-1/P0-2 收口）、管线页 VRAM 账本/设备绑定/导入导出/任务视图、桌面核心（P0-5/P1-6/P1-7/P1-1+管线直连执行）、桌面 UI 全页面、ep-pack-cli 六命令、设置 PUT 合并+主题三端同步、i18n 全量落盘（首轮 81 键 + 二轮 395 键）+ 四份文档
+- [x] Wave 4（D1-D4）：E2E 加固 19 测试（整合包全链/直跑/wait/callback/VRAM/闸门/取消+video-to-srt 条件回归）、死代码清除 −255 行、打包修复（P2-17+5 处脚本漂移+ep-pack 入包+watcher 双平台示例）、constraints.txt 定稿+迁移文档
+- [x] Wave 5：异构真机验证 + API/WebUI/桌面 GUI 冒烟 + 完整双模式打包 + 本文档
+
+### 验证结果（Windows 执行机实测）
+- 最终门禁：`cargo clippy --workspace --all-targets` 零警告；`cargo test --workspace` **936 全过**；前端 build+lint 零 error
+- 异构设备真机：`/api/devices` 检出 **cuda:0（RTX 5090 D 32GB 实时显存/温度）+ openvino:NPU.0（Intel AI Boost）+ openvino:GPU.0（Intel Graphics）+ cpu（实时利用率）**，DirectML 按去重策略恒空（预期）
+- API 冒烟：health/modules（capabilities+active_model_id）/packs/pipelines/WebUI 首页全过
+- 桌面 GUI：启动渲染完整（7 页侧栏含整合包页、管线编辑器、CJK 字体）；自动化点击注入对 egui/winit 事件循环受限（驱动限制，非应用缺陷，46 桌面单测覆盖）
+- 打包：`build.ps1 gui` + `build.ps1 server` 全量流程（含 clippy+tests+release），产物含 ep-pack.exe + VC 运行库 + cuda-libs 存在性附带
+
+### 已知限制（如实记录）
+- workspace 级 Linux target 交叉 check 被 openssl-sys 卡死（需系统 OpenSSL+交叉 C 工具链）；Linux 编译面靠 cfg 纪律保障，真验证留 Linux 环境
+- video-to-srt 真实执行/真实模块推理/真实下载链需 ffmpeg+venv 环境（D1 条件回归测试已就绪，环境满足即自动运行）
+- log_level/check_updates 后端接线、keep_workspace 清理实现延后（UI 已如实标注）；scripts/build-desktop.sh 保留待裁撤
+- 桌面 GUI 自动化点击注入受限（见上）
+
+#### Git
+- 波次合并提交序列见 `git log --oneline --grep="wave-"`；最终门禁与打包产物提交见本节后续 commit
+
+---
+
 ## 最终统计
 
 | 指标 | 值 |
 |---|---|
-| Rust 测试数 | 288（2026-08-04 WebUI E2E 强化后；含单元/集成/daemon/桌面端） |
-| Clippy warnings | 0（--workspace --all-targets -D warnings） |
-| Rust 源文件数 | ~70 .rs files |
+| Rust 测试数 | 936（2026-08-05 整合包执行后；含单元/集成/E2E/桌面端/CLI） |
+| Clippy warnings | 0（--workspace --all-targets） |
+| Rust 源文件数 | ~90 .rs files |
 | 前端源文件数 | 58 (.ts/.tsx) |
-| 前端代码行数 | ~9500 行 |
-| 桌面端代码行数 | ~3100 行 |
-| Crate 数 | 4 (ep-core, ep-daemon, ep-desktop, ep-webui) |
-| Release 构建时间 | ~3m 34s (含前端) |
-| Git commits | 25+ |
-| E2E 测试 | ✅ 真实媒体全流程（视频→音频→ASR→SRT 产物下载，含 CPU 回退）+ 模型上传/下载回环 + 浏览器 8 页巡测零错误 |
+| 前端代码行数 | ~14000 行 |
+| 桌面端代码行数 | ~9000 行 |
+| Crate 数 | 6 (ep-core, ep-daemon, ep-desktop, ep-webui, ep-pack, ep-pack-cli) |
+| Release 构建时间 | ~4m（含前端） |
+| Git commits | 60+ |
+| E2E 测试 | ✅ 整合包全链/直跑/wait/callback/VRAM/闸门/取消 19 项（D1）+ 既有真实媒体全流程（Linux 侧） |
+| 异构设备 | ✅ Windows 真机：cuda:0 + openvino:NPU.0/GPU.0 + cpu 四设备实时数据 |
 
 ---
 
