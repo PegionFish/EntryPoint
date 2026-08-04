@@ -820,6 +820,9 @@ to = ["output", "input"]
                 id: "spec-pipe".into(),
                 name: "spec 管线".into(),
                 description: String::new(),
+                // B7（wave-2 返工）PipelineMeta 新增 §6.8 max_instances 后的
+                // 机械补齐（仲裁 #11 同款模式，测试字面量无行为含义）
+                max_instances: None,
             },
             nodes: vec![
                 SpecNode {

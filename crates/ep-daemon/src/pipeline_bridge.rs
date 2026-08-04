@@ -37,6 +37,10 @@ pub struct PipelineMeta {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    /// 管线级并发上限（§6.8）：null/缺省 = 跟随全局 `max_parallel`。
+    /// TOML `[pipeline]` 段 `max_instances` 键，执行层（B3）消费。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_instances: Option<u32>,
 }
 
 /// spec 节点类型判别（前端契约 `kind: "builtin" | "module"`）
@@ -146,6 +150,7 @@ pub fn spec_to_pipeline(spec: &PipelineSpec) -> Result<Pipeline> {
         description: spec.pipeline.description.clone(),
         nodes,
         edges: spec.edges.clone(),
+        max_instances: spec.pipeline.max_instances,
     })
 }
 
@@ -234,6 +239,7 @@ pub fn pipeline_to_spec(pipeline: &Pipeline) -> Result<PipelineSpec> {
             id: pipeline.id.clone(),
             name: pipeline.name.clone(),
             description: pipeline.description.clone(),
+            max_instances: pipeline.max_instances,
         },
         nodes,
         edges: pipeline.edges.clone(),
@@ -358,6 +364,10 @@ fn spec_to_toml(spec: &PipelineSpec) -> Result<String> {
         "description = {}\n",
         toml_string(&spec.pipeline.description)
     ));
+    // §6.8 管线级并发上限（缺省不写出该键）
+    if let Some(max_instances) = spec.pipeline.max_instances {
+        out.push_str(&format!("max_instances = {max_instances}\n"));
+    }
 
     for node in &spec.nodes {
         out.push_str("\n[[nodes]]\n");
@@ -542,6 +552,7 @@ mod tests {
                 id: id.into(),
                 name: "测试管线".into(),
                 description: "桥接测试".into(),
+                max_instances: None,
             },
             nodes: vec![
                 SpecNode {
@@ -789,6 +800,42 @@ system_prompt = "翻译：{input}"
         spec.nodes[1].device = Some("".into());
         let err = spec_to_pipeline(&spec).unwrap_err().to_string();
         assert!(err.contains("device") && err.contains("empty"), "got: {err}");
+    }
+
+    // ── §6.8 max_instances：桥接往返不丢失 ──────────────────────────────────
+
+    #[test]
+    fn test_max_instances_roundtrip() {
+        let mut spec = sample_spec_body("mi-pipe");
+        spec.pipeline.max_instances = Some(1); // GPU 重管线锁 1
+
+        // spec → TOML 文本：[pipeline] 段写出该键
+        let toml_text = spec_to_toml(&spec).unwrap();
+        assert!(toml_text.contains("max_instances = 1"), "got: {toml_text}");
+
+        // spec → Pipeline：执行层可见
+        let pipeline = spec_to_pipeline(&spec).unwrap();
+        assert_eq!(pipeline.max_instances, Some(1));
+
+        // 保存 → 重读：spec 完全等价（B3 报告指出的丢弃问题修复）
+        let dir = temp_dir("mi");
+        let out = dir.join("mi.toml");
+        save_spec(&spec, &out).expect("save with max_instances");
+        let back = load_spec(&out).expect("reload max_instances toml");
+        assert_eq!(spec, back, "max_instances must survive save/load");
+        assert_eq!(back.pipeline.max_instances, Some(1));
+
+        // ep-core 直读同样可见
+        let via_core = ep_core::pipeline::load_pipeline(&out).unwrap();
+        assert_eq!(via_core.max_instances, Some(1));
+
+        // 缺省时不写键，重读为 None
+        let mut spec_none = sample_spec_body("mi-none");
+        spec_none.pipeline.max_instances = None;
+        let toml_none = spec_to_toml(&spec_none).unwrap();
+        assert!(!toml_none.contains("max_instances"), "got: {toml_none}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
