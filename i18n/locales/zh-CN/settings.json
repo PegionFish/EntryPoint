@@ -82,7 +82,6 @@
   "toast.savedRestart": "配置已保存，部分改动需重启服务生效",
   "toast.savedRestartDescription": "本次改动包含重启敏感项（监听地址/端口、端口范围、工作区目录、CUDA 库目录、日志级别、代理等），需重启 daemon 后生效",
   "general.logLevelDescription": "daemon 日志输出级别。保存后需重启生效；当前 daemon 启动时读取 RUST_LOG 环境变量，本项后端接线待完成",
-  "general.checkUpdatesPending": "启动时自动检测新版本并发出提示（daemon 更新检查后端尚未接线，开关已保存但暂不生效）",
   "compute.cudaLibsDir": "共享 CUDA 库目录",
   "compute.cudaLibsDirDescription": "启动模块时注入的共享 CUDA 库路径（Linux LD_LIBRARY_PATH / Windows PATH 前置），相对应用根目录",
   "python.uvCacheDir": "uv 缓存目录",
