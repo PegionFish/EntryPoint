@@ -13,6 +13,9 @@ node_modules/
 *.swo
 .qwen/
 
+# 会话交接记录（不入仓库）
+session-*.md
+
 # OS
 .DS_Store
 Thumbs.db
