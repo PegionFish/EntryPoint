@@ -1297,6 +1297,572 @@ to = ["output", "input"]
         assert!(err.to_string().contains("not set"), "got: {err}");
         assert!(server.captured().is_empty(), "no HTTP request may be sent");
     }
+
+    // ─── 模块节点：HTTP 推理路径（GAP-1 G1 补测） ───────────────────────────
+    // 复用上方 MockLlmServer —— 它实际是通用的"记录原始请求 + 固定响应/Hang"
+    // mock HTTP 端点；模块协议契约通过断言其捕获的原始请求锁住。
+
+    /// 模块节点测试夹具（节点 id 取 capability，与 output_path 派生口径一致）
+    fn module_node_with(
+        module_id: &str,
+        capability: &str,
+        params: serde_json::Value,
+    ) -> PipelineNode {
+        PipelineNode {
+            id: capability.to_string(),
+            kind: NodeKind::Module {
+                module_id: module_id.to_string(),
+                capability: capability.to_string(),
+                model_id: None,
+                device: None,
+            },
+            label: String::new(),
+            params,
+            position: None,
+            timeout_secs: None,
+            retry_count: None,
+        }
+    }
+
+    /// mock 服务器端口（base_url 形状固定为 http://127.0.0.1:{port}）
+    fn mock_server_port(server: &MockLlmServer) -> u16 {
+        server.base_url.rsplit(':').next().unwrap().parse().unwrap()
+    }
+
+    /// 单模块端口注册表
+    fn single_port_map(module_id: &str, server: &MockLlmServer) -> HashMap<String, u16> {
+        let mut m = HashMap::new();
+        m.insert(module_id.to_string(), mock_server_port(server));
+        m
+    }
+
+    /// 模块成功响应体（锁定 ModuleResponse 反序列化形状）
+    fn module_ok_response(output_type: Option<&str>, result: serde_json::Value) -> String {
+        serde_json::json!({
+            "status": "completed",
+            "output_type": output_type,
+            "result": result,
+        })
+        .to_string()
+    }
+
+    /// 从原始请求头提取 multipart boundary
+    fn multipart_boundary(raw: &str) -> String {
+        raw.lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.trim()
+                    .eq_ignore_ascii_case("content-type")
+                    .then(|| v.to_string())
+            })
+            .expect("multipart request must carry Content-Type header")
+            .split(';')
+            .find_map(|seg| seg.trim().strip_prefix("boundary=").map(str::to_string))
+            .expect("Content-Type must carry boundary parameter")
+    }
+
+    /// 解析 multipart body 为 (字段名, 文件名, 内容) 列表
+    /// （测试夹具文件使用纯 ASCII 内容，保证 lossy 捕获下可无损比较）
+    fn multipart_fields(raw: &str) -> Vec<(String, Option<String>, String)> {
+        let boundary = multipart_boundary(raw);
+        let body = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or_default();
+        let mut fields = Vec::new();
+        for seg in body.split(&format!("--{boundary}")) {
+            let seg = seg.trim_start_matches("\r\n");
+            // 首段为空（前导 --boundary），末段为 "--" 收尾标记
+            if seg.is_empty() || seg.starts_with("--") {
+                continue;
+            }
+            let Some((head, content)) = seg.split_once("\r\n\r\n") else {
+                continue;
+            };
+            let content = content.strip_suffix("\r\n").unwrap_or(content);
+            let disp = head
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("content-disposition"))
+                .unwrap_or_default();
+            let name = disp
+                .split("name=\"")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .unwrap_or_default()
+                .to_string();
+            let filename = disp
+                .split("filename=\"")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .map(str::to_string);
+            fields.push((name, filename, content.to_string()));
+        }
+        fields
+    }
+
+    /// 文本输入 → JSON body 形状正确；响应 output_type="text" → Artifact::Text
+    #[tokio::test]
+    async fn test_module_node_text_input_json_request_shape() {
+        let server = MockLlmServer::start(MockLlmBehavior::Respond {
+            status: 200,
+            body: module_ok_response(Some("text"), serde_json::json!("你好，世界")),
+        })
+        .await;
+
+        let node = module_node_with(
+            "faster-whisper",
+            "transcribe",
+            serde_json::json!({ "language": "zh", "beam_size": 5 }),
+        );
+        let work_dir = std::env::temp_dir().join(format!("ep_mod_json_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&work_dir).unwrap();
+
+        let artifact = execute_module_node(
+            &node,
+            &[Artifact::Text("hello world".into())],
+            &work_dir,
+            &single_port_map("faster-whisper", &server),
+        )
+        .await
+        .expect("module JSON call should succeed");
+        assert_eq!(artifact, Artifact::Text("你好，世界".into()));
+
+        // 请求形状断言：URL 路径 = /predict/{capability}；body = {params, input}
+        let reqs = server.captured();
+        assert_eq!(reqs.len(), 1);
+        let req = &reqs[0];
+        assert!(req.starts_with("POST /predict/transcribe"), "got: {req}");
+        let body = req.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(body).expect("request body must be JSON");
+        assert_eq!(v["input"], "hello world");
+        assert_eq!(v["params"]["language"], "zh");
+        assert_eq!(v["params"]["beam_size"], 5);
+
+        let _ = std::fs::remove_dir_all(&work_dir);
+    }
+
+    /// 响应 JSON 输出解析：output_type = "json" / 缺省 / 未知 均映射 Artifact::Json；
+    /// 上游 Json 产物原样进入请求体 input
+    #[tokio::test]
+    async fn test_module_node_json_output_type_mapping() {
+        let work_dir = std::env::temp_dir().join(format!("ep_mod_jmap_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let node = module_node_with("m1", "cap", serde_json::json!({}));
+
+        // output_type = "json"
+        let server = MockLlmServer::start(MockLlmBehavior::Respond {
+            status: 200,
+            body: module_ok_response(Some("json"), serde_json::json!({"segments": ["a", "b"]})),
+        })
+        .await;
+        let artifact = execute_module_node(
+            &node,
+            &[Artifact::Json(serde_json::json!({"text": "hi"}))],
+            &work_dir,
+            &single_port_map("m1", &server),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            artifact,
+            Artifact::Json(serde_json::json!({"segments": ["a", "b"]}))
+        );
+        let raw = server.captured().pop().unwrap();
+        let body = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(v["input"], serde_json::json!({"text": "hi"}));
+
+        // output_type 缺省 → 按 Json
+        let server = MockLlmServer::start(MockLlmBehavior::Respond {
+            status: 200,
+            body: serde_json::json!({"status": "completed", "result": {"ok": true}}).to_string(),
+        })
+        .await;
+        let artifact = execute_module_node(
+            &node,
+            &[],
+            &work_dir,
+            &single_port_map("m1", &server),
+        )
+        .await
+        .unwrap();
+        assert_eq!(artifact, Artifact::Json(serde_json::json!({"ok": true})));
+
+        // 未知 output_type → 回退 Json（不按未知类型失败）
+        let server = MockLlmServer::start(MockLlmBehavior::Respond {
+            status: 200,
+            body: module_ok_response(Some("weird"), serde_json::json!([1, 2])),
+        })
+        .await;
+        let artifact = execute_module_node(
+            &node,
+            &[],
+            &work_dir,
+            &single_port_map("m1", &server),
+        )
+        .await
+        .unwrap();
+        assert_eq!(artifact, Artifact::Json(serde_json::json!([1, 2])));
+
+        let _ = std::fs::remove_dir_all(&work_dir);
+    }
+
+    /// 文件输入 → multipart 投递契约：字段名 "file" + filename 透传 + 内容原样；
+    /// params 字段附加节点参数 JSON（含 output_path 注入）；
+    /// 响应 output_type="file" → Artifact::File（模块返回路径，G1-b/d）
+    #[tokio::test]
+    async fn test_module_node_file_input_multipart_contract() {
+        let work_dir = std::env::temp_dir().join(format!("ep_mod_mp_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let input_file = work_dir.join("audio.wav");
+        std::fs::write(&input_file, b"RIFF mock wav payload").unwrap();
+
+        let expected_out = work_dir.join("transcribe_output.srt");
+        let server = MockLlmServer::start(MockLlmBehavior::Respond {
+            status: 200,
+            body: module_ok_response(
+                Some("file"),
+                serde_json::json!(expected_out.to_string_lossy().to_string()),
+            ),
+        })
+        .await;
+
+        let node = module_node_with(
+            "faster-whisper",
+            "transcribe",
+            serde_json::json!({ "output_format": "srt", "language": "zh" }),
+        );
+        let artifact = execute_module_node(
+            &node,
+            &[Artifact::File(input_file)],
+            &work_dir,
+            &single_port_map("faster-whisper", &server),
+        )
+        .await
+        .expect("multipart module call should succeed");
+
+        // 产物契约：output_type="file" → Artifact::File(模块返回的路径)
+        assert_eq!(artifact, Artifact::File(expected_out.clone()));
+
+        let req = server.captured().pop().unwrap();
+        assert!(req.starts_with("POST /predict/transcribe"), "got: {req}");
+        let head = req.split_once("\r\n\r\n").map(|(h, _)| h).unwrap_or_default();
+        assert!(
+            head.to_ascii_lowercase().contains("multipart/form-data"),
+            "file input must use multipart: {head}"
+        );
+
+        let fields = multipart_fields(&req);
+        // 文件字段：name="file"、filename 透传上游文件名、字节内容原样
+        let file_field = fields
+            .iter()
+            .find(|(n, _, _)| n == "file")
+            .expect("multipart must carry a 'file' part");
+        assert_eq!(file_field.1.as_deref(), Some("audio.wav"));
+        assert_eq!(file_field.2, "RIFF mock wav payload");
+        // params 字段：节点参数 JSON 化，且注入 output_path 指向任务工作目录
+        let params_field = fields
+            .iter()
+            .find(|(n, _, _)| n == "params")
+            .expect("multipart must carry a 'params' part");
+        let params: serde_json::Value = serde_json::from_str(&params_field.2)
+            .expect("params part must be JSON");
+        assert_eq!(params["language"], "zh");
+        assert_eq!(params["output_format"], "srt");
+        assert_eq!(
+            params["output_path"],
+            serde_json::json!(expected_out.to_string_lossy().to_string()),
+            "output_path must be injected into task work_dir"
+        );
+
+        let _ = std::fs::remove_dir_all(&work_dir);
+    }
+
+    /// output_format 声明 → output_path 注入 params（JSON body 路径）；
+    /// output_format="json" 不注入
+    #[tokio::test]
+    async fn test_module_node_output_path_injection_json_body() {
+        let work_dir = std::env::temp_dir().join(format!("ep_mod_op_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&work_dir).unwrap();
+
+        let server = MockLlmServer::start(MockLlmBehavior::Respond {
+            status: 200,
+            body: module_ok_response(Some("text"), serde_json::json!("ok")),
+        })
+        .await;
+        let node = module_node_with("m1", "cap", serde_json::json!({"output_format": "srt"}));
+        execute_module_node(
+            &node,
+            &[Artifact::Text("hi".into())],
+            &work_dir,
+            &single_port_map("m1", &server),
+        )
+        .await
+        .unwrap();
+        let raw = server.captured().pop().unwrap();
+        let body = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            v["params"]["output_path"],
+            serde_json::json!(work_dir.join("cap_output.srt").to_string_lossy().to_string()),
+            "output_path must be derived from node id and point into work_dir"
+        );
+
+        // output_format="json" → 不注入 output_path
+        let server = MockLlmServer::start(MockLlmBehavior::Respond {
+            status: 200,
+            body: module_ok_response(Some("text"), serde_json::json!("ok")),
+        })
+        .await;
+        let node = module_node_with("m1", "cap", serde_json::json!({"output_format": "json"}));
+        execute_module_node(
+            &node,
+            &[Artifact::Text("hi".into())],
+            &work_dir,
+            &single_port_map("m1", &server),
+        )
+        .await
+        .unwrap();
+        let raw = server.captured().pop().unwrap();
+        let body = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert!(
+            v["params"].get("output_path").is_none(),
+            "output_format=json must not inject output_path"
+        );
+
+        let _ = std::fs::remove_dir_all(&work_dir);
+    }
+
+    /// 模块返回 500 → 节点失败，错误信息保留状态码与响应体，且不重试（G1-f）
+    #[tokio::test]
+    async fn test_module_node_http_500_fails_and_error_preserved() {
+        let server = MockLlmServer::start(MockLlmBehavior::Respond {
+            status: 500,
+            body: r#"{"error": "model exploded"}"#.to_string(),
+        })
+        .await;
+        let node = module_node_with("m1", "cap", serde_json::json!({}));
+
+        let err = execute_module_node(
+            &node,
+            &[Artifact::Text("hi".into())],
+            std::path::Path::new("."),
+            &single_port_map("m1", &server),
+        )
+        .await
+        .unwrap_err();
+        let mce = err.downcast_ref::<ModuleCallError>().expect("ModuleCallError");
+        assert!(!mce.retryable, "HTTP status errors must not be retryable");
+        assert!(mce.message.contains("500"), "status code preserved: {}", mce.message);
+        assert!(
+            mce.message.contains("model exploded"),
+            "response body preserved: {}",
+            mce.message
+        );
+        assert_eq!(server.captured().len(), 1, "non-retryable error must not retry");
+    }
+
+    /// HTTP 4xx → 不可重试：即使配置了 retry_count 也短路（G1-e 分类边界）
+    #[tokio::test]
+    async fn test_module_node_http_404_not_retried_even_with_retry_budget() {
+        let server = MockLlmServer::start(MockLlmBehavior::Respond {
+            status: 404,
+            body: r#"{"error": "no such capability"}"#.to_string(),
+        })
+        .await;
+        let mut node = module_node_with("m1", "cap", serde_json::json!({}));
+        node.retry_count = Some(3);
+
+        let err = execute_module_node(
+            &node,
+            &[Artifact::Text("hi".into())],
+            std::path::Path::new("."),
+            &single_port_map("m1", &server),
+        )
+        .await
+        .unwrap_err();
+        let mce = err.downcast_ref::<ModuleCallError>().expect("ModuleCallError");
+        assert!(!mce.retryable);
+        assert!(mce.message.contains("404"), "got: {}", mce.message);
+        assert_eq!(
+            server.captured().len(),
+            1,
+            "4xx must short-circuit regardless of retry_count"
+        );
+    }
+
+    /// 模块返回非 completed 状态 → 失败且错误携带原状态值，不重试
+    #[tokio::test]
+    async fn test_module_node_non_completed_status_fails() {
+        let server = MockLlmServer::start(MockLlmBehavior::Respond {
+            status: 200,
+            body: serde_json::json!({"status": "failed", "result": null}).to_string(),
+        })
+        .await;
+        let node = module_node_with("m1", "cap", serde_json::json!({}));
+
+        let err = execute_module_node(
+            &node,
+            &[],
+            std::path::Path::new("."),
+            &single_port_map("m1", &server),
+        )
+        .await
+        .unwrap_err();
+        let mce = err.downcast_ref::<ModuleCallError>().expect("ModuleCallError");
+        assert!(!mce.retryable);
+        assert!(
+            mce.message.contains("non-completed status") && mce.message.contains("'failed'"),
+            "got: {}",
+            mce.message
+        );
+        assert_eq!(server.captured().len(), 1);
+    }
+
+    /// 响应体非 JSON → 解析失败（不可重试、不重试）
+    #[tokio::test]
+    async fn test_module_node_invalid_json_response_fails() {
+        let server = MockLlmServer::start(MockLlmBehavior::Respond {
+            status: 200,
+            body: "this is not json".to_string(),
+        })
+        .await;
+        let node = module_node_with("m1", "cap", serde_json::json!({}));
+
+        let err = execute_module_node(
+            &node,
+            &[],
+            std::path::Path::new("."),
+            &single_port_map("m1", &server),
+        )
+        .await
+        .unwrap_err();
+        let mce = err.downcast_ref::<ModuleCallError>().expect("ModuleCallError");
+        assert!(!mce.retryable);
+        assert!(
+            mce.message.contains("failed to parse response JSON"),
+            "got: {}",
+            mce.message
+        );
+        assert_eq!(server.captured().len(), 1);
+    }
+
+    /// 连接拒绝 → 可重试错误（G1-e）
+    #[tokio::test]
+    async fn test_module_node_connect_refused_is_retryable() {
+        // 取确定空闲的端口后立即释放监听 → 连接必被拒绝
+        let closed_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let mut node = module_node_with("m1", "cap", serde_json::json!({}));
+        // 单尝试，避免重试间隔拉长测试
+        node.retry_count = Some(0);
+
+        let mut module_ports = HashMap::new();
+        module_ports.insert("m1".to_string(), closed_port);
+
+        let err = execute_module_node(&node, &[], std::path::Path::new("."), &module_ports)
+            .await
+            .unwrap_err();
+        let mce = err.downcast_ref::<ModuleCallError>().expect("ModuleCallError");
+        assert!(mce.retryable, "connection refused must be retryable: {mce}");
+        assert!(
+            mce.message.contains("connection failed"),
+            "got: {}",
+            mce.message
+        );
+    }
+
+    /// 超时 → 可重试；缺省重试预算 1 次（共两次尝试）后耗尽（G1-e）
+    #[tokio::test]
+    async fn test_module_node_timeout_retried_then_exhausted() {
+        let server = MockLlmServer::start(MockLlmBehavior::Hang).await;
+        let mut node = module_node_with("m1", "cap", serde_json::json!({}));
+        node.timeout_secs = Some(1);
+        // retry_count 缺省 → MAX_RETRIES=1
+
+        let err = execute_module_node(
+            &node,
+            &[Artifact::Text("hi".into())],
+            std::path::Path::new("."),
+            &single_port_map("m1", &server),
+        )
+        .await
+        .unwrap_err();
+        let mce = err.downcast_ref::<ModuleCallError>().expect("ModuleCallError");
+        assert!(mce.retryable, "timeout must be retryable: {mce}");
+        assert!(mce.message.contains("timed out"), "got: {}", mce.message);
+        assert_eq!(
+            server.captured().len(),
+            2,
+            "default retry budget means two attempts"
+        );
+    }
+
+    /// 端口解析：注册表与 params 均缺失 → 本地失败不发 HTTP；
+    /// params.port 回退生效；注册表优先于 params.port
+    #[tokio::test]
+    async fn test_module_node_port_resolution_registry_params_and_missing() {
+        // 1) 无注册表条目且 params 无 port → 本地即失败，不可重试
+        let node = module_node_with("ghost", "cap", serde_json::json!({}));
+        let err = execute_module_node(&node, &[], std::path::Path::new("."), &HashMap::new())
+            .await
+            .unwrap_err();
+        let mce = err.downcast_ref::<ModuleCallError>().expect("ModuleCallError");
+        assert!(!mce.retryable);
+        assert!(
+            mce.message.contains("no port registered"),
+            "got: {}",
+            mce.message
+        );
+
+        // 2) params.port 回退生效
+        let server = MockLlmServer::start(MockLlmBehavior::Respond {
+            status: 200,
+            body: module_ok_response(Some("text"), serde_json::json!("via params port")),
+        })
+        .await;
+        let node = module_node_with(
+            "m1",
+            "cap",
+            serde_json::json!({ "port": mock_server_port(&server) }),
+        );
+        let artifact = execute_module_node(&node, &[], std::path::Path::new("."), &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(artifact, Artifact::Text("via params port".into()));
+
+        // 3) 注册表优先于 params.port
+        let registry_server = MockLlmServer::start(MockLlmBehavior::Respond {
+            status: 200,
+            body: module_ok_response(Some("text"), serde_json::json!("from registry")),
+        })
+        .await;
+        let decoy_server = MockLlmServer::start(MockLlmBehavior::Respond {
+            status: 200,
+            body: module_ok_response(Some("text"), serde_json::json!("from params")),
+        })
+        .await;
+        let mut node = module_node_with(
+            "m1",
+            "cap",
+            serde_json::json!({ "port": mock_server_port(&decoy_server) }),
+        );
+        node.id = "prio".to_string();
+        let artifact = execute_module_node(
+            &node,
+            &[],
+            std::path::Path::new("."),
+            &single_port_map("m1", &registry_server),
+        )
+        .await
+        .unwrap();
+        assert_eq!(artifact, Artifact::Text("from registry".into()));
+        assert_eq!(registry_server.captured().len(), 1);
+        assert!(
+            decoy_server.captured().is_empty(),
+            "params.port must be ignored when registry has the module"
+        );
+    }
 }
 
 // ─── 节点执行辅助函数 ────────────────────────────────────────────────────────
