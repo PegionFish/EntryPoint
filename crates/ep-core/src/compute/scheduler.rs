@@ -70,6 +70,22 @@ impl ComputeScheduler {
         format!("{id}")
     }
 
+    /// LeastMemory 选择用的排序键：`(容量是否已知, 剩余显存)`。
+    ///
+    /// D-3 语义修正：`total_memory_mb == None`（容量未知：CPU/OpenVINO/DirectML
+    /// 等探测不到总量的设备）不再伪装成无限容量参与比较。兼容设备排序时
+    /// **已知容量设备在前**（按剩余降序），**未知容量设备殿后**（仍可选，
+    /// 只是最后）。`max_by_key` 按字典序比较元组：`(true, _)` 恒大于
+    /// `(false, _)`；候选全部未知容量时退化为检测顺序（同键取最后，
+    /// 与修正前的平局行为一致）。
+    fn least_memory_key(&self, device_index: usize) -> (bool, u32) {
+        let device = &self.devices[device_index];
+        match device.total_memory_mb {
+            Some(_) => (true, self.remaining_memory(device_index)),
+            None => (false, 0),
+        }
+    }
+
     /// 设备剩余显存。
     /// `total_memory_mb == None` 视为无限制（如 CPU），返回 `u32::MAX`。
     fn remaining_memory(&self, device_index: usize) -> u32 {
@@ -152,10 +168,11 @@ impl DeviceScheduler for ComputeScheduler {
         let selected_index = match self.strategy {
             SchedulingStrategy::Manual => return None,
 
+            // D-3：已知容量设备按剩余降序在前，未知容量设备殿后（仍可选）
             SchedulingStrategy::LeastMemory => compatible
                 .iter()
                 .copied()
-                .max_by_key(|&idx| self.remaining_memory(idx))?,
+                .max_by_key(|&idx| self.least_memory_key(idx))?,
 
             SchedulingStrategy::RoundRobin => {
                 let idx_pos =
@@ -314,9 +331,82 @@ mod tests {
         let result = scheduler.assign("mod_b", &[ComputeBackend::Cpu], 0);
         assert_eq!(result, Some(DeviceId::Cpu));
 
-        // 请求 Cuda 或 Cpu → LeastMemory 选 Cpu（total_memory_mb=None → 视为无限）
+        // 请求 Cuda 或 Cpu → LeastMemory 选已知容量的 cuda:0
+        //（D-3：容量未知的 CPU 不再伪装无限容量压过真 GPU，而是殿后）
         let result = scheduler.assign("mod_c", &[ComputeBackend::Cuda, ComputeBackend::Cpu], 100);
+        assert_eq!(result, Some(DeviceId::Cuda(0)));
+    }
+
+    // ── D-3：None 容量 = 容量未知，殿后但可选 ──────────────────────────────
+
+    #[test]
+    fn test_least_memory_prefers_known_capacity_over_unknown() {
+        // cuda 有容量 + openvino None（任务要求的构造）：
+        // 即便未知容量设备排在设备表首位，LeastMemory 仍选已知容量的 cuda
+        let devices = vec![
+            make_device(DeviceId::OpenVINO("GPU.0".into()), "Intel NPU", None),
+            cuda_device(0, "NVIDIA GPU", 8192),
+        ];
+        let scheduler = ComputeScheduler::new(devices, SchedulingStrategy::LeastMemory);
+
+        let result = scheduler.assign(
+            "mod_a",
+            &[ComputeBackend::OpenVINO, ComputeBackend::Cuda],
+            1024,
+        );
+        assert_eq!(result, Some(DeviceId::Cuda(0)));
+    }
+
+    #[test]
+    fn test_least_memory_known_beats_unknown_regardless_of_size() {
+        // 已知容量设备哪怕剩余很小，排序也在任何未知容量设备之前
+        let devices = vec![
+            cuda_device(0, "Small GPU", 512),
+            make_device(DeviceId::OpenVINO("GPU.0".into()), "Intel NPU", None),
+        ];
+        let scheduler = ComputeScheduler::new(devices, SchedulingStrategy::LeastMemory);
+
+        let result = scheduler.assign(
+            "mod_a",
+            &[ComputeBackend::Cuda, ComputeBackend::OpenVINO],
+            100,
+        );
+        assert_eq!(result, Some(DeviceId::Cuda(0)));
+    }
+
+    #[test]
+    fn test_least_memory_unknown_capacity_devices_still_selectable() {
+        // 候选全部容量未知 → 仍可分配（殿后不等于淘汰；平局取检测序最后）
+        let devices = vec![
+            make_device(DeviceId::OpenVINO("GPU.0".into()), "Intel NPU", None),
+            cpu_device(),
+        ];
+        let scheduler = ComputeScheduler::new(devices, SchedulingStrategy::LeastMemory);
+
+        let result = scheduler.assign(
+            "mod_a",
+            &[ComputeBackend::OpenVINO, ComputeBackend::Cpu],
+            1024,
+        );
         assert_eq!(result, Some(DeviceId::Cpu));
+    }
+
+    #[test]
+    fn test_least_memory_known_devices_ranked_by_remaining_desc() {
+        // 已知容量设备之间仍按剩余降序（D-3 只改未知容量的位置，不改组内排序）
+        let devices = vec![
+            cuda_device(0, "GPU-A", 4096),
+            make_device(DeviceId::OpenVINO("GPU.0".into()), "Intel NPU", None),
+            cuda_device(1, "GPU-B", 8192),
+        ];
+        let scheduler = ComputeScheduler::new(devices, SchedulingStrategy::LeastMemory);
+
+        let result = scheduler.assign(
+            "mod_a",
+            &[ComputeBackend::Cuda, ComputeBackend::OpenVINO],
+            1024,
+        );
+        assert_eq!(result, Some(DeviceId::Cuda(1)));
     }
 
     #[test]

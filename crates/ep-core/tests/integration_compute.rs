@@ -197,12 +197,14 @@ fn test_scheduler_compatibility() {
     let result = scheduler.assign("ov-mod", &[ComputeBackend::OpenVINO], 100);
     assert_eq!(result, None, "no OpenVINO device available");
 
-    // Request CUDA or CPU — LeastMemory picks CPU (None total_memory → u32::MAX remaining)
+    // Request CUDA or CPU — LeastMemory picks the known-capacity GPU
+    // (D-3: CPU total_memory=None means "unknown capacity" and ranks last,
+    // it no longer masquerades as unlimited memory)
     let result = scheduler.assign("flex-mod", &[ComputeBackend::Cuda, ComputeBackend::Cpu], 100);
     assert_eq!(
         result,
-        Some(DeviceId::Cpu),
-        "CPU has unlimited memory, should be preferred by LeastMemory"
+        Some(DeviceId::Cuda(0)),
+        "known-capacity GPU should be preferred over unknown-capacity CPU"
     );
 
     // VRAM overcommit blocked by default
