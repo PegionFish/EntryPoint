@@ -94,6 +94,8 @@
   "modelUpdate.available": "An update is available",
   "modelUpdate.upToDate": "Already up to date",
   "modelUpdate.failed": "Update check failed",
+  "ws.modelUpdate": "{{module}} / {{model}} has an available update",
+  "ws.goModules": "Go to Modules",
   "modelDelete.succeeded": "Model deleted",
   "modelDelete.failed": "Model deletion failed",
   "modelDelete.confirmTitle": "Delete model \"{{name}}\"?",

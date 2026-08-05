@@ -94,6 +94,8 @@
   "modelUpdate.available": "发现可用更新",
   "modelUpdate.upToDate": "已是最新版本",
   "modelUpdate.failed": "检查更新失败",
+  "ws.modelUpdate": "「{{module}}」/「{{model}}」有可用更新",
+  "ws.goModules": "前往模块页",
   "modelDelete.succeeded": "模型已删除",
   "modelDelete.failed": "模型删除失败",
   "modelDelete.confirmTitle": "删除模型「{{name}}」？",
