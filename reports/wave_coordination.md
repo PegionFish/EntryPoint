@@ -53,7 +53,10 @@
 | 45 | D3：cuda-libs 入 gui+server 双包 + P2-17 连带修复（service 目录对齐/install 用户创建/PKGBUILD 挂 install） | **追认**（存在性复制无副作用；packaging 自洽必要） | D3 |
 | 46 | D3：scripts/build-desktop.sh 功能已被 build.sh/build.ps1 gui 覆盖 | **保留暂不裁撤**，列 PROGRESS 后续项 | D3 |
 | 47 | 用户裁决（IA 终稿）：模型=模块同一概念；单页「模块」；工具栏「导入模块/导出模块」；旧模块页/整合包页直接删除（无重定向）；变体折叠进选择器不独立成模型 | WebUI+桌面两代理按此执行 | 用户 |
-| 48 | 缺陷：daemon 保存配置时把相对路径绝对化持久化（cache_dir/workspace_dir 写为 C:\...），迁移部署目录即坏 | **已知限制，后续修复**（config save 保留原始相对形态，解析与持久化分离）；出厂 config/ 与打包产物不受影响 | 门禁发现 |
+| 48 | 缺陷：daemon 保存配置时把相对路径绝对化持久化（cache_dir/workspace_dir 写为 C:\...），迁移部署目录即坏 | **已修复**（ConfigFix `21ab888`：ResolvedPaths 运行期缓存与序列化字段分离，943 测试全绿）；GET /api/config 回原始形态=预期；requires_restart 更保守=接受 | 门禁发现→修复 |
+| 49 | 打包报"18 测试失败" | **build.ps1 计数误报**（旧逻辑数含 "failed" 字样的摘要行，全绿也=18）；已修计数+失败明细（TestStab `d167495`）；测试环境隔离经干扰复现证伪端口争用；**最终打包需合并后重跑** | TestStab |
+| 50 | IA-WebUI 重构随设计移除的存量 UI 入口：按模型本机上传/本地路径导入/检查更新/删除模型/tag 筛选 chips（后端端点仍在）；导出产物离开页面无重下入口 | **待用户收尾裁决**（恢复入口 or 确认移除）；孤儿 module-card.tsx 门禁期删除 | IA-WebUI→用户 |
+| 51 | DaemonWire 后续：settings.tsx `general.checkUpdatesPending` 文案切回 `checkUpdatesDescription`（后端已接线）；WS `model_update` 类型预留（前端消费延后）；自动检查节奏 15s+24h 常量接受；桌面端 check_updates 不受开关影响（延后） | 文案切换归门禁批；其余接受/延后 | DaemonWire |
 
 ## 待收集（各波代理报告中来）
 
