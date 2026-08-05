@@ -90,18 +90,18 @@ async fn run_module_standalone(module_id: &str, root: PathBuf, cfg: AppConfig) -
         manifest.module.category
     );
 
-    // Detect devices and pick the best one
+    // Detect devices and pick the best one（D-4 调度器接线：替代旧 first-match，
+    // 经 ep-core 共享选择核心统一分配；无兼容设备时保留原 Cpu 兜底语义）
     let devices = detect_all_devices(&cfg.compute.disabled_backends);
-    let device = devices
-        .iter()
-        .find(|d| {
-            manifest
-                .compute
-                .backends
-                .contains(&d.backend)
-        })
-        .map(|d| d.id.clone())
-        .unwrap_or(ep_core::types::DeviceId::Cpu);
+    let device = ep_core::compute::scheduler::select_device_for_module(
+        &devices,
+        manifest,
+        ep_core::compute::scheduler::module_vram_request(&cfg, manifest),
+        ep_core::compute::scheduler::scheduling_strategy_for(&cfg),
+        cfg.compute.allow_overcommit,
+        &cfg.compute.disabled_backends,
+    )
+    .unwrap_or(ep_core::types::DeviceId::Cpu);
 
     tracing::info!("Using device: {}", device);
 

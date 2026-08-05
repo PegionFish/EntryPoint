@@ -218,15 +218,9 @@ async fn start_via_existing_path(
         })?
     };
 
-    // 4. 选择设备：manifest 声明的后端优先，否则回退 CPU（与 modules.rs 一致）
-    let device = {
-        let devices = state.devices.read().await;
-        devices
-            .iter()
-            .find(|d| manifest.compute.backends.contains(&d.backend))
-            .map(|d| d.id.clone())
-            .unwrap_or(DeviceId::Cpu)
-    };
+    // 4. 选择设备（D-4 调度器接线，与 modules.rs 同源）：经 ep-core 共享选择
+    //    核心统一分配，语义见 [`super::select_module_device`]（无兼容设备时 Cpu 兜底）
+    let device = super::select_module_device(state, manifest).await;
 
     // 5. 构建环境变量（与 modules.rs::start_module 同款集合）
     let env_vars = build_env_vars(state, manifest, module_path, port, &device);

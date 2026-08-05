@@ -17,7 +17,7 @@ use ep_core::config::AppConfig;
 use ep_core::model::{ModelManager, ModelStatus, active_model_for};
 use ep_core::module::discovery::{DiscoveredModule, DiscoveryStatus};
 use ep_core::module::manifest::{CapabilityDecl, ModelDecl, ModuleManifest};
-use ep_core::types::{DeviceId, ServiceStatus};
+use ep_core::types::ServiceStatus;
 
 use super::err_response;
 use crate::state::AppState;
@@ -288,15 +288,9 @@ pub async fn start_module(
         }
     };
 
-    // 5. 选择设备：manifest 声明的后端优先，否则回退 CPU
-    let device = {
-        let devices = state.devices.read().await;
-        devices
-            .iter()
-            .find(|d| manifest.compute.backends.contains(&d.backend))
-            .map(|d| d.id.clone())
-            .unwrap_or(DeviceId::Cpu)
-    };
+    // 5. 选择设备（D-4 调度器接线）：经 ep-core 共享选择核心统一分配，
+    //    语义见 [`super::select_module_device`]（无兼容设备时 Cpu 兜底）
+    let device = super::select_module_device(&state, &manifest).await;
 
     // 6. 构建环境变量（MODEL_DIR 经激活变体 + config.models.cache_dir 解析，P2-9）
     let env_vars = {
@@ -649,6 +643,7 @@ pub async fn set_model_variant(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ep_core::types::DeviceId;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static SEQ: AtomicUsize = AtomicUsize::new(0);
