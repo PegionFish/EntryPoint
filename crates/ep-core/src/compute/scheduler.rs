@@ -1,11 +1,23 @@
 //! 计算设备调度器 — Wave 1a Agent B 实现
 //!
 //! 根据策略为模块分配计算设备。
+//!
+//! ## 模块级设备选择（D-4 下沉，daemon/桌面共享）
+//!
+//! [`ComputeScheduler::assign_module_device`] 是两端共用的选择核心：
+//! manifest backends 兼容过滤（尊重 `[compute].disabled_backends`）→
+//! 非 CPU 加速优先（strategy + VRAM 闸门）→ CPU 保底。
+//! 桌面端经常驻调度器调用（带显存记账）；daemon 三处经
+//! [`select_device_for_module`] 以临时调度器做无状态一次性选择
+//! （语义完全同源）。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::RwLock;
 
+use crate::config::{AppConfig, AssignStrategy};
+use crate::model::active_model_for;
+use crate::module::manifest::ModuleManifest;
 use crate::types::{ComputeBackend, ComputeDevice, DeviceId, DeviceScheduler, SchedulingStrategy};
 
 /// 设备调度器
@@ -26,6 +38,9 @@ pub struct ComputeScheduler {
     allocated_per_device: RwLock<HashMap<String, u32>>,
     /// 每个模块分配的显存 (MB)，用于 release 时精确释放
     vram_per_module: RwLock<HashMap<String, u32>>,
+    /// 全局禁用后端（`[compute].disabled_backends`）— 共享选择时从 manifest
+    /// 兼容集中剔除（设备探测与选择双重保险，配置热改后不依赖下一轮重探测）
+    disabled_backends: Vec<ComputeBackend>,
 }
 
 /// 设备分配摘要（由 `status_report` 返回）
@@ -48,11 +63,17 @@ impl ComputeScheduler {
             allow_overcommit: false,
             allocated_per_device: RwLock::new(HashMap::new()),
             vram_per_module: RwLock::new(HashMap::new()),
+            disabled_backends: Vec::new(),
         }
     }
 
     pub fn set_allow_overcommit(&mut self, allow: bool) {
         self.allow_overcommit = allow;
+    }
+
+    /// 设置全局禁用后端（`[compute].disabled_backends`，共享选择尊重该清单）
+    pub fn set_disabled_backends(&mut self, disabled: Vec<ComputeBackend>) {
+        self.disabled_backends = disabled;
     }
 
     /// 筛选后端兼容的设备
@@ -154,6 +175,60 @@ impl ComputeScheduler {
             })
             .collect()
     }
+
+    /// 模块级设备选择 — daemon/桌面共享实现（D-4），替代 daemon 旧 first-match
+    /// 与桌面端同名自由函数。语义：
+    ///
+    /// 1. 按 manifest `[compute].backends` 兼容过滤，并剔除
+    ///    `[compute].disabled_backends`；过滤后为空 → `None`；
+    /// 2. 非 CPU 加速后端优先：以加速后端组走 [`DeviceScheduler::assign`]
+    ///    （四策略与 VRAM 闸门在此生效；`allow_overcommit=false` 超限拒绝）；
+    /// 3. 加速组被拒（无设备 / Manual / 显存闸门）且 manifest 声明 CPU →
+    ///    CPU 保底（绕过调度器与显存闸门：CPU 恒可用，与桌面原语义一致）；
+    /// 4. 无任何兼容设备 → `None`（调用方决定错误/兜底语义）。
+    ///
+    /// 纯 CPU 模块（backends 仅含 CPU）直接走 CPU 后端分配路径。
+    /// `vram_mb` 为调度显存请求量（见 [`module_vram_request`]）。
+    pub fn assign_module_device(
+        &self,
+        module_id: &str,
+        manifest: &ModuleManifest,
+        vram_mb: u32,
+    ) -> Option<DeviceId> {
+        // 1. 兼容过滤（含禁用后端）
+        let backends: Vec<ComputeBackend> = manifest
+            .compute
+            .backends
+            .iter()
+            .copied()
+            .filter(|b| !self.disabled_backends.contains(b))
+            .collect();
+        if backends.is_empty() {
+            return None;
+        }
+
+        // 2. 非 CPU 加速优先
+        let accel: Vec<ComputeBackend> = backends
+            .iter()
+            .copied()
+            .filter(|b| *b != ComputeBackend::Cpu)
+            .collect();
+        let assigned = if accel.is_empty() {
+            // 纯 CPU 模块：直接走 CPU 后端分配（CPU 设备 total_memory_mb=None
+            // → 不受显存闸门约束）
+            self.assign(module_id, &[ComputeBackend::Cpu], 0)
+        } else {
+            self.assign(module_id, &accel, vram_mb)
+        };
+        if assigned.is_some() {
+            return assigned;
+        }
+
+        // 3. CPU 保底（绕过调度器：CPU 恒可用，无需记账）
+        backends
+            .contains(&ComputeBackend::Cpu)
+            .then_some(DeviceId::Cpu)
+    }
 }
 
 impl DeviceScheduler for ComputeScheduler {
@@ -234,6 +309,64 @@ impl DeviceScheduler for ComputeScheduler {
 
     fn devices(&self) -> &[ComputeDevice] {
         &self.devices
+    }
+}
+
+// ─── 无状态一次性选择与共享助手（D-4：daemon 三处消费） ─────────────────────
+
+/// 无状态一次性选择的进程级 RoundRobin 游标（D-4）。
+///
+/// daemon 三处调用点每次请求构建临时调度器，实例游标恒从 0 开始会让
+/// RoundRobin 退化为 Single；进程级游标保证跨请求轮转。桌面端使用常驻
+/// 调度器（自有实例游标），不消费本游标。
+static STATELESS_ROUND_ROBIN_CURSOR: AtomicUsize = AtomicUsize::new(0);
+
+/// 无状态一次性设备选择 — daemon 三处启动路径的共享入口（D-4）。
+///
+/// 内部构建临时 [`ComputeScheduler`] 并走与桌面端完全相同的
+/// [`ComputeScheduler::assign_module_device`] 路径，保证两端语义同源；
+/// 临时实例的显存记账随实例丢弃——daemon 不做跨模块记账，闸门实时占用
+/// 由检测器采样提供（见 `remaining_memory` 的 D-6 语义）。
+///
+/// - `strategy` / `allow_overcommit` / `disabled_backends` 取自 `[compute]` 配置；
+/// - RoundRobin 策略由进程级游标驱动跨请求轮转；
+/// - 返回 `None` = 无兼容设备（调用方决定错误/兜底语义）。
+pub fn select_device_for_module(
+    devices: &[ComputeDevice],
+    manifest: &ModuleManifest,
+    vram_mb: u32,
+    strategy: SchedulingStrategy,
+    allow_overcommit: bool,
+    disabled_backends: &[ComputeBackend],
+) -> Option<DeviceId> {
+    let mut scheduler = ComputeScheduler::new(devices.to_vec(), strategy);
+    scheduler.set_allow_overcommit(allow_overcommit);
+    scheduler.set_disabled_backends(disabled_backends.to_vec());
+    if strategy == SchedulingStrategy::RoundRobin {
+        let start = STATELESS_ROUND_ROBIN_CURSOR.fetch_add(1, Ordering::SeqCst);
+        scheduler.round_robin_index.store(start, Ordering::SeqCst);
+    }
+    scheduler.assign_module_device(&manifest.module.id, manifest, vram_mb)
+}
+
+/// 调度显存请求量（MB）：激活变体级估算优先、模块级兜底（§6.3 同源口径，
+/// [`ModuleManifest::resolve_vram_estimate`] 在变体未命中时自动回退模块级），
+/// 未知 → 0（不参与显存闸门）。daemon/桌面共享，语义同桌面原
+/// `scheduler_vram_mb`。
+pub fn module_vram_request(config: &AppConfig, manifest: &ModuleManifest) -> u32 {
+    let variant = active_model_for(config, manifest).unwrap_or("");
+    let mb = manifest.resolve_vram_estimate(variant).unwrap_or(0);
+    u32::try_from(mb).unwrap_or(u32::MAX)
+}
+
+/// `[compute].strategy` → 调度器策略（daemon/桌面共享，语义同桌面原
+/// `scheduling_strategy_for`；`Single` 的具体设备名当前不参与落位）
+pub fn scheduling_strategy_for(config: &AppConfig) -> SchedulingStrategy {
+    match config.compute.resolved_strategy() {
+        AssignStrategy::Manual => SchedulingStrategy::Manual,
+        AssignStrategy::LeastMemory => SchedulingStrategy::LeastMemory,
+        AssignStrategy::RoundRobin => SchedulingStrategy::RoundRobin,
+        AssignStrategy::Single(_) => SchedulingStrategy::Single,
     }
 }
 
@@ -549,5 +682,208 @@ mod tests {
         assert_eq!(report[0].allocated_memory_mb, 1024);
         assert!(report[1].assigned_modules.is_empty());
         assert_eq!(report[1].allocated_memory_mb, 0);
+    }
+
+    // ── D-4：模块级设备选择共享实现（daemon/桌面同源） ────────────────────
+
+    /// manifest 测试夹具：backends + 可选附加 `[compute]` 行（如 vram_estimate_mb / models）
+    fn manifest_fixture(id: &str, backends: &[ComputeBackend], extra: &str) -> ModuleManifest {
+        let backends_str = backends
+            .iter()
+            .map(|b| format!("\"{b}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        toml::from_str(&format!(
+            r#"
+[module]
+id = "{id}"
+name = "t"
+version = "0.1.0"
+description = "t"
+category = "asr"
+genre = "test"
+
+[runtime]
+type = "native"
+binaries = {{ "x" = "x" }}
+
+[compute]
+backends = [{backends_str}]
+{extra}
+
+[interface]
+type = "http"
+"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_assign_module_device_accelerator_first_least_memory() {
+        // cuda+cpu 声明：加速后端优先，LeastMemory 选剩余显存最大的 cuda:1
+        let devices = vec![cuda_device(0, "GPU-Small", 4096), cuda_device(1, "GPU-Large", 8192), cpu_device()];
+        let scheduler = ComputeScheduler::new(devices, SchedulingStrategy::LeastMemory);
+        let mf = manifest_fixture("mod-a", &[ComputeBackend::Cuda, ComputeBackend::Cpu], "");
+
+        let r = scheduler.assign_module_device("mod-a", &mf, 100);
+        assert_eq!(r, Some(DeviceId::Cuda(1)));
+    }
+
+    #[test]
+    fn test_assign_module_device_pure_cpu_module() {
+        // 纯 CPU 模块：走 CPU 分配路径；设备表即使没有 CPU 条目也返回 Cpu
+        //（CPU 保底绕过设备表：CPU 恒可用）
+        let devices = vec![cuda_device(0, "GPU", 8192)];
+        let scheduler = ComputeScheduler::new(devices, SchedulingStrategy::LeastMemory);
+        let mf = manifest_fixture("mod-a", &[ComputeBackend::Cpu], "");
+
+        let r = scheduler.assign_module_device("mod-a", &mf, 0);
+        assert_eq!(r, Some(DeviceId::Cpu));
+    }
+
+    #[test]
+    fn test_assign_module_device_disabled_backends_excluded() {
+        // 禁用 cuda → 加速组为空，manifest 声明 cpu → CPU 保底
+        let devices = vec![cuda_device(0, "GPU", 8192), cpu_device()];
+        let mut scheduler = ComputeScheduler::new(devices, SchedulingStrategy::LeastMemory);
+        scheduler.set_disabled_backends(vec![ComputeBackend::Cuda]);
+        let mf = manifest_fixture("mod-a", &[ComputeBackend::Cuda, ComputeBackend::Cpu], "");
+
+        let r = scheduler.assign_module_device("mod-a", &mf, 100);
+        assert_eq!(r, Some(DeviceId::Cpu));
+    }
+
+    #[test]
+    fn test_assign_module_device_all_backends_disabled_returns_none() {
+        // manifest 全部后端被禁用 → None（调用方决定兜底语义）
+        let devices = vec![cuda_device(0, "GPU", 8192), cpu_device()];
+        let mut scheduler = ComputeScheduler::new(devices, SchedulingStrategy::LeastMemory);
+        scheduler.set_disabled_backends(vec![ComputeBackend::Cuda, ComputeBackend::Cpu]);
+        let mf = manifest_fixture("mod-a", &[ComputeBackend::Cuda, ComputeBackend::Cpu], "");
+
+        let r = scheduler.assign_module_device("mod-a", &mf, 100);
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn test_assign_module_device_vram_gate_reject_cpu_fallback() {
+        // 显存闸门拒绝（超限且未开超分）：声明 cpu → CPU 保底；仅 cuda → None
+        let devices = vec![cuda_device(0, "GPU", 4096), cpu_device()];
+        let scheduler = ComputeScheduler::new(devices, SchedulingStrategy::LeastMemory);
+
+        let mf = manifest_fixture("mod-a", &[ComputeBackend::Cuda, ComputeBackend::Cpu], "");
+        let r = scheduler.assign_module_device("mod-a", &mf, 9999);
+        assert_eq!(r, Some(DeviceId::Cpu));
+
+        let mf_gpu_only = manifest_fixture("mod-b", &[ComputeBackend::Cuda], "");
+        let r = scheduler.assign_module_device("mod-b", &mf_gpu_only, 9999);
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn test_assign_module_device_manual_strategy_cpu_fallback() {
+        // Manual 策略下调度器拒绝自动分配 → manifest 声明 cpu 则 CPU 保底
+        let devices = vec![cuda_device(0, "GPU", 8192), cpu_device()];
+        let scheduler = ComputeScheduler::new(devices, SchedulingStrategy::Manual);
+        let mf = manifest_fixture("mod-a", &[ComputeBackend::Cuda, ComputeBackend::Cpu], "");
+
+        let r = scheduler.assign_module_device("mod-a", &mf, 100);
+        assert_eq!(r, Some(DeviceId::Cpu));
+    }
+
+    #[test]
+    fn test_select_device_for_module_respects_config() {
+        // 无状态入口消费 [compute] 配置：disabled_backends 过滤生效
+        let devices = vec![cuda_device(0, "GPU", 8192), cpu_device()];
+        let mf = manifest_fixture("mod-a", &[ComputeBackend::Cuda, ComputeBackend::Cpu], "");
+
+        let r = select_device_for_module(
+            &devices,
+            &mf,
+            100,
+            SchedulingStrategy::LeastMemory,
+            false,
+            &[ComputeBackend::Cuda],
+        );
+        assert_eq!(r, Some(DeviceId::Cpu));
+
+        // 不禁用 → 加速器优先
+        let r = select_device_for_module(
+            &devices,
+            &mf,
+            100,
+            SchedulingStrategy::LeastMemory,
+            false,
+            &[],
+        );
+        assert_eq!(r, Some(DeviceId::Cuda(0)));
+    }
+
+    #[test]
+    fn test_select_device_for_module_round_robin_rotates_across_requests() {
+        // 每次调用构建临时调度器，进程级游标保证跨请求轮转不退化为 Single。
+        // 本测试是 STATELESS_ROUND_ROBIN_CURSOR 的唯一消费者，断言确定性成立。
+        let devices = vec![cuda_device(0, "GPU-0", 8192), cuda_device(1, "GPU-1", 8192)];
+        let mf = manifest_fixture("mod-a", &[ComputeBackend::Cuda], "");
+
+        let picks: Vec<DeviceId> = (0..4)
+            .map(|_| {
+                select_device_for_module(
+                    &devices,
+                    &mf,
+                    0,
+                    SchedulingStrategy::RoundRobin,
+                    true,
+                    &[],
+                )
+                .unwrap()
+            })
+            .collect();
+        // 相邻两次必不同（游标 +1，候选数 2），且两块设备都被轮到
+        for w in picks.windows(2) {
+            assert_ne!(w[0], w[1]);
+        }
+        assert!(picks.contains(&DeviceId::Cuda(0)));
+        assert!(picks.contains(&DeviceId::Cuda(1)));
+    }
+
+    #[test]
+    fn test_module_vram_request_variant_priority_and_fallback() {
+        // 变体级估算优先（config.active_models 命中）；未命中回退模块级；全缺 → 0
+        let extra = "vram_estimate_mb = 512\n\n[[models]]\nid = \"m1\"\nname = \"M1\"\nsource = \"huggingface\"\nrepo_id = \"a/b\"\ntarget_dir = \"m1\"\nvram_estimate_mb = 2048\ndefault = true";
+        let mf = manifest_fixture("mod-a", &[ComputeBackend::Cuda, ComputeBackend::Cpu], extra);
+
+        let mut config = AppConfig::default();
+        config.active_models.insert("mod-a".into(), "m1".into());
+        assert_eq!(module_vram_request(&config, &mf), 2048);
+
+        // 激活变体未配置 → 三级回退取 default 变体 m1，仍是变体级 2048
+        let config_default = AppConfig::default();
+        assert_eq!(module_vram_request(&config_default, &mf), 2048);
+
+        // 变体级缺失 → 回退模块级 512（active_models 指向无估算的变体也同理）
+        let mf_no_variant = manifest_fixture("mod-b", &[ComputeBackend::Cpu], "vram_estimate_mb = 512");
+        assert_eq!(module_vram_request(&AppConfig::default(), &mf_no_variant), 512);
+
+        // 全缺 → 0（不参与显存闸门）
+        let mf_none = manifest_fixture("mod-c", &[ComputeBackend::Cpu], "");
+        assert_eq!(module_vram_request(&AppConfig::default(), &mf_none), 0);
+    }
+
+    #[test]
+    fn test_scheduling_strategy_for_config_mapping() {
+        let mut config = AppConfig::default();
+
+        config.compute.strategy = AssignStrategy::Manual;
+        assert_eq!(scheduling_strategy_for(&config), SchedulingStrategy::Manual);
+
+        config.compute.strategy = AssignStrategy::LeastMemory;
+        assert_eq!(scheduling_strategy_for(&config), SchedulingStrategy::LeastMemory);
+
+        config.compute.strategy = AssignStrategy::RoundRobin;
+        assert_eq!(scheduling_strategy_for(&config), SchedulingStrategy::RoundRobin);
+
+        config.compute.strategy = AssignStrategy::Single(None);
+        assert_eq!(scheduling_strategy_for(&config), SchedulingStrategy::Single);
     }
 }
