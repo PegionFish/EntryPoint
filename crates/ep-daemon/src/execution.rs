@@ -827,6 +827,29 @@ fn start_task(
 
 // ─── 终结（唯一终态写入点：CAS 竞争 + 闸门释放 + 回调） ─────────────────────
 
+/// 清理任务工作目录中的中间文件（keep_workspace=false）。
+///
+/// 产物已归集到 `files/`（硬链接/复制，供 ServeDir 下载），本函数**完全跳过
+/// files/**（含其内容），只删除其余中间文件（临时文件、解包目录等）。
+fn cleanup_task_workdir(task_dir: &std::path::Path) -> std::io::Result<()> {
+    if !task_dir.is_dir() {
+        return Ok(());
+    }
+    let files_dir = task_dir.join("files");
+    for entry in std::fs::read_dir(task_dir)? {
+        let p = entry?.path();
+        if p == files_dir {
+            continue;
+        }
+        if p.is_dir() {
+            std::fs::remove_dir_all(&p)?;
+        } else {
+            std::fs::remove_file(&p)?;
+        }
+    }
+    Ok(())
+}
+
 /// 终结原因
 enum TerminalCause {
     /// 引擎自然收尾：None = 成功，Some = 失败原因
@@ -929,6 +952,22 @@ async fn finalize_task(
             }
         }) {
             warn!(task_id, error = %e, "failed to persist terminal task state");
+        }
+    }
+
+    // keep_workspace=false → 清理任务工作目录的中间文件。
+    // 产物已归集到 files/（硬链接/复制），files/ 保留供产物下载；
+    // 其余中间产物（临时文件、解包目录等）一律删除。清理失败仅告警。
+    if !{ state.config.read().await.pipeline.keep_workspace } {
+        let work_dir = registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(task_id)
+            .map(|r| r.work_dir.clone());
+        if let Some(dir) = work_dir {
+            if let Err(e) = cleanup_task_workdir(&dir) {
+                warn!(task_id, dir = %dir.display(), error = %e, "keep_workspace=false cleanup failed");
+            }
         }
     }
 
@@ -1570,6 +1609,43 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    // ── cleanup_task_workdir：keep_workspace=false 中间文件清理 ──────────────
+
+    #[test]
+    fn cleanup_removes_intermediates_keeps_files_dir() {
+        let root = unique_root("cleanup");
+        let task_dir = root.join("tasks").join("t1");
+        std::fs::create_dir_all(task_dir.join("files").join("node1")).unwrap();
+        std::fs::write(task_dir.join("files").join("node1").join("out.txt"), "out").unwrap();
+        std::fs::write(task_dir.join("staging.bin"), "staging").unwrap();
+        std::fs::create_dir_all(task_dir.join("tmp")).unwrap();
+        std::fs::write(task_dir.join("tmp").join("mid.wav"), "mid").unwrap();
+
+        cleanup_task_workdir(&task_dir).unwrap();
+
+        // 中间文件与临时目录被清
+        assert!(!task_dir.join("staging.bin").exists());
+        assert!(!task_dir.join("tmp").exists());
+        // files/ 及其产物保留
+        assert!(task_dir.join("files").join("node1").join("out.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cleanup_removes_empty_files_dir_and_missing_dir_is_noop() {
+        let root = unique_root("cleanup2");
+        let task_dir = root.join("tasks").join("t2");
+        std::fs::create_dir_all(&task_dir).unwrap();
+
+        cleanup_task_workdir(&task_dir).unwrap();
+        // files/ 不存在 → 任务目录本身被清空（目录仍在，由调用方决定去留）
+        assert!(task_dir.exists());
+
+        // 不存在目录 → noop 不报错
+        cleanup_task_workdir(&root.join("ghost")).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn test_state(root: PathBuf) -> Arc<AppState> {
