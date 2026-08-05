@@ -312,8 +312,36 @@ async fn run_server(root: PathBuf, cfg: AppConfig) -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await?;
 
+    // 优雅退出：回收所有运行中的模块子进程（stop_module 会 kill 子进程并
+    // 释放端口）。已知限制修复：daemon 重启不再留下孤儿进程占用端口。
+    stop_all_modules(&state).await;
+
     tracing::info!("Daemon shut down gracefully");
     Ok(())
+}
+
+/// 停止所有运行中的模块子进程（优雅退出时的回收）。
+/// 逐个 stop_module（内部 kill 子进程 + 释放端口），单个失败仅告警不阻断。
+async fn stop_all_modules(state: &Arc<AppState>) {
+    let running: Vec<String> = {
+        let pm = state.process_manager.read().await;
+        pm.list_running()
+            .iter()
+            .map(|inst| inst.module_id.clone())
+            .collect()
+    };
+    if running.is_empty() {
+        tracing::info!("No running modules to stop");
+        return;
+    }
+    tracing::info!(count = running.len(), "Stopping running modules…");
+    for module_id in running {
+        let mut pm = state.process_manager.write().await;
+        match pm.stop_module(&module_id).await {
+            Ok(()) => tracing::info!(module_id = %module_id, "module stopped on shutdown"),
+            Err(e) => tracing::warn!(module_id = %module_id, error = %e, "failed to stop module on shutdown"),
+        }
+    }
 }
 
 /// 构建完整路由（API + WebSocket + SPA 静态资源）。
@@ -770,5 +798,122 @@ mod tests {
         let last = s(&["a", "a", "a"]);
         let new = s(&["a", "a", "a", "a"]);
         assert_eq!(diff_new_lines(&last, &new), s(&["a"]));
+    }
+
+    // ── stop_all_modules：优雅退出回收 ────────────────────────────────────────
+
+    /// 跨平台"存活若干秒"的启动命令（Windows 无 sleep；ping 自带秒级延时）
+    fn keepalive_command() -> &'static str {
+        if cfg!(target_os = "windows") {
+            "ping -n 30 127.0.0.1 > NUL"
+        } else {
+            "sleep 30"
+        }
+    }
+
+    /// 构造测试 manifest（native 类型 + 存活命令）
+    fn shutdown_test_manifest(module_id: &str) -> ep_core::module::manifest::ModuleManifest {
+        use ep_core::module::manifest::{
+            ComputeConfig, InterfaceConfig, InterfaceType, ModuleInfo, ModuleManifest,
+            RuntimeConfig, RuntimeType,
+        };
+        use ep_core::types::ModuleCategory;
+        ModuleManifest {
+            module: ModuleInfo {
+                id: module_id.to_string(),
+                name: "shutdown-test".to_string(),
+                version: "0.1.0".to_string(),
+                description: String::new(),
+                category: ModuleCategory::Other("test".to_string()),
+                genre: String::new(),
+                authors: vec![],
+                license: None,
+                homepage: None,
+                tags: vec![],
+            },
+            runtime: RuntimeConfig {
+                runtime_type: RuntimeType::Native,
+                python_version: None,
+                requirements: None,
+                entrypoint: None,
+                start_command: Some(keepalive_command().to_string()),
+                binaries: None,
+            },
+            compute: ComputeConfig {
+                backends: vec![ep_core::types::ComputeBackend::Cpu],
+                default_backend: Some(ep_core::types::ComputeBackend::Cpu),
+                vram_estimate_mb: None,
+                min_vram_mb: None,
+                env: None,
+            },
+            models: vec![],
+            interface: InterfaceConfig {
+                interface_type: InterfaceType::Http,
+                health_endpoint: Some("/health".to_string()),
+                ready_timeout_secs: Some(60),
+                working_dir: None,
+                capabilities: vec![],
+            },
+        }
+    }
+
+    /// 启动两个存活模块到 state.process_manager（真实子进程，跳过健康等待）
+    async fn seed_running_modules(state: &Arc<AppState>) {
+        use ep_core::types::DeviceId;
+        let (start, end) = (30000_u16, 30050_u16);
+        let mut port = start;
+        for mid in ["shut-a", "shut-b"] {
+            let manifest = shutdown_test_manifest(mid);
+            {
+                let mut pm = state.process_manager.write().await;
+                pm.start_module(mid, &manifest, DeviceId::Cpu, port, Default::default())
+                    .await
+                    .expect("mock module should start");
+            }
+            port += 1;
+            if port > end {
+                break;
+            }
+        }
+    }
+
+    // 21. 优雅退出：stop_all_modules 停止全部运行中模块（子进程不再残留）
+    #[tokio::test]
+    async fn test_stop_all_modules_reaps_child_processes() {
+        let state = test_state();
+        seed_running_modules(&state).await;
+
+        // 前置：两个模块均已注册且 Running/Starting
+        {
+            let pm = state.process_manager.read().await;
+            assert!(pm.get_instance("shut-a").is_some());
+            assert!(pm.get_instance("shut-b").is_some());
+            assert_eq!(pm.list_running().len(), 2);
+        }
+
+        crate::stop_all_modules(&state).await;
+
+        // 后置：实例已停止（child 已 kill 并 reap）
+        {
+            let pm = state.process_manager.read().await;
+            assert!(pm.list_running().is_empty());
+            assert_eq!(
+                pm.get_status("shut-a"),
+                Some(&ep_core::types::ServiceStatus::Stopped)
+            );
+            assert_eq!(
+                pm.get_status("shut-b"),
+                Some(&ep_core::types::ServiceStatus::Stopped)
+            );
+        }
+    }
+
+    // 22. 无运行模块 → stop_all_modules 无副作用直接返回
+    #[tokio::test]
+    async fn test_stop_all_modules_idle_noop() {
+        let state = test_state();
+        crate::stop_all_modules(&state).await;
+        let pm = state.process_manager.read().await;
+        assert!(pm.list_running().is_empty());
     }
 }
