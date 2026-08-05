@@ -226,6 +226,39 @@ to = ["output", "input"]
         }
     }
 
+    /// harness teardown：停止 state 内所有运行中/启动中的模块子进程并释放
+    /// 其端口。
+    ///
+    /// E2E 以进程内 `Router::oneshot` 驱动，**不经过** main.rs `run_server`
+    /// 的优雅退出路径（Ctrl+C → stop_all_modules）；若不显式回收，自动拉起
+    /// 的模块进程在测试结束后成为孤儿并占用端口（实测：faster-whisper
+    /// adapter 残留监听 0.0.0.0:18000）。语义对齐 main.rs stop_all_modules
+    /// 与停止端点的端口释放：逐个停止（stop_module 内部含进程树回收），
+    /// 单个失败仅告警不阻断。
+    pub async fn stop_all_running_modules(state: &std::sync::Arc<AppState>) {
+        let running: Vec<String> = {
+            let pm = state.process_manager.read().await;
+            pm.list_running()
+                .iter()
+                .map(|inst| inst.module_id.clone())
+                .collect()
+        };
+        for module_id in running {
+            let stop_result = {
+                let mut pm = state.process_manager.write().await;
+                pm.stop_module(&module_id).await
+            };
+            match stop_result {
+                Ok(()) => {
+                    state.port_manager.write().await.release(&module_id);
+                }
+                Err(e) => {
+                    eprintln!("teardown: 停止模块 {module_id} 失败: {e}");
+                }
+            }
+        }
+    }
+
     // ── multipart 构造（/upload/input 字段名 file，仲裁 #3） ──────────────
 
     pub const BOUNDARY: &str = "----ep-e2e-boundary";
@@ -1497,7 +1530,7 @@ mod e2e_video_to_srt {
             PortManager::new(18000, 19000),
         ));
         let resp = oneshot(
-            app(state),
+            app(state.clone()),
             json_request(
                 axum::http::Method::POST,
                 "/pipelines/execute",
@@ -1528,5 +1561,109 @@ mod e2e_video_to_srt {
             .expect("任务记录");
         assert!(!record.artifacts.is_empty());
         tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // teardown：回收自动拉起的模块子进程（faster-whisper adapter 及其
+        // 进程树）——进程内 harness 不走 main.rs 优雅退出路径，不显式停止
+        // 会留下孤儿 adapter 监听 0.0.0.0:18000，污染后续测试/开发运行
+        stop_all_running_modules(&state).await;
+    }
+}
+
+// ─── 7. harness teardown 回收：进程内 E2E 必须显式停止模块子进程 ────────────
+
+mod e2e_harness_teardown {
+    //! 进程内 `Router::oneshot` harness 不经过 main.rs 优雅退出路径，
+    //! `common::stop_all_running_modules` 是 E2E 的唯一回收手段。本模块用
+    //! 真实长活子进程验证该路径：拉起 → 运行中 → teardown 停止
+    //! （stop_module 内含 Windows cmd /C 进程树回收）→ 无残留实例、端口释放。
+
+    use std::collections::HashMap;
+
+    use ep_core::module::manifest::{
+        ComputeConfig, InterfaceConfig, InterfaceType, ModuleInfo, ModuleManifest, RuntimeConfig,
+        RuntimeType,
+    };
+    use ep_core::types::{ComputeBackend, DeviceId, ModuleCategory, ServiceStatus};
+
+    use crate::common::*;
+
+    /// 长活 native 模块 manifest（keepalive 命令，形状同 main.rs 优雅退出
+    /// 测试的 shutdown fixture）
+    fn teardown_test_manifest() -> ModuleManifest {
+        ModuleManifest {
+            module: ModuleInfo {
+                id: "td-mod".into(),
+                name: "teardown-test".into(),
+                version: "0.1.0".into(),
+                description: String::new(),
+                category: ModuleCategory::Other("test".into()),
+                genre: String::new(),
+                authors: vec![],
+                license: None,
+                homepage: None,
+                tags: vec![],
+            },
+            runtime: RuntimeConfig {
+                runtime_type: RuntimeType::Native,
+                python_version: None,
+                requirements: None,
+                entrypoint: None,
+                start_command: Some(keepalive_command()),
+                binaries: None,
+            },
+            compute: ComputeConfig {
+                backends: vec![ComputeBackend::Cpu],
+                default_backend: Some(ComputeBackend::Cpu),
+                vram_estimate_mb: None,
+                min_vram_mb: None,
+                env: None,
+            },
+            models: vec![],
+            interface: InterfaceConfig {
+                interface_type: InterfaceType::Http,
+                health_endpoint: Some("/health".into()),
+                ready_timeout_secs: Some(60),
+                working_dir: None,
+                capabilities: vec![],
+            },
+        }
+    }
+
+    // teardown 停止运行中的真实子进程并释放端口（无残留）
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teardown_stops_running_module_and_releases_port() {
+        let root = unique_root("teardown");
+        let state = test_state(root);
+
+        // 拉起真实长活子进程（keepalive：Windows ping / Unix sleep）
+        {
+            let mut pm = state.process_manager.write().await;
+            pm.start_module(
+                "td-mod",
+                &teardown_test_manifest(),
+                DeviceId::Cpu,
+                39100,
+                HashMap::new(),
+            )
+            .await
+            .expect("keepalive module should start");
+        }
+        {
+            let pm = state.process_manager.read().await;
+            assert_eq!(pm.list_running().len(), 1, "子进程应在运行中");
+        }
+
+        stop_all_running_modules(&state).await;
+
+        // 后置：实例停止、无运行残留、端口已释放
+        {
+            let pm = state.process_manager.read().await;
+            assert!(pm.list_running().is_empty());
+            assert_eq!(pm.get_status("td-mod"), Some(&ServiceStatus::Stopped));
+        }
+        assert!(
+            state.port_manager.read().await.get_port("td-mod").is_none(),
+            "teardown 应释放端口"
+        );
     }
 }

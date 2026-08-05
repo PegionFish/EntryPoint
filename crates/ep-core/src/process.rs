@@ -279,6 +279,45 @@ impl ServiceInstance {
 
 // ─── ProcessManager ──────────────────────────────────────────────────────────
 
+/// 尽力终止给定 PID 及其整棵进程树，返回树级终止命令是否执行成功
+/// （返回值不保证所有进程已死亡，调用方仍需 reap 直接子进程）。
+///
+/// Windows：模块启动命令经 `cmd /C` 壳包裹（见 [`ProcessManager::start_module`]），
+/// 只杀直接子进程（cmd.exe）会留下实际服务的子孙树（如 python adapter）成为
+/// 占端口的孤儿进程。此处用系统自带 `taskkill /PID <pid> /T /F` 达成树级终止
+/// （/T = 连同所有子孙进程，/F = 强制），无需引入额外 windows 依赖。
+///
+/// 非 Windows：当前直接返回 false，调用方回退到杀直接子进程——
+/// `sh -c <单一命令>` 通常被优化为 exec（子进程即目标进程本身），直接 kill
+/// 可覆盖主要场景；复合命令（管道/后台）的子孙树不在当前保证范围内。
+#[cfg(target_os = "windows")]
+async fn kill_process_tree(pid: u32) -> bool {
+    let pid_arg = pid.to_string();
+    match tokio::process::Command::new("taskkill")
+        .args(["/PID", pid_arg.as_str(), "/T", "/F"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+    {
+        Ok(status) => {
+            if !status.success() {
+                debug!(pid, ?status, "taskkill /T /F 未成功，回退直接 kill");
+            }
+            status.success()
+        }
+        Err(e) => {
+            warn!(pid, error = %e, "taskkill 不可用，回退直接 kill");
+            false
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn kill_process_tree(_pid: u32) -> bool {
+    false
+}
+
 /// 进程管理器：跟踪所有模块服务实例
 pub struct ProcessManager {
     instances: HashMap<String, ServiceInstance>,
@@ -452,7 +491,12 @@ impl ProcessManager {
         Ok(())
     }
 
-    /// 停止模块服务，kill 子进程。
+    /// 停止模块服务，回收子进程及其整棵进程树。
+    ///
+    /// Windows 下启动命令经 `cmd /C` 壳包裹（见 [`Self::start_module`]），
+    /// 只杀直接子进程（cmd.exe）会留下实际服务的子孙树（如 python adapter）
+    /// 成为占端口的孤儿进程；因此优先树级回收（[`kill_process_tree`]，
+    /// taskkill /T 语义），未成功时回退直接 kill，最后 reap 直接子进程。
     pub async fn stop_module(&mut self, module_id: &str) -> Result<()> {
         let instance = self
             .instances
@@ -460,8 +504,14 @@ impl ProcessManager {
             .ok_or_else(|| anyhow::anyhow!("module '{}' not found", module_id))?;
 
         if let Some(ref mut child) = instance.child {
-            debug!(module_id, "killing child process");
-            let _ = child.kill().await;
+            debug!(module_id, "killing child process tree");
+            let tree_killed = match child.id() {
+                Some(pid) => kill_process_tree(pid).await,
+                None => false, // 进程已退出
+            };
+            if !tree_killed {
+                let _ = child.kill().await;
+            }
             let _ = child.wait().await; // reap zombie
         }
 
@@ -963,6 +1013,85 @@ mod tests {
             pm.get_status("cleanup-mod"),
             Some(&ServiceStatus::Stopped)
         );
+    }
+
+    // ─── 进程树回收：stop_module 必须终止 cmd /C 子孙树（Windows 孤儿修复） ──
+
+    /// 测试辅助：构造"持续向文件写心跳"的启动命令（写者是 shell 的子孙进程）。
+    ///
+    /// Windows：实际写者是 powershell（cmd /C 的子孙）——只杀 cmd 壳无法令其
+    /// 停笔，正是孤儿 adapter 的形态；以脚本文件方式执行，避免内联 -Command
+    /// 的引号/特殊字符被 cmd /C 误解析。
+    /// 非 Windows：sh 在自身进程内执行循环，直接 kill 即可覆盖。
+    fn heartbeat_command(heartbeat: &std::path::Path, script: &std::path::Path) -> String {
+        if cfg!(target_os = "windows") {
+            std::fs::write(
+                script,
+                format!(
+                    "for ($i = 0; $i -lt 60; $i++) {{\n  \
+                     Add-Content -LiteralPath '{}' -Value 'tick'\n  \
+                     Start-Sleep -Seconds 1\n}}\n",
+                    heartbeat.display()
+                ),
+            )
+            .expect("write heartbeat script");
+            format!(
+                "powershell -NoProfile -ExecutionPolicy Bypass -File {}",
+                script.display()
+            )
+        } else {
+            format!(
+                "i=0; while [ $i -lt 60 ]; do echo tick >> '{}'; sleep 1; i=$((i+1)); done",
+                heartbeat.display()
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stop_module_reaps_process_tree() {
+        let dir = std::env::temp_dir().join(format!(
+            "ep-tree-kill-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let heartbeat = dir.join("heartbeat.txt");
+        let script = dir.join("heartbeat.ps1");
+
+        let mut pm = ProcessManager::new();
+        let manifest = test_manifest(Some(&heartbeat_command(&heartbeat, &script)));
+        pm.start_module("tree-mod", &manifest, DeviceId::Cpu, 19050, HashMap::new())
+            .await
+            .unwrap();
+
+        // 等待子孙写者启动（Windows powershell 冷启动可达数秒，15s 预算）
+        let mut started = false;
+        for _ in 0..150 {
+            if std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0) > 0 {
+                started = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(started, "心跳文件应开始增长（写者子孙进程已启动）");
+
+        pm.stop_module("tree-mod").await.unwrap();
+
+        // 停止后等过两个心跳周期，确认文件不再增长——若只杀了 cmd/sh 壳，
+        // 写者子孙会继续写入（孤儿回归）
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        let size1 = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        let size2 = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(
+            size1, size2,
+            "写者子孙未被回收：心跳持续增长 {size1} → {size2}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ─── A2 环境注入：CUDA 库路径（§3.1/§15.3 双平台分支） ─────────────────

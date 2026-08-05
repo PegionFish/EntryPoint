@@ -528,12 +528,18 @@ output_type = "file"
         ))
     }
 
-    /// 在随机空闲端口启动一个最小 HTTP 服务（任意请求一律 200），
-    /// 模拟模块的 /health 端点。返回端口与任务句柄。
-    async fn spawn_mock_health_server() -> (u16, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = tokio::spawn(async move {
+    /// 在指定端口启动一个最小 HTTP 服务（任意请求一律 200），模拟模块的
+    /// /health 端点，返回任务句柄。
+    ///
+    /// 测试序列必须是「先 allocate 端口 → 再在该端口起 mock」：
+    /// [`ep_core::port::PortManager::allocate`] 带 OS 层占用探测，mock 先占住
+    /// 端口会让 allocate 判其占用而拒绝分配（fake 模块进程虽不监听，
+    /// 真实模块会 bind 同端口，探测语义上该端口确实不可用）。
+    async fn spawn_mock_health_server_on(port: u16) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
             loop {
                 if let Ok((mut stream, _)) = listener.accept().await {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -545,8 +551,7 @@ output_type = "file"
                     let _ = stream.shutdown().await;
                 }
             }
-        });
-        (port, handle)
+        })
     }
 
     /// 等待并清理：停止模块进程、abort mock server
@@ -579,14 +584,23 @@ output_type = "file"
 
     #[tokio::test]
     async fn ensure_starts_stopped_module_and_second_call_passes_through() {
-        let (port, server) = spawn_mock_health_server().await;
         let root = unique_root("start-ok");
         let toml = test_manifest_toml("auto-mod", 30, "");
         let state = test_state(
             root.clone(),
             vec![module_from_toml(&root, &toml)],
-            (port, port), // 端口范围锁定到 mock server 端口 → allocate 必然命中
+            (39201, 39210),
         );
+        // 先 allocate（OS 探测在 mock 启动前执行）→ 再在分得的端口起 mock
+        // 模拟 /health（序列约束见 spawn_mock_health_server_on 注释）；
+        // ensure 内 allocate 幂等命中已分配端口，不再探测
+        let port = state
+            .port_manager
+            .write()
+            .await
+            .allocate("auto-mod")
+            .expect("预分配端口");
+        let server = spawn_mock_health_server_on(port).await;
 
         // 前置：无实例（相当于 Stopped）
         assert!(state
@@ -699,7 +713,6 @@ default = true
 
     #[tokio::test]
     async fn ensure_python_module_skips_venv_when_present() {
-        let (port, server) = spawn_mock_health_server().await;
         let root = unique_root("venv-ok");
         // python 运行时 manifest（start_command 与 runtime type 无关，仍用保活命令）
         let toml = format!(
@@ -730,8 +743,16 @@ ready_timeout_secs = 30
         let state = test_state(
             root.clone(),
             vec![module_from_toml(&root, &toml)],
-            (port, port),
+            (39211, 39220),
         );
+        // 先 allocate 再起 mock（序列约束见 spawn_mock_health_server_on 注释）
+        let port = state
+            .port_manager
+            .write()
+            .await
+            .allocate("py-mod")
+            .expect("预分配端口");
+        let server = spawn_mock_health_server_on(port).await;
 
         // 预置 venv python（双平台路径），使准备分支被跳过
         let py = if cfg!(target_os = "windows") {
@@ -758,14 +779,21 @@ ready_timeout_secs = 30
 
     #[tokio::test]
     async fn ensure_restarts_module_in_error_state() {
-        let (port, server) = spawn_mock_health_server().await;
         let root = unique_root("restart");
         let toml = test_manifest_toml("retry-mod", 30, "");
         let state = test_state(
             root.clone(),
             vec![module_from_toml(&root, &toml)],
-            (port, port),
+            (39221, 39230),
         );
+        // 先 allocate 再起 mock（序列约束见 spawn_mock_health_server_on 注释）
+        let port = state
+            .port_manager
+            .write()
+            .await
+            .allocate("retry-mod")
+            .expect("预分配端口");
+        let server = spawn_mock_health_server_on(port).await;
 
         // 先把实例打到 Error（模拟上次启动失败残留）：
         // 拉起→无健康等待至 Error 不可控，直接经 stop 制造 Stopped 再断言等价语义。
