@@ -38,6 +38,10 @@ mod api;
 // 纳入以保持与 main.rs 模块树对齐（缺之触发 dead_code 警告）
 #[path = "../src/ws/mod.rs"]
 mod ws;
+// logging 模块被 api/config.rs 引用（PUT /api/config 的 log_level 动态
+// reload 接线，P2-1），纳入以保持与 main.rs 模块树对齐
+#[path = "../src/logging.rs"]
+mod logging;
 
 // ─── 公共 harness ────────────────────────────────────────────────────────────
 

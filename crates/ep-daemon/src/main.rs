@@ -1,10 +1,12 @@
 mod api;
+mod logging;
 mod state;
+mod updates;
 mod ws;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::extract::ConnectInfo;
@@ -12,7 +14,6 @@ use axum::response::IntoResponse;
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
-use tracing_subscriber::EnvFilter;
 
 use ep_core::compute::detect_all_devices;
 use ep_core::config::{self, AppConfig};
@@ -25,35 +26,42 @@ use crate::state::AppState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ep_daemon=info,ep_core=info".into()),
-        )
-        .init();
-
     // Parse CLI args
     let args: Vec<String> = std::env::args().collect();
+    let module_pos = args.iter().position(|a| a == "--run-module");
 
-    if let Some(pos) = args.iter().position(|a| a == "--run-module") {
+    // ── P2-1/P1-10：配置加载先于 tracing 初始化 ─────────────────────────
+    // `general.log_level` 决定日志过滤器（RUST_LOG 仍优先覆盖，见
+    // logging::build_env_filter）；加载失败时按默认级别初始化，
+    // 各模式沿用迁移前的错误容忍度（server 模式 fail-fast / standalone 容忍）。
+    let root = config::resolve_root();
+    let load_result = AppConfig::load_or_create(&root.join("config"));
+    let log_level = load_result
+        .as_ref()
+        .map(|c| c.general.log_level.clone())
+        .unwrap_or_else(|_| AppConfig::default().general.log_level);
+    logging::init_tracing(&log_level);
+
+    if let Some(pos) = module_pos {
         let module_id = args
             .get(pos + 1)
             .ok_or_else(|| anyhow::anyhow!("--run-module requires a module ID"))?;
-        return run_module_standalone(module_id).await;
+        // standalone 模式容忍配置加载失败（与迁移前 unwrap_or_default 语义一致）
+        let mut cfg = load_result.unwrap_or_default();
+        cfg.resolve_paths(&root);
+        return run_module_standalone(module_id, root, cfg).await;
     }
 
-    run_server().await
+    let mut cfg = load_result?;
+    cfg.resolve_paths(&root);
+    run_server(root, cfg).await
 }
 
 /// Standalone module runner — start a single module and keep it running.
-async fn run_module_standalone(module_id: &str) -> anyhow::Result<()> {
+///
+/// `root` / `cfg` 由 main() 在 tracing 初始化前统一加载（P2-1 接线）。
+async fn run_module_standalone(module_id: &str, root: PathBuf, cfg: AppConfig) -> anyhow::Result<()> {
     tracing::info!("Standalone mode: running module '{}'", module_id);
-
-    // Resolve root directory and load config
-    let root = config::resolve_root();
-    let config_dir = root.join("config");
-    let mut cfg = AppConfig::load_or_create(&config_dir).unwrap_or_default();
-    cfg.resolve_paths(&root);
 
     // Discover modules
     let modules_dir = root.join("modules");
@@ -136,17 +144,19 @@ async fn run_module_standalone(module_id: &str) -> anyhow::Result<()> {
 }
 
 /// Normal HTTP server mode.
-async fn run_server() -> anyhow::Result<()> {
+///
+/// `root` / `cfg` 由 main() 在 tracing 初始化前统一加载（P2-1 接线：
+/// `general.log_level` 决定 subscriber 过滤规则）。
+async fn run_server(root: PathBuf, cfg: AppConfig) -> anyhow::Result<()> {
     tracing::info!("EntryPoint Daemon starting...");
 
-    // 1. Resolve root directory and load configuration
-    let root = config::resolve_root();
+    // 1. root 与配置已在 main() 中先行加载（tracing 初始化之前，P2-1）
     tracing::info!(root = %root.display(), "project root resolved");
-
-    let config_dir = root.join("config");
-    let mut cfg = AppConfig::load_or_create(&config_dir)?;
-    cfg.resolve_paths(&root);
-    tracing::info!("Configuration loaded");
+    tracing::info!(
+        log_level = %cfg.general.log_level,
+        check_updates = cfg.general.check_updates,
+        "configuration loaded"
+    );
 
     // 2. Check and auto-install missing system dependencies
     {
@@ -282,7 +292,11 @@ async fn run_server() -> anyhow::Result<()> {
         });
     }
 
-    // 11. Start server
+    // 11. Spawn 后台模型更新自动检查（P1-10：general.check_updates 接线）。
+    //     开关每轮实时读取——运行期经 PUT /api/config 改动即时生效，无需重启。
+    updates::spawn_auto_update_checker(state.clone());
+
+    // 12. Start server
     let cfg = state.config.read().await;
     let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port)
         .parse()
