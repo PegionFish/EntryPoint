@@ -56,6 +56,13 @@ export interface ModuleResponse {
   service_status: string
   /** 模块 manifest 声明的能力列表（§8.2；后端 B5 上线前的过渡期可能缺失） */
   capabilities?: CapabilityDecl[]
+  /** 当前绑定设备（如 "cuda:0"；未运行为 null） */
+  device?: string | null
+  /**
+   * 解析后的激活变体 id（config.active_models → default → 首变体；
+   * 无模型模块为 null）——模块卡「变体选择器」选中值的权威数据源
+   */
+  active_model_id?: string | null
 }
 
 export interface ModuleStatusResponse {
@@ -430,6 +437,14 @@ export interface PackBuildRequest {
   bundle?: string[]
   /** 按 tag 圈选模型 */
   tags?: string[]
+  /** 包身份字段（可选，缺省自动生成）：`<publisher>.<pack-name>` */
+  id?: string
+  /** 显示名称（可选） */
+  name?: string
+  /** 版本号（可选） */
+  version?: string
+  /** 描述（可选） */
+  description?: string
 }
 
 /** POST /api/packs/build 202 响应：构建完成后经 export 端点下载 .epzip */

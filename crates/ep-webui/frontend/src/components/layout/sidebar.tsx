@@ -1,11 +1,9 @@
 import { NavLink } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import {
-  Database,
   GitBranch,
   LayoutDashboard,
   ListTodo,
-  Package,
   Puzzle,
   Settings,
   type LucideIcon,
@@ -16,11 +14,6 @@ interface NavItem {
   to: string
   /** components 命名空间下的标签键 */
   labelKey: string
-  /**
-   * i18n 键尚未落盘时的过渡兜底文案（i18next defaultValue）。
-   * 键由 DocsI18n 波次落盘后该兜底自动失效，无需改代码。
-   */
-  fallback?: string
   icon: LucideIcon
   end?: boolean
 }
@@ -30,8 +23,6 @@ const NAV_ITEMS: NavItem[] = [
   { to: '/modules', labelKey: 'sidebar.nav.modules', icon: Puzzle },
   { to: '/pipeline', labelKey: 'sidebar.nav.pipeline', icon: GitBranch },
   { to: '/tasks', labelKey: 'sidebar.nav.tasks', icon: ListTodo },
-  { to: '/models', labelKey: 'sidebar.nav.models', icon: Database },
-  { to: '/packs', labelKey: 'sidebar.nav.packs', fallback: '整合包', icon: Package },
   { to: '/settings', labelKey: 'sidebar.nav.settings', icon: Settings },
 ]
 
@@ -62,11 +53,7 @@ export function SidebarNav({ onNavigate, className }: SidebarNavProps) {
           }
         >
           <item.icon className="h-4 w-4 shrink-0" />
-          <span>
-            {item.fallback !== undefined
-              ? t(item.labelKey, { defaultValue: item.fallback })
-              : t(item.labelKey)}
-          </span>
+          <span>{t(item.labelKey)}</span>
         </NavLink>
       ))}
     </nav>

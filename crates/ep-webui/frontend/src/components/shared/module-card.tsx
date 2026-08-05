@@ -161,7 +161,7 @@ export function ModuleCard({
           </span>
           <span className="flex shrink-0 items-center gap-2.5 text-xs font-medium">
             <Link
-              to="/models"
+              to="/modules"
               className="rounded-sm text-status-preparing underline-offset-2 transition-colors hover:text-status-preparing/80 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
             >
               {t('moduleCard.manageModels')}
