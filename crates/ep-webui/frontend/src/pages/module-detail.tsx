@@ -323,7 +323,7 @@ export default function ModuleDetailPage() {
                       size="xs"
                       className="border-status-preparing/40 bg-transparent text-status-preparing hover:bg-status-preparing/10 hover:text-status-preparing"
                     >
-                      <Link to="/models">
+                      <Link to="/modules">
                         <Database />
                         {t('detail.goToModels')}
                       </Link>

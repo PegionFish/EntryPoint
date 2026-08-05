@@ -2595,8 +2595,8 @@ function VariantPinDialog({
             {t('common:action.close')}
           </Button>
           <Button variant="secondary" asChild>
-            <Link to="/models">
-              {t('pinCheck.goModels', { defaultValue: '前往模型统一页' })}
+            <Link to="/modules">
+              {t('pinCheck.goModels', { defaultValue: '前往模块管理' })}
             </Link>
           </Button>
         </DialogFooter>
@@ -2987,10 +2987,10 @@ function ImportTomlDialog({
                     defaultValue: '以上问题不阻断注册；缺失的模型/变体可到模型统一页下载或切换。',
                   })}{' '}
                   <Link
-                    to="/models"
+                    to="/modules"
                     className="text-primary underline-offset-4 hover:underline"
                   >
-                    {t('pinCheck.goModels', { defaultValue: '前往模型统一页' })}
+                    {t('pinCheck.goModels', { defaultValue: '前往模块管理' })}
                   </Link>
                 </p>
               </div>
