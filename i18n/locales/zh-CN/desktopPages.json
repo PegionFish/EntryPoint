@@ -165,5 +165,12 @@
   "modules.uninstall.message": "卸载「{{name}}」？可选择是否保留已下载的模型文件。",
   "modules.uninstall.keepModels": "保留模型文件",
   "modules.uninstall.confirm": "卸载",
-  "modules.uninstall.submitted": "卸载请求已提交"
+  "modules.uninstall.submitted": "卸载请求已提交",
+  "modules.importModel": "导入模型",
+  "modules.importModelTip": "从本地选择模型文件或目录导入到选中变体",
+  "modules.importModelNoVariant": "请先选择模型变体",
+  "modules.pickModelSource": "选择模型文件或目录",
+  "modules.deleteModel.title": "删除模型「{{name}}」？",
+  "modules.deleteModel.description": "将删除该模型的本机文件与缓存目录（{{dir}}），不可恢复",
+  "modules.deleteModel.deleting": "正在删除模型…"
 }
