@@ -82,7 +82,6 @@
   "toast.savedRestart": "Settings saved — restart required for some changes",
   "toast.savedRestartDescription": "This change touches restart-sensitive items (listen host/port, port range, workspace dir, CUDA libs dir, log level, proxy) — restart the daemon to apply.",
   "general.logLevelDescription": "Daemon log level. Requires restart; the daemon currently reads RUST_LOG at startup — backend wiring pending.",
-  "general.checkUpdatesPending": "Check for updates at startup (backend not wired yet — saved but inactive for now).",
   "compute.cudaLibsDir": "Shared CUDA libraries directory",
   "compute.cudaLibsDirDescription": "Shared CUDA libs path injected at module start (LD_LIBRARY_PATH on Linux / PATH prepend on Windows), relative to app root",
   "python.uvCacheDir": "uv cache directory",
