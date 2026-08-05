@@ -53,6 +53,30 @@ pub fn show(ui: &mut egui::Ui, config: &mut AppConfig, toasts: &mut ToastManager
             );
         });
 
+        // ── 启动时检查更新（#51 延后项：general.check_updates 桌面端接线） ──
+        card(ui, &pal, |ui| {
+            section_title(ui, &tr(lang, "settings.general.checkUpdates", &[]));
+            ui.add_space(8.0);
+            egui::Grid::new("settings_check_updates")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    field_label(ui, &pal, &lbl(lang, "settings.general.checkUpdates"));
+                    ui.checkbox(&mut config.general.check_updates, "");
+                    ui.end_row();
+                });
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(tr(
+                    lang,
+                    "settings.general.checkUpdatesDescription",
+                    &[],
+                ))
+                .small()
+                .color(pal.text_faint),
+            );
+        });
+
         // ── 计算设备 ──
         section_card(
             ui,

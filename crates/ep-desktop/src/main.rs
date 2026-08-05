@@ -20,6 +20,10 @@ use ep_core::types::{
     SchedulingStrategy, ServiceStatus, TaskStatus,
 };
 
+/// 启动后首轮自动更新检查延迟：避开启动高峰的 I/O 与网络争用
+///（语义对齐 daemon updates.rs STARTUP_CHECK_DELAY）
+const STARTUP_CHECK_DELAY: Duration = Duration::from_secs(15);
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -51,8 +55,19 @@ fn main() -> anyhow::Result<()> {
     // Spawn tokio runtime on a dedicated background thread
     let bg_tx = tx.clone();
     let bg_root = root.clone();
+    // #51 延后项接线：启动自动更新检查 —— 后台线程初始化时读一次开关，
+    // 开启则延迟 STARTUP_CHECK_DELAY 后向命令通道发一次 CheckAllUpdates
+    //（复用既有 handler；运行期改开关不热跟随，重启生效，与 daemon 不同）
+    let bg_cmd_tx = cmd_tx.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
+        if config.general.check_updates {
+            let cmd_tx = bg_cmd_tx.clone();
+            rt.spawn(async move {
+                tokio::time::sleep(STARTUP_CHECK_DELAY).await;
+                let _ = cmd_tx.send(ep_desktop::app::AppCmd::CheckAllUpdates);
+            });
+        }
         rt.block_on(background_loop(bg_tx, cmd_rx, config, bg_root));
     });
 
