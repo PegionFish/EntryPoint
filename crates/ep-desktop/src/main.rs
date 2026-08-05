@@ -499,6 +499,375 @@ fn pack_reference_descriptor(
     })
 }
 
+// ─── 协调记录 #47：导出模块（组装暂存 → ep_pack::build::build_pack） ────────
+
+/// 后台消息 i18n 兜底：键未落盘时返回兜底文案而非键本身（与 pages::trfb 同策略；
+/// ep-core 的缺失键路径返回键本身、不做插值，故兜底分支自行插值）。
+fn trfb_bg(lang: &str, key: &str, fallback: &str, params: &[(&str, &str)]) -> String {
+    let translated = ep_core::i18n::t(lang, key, params);
+    if translated != key {
+        return translated;
+    }
+    let mut out = fallback.to_string();
+    for (name, value) in params {
+        let pattern = format!("{{{{{name}}}}}");
+        out = out.replace(&pattern, value);
+    }
+    out
+}
+
+/// 唯一暂存 id（纳秒时间戳 + 进程内序号 + pid；与 daemon unique_id 同款）
+fn unique_pack_id() -> String {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:x}-{seq:04x}-{}", std::process::id())
+}
+
+/// 导出模块（桌面端独立实现库层调用，组装逻辑参照 daemon packs.rs build 路径）：
+/// 圈选校验 → 暂存目录组装（bundle 权重**硬链接优先**）→ [`ep_pack::build::build_pack`]
+/// → 用户选定目录 `.epzip`。返回 (归档路径, 文件条目数)。
+fn build_export_pack(
+    root: &Path,
+    staging_cfg: &str,
+    models_cfg: &ep_core::config::ModelsConfig,
+    manifests: &[ModuleManifest],
+    spec: ep_desktop::app::PackExportSpec,
+) -> Result<(PathBuf, usize), String> {
+    use ep_pack::manifest::{ModelMode, PackManifest, PackModelEntry, PackPipelineRef};
+
+    let mgr = ModelManager::new(models_cfg, root).with_manifests(manifests.to_vec());
+
+    // ── 模型圈选 + bundle 权重目录 + 后端并集 ──
+    let mut entries: Vec<PackModelEntry> = Vec::new();
+    let mut bundle_dirs: Vec<(String, PathBuf)> = Vec::new();
+    let mut backends: Vec<ComputeBackend> = Vec::new();
+    for m in &spec.modules {
+        let mf = manifests
+            .iter()
+            .find(|mf| mf.module.id == m.module_id)
+            .ok_or_else(|| format!("module '{}' not found", m.module_id))?;
+        for variant in &m.variants {
+            let decl = mf
+                .models
+                .iter()
+                .find(|d| d.id == *variant)
+                .ok_or_else(|| {
+                    format!("module '{}' has no variant '{}'", m.module_id, variant)
+                })?;
+            let meta = mgr.read_meta(&decl.target_dir);
+            // qualified_id：manifest 声明优先，meta 兜底（均缺失 → 身份缺失不可入包，§4.3）
+            let qualified = decl
+                .qualified_id
+                .clone()
+                .or_else(|| meta.as_ref().and_then(|mm| mm.qualified_id.clone()))
+                .ok_or_else(|| {
+                    format!(
+                        "model {}@{} lacks qualified_id; cannot export",
+                        m.module_id, variant
+                    )
+                })?;
+            let qid = ep_core::model_id::QualifiedId::parse(&qualified)
+                .map_err(|e| format!("invalid qualified_id '{qualified}': {e}"))?
+                .to_canonical();
+            let tags = meta.map(|mm| mm.tags).unwrap_or_default();
+            if m.bundle {
+                let src = mgr.model_dir(&decl.target_dir);
+                if !src.is_dir() {
+                    return Err(format!(
+                        "bundle model {qid}@{variant}: weights dir {} missing",
+                        src.display()
+                    ));
+                }
+                bundle_dirs.push((decl.target_dir.clone(), src));
+            }
+            for b in &mf.compute.backends {
+                if !backends.contains(b) {
+                    backends.push(*b);
+                }
+            }
+            entries.push(PackModelEntry {
+                qualified_id: qid,
+                variant: variant.clone(),
+                mode: if m.bundle {
+                    ModelMode::Bundle
+                } else {
+                    ModelMode::Reference
+                },
+                tags,
+            });
+        }
+    }
+    if backends.is_empty() {
+        backends.push(ComputeBackend::Cpu);
+    }
+
+    // ── 管线圈选：按 id 查找 config/pipelines/*.toml ──
+    let pipelines_dir = root.join("config").join("pipelines");
+    let specs = scan_pipeline_specs_desktop(&pipelines_dir);
+    let mut pipeline_files: Vec<(PathBuf, String)> = Vec::new();
+    let mut pipeline_refs: Vec<PackPipelineRef> = Vec::new();
+    let mut missing_pipelines: Vec<String> = Vec::new();
+    for pid in &spec.pipelines {
+        match specs.iter().find(|(_, id)| id == pid) {
+            Some((path, _)) => {
+                pipeline_files.push((path.clone(), format!("{pid}.toml")));
+                pipeline_refs.push(PackPipelineRef {
+                    file: format!("pipelines/{pid}.toml"),
+                });
+            }
+            None => missing_pipelines.push(pid.clone()),
+        }
+    }
+    if !missing_pipelines.is_empty() {
+        return Err(format!(
+            "pipeline(s) not found: {}",
+            missing_pipelines.join(", ")
+        ));
+    }
+
+    // ── 包身份：对话框显式字段优先，缺省自动生成 ──
+    let id = if spec.id.trim().is_empty() {
+        format!("local.build-{}", Utc::now().format("%Y%m%d-%H%M%S"))
+    } else {
+        spec.id.trim().to_string()
+    };
+    let version = if spec.version.trim().is_empty() {
+        "0.1.0".to_string()
+    } else {
+        spec.version.trim().to_string()
+    };
+    let name = if spec.name.trim().is_empty() {
+        id.clone()
+    } else {
+        spec.name.trim().to_string()
+    };
+
+    let manifest = PackManifest {
+        pack: ep_pack::manifest::PackInfo {
+            id: id.clone(),
+            version: version.clone(),
+            name,
+            description: String::new(),
+            authors: vec![],
+            license: None,
+            homepage: None,
+            min_ep_version: None,
+            tags: vec![],
+        },
+        compute: ep_pack::manifest::PackCompute {
+            backends,
+            notes: HashMap::new(),
+        },
+        models: entries,
+        pipelines: pipeline_refs,
+    };
+    if let Err(errors) = manifest.validate() {
+        return Err(errors.join("; "));
+    }
+
+    // ── 组装暂存目录 ──
+    let staging = {
+        let p = Path::new(staging_cfg);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            root.join(p)
+        }
+    };
+    let source_dir = staging.join(format!("build-{}-{}", id, unique_pack_id()));
+    let assemble = assemble_export_tree(&source_dir, &manifest, &bundle_dirs, &pipeline_files);
+    if let Err(e) = assemble {
+        let _ = std::fs::remove_dir_all(&source_dir);
+        return Err(e);
+    }
+
+    // ── 打包（CHECKSUMS.toml 由 build_pack 生成并写入归档） ──
+    std::fs::create_dir_all(&spec.output_dir)
+        .map_err(|e| format!("create output dir failed: {e}"))?;
+    let output = spec
+        .output_dir
+        .join(format!("{}-{}.epzip", manifest.pack.id, manifest.pack.version));
+    let plan = ep_pack::build::BuildPlan::new(&source_dir, &output);
+    let result = ep_pack::build::build_pack(&plan);
+    let _ = std::fs::remove_dir_all(&source_dir); // 无论成败清理暂存
+    match result {
+        Ok(summary) => Ok((summary.archive_path, summary.file_count)),
+        Err(e) => Err(format!("pack build failed: {e}")),
+    }
+}
+
+/// 组装包内容目录：ep-pack.toml + models/<target_dir>/（bundle，硬链接优先）
+/// + pipelines/<id>.toml。与 daemon `assemble_and_build` 同布局。
+fn assemble_export_tree(
+    source_dir: &Path,
+    manifest: &ep_pack::manifest::PackManifest,
+    bundle_dirs: &[(String, PathBuf)],
+    pipeline_files: &[(PathBuf, String)],
+) -> Result<(), String> {
+    std::fs::create_dir_all(source_dir).map_err(|e| format!("create staging failed: {e}"))?;
+
+    // 1) 清单（ep-pack.toml）：桌面端无 toml 序列化依赖，用内置最小 TOML 输出器
+    let manifest_toml = render_pack_manifest(manifest);
+    std::fs::write(
+        source_dir.join(ep_pack::extract::MANIFEST_FILE_NAME),
+        manifest_toml,
+    )
+    .map_err(|e| format!("write manifest failed: {e}"))?;
+
+    // 2) bundle 权重：models/<target_dir>/（硬链接优先，跨卷/不支持时回退复制）
+    for (target_dir, src) in bundle_dirs {
+        let dest = source_dir.join("models").join(target_dir);
+        std::fs::create_dir_all(&dest).map_err(|e| format!("create model dir failed: {e}"))?;
+        copy_dir_hardlink_preferred(src, &dest)
+            .map_err(|e| format!("stage weights for '{target_dir}' failed: {e}"))?;
+    }
+
+    // 3) 管线文件：pipelines/<id>.toml
+    for (src, file_name) in pipeline_files {
+        let dest = source_dir.join("pipelines").join(file_name);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create pipelines dir failed: {e}"))?;
+        }
+        std::fs::copy(src, &dest).map_err(|e| format!("copy pipeline failed: {e}"))?;
+    }
+    Ok(())
+}
+
+/// 递归目录落盘：**硬链接优先**（同卷近零成本），失败回退普通复制；
+/// 跳过符号链接等非普通文件类型（与 daemon copy_dir_contents 同纪律）。
+fn copy_dir_hardlink_preferred(src: &Path, dst: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            std::fs::create_dir_all(&to)?;
+            copy_dir_hardlink_preferred(&from, &to)?;
+        } else if ft.is_file() && std::fs::hard_link(&from, &to).is_err() {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// 扫描目录下管线文件 → (路径, pipeline.id)；损坏文件跳过
+fn scan_pipeline_specs_desktop(dir: &Path) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    let mut paths: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("toml"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        match Pipeline::from_toml(&path) {
+            Ok(pipeline) => out.push((path, pipeline.id)),
+            Err(e) => {
+                tracing::warn!(file = %path.display(), error = %e, "pipeline file corrupted, skipping");
+            }
+        }
+    }
+    out
+}
+
+// ─── 最小 TOML 输出器（ep-pack.toml 渲染；形状与 daemon render_pack_manifest 一致） ──
+
+/// TOML basic string 转义（覆盖清单字段可能出现的引号/反斜杠/控制字符）
+fn toml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn toml_str(s: &str) -> String {
+    format!("\"{}\"", toml_escape(s))
+}
+
+fn toml_str_array(items: &[String]) -> String {
+    let inner: Vec<String> = items.iter().map(|s| toml_str(s)).collect();
+    format!("[{}]", inner.join(", "))
+}
+
+/// 渲染 [`ep_pack::manifest::PackManifest`] 为 TOML 文本
+///（`PackManifest::from_file` 可原样读回，见单测 roundtrip）。
+fn render_pack_manifest(m: &ep_pack::manifest::PackManifest) -> String {
+    let mut out = String::new();
+    out.push_str("[pack]\n");
+    out.push_str(&format!("id = {}\n", toml_str(&m.pack.id)));
+    out.push_str(&format!("version = {}\n", toml_str(&m.pack.version)));
+    out.push_str(&format!("name = {}\n", toml_str(&m.pack.name)));
+    out.push_str(&format!("description = {}\n", toml_str(&m.pack.description)));
+    if !m.pack.authors.is_empty() {
+        out.push_str(&format!("authors = {}\n", toml_str_array(&m.pack.authors)));
+    }
+    if let Some(license) = &m.pack.license {
+        out.push_str(&format!("license = {}\n", toml_str(license)));
+    }
+    if let Some(homepage) = &m.pack.homepage {
+        out.push_str(&format!("homepage = {}\n", toml_str(homepage)));
+    }
+    if let Some(min) = &m.pack.min_ep_version {
+        out.push_str(&format!("min_ep_version = {}\n", toml_str(min)));
+    }
+    if !m.pack.tags.is_empty() {
+        out.push_str(&format!("tags = {}\n", toml_str_array(&m.pack.tags)));
+    }
+
+    out.push_str("\n[compute]\n");
+    let backends: Vec<String> = m.compute.backends.iter().map(|b| b.to_string()).collect();
+    out.push_str(&format!("backends = {}\n", toml_str_array(&backends)));
+    if !m.compute.notes.is_empty() {
+        out.push_str("\n[compute.notes]\n");
+        let mut notes: Vec<(String, String)> = m
+            .compute
+            .notes
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        notes.sort_by(|a, b| a.0.cmp(&b.0));
+        for (k, v) in notes {
+            out.push_str(&format!("{k} = {}\n", toml_str(&v)));
+        }
+    }
+
+    for model in &m.models {
+        out.push_str("\n[[models]]\n");
+        out.push_str(&format!("qualified_id = {}\n", toml_str(&model.qualified_id)));
+        out.push_str(&format!("variant = {}\n", toml_str(&model.variant)));
+        out.push_str(&format!("mode = {}\n", toml_str(model.mode.as_str())));
+        if !model.tags.is_empty() {
+            out.push_str(&format!("tags = {}\n", toml_str_array(&model.tags)));
+        }
+    }
+
+    for pipeline in &m.pipelines {
+        out.push_str("\n[[pipelines]]\n");
+        out.push_str(&format!("file = {}\n", toml_str(&pipeline.file)));
+    }
+    out
+}
+
 /// venv 准备（P0-5 公共件）：Python 运行时且 venv 缺失 → EnvManager::ensure_venv
 ///（阻塞操作放入 spawn_blocking）。返回就绪的 venv python 路径。
 async fn prepare_module_venv(
@@ -1776,6 +2145,176 @@ async fn background_loop(
                             });
                         }
                     }
+                    Some(AppCmd::ExportPack { spec }) => {
+                        // 协调记录 #47 导出模块：后台组装暂存目录（bundle 硬链接优先）
+                        // → ep_pack::build::build_pack → 用户选定目录 .epzip。
+                        if spec.modules.is_empty() && spec.pipelines.is_empty() {
+                            let _ = tx.send(AppMsg::Error(trfb_bg(
+                                lang,
+                                "desktopApp.error.packExportEmpty",
+                                "导出失败：未圈选任何模型或管线",
+                                &[],
+                            )));
+                        } else {
+                            let manifests_snapshot = manifests_from(&discovered);
+                            let models_cfg = config.models.clone();
+                            let staging_cfg = config.packs.staging_dir.clone();
+                            let root2 = root.clone();
+                            let tx2 = tx.clone();
+                            tokio::spawn(async move {
+                                let result = tokio::task::spawn_blocking(move || {
+                                    build_export_pack(
+                                        &root2,
+                                        &staging_cfg,
+                                        &models_cfg,
+                                        &manifests_snapshot,
+                                        spec,
+                                    )
+                                })
+                                .await;
+                                match result {
+                                    Ok(Ok((archive, files))) => {
+                                        let files_s = files.to_string();
+                                        let _ = tx2.send(AppMsg::Info(trfb_bg(
+                                            lang,
+                                            "desktopApp.info.packExportDone",
+                                            "导出完成：{{path}}（{{files}} 个文件）",
+                                            &[
+                                                ("path", &archive.display().to_string()),
+                                                ("files", &files_s),
+                                            ],
+                                        )));
+                                    }
+                                    Ok(Err(e)) => {
+                                        let _ = tx2.send(AppMsg::Error(trfb_bg(
+                                            lang,
+                                            "desktopApp.error.packExportFailed",
+                                            "导出失败：{{detail}}",
+                                            &[("detail", &e)],
+                                        )));
+                                    }
+                                    Err(join_err) => {
+                                        let _ = tx2.send(AppMsg::Error(trfb_bg(
+                                            lang,
+                                            "desktopApp.error.packExportFailed",
+                                            "导出失败：{{detail}}",
+                                            &[("detail", &format!("export task panicked: {join_err}"))],
+                                        )));
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    Some(AppCmd::UninstallPack { pack_id, keep_models }) => {
+                        // 协调记录 #47：pack 来源徽章菜单「卸载来源整合包」。
+                        // 语义对齐 daemon DELETE /api/packs/{id}：
+                        // keep_models=false → 删除 meta.pack_id 指向本包的模型目录；
+                        // 本包安装的管线与注册表条目一并移除。
+                        let registry_dir = root.join("runtime").join("packs");
+                        let reg_path =
+                            ep_pack::import::registry_entry_path(&registry_dir, &pack_id);
+                        match ep_pack::import::read_installed_pack(&reg_path) {
+                            Ok(Some(installed)) => {
+                                if !keep_models {
+                                    for model in model_manager.list_downloaded_models() {
+                                        if model.meta.pack_id.as_deref()
+                                            == Some(installed.id.as_str())
+                                        {
+                                            let dir = model_manager.model_dir(&model.target_dir);
+                                            if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+                                                tracing::warn!(
+                                                    dir = %dir.display(),
+                                                    error = %e,
+                                                    "failed to remove pack model dir"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                // 管线删除：按已装 id 反查 config/pipelines/*.toml
+                                let pipelines_dir = root.join("config").join("pipelines");
+                                if let Ok(rd) = tokio::fs::read_dir(&pipelines_dir).await {
+                                    let mut entries = Vec::new();
+                                    let mut rd = rd;
+                                    while let Ok(Some(entry)) = rd.next_entry().await {
+                                        entries.push(entry.path());
+                                    }
+                                    for path in entries {
+                                        if path.extension().and_then(|x| x.to_str())
+                                            != Some("toml")
+                                        {
+                                            continue;
+                                        }
+                                        let path_bg = path.clone();
+                                        let parse = tokio::task::spawn_blocking(move || {
+                                            ep_core::pipeline::Pipeline::from_toml(&path_bg)
+                                        })
+                                        .await;
+                                        if let Ok(Ok(pipeline)) = parse {
+                                            if installed.pipelines.contains(&pipeline.id) {
+                                                if let Err(e) = tokio::fs::remove_file(&path).await
+                                                {
+                                                    tracing::warn!(
+                                                        file = %path.display(),
+                                                        error = %e,
+                                                        "failed to remove pack pipeline"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Err(e) = tokio::fs::remove_file(&reg_path).await {
+                                    if e.kind() != std::io::ErrorKind::NotFound {
+                                        tracing::warn!(
+                                            path = %reg_path.display(),
+                                            error = %e,
+                                            "failed to remove pack registry file"
+                                        );
+                                    }
+                                }
+                                let _ = tx.send(AppMsg::Info(trfb_bg(
+                                    lang,
+                                    "desktopApp.info.packUninstalled",
+                                    "已卸载整合包「{{id}}」",
+                                    &[("id", &installed.id)],
+                                )));
+                                // 刷新模型列表与已装包列表
+                                let _ = tx.send(AppMsg::ModelsRefreshed(
+                                    model_manager.list_all_models(&manifests_from(&discovered)),
+                                ));
+                                match ep_pack::import::list_installed_packs(&registry_dir) {
+                                    Ok(packs) => {
+                                        let entries =
+                                            packs.into_iter().map(pack_entry_from).collect();
+                                        let _ = tx.send(AppMsg::PacksRefreshed(entries));
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(AppMsg::Error(tr(
+                                            lang,
+                                            "desktopApp.error.packListFailed",
+                                            &[("detail", &e.to_string())],
+                                        )));
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                let _ = tx.send(AppMsg::Error(trfb_bg(
+                                    lang,
+                                    "desktopApp.error.packNotFound",
+                                    "整合包「{{id}}」未安装或注册条目缺失",
+                                    &[("id", &pack_id)],
+                                )));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(AppMsg::Error(tr(
+                                    lang,
+                                    "desktopApp.error.packListFailed",
+                                    &[("detail", &e.to_string())],
+                                )));
+                            }
+                        }
+                    }
                     Some(AppCmd::ExecuteSingle {
                         module_id,
                         capability,
@@ -2369,5 +2908,225 @@ type = "http"
         };
         config.pipeline.workspace_dir = abs.to_string();
         assert_eq!(workspace_dir(&root, &config), PathBuf::from(abs));
+    }
+
+    // ── 协调记录 #47：导出模块（组装/打包/清单渲染） ──────────────────────
+
+    fn export_test_root(tag: &str) -> PathBuf {
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!(
+            "ep-desktop-export-{tag}-{}-{seq}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// 单变体模块 manifest 夹具（qualified_id 已声明，可入包）
+    fn export_fixture_manifest() -> ModuleManifest {
+        toml::from_str(
+            r#"
+[module]
+id = "mod-x"
+name = "X"
+version = "0.1.0"
+description = "d"
+category = "asr"
+genre = "g"
+
+[runtime]
+type = "python"
+python_version = ">=3.10"
+
+[compute]
+backends = ["cpu"]
+
+[[models]]
+id = "small"
+name = "Small"
+source = "huggingface"
+repo_id = "org/small"
+target_dir = "small-dir"
+qualified_id = "test.vendor.model"
+
+[interface]
+type = "http"
+"#,
+        )
+        .unwrap()
+    }
+
+    fn export_models_cfg() -> ep_core::config::ModelsConfig {
+        ep_core::config::ModelsConfig {
+            cache_dir: "models".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn render_pack_manifest_roundtrip() {
+        use ep_pack::manifest::{ModelMode, PackManifest, PackModelEntry, PackPipelineRef};
+        let manifest = PackManifest {
+            pack: ep_pack::manifest::PackInfo {
+                id: "test.pack".into(),
+                version: "1.0.0".into(),
+                name: "Test \"Pack\"\n".into(), // 覆盖转义路径
+                description: "d".into(),
+                authors: vec!["a".into()],
+                license: None,
+                homepage: None,
+                min_ep_version: None,
+                tags: vec!["t1".into()],
+            },
+            compute: ep_pack::manifest::PackCompute {
+                backends: vec![ComputeBackend::Cpu],
+                notes: HashMap::new(),
+            },
+            models: vec![PackModelEntry {
+                qualified_id: "test.vendor.model".into(),
+                variant: "small".into(),
+                mode: ModelMode::Bundle,
+                tags: vec![],
+            }],
+            pipelines: vec![PackPipelineRef {
+                file: "pipelines/p.toml".into(),
+            }],
+        };
+        let rendered = render_pack_manifest(&manifest);
+        let dir = export_test_root("manifest-roundtrip");
+        let path = dir.join("ep-pack.toml");
+        std::fs::write(&path, &rendered).unwrap();
+        let parsed = PackManifest::from_file(&path).unwrap();
+        assert_eq!(parsed, manifest, "rendered TOML must roundtrip losslessly");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_dir_hardlink_preferred_preserves_tree() {
+        let dir = export_test_root("hardlink-copy");
+        let src = dir.join("src");
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::write(src.join("a.bin"), b"alpha").unwrap();
+        std::fs::write(src.join("nested").join("b.bin"), b"beta").unwrap();
+        let dst = dir.join("dst");
+        std::fs::create_dir_all(&dst).unwrap();
+
+        copy_dir_hardlink_preferred(&src, &dst).unwrap();
+        assert_eq!(std::fs::read(dst.join("a.bin")).unwrap(), b"alpha");
+        assert_eq!(std::fs::read(dst.join("nested").join("b.bin")).unwrap(), b"beta");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_export_pack_bundle_e2e() {
+        let root = export_test_root("bundle-e2e");
+        // 权重落盘（bundle 要求目录存在）
+        let model_dir = root.join("models").join("small-dir");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("weights.bin"), b"weights-data").unwrap();
+
+        let spec = ep_desktop::app::PackExportSpec {
+            modules: vec![ep_desktop::app::PackExportModule {
+                module_id: "mod-x".into(),
+                bundle: true,
+                variants: vec!["small".into()],
+            }],
+            pipelines: vec![],
+            id: "test.pack".into(),
+            name: "Test Pack".into(),
+            version: "1.0.0".into(),
+            output_dir: root.join("out"),
+        };
+        let manifests = vec![export_fixture_manifest()];
+        let (archive, files) = build_export_pack(
+            &root,
+            "staging",
+            &export_models_cfg(),
+            &manifests,
+            spec,
+        )
+        .unwrap();
+        assert!(archive.is_file(), "archive must exist");
+        assert_eq!(archive.file_name().unwrap(), "test.pack-1.0.0.epzip");
+        // ep-pack.toml + models/small-dir/weights.bin + CHECKSUMS.toml
+        assert_eq!(files, 3);
+        // 暂存目录已清理
+        let leftover: Vec<_> = std::fs::read_dir(root.join("staging"))
+            .map(|rd| rd.flatten().collect())
+            .unwrap_or_default();
+        assert!(leftover.is_empty(), "staging must be cleaned after build");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_export_pack_bundle_requires_weights() {
+        let root = export_test_root("bundle-missing");
+        // 不落盘权重 → bundle 必须报错
+        let spec = ep_desktop::app::PackExportSpec {
+            modules: vec![ep_desktop::app::PackExportModule {
+                module_id: "mod-x".into(),
+                bundle: true,
+                variants: vec!["small".into()],
+            }],
+            pipelines: vec![],
+            id: "test.pack".into(),
+            name: String::new(),
+            version: String::new(),
+            output_dir: root.join("out"),
+        };
+        let manifests = vec![export_fixture_manifest()];
+        let err = build_export_pack(&root, "staging", &export_models_cfg(), &manifests, spec)
+            .unwrap_err();
+        assert!(err.contains("missing"), "error must mention missing weights: {err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_export_pack_reference_without_weights_ok() {
+        let root = export_test_root("reference-only");
+        // reference 模式无需权重落盘
+        let spec = ep_desktop::app::PackExportSpec {
+            modules: vec![ep_desktop::app::PackExportModule {
+                module_id: "mod-x".into(),
+                bundle: false,
+                variants: vec!["small".into()],
+            }],
+            pipelines: vec![],
+            id: String::new(), // 自动生成 local.build-<stamp>
+            name: String::new(),
+            version: String::new(),
+            output_dir: root.join("out"),
+        };
+        let manifests = vec![export_fixture_manifest()];
+        let (archive, files) = build_export_pack(
+            &root,
+            "staging",
+            &export_models_cfg(),
+            &manifests,
+            spec,
+        )
+        .unwrap();
+        assert!(archive.is_file());
+        // ep-pack.toml + CHECKSUMS.toml（无权重、无管线）
+        assert_eq!(files, 2);
+        let name = archive.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.starts_with("local.build-"), "auto id expected: {name}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn trfb_bg_falls_back_and_interpolates() {
+        // 已落盘键 → 译文（desktopApp.error.packImportFailed 已落盘 zh-CN）
+        let hit = trfb_bg("zh-CN", "common.action.save", "兜底", &[]);
+        assert_eq!(hit, "保存");
+        // 未落盘键 → 兜底文案 + 插值
+        let miss = trfb_bg(
+            "zh-CN",
+            "desktopApp.notYetLandedKey47",
+            "共 {{count}} 个",
+            &[("count", "3")],
+        );
+        assert_eq!(miss, "共 3 个");
     }
 }

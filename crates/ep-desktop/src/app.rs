@@ -12,9 +12,7 @@ use crate::i18n::tr;
 use crate::pages;
 use crate::theme;
 use crate::toast::ToastManager;
-use crate::ui::{
-    badge, card, empty_state, page_header, primary_button, section_title, subtle_button, Palette,
-};
+use crate::ui::Palette;
 
 // ─── Messages: background → UI ──────────────────────────────────────────────
 
@@ -107,8 +105,17 @@ pub enum AppCmd {
     /// 刷新已安装整合包列表（Wave S S2 骨架注册；C4 实现：ep-pack 注册表查询）
     RefreshPacks,
     /// 从本地路径导入整合包（§4.4；Wave S S2 骨架注册，C4 实现导入编排）。
-    /// URL/上传来源走 daemon HTTP API；桌面端仅本地路径（C5 用 rfd 选文件）
+    /// URL/上传来源走 daemon HTTP API；桌面端仅本地路径（模块页「导入模块」
+    /// 经 rfd 选 .epzip 后走本命令，进度/终态消息链不变）
     ImportPack { path: std::path::PathBuf },
+    /// 导出模块（协调记录 #47）：按 [`PackExportSpec`] 圈选组装包内容目录
+    ///（暂存目录，bundle 权重硬链接优先）→ [`ep_pack::build::build_pack`]
+    /// 产出 `.epzip` 到用户选定目录。后台执行，结果经 Info/Error Toast。
+    ExportPack { spec: PackExportSpec },
+    /// 卸载来源整合包（协调记录 #47：模块卡 pack 来源徽章菜单触发）。
+    /// keep_models=false → 删除 meta.pack_id 指向本包的模型目录；
+    /// 管线与注册表条目一并移除（语义对齐 daemon DELETE /api/packs/{id}）。
+    UninstallPack { pack_id: String, keep_models: bool },
     /// 单模型直跑（§5.3；Wave S S2 骨架注册，C4 实现：ep-core 直连 submit_direct）。
     /// params 为表单产出的 (参数名, 原始字符串值) 序列，
     /// 由 C4 按模块 manifest CapabilityDecl.params schema 强制类型化
@@ -220,27 +227,54 @@ pub struct PackImportUiState {
     pub percent: Option<f32>,
 }
 
+/// 导出模块（协调记录 #47）：单个模块的圈选结果——变体集合 + 许可证模式。
+#[derive(Debug, Clone)]
+pub struct PackExportModule {
+    pub module_id: String,
+    /// 许可证模式二选一（对话框文案提示按许可证选择）：
+    /// true = 「随包附带权重」(bundle)；false = 「仅元数据从指定渠道下载」(reference)
+    pub bundle: bool,
+    /// 勾选的变体 id 列表（模块 manifest [[models]].id）
+    pub variants: Vec<String>,
+}
+
+/// 导出模块请求（对话框圈选 → AppCmd::ExportPack → 后台组装+打包）。
+/// 形状对齐 daemon `POST /api/packs/build` 的编排输入（§4.5），
+/// 桌面端独立实现库层调用（组装暂存目录 → ep_pack::build::build_pack）。
+#[derive(Debug, Clone)]
+pub struct PackExportSpec {
+    /// 圈选模块（变体级勾选 + 每模块 bundle/reference 模式）
+    pub modules: Vec<PackExportModule>,
+    /// 勾选的管线 id 列表（config/pipelines/*.toml）
+    pub pipelines: Vec<String>,
+    /// 包身份 `<publisher>.<pack-name>`；空串时后台自动生成 local.build-<时间戳>
+    pub id: String,
+    /// 包显示名；空串时回退 id
+    pub name: String,
+    /// semver；空串时回退 0.1.0
+    pub version: String,
+    /// 用户 rfd 选定的 `.epzip` 保存目录
+    pub output_dir: std::path::PathBuf,
+}
+
 // ─── Page enum ──────────────────────────────────────────────────────────────
 
+/// 信息架构终稿（协调记录 #47）：「模型就是模块」——NAV 仅五个入口，
+/// 旧「模型」页与「整合包」页已并入「模块」（模块管理单页）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Dashboard,
     Modules,
-    Models,
-    /// 整合包管理（Wave S S2 骨架注册；页面实现见 Wave 3 C5）
-    Packs,
     PipelineEditor,
     Tasks,
     Settings,
 }
 
 /// (页面, 图标, 标题文案的 i18n 键, 键缺失时的兜底文案) — 文案渲染时按当前语言查表；
-/// 兜底仅在 i18n 键尚未落盘（C8 之前）的过渡期生效
+/// 兜底仅在 i18n 键尚未落盘的过渡期生效
 const NAV_ITEMS: &[(Page, &str, &str, &str)] = &[
     (Page::Dashboard, "📊", "desktopApp.nav.dashboard", "仪表盘"),
     (Page::Modules, "🧩", "desktopApp.nav.modules", "模块"),
-    (Page::Models, "📦", "desktopApp.nav.models", "模型"),
-    (Page::Packs, "🎁", "desktopApp.nav.packs", "整合包"),
     (Page::PipelineEditor, "🔗", "desktopApp.nav.pipeline", "管线"),
     (Page::Tasks, "📋", "desktopApp.nav.tasks", "任务"),
     (Page::Settings, "⚙", "desktopApp.nav.settings", "设置"),
@@ -255,10 +289,9 @@ const COMPACT_WIDTH_THRESHOLD: f32 = 1000.0;
 
 pub struct App {
     current_page: Page,
-    /// 上一帧所在页面（页面切换时触发一次性数据刷新：Packs/Tasks，C4）
+    /// 上一帧所在页面（页面切换时触发一次性数据刷新：Modules/Tasks）
     last_page: Option<Page>,
     pub state: AppState,
-    selected_module: Option<usize>,
     rx: std::sync::mpsc::Receiver<AppMsg>,
     pub cmd_tx: tokio::sync::mpsc::UnboundedSender<AppCmd>,
     last_repaint: std::time::Instant,
@@ -341,7 +374,6 @@ impl App {
                 pack_imports: HashMap::new(),
                 pipeline_tasks: HashMap::new(),
             },
-            selected_module: None,
             rx,
             cmd_tx,
             last_repaint: std::time::Instant::now(),
@@ -560,168 +592,6 @@ impl App {
         }
     }
 
-    /// 整合包管理页（C4 实现）：已装包列表 + 导入进度 + 操作按钮（回调 AppCmd）。
-    ///
-    /// 数据来源：`AppState.packs`（AppMsg::PacksRefreshed）与
-    /// `AppState.pack_imports`（AppMsg::PackImportProgress）；进入页面时的
-    /// RefreshPacks 由 [`Self::update`] 的页面切换检测触发。
-    fn packs_page(&mut self, ui: &mut egui::Ui, lang: &str, pal: &Palette) {
-        let cmd_tx = self.cmd_tx.clone();
-        page_header(
-            ui,
-            &tr_or(lang, "desktopApp.packs.title", "整合包管理"),
-            |ui| {
-                if ui
-                    .add(subtle_button(
-                        pal,
-                        tr_or(lang, "desktopApp.packs.refresh", "刷新"),
-                    ))
-                    .on_hover_text(tr_or(
-                        lang,
-                        "desktopApp.packs.refreshTip",
-                        "重新读取已装包注册表",
-                    ))
-                    .clicked()
-                {
-                    let _ = cmd_tx.send(AppCmd::RefreshPacks);
-                }
-                if ui
-                    .add(primary_button(
-                        pal,
-                        tr_or(lang, "desktopApp.packs.import", "导入整合包"),
-                    ))
-                    .clicked()
-                {
-                    // 桌面端仅本地路径来源（URL/上传走 daemon HTTP API）
-                    if let Some(file) = rfd::FileDialog::new()
-                        .add_filter("EntryPoint Pack (.epzip)", &["epzip"])
-                        .pick_file()
-                    {
-                        let _ = cmd_tx.send(AppCmd::ImportPack { path: file });
-                    }
-                }
-            },
-        );
-        ui.add_space(8.0);
-
-        // ── 进行中的导入进度 ──
-        if !self.state.pack_imports.is_empty() {
-            section_title(
-                ui,
-                &tr_or(lang, "desktopApp.packs.importing", "导入中"),
-            );
-            ui.add_space(6.0);
-            let mut entries: Vec<(String, PackImportUiState)> = self
-                .state
-                .pack_imports
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            for (pack_id, st) in entries {
-                card(ui, pal, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(&pack_id).strong());
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.label(
-                                    egui::RichText::new(pack_stage_label(lang, &st.stage))
-                                        .small()
-                                        .color(pal.text_dim),
-                                );
-                            },
-                        );
-                    });
-                    ui.add_space(4.0);
-                    let bar = match st.percent {
-                        Some(p) => egui::ProgressBar::new((p / 100.0).clamp(0.0, 1.0))
-                            .desired_width(ui.available_width()),
-                        // 无法估算进度：动画不定量进度条 + 仅显示阶段文案
-                        None => egui::ProgressBar::new(0.0)
-                            .desired_width(ui.available_width())
-                            .animate(true),
-                    };
-                    ui.add(bar);
-                });
-                ui.add_space(6.0);
-            }
-            ui.add_space(6.0);
-        }
-
-        // ── 已装包列表 ──
-        if self.state.packs.is_empty() {
-            empty_state(
-                ui,
-                pal,
-                "🎁",
-                &tr_or(lang, "desktopApp.packs.emptyTitle", "尚未安装整合包"),
-                &tr_or(
-                    lang,
-                    "desktopApp.packs.emptyHint",
-                    "点击右上角「导入整合包」选择 .epzip 包文件导入",
-                ),
-            );
-            return;
-        }
-
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for pack in &self.state.packs {
-                card(ui, pal, |ui| {
-                    // 行 1：名称 + 版本徽章 + 安装时间（右对齐）
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(&pack.name).strong());
-                        badge(
-                            ui,
-                            pal,
-                            pal.neutral,
-                            format!("v{}", pack.version),
-                        );
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if let Some(t) = &pack.installed_at {
-                                    ui.label(
-                                        egui::RichText::new(iso_to_secs(t))
-                                            .monospace()
-                                            .small()
-                                            .color(pal.text_faint),
-                                    );
-                                }
-                            },
-                        );
-                    });
-                    // 行 2：包 id（与显示名不同时展示，mono 弱色）
-                    if pack.id != pack.name {
-                        ui.label(
-                            egui::RichText::new(&pack.id)
-                                .monospace()
-                                .small()
-                                .color(pal.text_faint),
-                        );
-                    }
-                    // 行 3：描述
-                    if !pack.description.is_empty() {
-                        ui.add_space(2.0);
-                        ui.label(
-                            egui::RichText::new(&pack.description).color(pal.text_dim),
-                        );
-                    }
-                    // 行 4：tags
-                    if !pack.tags.is_empty() {
-                        ui.add_space(4.0);
-                        ui.horizontal_wrapped(|ui| {
-                            for tag in &pack.tags {
-                                badge(ui, pal, pal.info, tag.clone());
-                                ui.add_space(4.0);
-                            }
-                        });
-                    }
-                });
-                ui.add_space(8.0);
-            }
-        });
-    }
 }
 
 impl eframe::App for App {
@@ -748,10 +618,11 @@ impl eframe::App for App {
         // Poll messages from background thread
         self.process_messages();
 
-        // C4：页面进入时一次性数据刷新（P1-6 任务拉取 / 整合包列表）
+        // 页面进入时一次性数据刷新（模块页：已装包注册表供来源徽章/卸载菜单；
+        // 任务页：P1-6 任务拉取）
         if self.last_page != Some(self.current_page) {
             match self.current_page {
-                Page::Packs => {
+                Page::Modules => {
                     let _ = self.cmd_tx.send(AppCmd::RefreshPacks);
                 }
                 Page::Tasks => {
@@ -875,29 +746,20 @@ impl eframe::App for App {
                 );
             }
             Page::Modules => {
+                // 模块管理单页（协调记录 #47）：模块卡 + 变体选择器 +
+                // 工具栏导入/导出模块 + pack 来源徽章卸载
                 pages::modules::show(
                     ui,
                     &self.state.config,
                     &mut self.state.modules,
-                    &mut self.selected_module,
-                    &self.cmd_tx,
-                );
-            }
-            Page::Models => {
-                pages::models::show(
-                    ui,
-                    &self.state.config,
                     &self.state.models,
-                    &self.state.model_cache_dir,
                     &self.state.downloads,
                     &self.state.updates,
                     &mut self.state.download_sources,
+                    &self.state.packs,
+                    &self.state.pack_imports,
                     &self.cmd_tx,
                 );
-            }
-            Page::Packs => {
-                // C4：整合包管理页（列表 + 导入进度 + 操作按钮回调 AppCmd）
-                self.packs_page(ui, lang, &pal);
             }
             Page::PipelineEditor => {
                 pages::pipeline_editor::show_full(ui, &self.state.config, Some(&self.cmd_tx));
@@ -994,32 +856,39 @@ fn nav_item(
     }
 }
 
-// ─── i18n 辅助 ───────────────────────────────────────────────────────────────
+// ─── 测试 ────────────────────────────────────────────────────────────────────
 
-/// i18n 查找 + 兜底：键缺失时 [`tr`] 原样返回键本身（ep-core 约定），
-/// 回退到 fallback 文案。兜底仅在键尚未落盘（C8 之前）的过渡期生效。
-fn tr_or(lang: &str, key: &str, fallback: &str) -> String {
-    let translated = tr(lang, key, &[]);
-    if translated == key {
-        fallback.to_string()
-    } else {
-        translated
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 信息架构终稿（协调记录 #47）：NAV 收敛为五入口——
+    /// 仪表盘/模块/管线/任务/设置；「模型」旧入口与「整合包」已删除。
+    #[test]
+    fn nav_items_are_converged_five_entries() {
+        let pages: Vec<Page> = NAV_ITEMS.iter().map(|(p, _, _, _)| *p).collect();
+        assert_eq!(
+            pages,
+            vec![
+                Page::Dashboard,
+                Page::Modules,
+                Page::PipelineEditor,
+                Page::Tasks,
+                Page::Settings,
+            ],
+            "NAV 必须恰为五个入口且顺序固定（#47 导航收敛）"
+        );
     }
-}
 
-/// 整合包导入阶段文案（§4.4 ImportStage 小写阶段名 → i18n 键
-/// `desktopApp.packs.stage.<stage>`；键未落盘时兜底显示原始阶段名）。
-fn pack_stage_label(lang: &str, stage: &str) -> String {
-    let key = format!("desktopApp.packs.stage.{stage}");
-    let translated = tr(lang, &key, &[]);
-    if translated == key {
-        stage.to_string()
-    } else {
-        translated
+    /// Page 枚举与 NAV 一一对应（match 穷尽性由编译期保证，此处断言数量同步）
+    #[test]
+    fn page_enum_matches_nav_count() {
+        assert_eq!(NAV_ITEMS.len(), 5);
+        // 每个 NAV 条目都有非空图标与 i18n 键
+        for &(_, icon, key, fallback) in NAV_ITEMS {
+            assert!(!icon.is_empty());
+            assert!(key.starts_with("desktopApp.nav."));
+            assert!(!fallback.is_empty());
+        }
     }
-}
-
-/// ISO 8601 时间字符串截短到秒（前 19 字符）；长度不足或边界不安全时原样返回
-fn iso_to_secs(iso: &str) -> &str {
-    iso.get(..19).unwrap_or(iso)
 }

@@ -2,20 +2,21 @@
 //!
 //! ## 页面层数据桥（Wave 3 C5）
 //!
-//! 桌面端页面由 `app.rs` 按 S2 骨架签名分发（C4 同波维护 app.rs，接口增补
-//! 经门禁期仲裁）。部分跨页数据（模块运行状态/设备列表/任务列表）在 S2
-//! 签名下不直接可达，本模块提供 **ctx-data 快照桥**：
+//! 桌面端页面由 `app.rs` 按骨架签名分发。部分跨页数据（设备列表/任务列表）
+//! 在页面签名下不直接可达，本模块提供 **ctx-data 快照桥**：
 //!
-//! - dashboard/modules/tasks 页每帧渲染时发布权威快照（它们从 app.rs 收到
-//!   `&[ModuleEntry]` / `&[ComputeDevice]` / `&[TaskSummary]`）；
-//! - models / pipeline_editor 页消费快照。仪表盘为默认首页，应用启动后
-//!   快照即存在；快照过期/缺失时消费侧按"未知"降级渲染。
+//! - dashboard/tasks 页每帧渲染时发布权威快照（它们从 app.rs 收到
+//!   `&[ComputeDevice]` / `&[TaskSummary]`）；
+//! - pipeline_editor 页消费快照。仪表盘为默认首页，应用启动后快照即存在；
+//!   快照过期/缺失时消费侧按"未知"降级渲染。
+//!
+//! 信息架构终稿（协调记录 #47）后「模型就是模块」：模块卡直接消费 app.rs
+//! 传入的 `&[ModuleEntry]`（运行状态/日志权威数据），不再经模块快照桥。
 //!
 //! 快照只做展示辅助，写入全部经 [`crate::app::AppCmd`] 走后台线程，
 //! 页面不直接改动后台状态。
 
 pub mod dashboard;
-pub mod models;
 pub mod modules;
 pub mod pipeline_editor;
 pub mod settings;
@@ -29,9 +30,8 @@ use ep_core::config::AppConfig;
 use ep_core::model::{ModelManager, ModelMeta};
 use ep_core::module::{CapabilityDecl, DiscoveredModule, ModuleManifest};
 use ep_core::pipeline::runner::TaskSummary;
-use ep_core::types::{ComputeDevice, ServiceStatus};
+use ep_core::types::ComputeDevice;
 
-use crate::app::ModuleEntry;
 use crate::i18n::tr;
 
 /// 模块清单缓存的 TTL：页面层本地读取 modules/ 目录的复用窗口。
@@ -56,53 +56,6 @@ pub(crate) fn trfb(lang: &str, key: &str, fallback: &str, params: &[(&str, &str)
         out = out.replace(&pattern, value);
     }
     out
-}
-
-// ─── 模块状态快照（modules/dashboard/tasks 发布 → models 消费） ────────────
-
-/// 单个模块的运行状态快照（来自 app.rs 的权威 [`ModuleEntry`]）
-#[derive(Debug, Clone)]
-pub(crate) struct ModuleSnapEntry {
-    pub id: String,
-    pub name: String,
-    pub status: ServiceStatus,
-    pub port: Option<u16>,
-    pub device: Option<String>,
-    /// 最近日志（上限与 ModuleEntry 一致，展示用；统一页日志抽屉消费）
-    pub logs: Vec<String>,
-}
-
-/// 全量模块状态快照
-#[derive(Debug, Clone, Default)]
-pub(crate) struct ModuleSnapshot {
-    pub entries: Vec<ModuleSnapEntry>,
-}
-
-fn module_snapshot_id() -> egui::Id {
-    egui::Id::new("ep_pages_module_snapshot")
-}
-
-/// 发布模块状态快照（dashboard/modules/tasks 页每帧调用）
-pub(crate) fn publish_module_snapshot(ctx: &egui::Context, modules: &[ModuleEntry]) {
-    let snapshot = ModuleSnapshot {
-        entries: modules
-            .iter()
-            .map(|m| ModuleSnapEntry {
-                id: m.id.clone(),
-                name: m.name.clone(),
-                status: m.status.clone(),
-                port: m.port,
-                device: m.device.clone(),
-                logs: m.logs.clone(),
-            })
-            .collect(),
-    };
-    ctx.data_mut(|d| d.insert_temp(module_snapshot_id(), snapshot));
-}
-
-/// 读取模块状态快照；None = 尚无任何页面发布过（降级：状态未知）
-pub(crate) fn module_snapshot(ctx: &egui::Context) -> Option<ModuleSnapshot> {
-    ctx.data(|d| d.get_temp::<ModuleSnapshot>(module_snapshot_id()))
 }
 
 // ─── 设备快照（dashboard 发布 → pipeline_editor VRAM 账本消费） ────────────

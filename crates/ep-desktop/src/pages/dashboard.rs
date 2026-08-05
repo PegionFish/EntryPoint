@@ -29,10 +29,10 @@ pub fn show(
     let lang = ep_core::i18n::normalize_language(&config.general.language);
     let pal = Palette::new(ui.style().visuals.dark_mode);
 
-    // 发布权威快照：设备列表（管线编辑器 VRAM 账本消费）+ 模块状态
-    // （统一页镜像消费）。仪表盘为默认首页，启动后快照即存在。
+    // 发布权威快照：设备列表（管线编辑器 VRAM 账本消费）。
+    // 仪表盘为默认首页，启动后快照即存在。模块运行状态由模块页直接消费
+    // app.rs 的 `&[ModuleEntry]`（协调记录 #47），不再经模块快照桥。
     crate::pages::publish_device_snapshot(ui.ctx(), devices);
-    crate::pages::publish_module_snapshot(ui.ctx(), modules);
 
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.add_space(16.0);
