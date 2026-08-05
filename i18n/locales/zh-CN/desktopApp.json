@@ -2,7 +2,6 @@
   "nav.dashboard": "仪表盘",
   "nav.modules": "模块",
   "nav.models": "模型",
-  "nav.packs": "整合包",
   "nav.pipeline": "管线",
   "nav.tasks": "任务",
   "nav.settings": "设置",
@@ -93,13 +92,6 @@
   "error.capabilityNotFound": "模块 {{module}} 没有能力 {{capability}}",
   "error.inputFileMissing": "输入文件不存在：{{path}}",
   "error.paramInvalid": "直跑参数无效：{{detail}}",
-  "packs.title": "整合包管理",
-  "packs.refresh": "刷新",
-  "packs.refreshTip": "重新读取已装包注册表",
-  "packs.import": "导入整合包",
-  "packs.importing": "导入中",
-  "packs.emptyTitle": "尚未安装整合包",
-  "packs.emptyHint": "点击右上角「导入整合包」选择 .epzip 包文件导入",
   "packs.stage.extracting": "解包中",
   "packs.stage.verifying": "校验校验和",
   "packs.stage.manifest": "校验清单",
@@ -164,5 +156,10 @@
   "tasks.cancel": "取消",
   "tasks.artifacts.title": "输出产物",
   "tasks.artifacts.dirMissing": "任务目录不存在（任务可能未在本机执行或产物已清理）",
-  "tasks.artifacts.openDir": "打开任务目录"
+  "tasks.artifacts.openDir": "打开任务目录",
+  "error.packExportEmpty": "导出失败：未圈选任何模型或管线",
+  "info.packExportDone": "导出完成：{{path}}（{{files}} 个文件）",
+  "error.packExportFailed": "导出失败：{{detail}}",
+  "info.packUninstalled": "已卸载整合包「{{id}}」",
+  "error.packNotFound": "整合包「{{id}}」未安装或注册条目缺失"
 }

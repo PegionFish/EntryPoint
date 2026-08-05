@@ -2,7 +2,6 @@
   "nav.dashboard": "Dashboard",
   "nav.modules": "Modules",
   "nav.models": "Models",
-  "nav.packs": "Packs",
   "nav.pipeline": "Pipeline",
   "nav.tasks": "Tasks",
   "nav.settings": "Settings",
@@ -93,13 +92,6 @@
   "error.capabilityNotFound": "Module {{module}} has no capability {{capability}}",
   "error.inputFileMissing": "Input file does not exist: {{path}}",
   "error.paramInvalid": "Invalid direct-exec parameters: {{detail}}",
-  "packs.title": "Pack Manager",
-  "packs.refresh": "Refresh",
-  "packs.refreshTip": "Re-read installed pack registry",
-  "packs.import": "Import Pack",
-  "packs.importing": "Importing",
-  "packs.emptyTitle": "No packs installed",
-  "packs.emptyHint": "Click \"Import Pack\" (top right) and choose a .epzip file",
   "packs.stage.extracting": "Extracting",
   "packs.stage.verifying": "Verifying checksums",
   "packs.stage.manifest": "Validating manifest",
@@ -164,5 +156,10 @@
   "tasks.cancel": "Cancel",
   "tasks.artifacts.title": "Output artifacts",
   "tasks.artifacts.dirMissing": "Task directory not found (the task may not have run on this machine, or artifacts were cleaned up)",
-  "tasks.artifacts.openDir": "Open task directory"
+  "tasks.artifacts.openDir": "Open task directory",
+  "error.packExportEmpty": "Export failed: no models or pipelines selected",
+  "info.packExportDone": "Export completed: {{path}} ({{files}} files)",
+  "error.packExportFailed": "Export failed: {{detail}}",
+  "info.packUninstalled": "Pack \"{{id}}\" uninstalled",
+  "error.packNotFound": "Pack \"{{id}}\" is not installed or its registry entry is missing"
 }
