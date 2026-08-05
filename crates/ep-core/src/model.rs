@@ -2103,6 +2103,107 @@ mod tests {
         assert!(code.contains("revision='master'"), "code: {code}");
     }
 
+    // ── gen_download_code 快照（GAP-1 G3 补测）──────────────────────────────
+    // 快照关键行而非全文，避免对脚本措辞调整过度敏感。
+
+    /// URL 来源测试夹具
+    fn test_url_model(url: &str) -> ModelDecl {
+        ModelDecl {
+            id: "url-model".to_string(),
+            name: "URL model".to_string(),
+            source: ModelSource::Url,
+            repo_id: None,
+            url: Some(url.to_string()),
+            target_dir: "url-model".to_string(),
+            revision: None,
+            size_estimate_mb: None,
+            qualified_id: None,
+            vram_estimate_mb: None,
+            default: false,
+            mirrors: vec![],
+        }
+    }
+
+    /// url="auto"：模块自管下载 → 空操作脚本（建目录 + 跳过日志），不发起下载
+    #[test]
+    fn test_gen_download_code_url_auto_is_noop() {
+        let mgr = ModelManager::new(&test_config("models"), Path::new("G:/EntryPoint"));
+        let (_program, args) =
+            mgr.build_download_command(&test_url_model("auto"), Path::new("python"));
+        let code = &args[1];
+
+        assert!(code.contains("os.makedirs("), "code: {code}");
+        assert!(
+            code.contains("auto-download model: skipped (managed by module)"),
+            "code: {code}"
+        );
+        assert!(!code.contains("urlretrieve"), "auto must not download: {code}");
+        assert!(code.contains("url-model"), "target dir must appear: {code}");
+    }
+
+    /// .tar.gz / .tgz URL → 下载 + 解压 + 清理临时包
+    #[test]
+    fn test_gen_download_code_url_tar_gz_extract() {
+        let mgr = ModelManager::new(&test_config("models"), Path::new("G:/EntryPoint"));
+        let url = "https://example.com/pack/model-v1.tar.gz";
+        let (_program, args) = mgr.build_download_command(&test_url_model(url), Path::new("python"));
+        let code = &args[1];
+
+        assert!(code.contains("import urllib.request, tarfile"), "code: {code}");
+        assert!(code.contains(&format!("urlretrieve('{url}'")), "code: {code}");
+        assert!(code.contains("extractall("), "must extract the archive: {code}");
+        assert!(code.contains("os.remove(tmp)"), "must clean up the temp archive: {code}");
+
+        // .tgz 同走解压分支
+        let (_program, args) = mgr.build_download_command(
+            &test_url_model("https://example.com/m.tgz"),
+            Path::new("python"),
+        );
+        assert!(
+            args[1].contains("tarfile"),
+            ".tgz must use the extract branch too: {}",
+            args[1]
+        );
+    }
+
+    /// 单文件 URL → 直接下载，文件名取自 URL 尾段
+    #[test]
+    fn test_gen_download_code_url_single_file_name_from_url() {
+        let mgr = ModelManager::new(&test_config("models"), Path::new("G:/EntryPoint"));
+        let url = "https://example.com/models/net.onnx";
+        let (_program, args) = mgr.build_download_command(&test_url_model(url), Path::new("python"));
+        let code = &args[1];
+
+        assert!(code.contains("import urllib.request"), "code: {code}");
+        assert!(code.contains(&format!("urlretrieve('{url}'")), "code: {code}");
+        assert!(
+            code.contains("'net.onnx'"),
+            "file name must come from URL tail: {code}"
+        );
+        assert!(!code.contains("tarfile"), "single file must not extract: {code}");
+    }
+
+    /// HF 镜像端点环境变量必须在 import huggingface_hub 之前设置（否则不生效）
+    #[test]
+    fn test_gen_download_code_hf_endpoint_set_before_import() {
+        let mut config = test_config("models");
+        config.hf_endpoint = "https://hf-mirror.com".to_string();
+        let mgr = ModelManager::new(&config, Path::new("G:/EntryPoint"));
+        let (_program, args) = mgr.build_download_command(&test_hf_model(), Path::new("python"));
+        let code = &args[1];
+
+        let env_pos = code
+            .find("os.environ['HF_ENDPOINT']")
+            .expect("must set HF_ENDPOINT");
+        let import_pos = code
+            .find("from huggingface_hub import")
+            .expect("must import huggingface_hub");
+        assert!(
+            env_pos < import_pos,
+            "HF_ENDPOINT must be set before the import: {code}"
+        );
+    }
+
     // ── read_meta / write_meta 往返 ────────────────────────────────────
 
     #[test]
