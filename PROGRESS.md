@@ -321,7 +321,7 @@ Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平�
 
 ### 验证结果（Windows 执行机实测）
 - 最终门禁：`cargo clippy --workspace --all-targets` 零警告；`cargo test --workspace` **936 全过**；前端 build+lint 零 error
-- 异构设备真机：`/api/devices` 检出 **cuda:0（RTX 5090 D 32GB 实时显存/温度）+ openvino:NPU.0（Intel AI Boost）+ openvino:GPU.0（Intel Graphics）+ cpu（实时利用率）**，DirectML 按去重策略恒空（预期）
+- 异构设备真机：`/api/devices` 检出 **cuda:0（RTX 5090 D 32GB 实时显存/温度）+ openvino:NPU.0（Intel AI Boost）+ openvino:GPU.0（Intel Graphics）+ cpu（注册表 ProcessorNameString 营销名「Intel(R) Core(TM) Ultra 7 270HX Plus」+ 实时利用率）**；DirectML 为空系预期双重原因：去重策略（CUDA>ROCm>OpenVINO>DirectML）+ 虚拟显示适配器黑名单过滤（OrayIddDriver 等向日葵残留，见「设备检测修复批」）
 - API 冒烟：health/modules（capabilities+active_model_id）/packs/pipelines/WebUI 首页全过
 - 桌面 GUI：启动渲染完整（模块单页含变体选择器/导入导出、管线编辑器、CJK 字体）；自动化点击注入对 egui/winit 事件循环受限（驱动限制，非应用缺陷，54 桌面单测覆盖）
 - 打包：`build.ps1 gui` + `build.ps1 server` 全量流程（含 clippy+tests+release），产物含 ep-pack.exe + VC 运行库 + cuda-libs 存在性附带
@@ -378,11 +378,56 @@ Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平�
 
 ---
 
+## 设备检测修复批（2026-08-05）— ✅ 完成
+
+### 完成（3 文件 +220/−7，新增 6 测试）
+- [x] `compute/directml.rs`：虚拟显示适配器黑名单扩充 —— 过滤 OrayIddDriver/Idd 等虚拟显示适配器（向日葵远程工具残留会混入 DirectML 设备列表）；原有去重策略（CUDA>ROCm>OpenVINO>DirectML）不变
+- [x] `compute/cpu.rs`：Windows CPU 名称改读注册表 `ProcessorNameString`（营销型号，免子进程，替代 PROCESSOR_IDENTIFIER 的 Family/Model 格式）→ 现显示如「Intel(R) Core(TM) Ultra 7 270HX Plus」；ARM 平台加 cpuinfo 回退
+- [x] `compute/openvino.rs`：Linux lspci 路径过滤 QEMU/VMware/llvmpipe 等虚拟/软件渲染设备
+
+### 验证
+- ep-core 367 测试全过；workspace 除 video_to_srt E2E 外全过
+
+### 遗留（如实记录）
+- ~~video_to_srt E2E（wait:true）卡死问题排查中~~ → 已定位根因并修复，见「video_to_srt 卡死修复批」
+
+### Git
+- commit: `7c367a6` — "fix(ep-core): 设备检测过滤虚拟显卡+CPU营销型号"
+
+---
+
+## video_to_srt 卡死修复批（2026-08-05）— ✅ 完成
+
+> 目标：根治 video_to_srt E2E（wait:true）卡死 / 孤儿 adapter 占端口链路。
+> 方式：并行子代理根因调查（绑定对照实验实证）+ 作用域修复 + 干净环境复跑验收。
+
+### 根因（实证）
+- Windows 绑定语义：端口被 `0.0.0.0:port` 监听时，bind `127.0.0.1:port` **仍成功**（共存语义）→ 仅探回环的 OS 探测误判空闲；而所有模块 adapter 均 bind `0.0.0.0`（uvicorn）
+- 模块子进程在测试结束后不回收：E2E 以进程内 `Router::oneshot` 驱动，不走 main.rs 优雅退出路径（C1 的 stop_all_modules 只挂 Ctrl+C）；Windows `cmd /C` 壳包裹使 kill 直接子进程只杀 cmd.exe → 孤儿 adapter 监 0.0.0.0:18000
+- 叠加效果：allocate 分出被占端口 → 新 adapter 绑定失败退出（exit 3）→ 健康检查打到孤儿 → 假"就绪"（寄生执行）或长超时卡死
+
+### 完成（+4 测试）
+- [x] `ep-core/src/port.rs`：`os_port_free` 双地址探测（先 `0.0.0.0` 后 `127.0.0.1`，任一失败判占用；通配监听器先 drop 再探回环避 Linux 互斥误判）；测试串行锁 + 通配预约辅助，+2 回归测试（0.0.0.0 占用形态）
+- [x] `ep-core/src/process.rs`：`kill_process_tree`（Windows 系统自带 `taskkill /T /F` 树级回收，零新依赖；非 Windows 回退直接 kill），`stop_module` 树回收优先 → 直接 kill 兜底 → reap；+1 心跳法测试（cmd /C 子孙进程形态）
+- [x] `ep-daemon/tests/e2e_daemon.rs`：harness teardown `stop_all_running_modules`（语义对齐 main.rs stop_all_modules：逐个 stop + 端口释放），video_to_srt 测试结尾接入；新增 `e2e_harness_teardown` 回归模块（真实长活子进程 → teardown → 无残留 + 端口释放）
+- [x] `ep-daemon/src/api/autostart.rs`：3 个测试适配 OS 探测（序列改"先 allocate → 在分得端口起 mock"，断言不变）
+
+### 验证
+- ep-core 373（360 lib + 13 集成）/ ep-daemon bin 237 / e2e 228 全过；clippy ep-core+ep-daemon 零警告；`cargo check --workspace --all-targets` 干净
+- 干净环境复跑 video_to_srt E2E：8.4s 真跑通过（真实拉起模块，3GB 模型热缓存 5.85s ready，4 节点产物落盘），**跑后零孤儿、18000 释放**（对照：全冷首轮含 venv 初备 1035s 亦通过；此前 7.1s"绿"经任务记录时间线证伪为寄生孤儿）
+
+### 遗留（如实记录）
+- E2E 断言 panic 路径跳过 teardown（双地址探测 + 18000-19000 宽范围兜底，可接受）
+- Linux 树回收依赖 `sh -c` 单命令 exec 优化（setpgid 进程组方案已提议未实施）；Windows job object 方案已提议未实施（taskkill /T 已足够且零依赖）
+- 探测 TOCTOU 已文档化；E2E 媒体为占位 fixture（链路回归），真实媒体转写回归仍在 Linux 侧（与已知限制一致）
+
+---
+
 ## 最终统计
 
 | 指标 | 值 |
 |---|---|
-| Rust 测试数 | 984（2026-08-05 收口批后：stop_all 回收 2 + keep_workspace 清理 2 + 既有 978；含单元/集成/E2E/桌面端/CLI） |
+| Rust 测试数 | 997（`cargo test --workspace -- --list` 实测口径；video_to_srt 修复批 +4 = 端口双探测 2 + 进程树回收 1 + e2e teardown 1；历史 984/990 为分 crate 报告累加口径，两者相差 3 系口径修正） |
 | Clippy warnings | 0（--workspace --all-targets） |
 | Rust 源文件数 | ~90 .rs files |
 | 前端源文件数 | 58 (.ts/.tsx) |
@@ -391,7 +436,7 @@ Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平�
 | Crate 数 | 6 (ep-core, ep-daemon, ep-desktop, ep-webui, ep-pack, ep-pack-cli) |
 | Release 构建时间 | ~4m（含前端） |
 | Git commits | 60+ |
-| E2E 测试 | ✅ 整合包全链/直跑/wait/callback/VRAM/闸门/取消 19 项（D1）+ 既有真实媒体全流程（Linux 侧） |
+| E2E 测试 | ✅ 整合包全链/直跑/wait/callback/VRAM/闸门/取消 19 项（D1）+ 既有真实媒体全流程（Linux 侧）+ video-to-srt 条件回归 Windows 真机复跑通过（2026-08-05） |
 | 异构设备 | ✅ Windows 真机：cuda:0 + openvino:NPU.0/GPU.0 + cpu 四设备实时数据 |
 
 ---
