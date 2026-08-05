@@ -387,6 +387,30 @@ fn default_pack_staging_dir() -> String {
     ".pack-staging".to_string()
 }
 
+// ─── ResolvedPaths（#48：解析与持久化分离）────────────────────────────────
+
+/// 运行期解析路径视图（#48）。
+///
+/// `AppConfig` 的序列化字段（`models.cache_dir` / `pipeline.workspace_dir` /
+/// `models.cache_paths` 等）**始终保留用户原始字符串**（相对保持相对、绝对保持绝对），
+/// 保证 `save()` 落盘形态与出厂/用户编辑一致，部署目录迁移后配置依然有效。
+///
+/// 运行期需要绝对路径时：
+/// - 启动期调用 [`AppConfig::resolve_paths`] 基于 root 一次性计算并缓存到本结构
+///   （经 [`AppConfig::resolved_paths`] 读取）；
+/// - 或随时使用 `resolve_*(root)` 只读视图（无状态，不依赖缓存）。
+///
+/// 本结构 `#[serde(skip)]`：绝不落盘、不参与 merge/roundtrip。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedPaths {
+    /// `models.cache_dir` 解析后的绝对路径
+    pub model_cache_dir: PathBuf,
+    /// `pipeline.workspace_dir` 解析后的绝对路径
+    pub workspace_dir: PathBuf,
+    /// `models.cache_paths` 逐项解析后的绝对路径（保持优先级顺序）
+    pub cache_paths: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[derive(Default)]
 pub struct AppConfig {
@@ -415,6 +439,14 @@ pub struct AppConfig {
     /// 每模块激活模型变体（单槽位语义 §5.2）：module_id → model_id；A6 消费
     #[serde(default)]
     pub active_models: std::collections::HashMap<String, String>,
+    /// 运行期解析路径缓存（#48：解析与持久化分离）。
+    ///
+    /// `#[serde(skip)]`：不落盘、不参与 merge/roundtrip；由
+    /// [`Self::resolve_paths`] 填充，经 [`Self::resolved_paths`] 读取。
+    /// 注意：[`Self::merge_partial`] 经 serde 重建配置后本字段会被重置，
+    /// 调用方合并后须重新调用 [`Self::resolve_paths`]（daemon put_config 已接线）。
+    #[serde(skip)]
+    resolved: ResolvedPaths,
 }
 
 
@@ -437,6 +469,10 @@ impl AppConfig {
         Ok(config)
     }
 
+    /// 持久化配置到 `config_dir/app.toml`。
+    ///
+    /// #48：序列化字段保留用户原始形态（相对路径保持相对），
+    /// 运行期解析缓存（[`Self::resolved_paths`]）`#[serde(skip)]` 不落盘。
     pub fn save(&self, config_dir: &Path) -> Result<()> {
         std::fs::create_dir_all(config_dir)
             .with_context(|| format!("failed to create config dir {}", config_dir.display()))?;
@@ -460,54 +496,68 @@ impl AppConfig {
         }
     }
 
+    /// 路径解析基元（#48）：相对路径基于 root 解析，绝对路径原样返回。
+    /// Path/PathBuf API 双平台通用，无平台硬编码。
+    fn absolutize(root: &Path, raw: &str) -> PathBuf {
+        let p = Path::new(raw);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            root.join(p)
+        }
+    }
+
+    /// 模型缓存目录的 `resolve(root)` 只读视图（#48）：
+    /// 相对 `models.cache_dir` 基于 root 解析，绝对路径原样返回。
+    /// 不修改配置本身，随时可调。
     pub fn resolve_model_cache_dir(&self, root: &Path) -> PathBuf {
-        let p = Path::new(&self.models.cache_dir);
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            root.join(p)
-        }
+        Self::absolutize(root, &self.models.cache_dir)
     }
 
+    /// 任务工作区的 `resolve(root)` 只读视图（#48）：
+    /// 相对 `pipeline.workspace_dir` 基于 root 解析，绝对路径原样返回。
+    /// 不修改配置本身，随时可调。
     pub fn resolve_workspace_dir(&self, root: &Path) -> PathBuf {
-        let p = Path::new(&self.pipeline.workspace_dir);
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            root.join(p)
-        }
+        Self::absolutize(root, &self.pipeline.workspace_dir)
     }
 
-    /// 将所有相对路径字段解析为绝对路径（基于 root）。
+    /// 基于 root 解析相对路径字段，结果缓存到运行期视图
+    /// [`Self::resolved_paths`]（#48：解析与持久化分离）。
     ///
-    /// 调用后 `models.cache_dir`、`pipeline.workspace_dir`、`models.cache_paths`
-    /// 中的相对路径均变为绝对路径。已经是绝对路径的不变。
+    /// **不修改任何序列化字段**：`models.cache_dir`、`pipeline.workspace_dir`、
+    /// `models.cache_paths` 保留用户原始字符串（相对保持相对、绝对保持绝对），
+    /// 因此 [`Self::save`] 落盘形态不变，部署目录迁移后配置依然有效。
+    /// 已经是绝对路径的项解析后原样进入视图。
+    ///
+    /// 调用时机：daemon 启动期各入口调用一次（常规服务模式与 --run-module
+    /// 独立模式，见 ep-daemon main.rs）；
+    /// [`Self::merge_partial`] 之后需重新调用（serde 重建会重置运行期缓存）。
     pub fn resolve_paths(&mut self, root: &Path) {
-        // models.cache_dir
-        let p = Path::new(&self.models.cache_dir);
-        if p.is_relative() {
-            self.models.cache_dir = root.join(p).to_string_lossy().to_string();
-        }
-
-        // pipeline.workspace_dir
-        let p = Path::new(&self.pipeline.workspace_dir);
-        if p.is_relative() {
-            self.pipeline.workspace_dir = root.join(p).to_string_lossy().to_string();
-        }
-
-        // models.cache_paths（逐项解析）
-        for cp in &mut self.models.cache_paths {
-            let p = Path::new(cp.as_str());
-            if p.is_relative() {
-                *cp = root.join(p).to_string_lossy().to_string();
-            }
-        }
+        self.resolved = ResolvedPaths {
+            model_cache_dir: Self::absolutize(root, &self.models.cache_dir),
+            workspace_dir: Self::absolutize(root, &self.pipeline.workspace_dir),
+            cache_paths: self
+                .models
+                .cache_paths
+                .iter()
+                .map(|p| Self::absolutize(root, p))
+                .collect(),
+        };
 
         debug!(
-            cache_dir = %self.models.cache_dir,
-            workspace_dir = %self.pipeline.workspace_dir,
-            "config paths resolved to absolute"
+            cache_dir = %self.resolved.model_cache_dir.display(),
+            workspace_dir = %self.resolved.workspace_dir.display(),
+            cache_paths_count = self.resolved.cache_paths.len(),
+            "config paths resolved to runtime view (serialized fields unchanged)"
         );
+    }
+
+    /// 运行期解析路径视图（#48）：由 [`Self::resolve_paths`] 填充的绝对路径缓存。
+    ///
+    /// 未在 `resolve_paths` 之前使用（字段为空）；daemon 启动期必然先解析。
+    /// 无状态场景请改用 `resolve_*(root)` 只读视图。
+    pub fn resolved_paths(&self) -> &ResolvedPaths {
+        &self.resolved
     }
 
     pub fn port_range(&self) -> (u16, u16) {
@@ -528,6 +578,10 @@ impl AppConfig {
     ///
     /// all-or-nothing：patch 非法或任一字段类型不匹配时返回错误，`self` 保持不变。
     /// 成功返回时 `self` 为合并后的完整配置。API 层接线（PUT /api/config）由 Wave 3 C7 完成。
+    ///
+    /// #48 注意：合并经 serde 重建配置，运行期缓存 `resolved`（`#[serde(skip)]`）
+    /// 会被重置；调用方须在合并后重新调用 [`Self::resolve_paths`]。
+    /// 序列化字段本身不受合并影响保持原始形态（相对仍为相对）。
     pub fn merge_partial(&mut self, patch: &serde_json::Value) -> Result<()> {
         let Some(patch_obj) = patch.as_object() else {
             bail!("config patch must be a JSON object");
@@ -818,6 +872,187 @@ disabled_backends = ["directml", "rocm"]
                 PathBuf::from("/opt/models")
             );
         }
+    }
+
+    // ── #48 解析与持久化分离（回归）────────────────────────────────────
+
+    /// resolve_paths 只填充运行期视图，绝不改写序列化字段
+    #[test]
+    fn resolve_paths_populates_runtime_view_without_mutation() {
+        // 未解析前视图为空默认值
+        let pristine = AppConfig::default();
+        assert_eq!(pristine.resolved_paths(), &ResolvedPaths::default());
+
+        let mut config = AppConfig::default();
+        config.models.cache_paths = vec!["shared/models".into(), "extra/cache".into()];
+
+        let root = if cfg!(windows) {
+            PathBuf::from("C:/EntryPoint")
+        } else {
+            PathBuf::from("/opt/entrypoint")
+        };
+        config.resolve_paths(&root);
+
+        // 序列化字段保持原始相对形态
+        assert_eq!(config.models.cache_dir, "models");
+        assert_eq!(config.pipeline.workspace_dir, "workspace");
+        assert_eq!(
+            config.models.cache_paths,
+            vec!["shared/models".to_string(), "extra/cache".to_string()]
+        );
+
+        // 运行期视图为绝对路径（顺序保持）
+        let resolved = config.resolved_paths();
+        assert_eq!(resolved.model_cache_dir, root.join("models"));
+        assert_eq!(resolved.workspace_dir, root.join("workspace"));
+        assert_eq!(
+            resolved.cache_paths,
+            vec![root.join("shared/models"), root.join("extra/cache")]
+        );
+
+        // resolve(root) 只读视图与运行期缓存一致
+        assert_eq!(
+            config.resolve_model_cache_dir(&root),
+            resolved.model_cache_dir
+        );
+        assert_eq!(config.resolve_workspace_dir(&root), resolved.workspace_dir);
+    }
+
+    /// 相对配置：加载 → resolve → save → 文件仍为相对形态（#48 核心回归）
+    #[test]
+    fn save_preserves_relative_paths_after_resolve() {
+        let dir = std::env::temp_dir().join(format!("ep_config_rel_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let toml_src = r#"
+[models]
+cache_dir = "models"
+cache_paths = ["shared/models", "extra/cache"]
+
+[pipeline]
+workspace_dir = "workspace"
+"#;
+        std::fs::write(dir.join(CONFIG_FILE_NAME), toml_src).unwrap();
+
+        let mut config = AppConfig::load(&dir).expect("load");
+        let root = dir.join("fake-root");
+        config.resolve_paths(&root);
+
+        // 消费方仍拿到绝对路径
+        assert!(config.resolved_paths().model_cache_dir.is_absolute());
+        assert!(config.resolved_paths().workspace_dir.is_absolute());
+
+        // 落盘 → 文件仍为相对形态
+        config.save(&dir).expect("save");
+        let raw = std::fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap();
+        assert!(
+            raw.contains("cache_dir = \"models\""),
+            "落盘应保持相对 cache_dir，实际:\n{raw}"
+        );
+        assert!(
+            raw.contains("workspace_dir = \"workspace\""),
+            "落盘应保持相对 workspace_dir，实际:\n{raw}"
+        );
+        assert!(
+            !raw.contains(root.to_string_lossy().as_ref()),
+            "落盘不得包含 root 绝对路径，实际:\n{raw}"
+        );
+
+        // 重载后字段仍为相对
+        let reloaded = AppConfig::load(&dir).expect("reload");
+        assert_eq!(reloaded.models.cache_dir, "models");
+        assert_eq!(reloaded.pipeline.workspace_dir, "workspace");
+        assert_eq!(
+            reloaded.models.cache_paths,
+            vec!["shared/models".to_string(), "extra/cache".to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 绝对配置：加载 → resolve → save → 保持绝对原值
+    #[test]
+    fn save_preserves_absolute_paths() {
+        let dir = std::env::temp_dir().join(format!("ep_config_abs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let abs_cache = if cfg!(windows) { "D:/AI_Models" } else { "/opt/models" };
+        let abs_ws = if cfg!(windows) { "D:/workspaces" } else { "/opt/workspaces" };
+        let toml_src = format!(
+            "[models]\ncache_dir = \"{abs_cache}\"\n\n[pipeline]\nworkspace_dir = \"{abs_ws}\"\n"
+        );
+        std::fs::write(dir.join(CONFIG_FILE_NAME), toml_src).unwrap();
+
+        let mut config = AppConfig::load(&dir).expect("load");
+        config.resolve_paths(dir.parent().unwrap());
+
+        // 绝对配置 → 视图即原值
+        assert_eq!(
+            config.resolved_paths().model_cache_dir,
+            PathBuf::from(abs_cache)
+        );
+        assert_eq!(
+            config.resolved_paths().workspace_dir,
+            PathBuf::from(abs_ws)
+        );
+
+        config.save(&dir).expect("save");
+        let reloaded = AppConfig::load(&dir).expect("reload");
+        assert_eq!(reloaded.models.cache_dir, abs_cache);
+        assert_eq!(reloaded.pipeline.workspace_dir, abs_ws);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PUT 语义回归：merge_partial（serde 重建）+ 重新 resolve + save → 相对形态保持
+    #[test]
+    fn merge_then_save_preserves_relative_paths() {
+        let dir = std::env::temp_dir().join(format!("ep_config_merge_rel_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut config = AppConfig::default(); // 出厂相对配置
+        let root = dir.join("fake-root");
+        config.resolve_paths(&root);
+
+        config
+            .merge_partial(&serde_json::json!({"general": {"language": "en-US"}}))
+            .expect("merge");
+        // merge 经 serde 重建 → 运行期缓存重置 → 重新解析（daemon put_config 同口径）
+        assert_eq!(config.resolved_paths(), &ResolvedPaths::default());
+        config.resolve_paths(&root);
+        assert!(config.resolved_paths().model_cache_dir.is_absolute());
+
+        config.save(&dir).expect("save");
+        let reloaded = AppConfig::load(&dir).expect("reload");
+        assert_eq!(reloaded.general.language, "en-US");
+        assert_eq!(reloaded.models.cache_dir, "models");
+        assert_eq!(reloaded.pipeline.workspace_dir, "workspace");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 运行期解析缓存不参与序列化（TOML 落盘 / JSON roundtrip 均跳过）
+    #[test]
+    fn resolved_paths_not_serialized() {
+        let mut config = AppConfig::default();
+        let root = if cfg!(windows) {
+            PathBuf::from("C:/app/root")
+        } else {
+            PathBuf::from("/app/root")
+        };
+        config.resolve_paths(&root);
+        assert!(config.resolved_paths().model_cache_dir.is_absolute());
+
+        let toml_str = toml::to_string_pretty(&config).expect("serialize");
+        assert!(
+            !toml_str.contains("resolved"),
+            "运行期缓存不得出现在 TOML 落盘内容中:\n{toml_str}"
+        );
+
+        let json = serde_json::to_value(&config).expect("json");
+        assert!(json.get("resolved").is_none());
     }
 
     #[test]
