@@ -68,6 +68,37 @@ pub async fn err_response(
     (status, Json(json!({ "error": message })))
 }
 
+/// 模块启动路径的设备选择（D-4 调度器接线）——手动启动（modules.rs）与
+/// 自动拉起（autostart.rs）共用：经 ep-core 共享选择核心统一分配
+/// （manifest backends 兼容过滤 + `[compute].disabled_backends` 剔除 +
+/// 策略/VRAM 闸门）；调度器拒绝且无兼容设备时保留旧 first-match 时代的
+/// Cpu 兜底语义。config 快照先行取出再取 devices 读锁，避免与设备刷新
+/// 写锁交叉等待。
+pub(crate) async fn select_module_device(
+    state: &AppState,
+    manifest: &ep_core::module::manifest::ModuleManifest,
+) -> ep_core::types::DeviceId {
+    let (vram_mb, strategy, allow_overcommit, disabled) = {
+        let config = state.config.read().await;
+        (
+            ep_core::compute::scheduler::module_vram_request(&config, manifest),
+            ep_core::compute::scheduler::scheduling_strategy_for(&config),
+            config.compute.allow_overcommit,
+            config.compute.disabled_backends.clone(),
+        )
+    };
+    let devices = state.devices.read().await;
+    ep_core::compute::scheduler::select_device_for_module(
+        &devices,
+        manifest,
+        vram_mb,
+        strategy,
+        allow_overcommit,
+        &disabled,
+    )
+    .unwrap_or(ep_core::types::DeviceId::Cpu)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,5 +165,149 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body.0["error"], "apiCore.notThereYet");
+    }
+
+    // ── D-4：select_module_device（启动路径设备选择共享助手） ──────────────
+
+    fn manifest_with_backends(
+        id: &str,
+        backends: &[ep_core::types::ComputeBackend],
+    ) -> ep_core::module::manifest::ModuleManifest {
+        let backends_str = backends
+            .iter()
+            .map(|b| format!("\"{b}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        toml::from_str(&format!(
+            r#"
+[module]
+id = "{id}"
+name = "t"
+version = "0.1.0"
+description = "t"
+category = "asr"
+genre = "test"
+
+[runtime]
+type = "native"
+binaries = {{ "x" = "x" }}
+
+[compute]
+backends = [{backends_str}]
+
+[interface]
+type = "http"
+"#
+        ))
+        .unwrap()
+    }
+
+    fn state_with_devices(
+        config: ep_core::config::AppConfig,
+        devices: Vec<ep_core::types::ComputeDevice>,
+    ) -> Arc<AppState> {
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        Arc::new(AppState::new(
+            std::env::temp_dir().join(format!("ep-api-dev-test-{}-{seq}", std::process::id())),
+            config,
+            devices,
+            vec![],
+            ep_core::port::PortManager::new(18000, 19000),
+        ))
+    }
+
+    fn cuda_device(index: u32, total_mb: u32) -> ep_core::types::ComputeDevice {
+        ep_core::types::ComputeDevice {
+            id: ep_core::types::DeviceId::Cuda(index),
+            backend: ep_core::types::ComputeBackend::Cuda,
+            name: format!("GPU-{index}"),
+            total_memory_mb: Some(total_mb),
+            used_memory_mb: None,
+            utilization: None,
+            temperature: None,
+        }
+    }
+
+    fn cpu_device() -> ep_core::types::ComputeDevice {
+        ep_core::types::ComputeDevice {
+            id: ep_core::types::DeviceId::Cpu,
+            backend: ep_core::types::ComputeBackend::Cpu,
+            name: "CPU".to_string(),
+            total_memory_mb: None,
+            used_memory_mb: None,
+            utilization: None,
+            temperature: None,
+        }
+    }
+
+    // 加速后端优先：cuda+cpu 声明 + cuda/cpu 设备 → 选中 cuda:0（替代旧 first-match 盲选）
+    #[tokio::test]
+    async fn select_module_device_prefers_accelerator() {
+        use ep_core::types::{ComputeBackend, DeviceId};
+        let state = state_with_devices(
+            ep_core::config::AppConfig::default(),
+            vec![cuda_device(0, 8192), cpu_device()],
+        );
+        let mf = manifest_with_backends("mod-a", &[ComputeBackend::Cuda, ComputeBackend::Cpu]);
+        assert_eq!(
+            select_module_device(&state, &mf).await,
+            DeviceId::Cuda(0)
+        );
+    }
+
+    // disabled_backends 全局过滤：禁用 cuda → CPU 保底
+    #[tokio::test]
+    async fn select_module_device_respects_disabled_backends() {
+        use ep_core::types::{ComputeBackend, DeviceId};
+        let mut config = ep_core::config::AppConfig::default();
+        config.compute.disabled_backends = vec![ComputeBackend::Cuda];
+        let state = state_with_devices(config, vec![cuda_device(0, 8192), cpu_device()]);
+        let mf = manifest_with_backends("mod-a", &[ComputeBackend::Cuda, ComputeBackend::Cpu]);
+        assert_eq!(select_module_device(&state, &mf).await, DeviceId::Cpu);
+    }
+
+    // 无兼容设备 → 保留旧 unwrap_or(Cpu) 兜底语义
+    #[tokio::test]
+    async fn select_module_device_cpu_fallback_when_no_compatible() {
+        use ep_core::types::{ComputeBackend, DeviceId};
+        let state = state_with_devices(
+            ep_core::config::AppConfig::default(),
+            vec![cpu_device()],
+        );
+        let mf = manifest_with_backends("mod-a", &[ComputeBackend::Rocm]);
+        assert_eq!(select_module_device(&state, &mf).await, DeviceId::Cpu);
+    }
+
+    // VRAM 闸门：超限且未开超分 → 声明 cpu 则 CPU 保底（旧 first-match 无此能力）
+    #[tokio::test]
+    async fn select_module_device_vram_gate_cpu_fallback() {
+        use ep_core::types::DeviceId;
+        let mut config = ep_core::config::AppConfig::default();
+        config.compute.allow_overcommit = false;
+        let state = state_with_devices(config, vec![cuda_device(0, 512), cpu_device()]);
+        let mf: ep_core::module::manifest::ModuleManifest = toml::from_str(
+            r#"
+[module]
+id = "mod-a"
+name = "t"
+version = "0.1.0"
+description = "t"
+category = "asr"
+genre = "test"
+
+[runtime]
+type = "native"
+binaries = { "x" = "x" }
+
+[compute]
+backends = ["cuda", "cpu"]
+vram_estimate_mb = 8000
+
+[interface]
+type = "http"
+"#,
+        )
+        .unwrap();
+        assert_eq!(select_module_device(&state, &mf).await, DeviceId::Cpu);
     }
 }
