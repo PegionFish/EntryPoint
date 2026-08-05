@@ -103,6 +103,16 @@ struct ModulesUi {
     // ── 卸载来源整合包确认 ──
     uninstall_pack: Option<String>,
     uninstall_keep: bool,
+    // ── 删除模型确认（§5.1 卡内删除）──
+    delete_confirm: Option<DeleteConfirm>,
+}
+
+/// 删除模型确认上下文
+#[derive(Debug, Clone)]
+struct DeleteConfirm {
+    module_id: String,
+    target_dir: String,
+    model_name: String,
 }
 
 fn page_state_id() -> egui::Id {
@@ -192,8 +202,61 @@ pub fn show(
     // ── 卸载来源整合包确认对话框 ──
     uninstall_confirm(ui, lang, &pal, packs, cmd_tx, &mut st);
 
+    // ── 删除模型确认对话框（§5.1 卡内删除） ──
+    delete_confirm_dialog(ui, lang, &pal, cmd_tx, &mut st);
+
     ui.ctx()
         .data_mut(|d| *d.get_temp_mut_or_default::<ModulesUi>(page_state_id()) = st);
+}
+
+// ─── 删除模型确认 ────────────────────────────────────────────────────────────
+
+fn delete_confirm_dialog(
+    ui: &mut egui::Ui,
+    lang: &str,
+    pal: &Palette,
+    cmd_tx: &UnboundedSender<AppCmd>,
+    st: &mut ModulesUi,
+) {
+    let Some(target) = st.delete_confirm.clone() else {
+        return;
+    };
+    let title = trfb(
+        lang,
+        "desktopPages.modules.deleteModel.title",
+        "删除模型「{{name}}」？",
+        &[("name", &target.model_name)],
+    );
+    let message = trfb(
+        lang,
+        "desktopPages.modules.deleteModel.description",
+        "将删除该模型的本机文件与缓存目录（{{dir}}），不可恢复",
+        &[("dir", &target.target_dir)],
+    );
+    let confirm = tr(lang, "common.action.delete", &[]);
+    match confirm_dialog_with_lang(
+        ui.ctx(),
+        pal,
+        &format!("dlg_delete_model_{}", target.module_id),
+        &title,
+        &message,
+        &confirm,
+        true,
+        lang,
+    ) {
+        Some(true) => {
+            let _ = cmd_tx.send(AppCmd::DeleteModel(target.target_dir.clone()));
+            st.delete_confirm = None;
+            st.note = Some(trfb(
+                lang,
+                "desktopPages.modules.deleteModel.deleting",
+                "正在删除模型…",
+                &[],
+            ));
+        }
+        Some(false) => st.delete_confirm = None,
+        None => {}
+    }
 }
 
 // ─── 顶部工具栏（协调记录 #47：导入模块 / 导出模块） ─────────────────────────
@@ -986,6 +1049,65 @@ fn action_row(
         };
         if tag_btn.clicked() {
             toggle_drawer(st, DrawerKind::Tags, &m.id);
+        }
+        // 导入模型（rfd 选文件/目录 → AppCmd::ImportModel；桌面端直连本地）
+        let import_btn = ui.add_enabled(
+            sel_mv.is_some(),
+            subtle_button(
+                pal,
+                format!("📂 {}", trfb(lang, "desktopPages.modules.importModel", "导入模型", &[])),
+            ),
+        );
+        let import_btn = if sel_mv.is_some() {
+            import_btn.on_hover_text(trfb(
+                lang,
+                "desktopPages.modules.importModelTip",
+                "从本地选择模型文件或目录导入到选中变体",
+                &[],
+            ))
+        } else {
+            import_btn.on_hover_text(trfb(
+                lang,
+                "desktopPages.modules.importModelNoVariant",
+                "请先选择模型变体",
+                &[],
+            ))
+        };
+        if import_btn.clicked() {
+            if let Some(mv) = sel_mv {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title(trfb(
+                        lang,
+                        "desktopPages.modules.pickModelSource",
+                        "选择模型文件或目录",
+                        &[],
+                    ))
+                    .pick_file()
+                {
+                    let _ = cmd_tx.send(AppCmd::ImportModel {
+                        module_id: m.id.clone(),
+                        model_id: mv.model_id.clone(),
+                        source: path,
+                    });
+                }
+            }
+        }
+        // 删除模型（确认 → AppCmd::DeleteModel；仅选中变体就绪时可用）
+        let del_btn = ui.add_enabled(
+            sel_ready,
+            danger_button(
+                pal,
+                format!("🗑 {}", tr(lang, "common.action.delete", &[])),
+            ),
+        );
+        if del_btn.clicked() {
+            if let Some(mv) = sel_mv {
+                st.delete_confirm = Some(DeleteConfirm {
+                    module_id: m.id.clone(),
+                    target_dir: mv.target_dir.clone(),
+                    model_name: mv.model_name.clone(),
+                });
+            }
         }
     });
     ui.add_space(4.0);

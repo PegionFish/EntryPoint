@@ -165,5 +165,12 @@
   "modules.uninstall.message": "Uninstall \"{{name}}\"? You can choose whether to keep the downloaded model files.",
   "modules.uninstall.keepModels": "Keep model files",
   "modules.uninstall.confirm": "Uninstall",
-  "modules.uninstall.submitted": "Uninstall request submitted"
+  "modules.uninstall.submitted": "Uninstall request submitted",
+  "modules.importModel": "Import model",
+  "modules.importModelTip": "Pick a local model file or directory to import into the selected variant",
+  "modules.importModelNoVariant": "Select a model variant first",
+  "modules.pickModelSource": "Pick model file or directory",
+  "modules.deleteModel.title": "Delete model \"{{name}}\"?",
+  "modules.deleteModel.description": "This removes the model's local files and cache directory ({{dir}}). This cannot be undone.",
+  "modules.deleteModel.deleting": "Deleting model…"
 }
