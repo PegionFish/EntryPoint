@@ -86,8 +86,15 @@ impl ComputeScheduler {
         }
     }
 
-    /// 设备剩余显存。
-    /// `total_memory_mb == None` 视为无限制（如 CPU），返回 `u32::MAX`。
+    /// 设备剩余显存（VRAM 闸门与 LeastMemory 排序共用）。
+    ///
+    /// - `total_memory_mb == None` 视为无限制（如 CPU），返回 `u32::MAX`；
+    /// - 已知容量：`total − max(账面已分配, 实时已用)`。
+    ///
+    /// D-6：实时已用来自检测器刷新采样（`used_memory_mb`，如 nvidia-smi）。
+    /// 外部程序占用显存时账面值低估实际占用，取两者较大值避免闸门失明；
+    /// 本调度器自身的分配也体现在实时采样里，`max` 而非相加，不重复记账。
+    /// `used_memory_mb == None`（无采样源）忽略，按 0 计。
     fn remaining_memory(&self, device_index: usize) -> u32 {
         let device = &self.devices[device_index];
         let total = match device.total_memory_mb {
@@ -102,7 +109,8 @@ impl ComputeScheduler {
             .get(&key)
             .copied()
             .unwrap_or(0);
-        total.saturating_sub(allocated)
+        let live_used = device.used_memory_mb.unwrap_or(0);
+        total.saturating_sub(allocated.max(live_used))
     }
 
     /// 在指定设备上记录显存分配
@@ -237,13 +245,22 @@ mod tests {
     use crate::types::{ComputeBackend, SchedulingStrategy};
 
     fn make_device(id: DeviceId, name: &str, total_mb: Option<u32>) -> ComputeDevice {
+        make_device_with_used(id, name, total_mb, None)
+    }
+
+    fn make_device_with_used(
+        id: DeviceId,
+        name: &str,
+        total_mb: Option<u32>,
+        used_mb: Option<u32>,
+    ) -> ComputeDevice {
         let backend = id.backend();
         ComputeDevice {
             id,
             backend,
             name: name.to_string(),
             total_memory_mb: total_mb,
-            used_memory_mb: None,
+            used_memory_mb: used_mb,
             utilization: None,
             temperature: None,
         }
@@ -407,6 +424,72 @@ mod tests {
             1024,
         );
         assert_eq!(result, Some(DeviceId::Cuda(1)));
+    }
+
+    // ── D-6：VRAM 闸门取 max(账面, 实时采样) ───────────────────────────────
+
+    #[test]
+    fn test_gate_uses_live_used_when_higher_than_booked() {
+        // 账面分配为 0，但实时采样已用 7000（外部程序占用）→ 闸门按 7000 计
+        let devices = vec![make_device_with_used(
+            DeviceId::Cuda(0),
+            "GPU",
+            Some(8192),
+            Some(7000),
+        )];
+        let scheduler = ComputeScheduler::new(devices, SchedulingStrategy::LeastMemory);
+
+        // 剩余 = 8192 − max(0, 7000) = 1192 < 2000 → 拒绝
+        let r = scheduler.assign("mod_a", &[ComputeBackend::Cuda], 2000);
+        assert_eq!(r, None);
+
+        // 1192 以内 → 放行
+        let r = scheduler.assign("mod_b", &[ComputeBackend::Cuda], 1000);
+        assert_eq!(r, Some(DeviceId::Cuda(0)));
+    }
+
+    #[test]
+    fn test_gate_booked_wins_when_higher_than_live() {
+        // 账面分配 6000 > 实时采样 1000 → 闸门按账面 6000 计（取较大值）
+        let devices = vec![make_device_with_used(
+            DeviceId::Cuda(0),
+            "GPU",
+            Some(8192),
+            Some(1000),
+        )];
+        let scheduler = ComputeScheduler::new(devices, SchedulingStrategy::LeastMemory);
+
+        let r1 = scheduler.assign("mod_a", &[ComputeBackend::Cuda], 6000);
+        assert_eq!(r1, Some(DeviceId::Cuda(0)));
+
+        // 剩余 = 8192 − max(6000, 1000) = 2192 < 3000 → 拒绝
+        let r2 = scheduler.assign("mod_b", &[ComputeBackend::Cuda], 3000);
+        assert_eq!(r2, None);
+    }
+
+    #[test]
+    fn test_least_memory_ranking_considers_live_used() {
+        // 同容量两块 GPU：cuda:0 实时已用 6000、cuda:1 已用 1000 → 选 cuda:1
+        let devices = vec![
+            make_device_with_used(DeviceId::Cuda(0), "GPU-0", Some(8192), Some(6000)),
+            make_device_with_used(DeviceId::Cuda(1), "GPU-1", Some(8192), Some(1000)),
+        ];
+        let scheduler = ComputeScheduler::new(devices, SchedulingStrategy::LeastMemory);
+
+        let r = scheduler.assign("mod_a", &[ComputeBackend::Cuda], 100);
+        assert_eq!(r, Some(DeviceId::Cuda(1)));
+    }
+
+    #[test]
+    fn test_gate_used_none_is_ignored() {
+        // used_memory_mb = None（无采样源）→ 忽略，仅按账面计（行为同修正前）
+        let devices = vec![make_device(DeviceId::Cuda(0), "GPU", Some(4096))];
+        let scheduler = ComputeScheduler::new(devices, SchedulingStrategy::LeastMemory);
+
+        let r = scheduler.assign("mod_a", &[ComputeBackend::Cuda], 4000);
+        assert_eq!(r, Some(DeviceId::Cuda(0)));
+        let r = scheduler.assign("mod_b", &[ComputeBackend::Cuda], 200);
+        assert_eq!(r, None);
     }
 
     #[test]
