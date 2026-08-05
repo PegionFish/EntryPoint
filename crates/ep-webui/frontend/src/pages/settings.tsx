@@ -591,9 +591,8 @@ export function SettingsPage() {
             </Field>
             <SwitchRow
               label={t('general.checkUpdates')}
-              // P1-10：daemon 自身更新检查尚无消费者（本期无人认领接线），
-              // 保留开关 + 文案如实标注后端待接，避免误导
-              description={t('general.checkUpdatesPending')}
+              // P1-10 已接线（DaemonWire）：后台自动检查由开关实时门控
+              description={t('general.checkUpdatesDescription')}
               checked={config.general.check_updates}
               onCheckedChange={(v) =>
                 patchSection('general', { check_updates: v })
