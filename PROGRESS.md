@@ -323,14 +323,22 @@ Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平�
 - 最终门禁：`cargo clippy --workspace --all-targets` 零警告；`cargo test --workspace` **936 全过**；前端 build+lint 零 error
 - 异构设备真机：`/api/devices` 检出 **cuda:0（RTX 5090 D 32GB 实时显存/温度）+ openvino:NPU.0（Intel AI Boost）+ openvino:GPU.0（Intel Graphics）+ cpu（实时利用率）**，DirectML 按去重策略恒空（预期）
 - API 冒烟：health/modules（capabilities+active_model_id）/packs/pipelines/WebUI 首页全过
-- 桌面 GUI：启动渲染完整（7 页侧栏含整合包页、管线编辑器、CJK 字体）；自动化点击注入对 egui/winit 事件循环受限（驱动限制，非应用缺陷，46 桌面单测覆盖）
+- 桌面 GUI：启动渲染完整（模块单页含变体选择器/导入导出、管线编辑器、CJK 字体）；自动化点击注入对 egui/winit 事件循环受限（驱动限制，非应用缺陷，54 桌面单测覆盖）
 - 打包：`build.ps1 gui` + `build.ps1 server` 全量流程（含 clippy+tests+release），产物含 ep-pack.exe + VC 运行库 + cuda-libs 存在性附带
 
 ### 已知限制（如实记录）
 - workspace 级 Linux target 交叉 check 被 openssl-sys 卡死（需系统 OpenSSL+交叉 C 工具链）；Linux 编译面靠 cfg 纪律保障，真验证留 Linux 环境
 - video-to-srt 真实执行/真实模块推理/真实下载链需 ffmpeg+venv 环境（D1 条件回归测试已就绪，环境满足即自动运行）
-- log_level/check_updates 后端接线、keep_workspace 清理实现延后（UI 已如实标注）；scripts/build-desktop.sh 保留待裁撤
+- keep_workspace 清理实现延后（UI 已如实标注）；scripts/build-desktop.sh 保留待裁撤
 - 桌面 GUI 自动化点击注入受限（见上）
+
+### 信息架构终稿（用户裁决，2026-08-05 执行）
+- **模型=模块**同一概念：WebUI/桌面均单页「模块管理」；旧「模型」「整合包」页与导航删除（无重定向）
+- 模块卡 = 模型家族 + 变体选择器（变体不独立成模型行）；激活变体以后端 `active_model_id` 为权威
+- 顶部工具栏「导入模块/导出模块」：导入 = .epzip 三来源 + WS 进度；导出 = 勾选模块(变体)+管线，**每模块许可证模式二选一**（随包附带权重 bundle / 仅元数据从指定渠道下载 reference）
+- 已装包管理无独立视图：pack 来源徽章菜单「卸载来源整合包」
+- 随重构移除的存量 UI 入口（后端端点仍在，待用户裁决是否恢复）：按模型本机上传/本地路径导入/检查更新/删除模型/tag 筛选 chips；导出产物离开页面无重下入口
+- 同期修复：配置持久化相对路径分离（#48）、build.ps1 测试计数误报（#49）、log_level 动态 reload + check_updates 自动检查（P1-10/P2-1 关闭）
 
 #### Git
 - 波次合并提交序列见 `git log --oneline --grep="wave-"`；最终门禁与打包产物提交见本节后续 commit
@@ -341,7 +349,7 @@ Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平�
 
 | 指标 | 值 |
 |---|---|
-| Rust 测试数 | 936（2026-08-05 整合包执行后；含单元/集成/E2E/桌面端/CLI） |
+| Rust 测试数 | 978（2026-08-05 IA 重构+修复批后；含单元/集成/E2E/桌面端/CLI） |
 | Clippy warnings | 0（--workspace --all-targets） |
 | Rust 源文件数 | ~90 .rs files |
 | 前端源文件数 | 58 (.ts/.tsx) |
