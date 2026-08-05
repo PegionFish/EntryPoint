@@ -1969,6 +1969,218 @@ function ExportModuleDialog({
   )
 }
 
+// ─── 模型级上传 / 本地路径导入对话框（MODULE_SPEC §6.3）──────────────
+
+/**
+ * 浏览器上传模型文件（§6.3）或导入服务器已有目录。
+ * - 上传：文件夹多文件（webkitdirectory）或单个 .zip/.tar.gz/.tgz 归档；
+ *   本地网络场景不做尺寸限制（后端 DefaultBodyLimit 已禁用）。
+ * - 导入：服务器本地路径 → 写入 .ep_meta.json，来源标记后可检查更新。
+ */
+function ModelUploadDialog({
+  open,
+  moduleId,
+  moduleName,
+  modelId,
+  modelName,
+  onClose,
+  onSettled,
+}: {
+  open: boolean
+  moduleId: string
+  moduleName: string
+  modelId: string
+  modelName: string
+  onClose: () => void
+  onSettled: () => void
+}) {
+  const { t } = useTranslation('modules')
+  const [tab, setTab] = useState<'upload' | 'import'>('upload')
+  const [files, setFiles] = useState<File[]>([])
+  const [sourcePath, setSourcePath] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+
+  useEffect(() => {
+    if (!open) {
+      setFiles([])
+      setSourcePath('')
+      setSubmitting(false)
+    }
+  }, [open])
+
+  const totalBytes = files.reduce((acc, f) => acc + f.size, 0)
+  const archivePicked =
+    files.length === 1 &&
+    /\.(zip|tar\.gz|tgz)$/i.test(files[0].name ?? '')
+
+  async function submitUpload() {
+    if (files.length === 0 || submitting) return
+    setSubmitting(true)
+    try {
+      if (archivePicked) {
+        await api.uploadModel(moduleId, modelId, files)
+      } else {
+        const paths = files.map((f) =>
+          (f as File & { webkitRelativePath?: string }).webkitRelativePath ||
+          f.name,
+        )
+        await api.uploadModel(moduleId, modelId, files, paths)
+      }
+      toast.success(t('modelUpload.succeeded', { defaultValue: '模型文件已上传' }), {
+        description: `${moduleName} / ${modelName}`,
+      })
+      onSettled()
+      onClose()
+    } catch (e) {
+      toast.error(t('modelUpload.failed', { defaultValue: '模型上传失败' }), {
+        description: errMsg(e),
+      })
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  async function submitImport() {
+    if (!sourcePath.trim() || submitting) return
+    setSubmitting(true)
+    try {
+      const resp = await api.importModel(moduleId, {
+        model_id: modelId,
+        source_path: sourcePath.trim(),
+      })
+      if (resp.error) throw new Error(resp.error)
+      toast.success(t('modelUpload.importSucceeded', { defaultValue: '模型已从本地路径导入' }), {
+        description: `${moduleName} / ${modelName}`,
+      })
+      onSettled()
+      onClose()
+    } catch (e) {
+      toast.error(t('modelUpload.importFailed', { defaultValue: '导入失败' }), {
+        description: errMsg(e),
+      })
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={(v) => (v ? undefined : onClose())}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <Upload className="size-4 text-primary" />
+            {t('modelUpload.title', {
+              defaultValue: '上传 / 导入模型「{{name}}」',
+              name: modelName,
+            })}
+          </DialogTitle>
+          <DialogDescription>
+            {t('modelUpload.description', {
+              defaultValue:
+                '浏览器上传文件夹或压缩包（zip/tar.gz），或导入服务器上已存在的目录；本地网络不做尺寸限制',
+            })}
+          </DialogDescription>
+        </DialogHeader>
+
+        <Tabs value={tab} onValueChange={(v) => setTab(v as 'upload' | 'import')}>
+          <TabsList>
+            <TabsTrigger value="upload">
+              <Upload className="size-3.5" />
+              {t('modelUpload.tabUpload', { defaultValue: '浏览器上传' })}
+            </TabsTrigger>
+            <TabsTrigger value="import">
+              <FolderOpen className="size-3.5" />
+              {t('modelUpload.tabImport', { defaultValue: '本地路径导入' })}
+            </TabsTrigger>
+          </TabsList>
+
+          <TabsContent value="upload" className="space-y-3">
+            <label className="flex cursor-pointer flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-border px-4 py-8 text-center">
+              <FolderOpen className="size-6 text-muted-foreground" />
+              <span className="text-sm text-muted-foreground">
+                {t('modelUpload.choose', {
+                  defaultValue: '选择文件夹（逐文件上传）或单个压缩包',
+                })}
+              </span>
+              <input
+                type="file"
+                multiple
+                className="hidden"
+                onChange={(e) => setFiles(Array.from(e.target.files ?? []))}
+              />
+            </label>
+            {files.length > 0 ? (
+              <div className="space-y-1.5 rounded-lg border border-border bg-muted/20 p-3">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-medium">
+                    {files.length}{' '}
+                    {t('modelUpload.fileCount', {
+                      defaultValue: '个文件',
+                      count: files.length,
+                    })}
+                  </span>
+                  <span className="font-mono text-muted-foreground">
+                    {formatBytes(totalBytes)}
+                  </span>
+                </div>
+                <ul className="max-h-40 space-y-0.5 overflow-y-auto text-xs text-muted-foreground">
+                  {files.slice(0, 50).map((f, i) => (
+                    <li key={i} className="truncate font-mono">
+                      {(f as File & { webkitRelativePath?: string })
+                        .webkitRelativePath || f.name}
+                    </li>
+                  ))}
+                  {files.length > 50 ? (
+                    <li>
+                      … {t('modelUpload.more', { defaultValue: '更多' })} (
+                      {files.length - 50})
+                    </li>
+                  ) : null}
+                </ul>
+              </div>
+            ) : null}
+          </TabsContent>
+
+          <TabsContent value="import" className="space-y-3">
+            <Input
+              value={sourcePath}
+              onChange={(e) => setSourcePath(e.target.value)}
+              placeholder={t('modelUpload.importPlaceholder', {
+                defaultValue: '服务器上已存在的模型目录路径',
+              })}
+              className="font-mono text-xs"
+            />
+            <p className="text-xs text-muted-foreground">
+              {t('modelUpload.importHint', {
+                defaultValue:
+                  '导入目录将被识别为模型来源并写入元数据，之后可检查更新',
+              })}
+            </p>
+          </TabsContent>
+        </Tabs>
+
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose} disabled={submitting}>
+            {t('common:action.cancel')}
+          </Button>
+          <Button
+            disabled={
+              submitting ||
+              (tab === 'upload' ? files.length === 0 : !sourcePath.trim())
+            }
+            onClick={() => void (tab === 'upload' ? submitUpload() : submitImport())}
+          >
+            {submitting ? <Loader2 className="size-4 animate-spin" /> : <Upload className="size-4" />}
+            {tab === 'upload'
+              ? t('modelUpload.submitUpload', { defaultValue: '上传' })
+              : t('modelUpload.submitImport', { defaultValue: '导入' })}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 // ─── 页面 ────────────────────────────────────────────────────────────────────
 
 /**
@@ -2003,6 +2215,20 @@ export function ModulesPage() {
   const [uninstallTarget, setUninstallTarget] = useState<string | null>(null)
   const [keepModels, setKeepModels] = useState(true)
   const [uninstalling, setUninstalling] = useState(false)
+  // ── 模型级操作（§6.3 / §5.1 卡内删除）：上传/导入、检查更新、删除 ──
+  const [uploadTarget, setUploadTarget] = useState<{
+    moduleId: string
+    moduleName: string
+    model: ModelInfo
+  } | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<{
+    moduleId: string
+    moduleName: string
+    model: ModelInfo
+  } | null>(null)
+  const [deleting, setDeleting] = useState(false)
+  /** 列表级 tag 筛选（§5.1 chips 筛选；null = 不过滤） */
+  const [tagFilter, setTagFilter] = useState<string | null>(null)
 
   /** 全部数据源刷新（模块 + 模型；pack 导入/卸载后落位可能变化） */
   async function refreshAll() {
@@ -2190,6 +2416,54 @@ export function ModulesPage() {
     }
   }
 
+  // ── 检查更新（POST /api/models/{m}/{mid}/check-update；手动触发不受
+  //    check_updates 开关约束，协调 #51 语义）──
+  async function checkUpdate(moduleId: string, model: ModelInfo) {
+    try {
+      const resp = await api.checkModelUpdate(moduleId, model.model_id)
+      if (resp.available) {
+        toast.info(
+          t('modelUpdate.available', { defaultValue: '发现可用更新' }),
+          { description: resp.reason || model.name },
+        )
+      } else {
+        toast.success(
+          t('modelUpdate.upToDate', { defaultValue: '已是最新版本' }),
+          { description: resp.reason || model.name },
+        )
+      }
+      void refresh()
+    } catch (e) {
+      toast.error(
+        t('modelUpdate.failed', { defaultValue: '检查更新失败' }),
+        { description: errMsg(e) },
+      )
+    }
+  }
+
+  // ── 删除模型（§5.1 卡内删除；确认框在页面底部）──
+  async function confirmDeleteModel() {
+    if (!deleteTarget || deleting) return
+    setDeleting(true)
+    try {
+      await api.deleteModel(deleteTarget.moduleId, deleteTarget.model.model_id)
+      toast.success(
+        t('modelDelete.succeeded', { defaultValue: '模型已删除' }),
+        { description: deleteTarget.model.name },
+      )
+      setDeleteTarget(null)
+      await refreshAll()
+    } catch (e) {
+      toast.error(
+        t('modelDelete.failed', { defaultValue: '模型删除失败' }),
+        { description: errMsg(e) },
+      )
+      throw e // 保持确认框打开便于重试
+    } finally {
+      setDeleting(false)
+    }
+  }
+
   // ── 卸载来源整合包（徽章菜单 → 确认框）──
   async function confirmUninstall() {
     if (!uninstallTarget || uninstalling) return
@@ -2222,6 +2496,28 @@ export function ModulesPage() {
     }
     return map
   }, [models])
+
+  /** 全部模型的 tag 集合（列表级 chips 筛选，§5.1） */
+  const allTags = useMemo(() => {
+    const set = new Set<string>()
+    for (const group of models?.modules ?? []) {
+      for (const model of group.models) {
+        for (const tag of model.tags ?? []) set.add(tag)
+      }
+    }
+    return Array.from(set).sort()
+  }, [models])
+
+  /** tag 筛选后的模块列表（模块任一模型命中 tag 即保留） */
+  const visibleModules = useMemo(() => {
+    if (!tagFilter) return modules
+    return modules.filter((m) => {
+      const group = groupByModule.get(m.id)
+      return (group?.models ?? []).some(
+        (model) => model.tags?.includes(tagFilter as string),
+      )
+    })
+  }, [modules, tagFilter, groupByModule])
 
   /**
    * 解析模块激活变体（单槽位）：后端 ModuleResponse.active_model_id 为
@@ -2333,6 +2629,22 @@ export function ModulesPage() {
                 {t('models:module.run', { defaultValue: '运行' })}
               </Button>
             ) : null}
+            {activeModel ? (
+              <Button
+                size="xs"
+                variant="outline"
+                onClick={() =>
+                  setUploadTarget({
+                    moduleId: m.id,
+                    moduleName: m.name,
+                    model: activeModel,
+                  })
+                }
+              >
+                <FolderOpen className="size-3" />
+                {t('modelUpload.cardButton', { defaultValue: '上传/导入' })}
+              </Button>
+            ) : null}
           </div>
 
           {modelList.length > 0 ? (
@@ -2430,6 +2742,33 @@ export function ModulesPage() {
                       {(activeModel.tags ?? []).length === 0
                         ? t('models:tags.addFirst', { defaultValue: '添加标签' })
                         : t('common:action.edit')}
+                    </Button>
+                  </div>
+
+                  {/* 模型级操作：检查更新 / 删除（§5.1 卡内删除；删除确认在页面底部） */}
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <Button
+                      size="xs"
+                      variant="ghost"
+                      onClick={() => void checkUpdate(m.id, activeModel)}
+                    >
+                      <RefreshCw className="size-3" />
+                      {t('modelUpdate.button', { defaultValue: '检查更新' })}
+                    </Button>
+                    <Button
+                      size="xs"
+                      variant="ghost"
+                      className="text-destructive hover:text-destructive"
+                      onClick={() =>
+                        setDeleteTarget({
+                          moduleId: m.id,
+                          moduleName: m.name,
+                          model: activeModel,
+                        })
+                      }
+                    >
+                      <Trash2 className="size-3" />
+                      {t('common:action.delete')}
                     </Button>
                   </div>
 
@@ -2634,6 +2973,30 @@ export function ModulesPage() {
           </div>
         )}
 
+        {/* tag 列表级筛选 chips（§5.1） */}
+        {allTags.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Tag className="size-3.5 text-muted-foreground" />
+            <Button
+              size="xs"
+              variant={tagFilter === null ? 'default' : 'outline'}
+              onClick={() => setTagFilter(null)}
+            >
+              {t('modelFilter.all', { defaultValue: '全部' })}
+            </Button>
+            {allTags.map((tag) => (
+              <Button
+                key={tag}
+                size="xs"
+                variant={tagFilter === tag ? 'default' : 'outline'}
+                onClick={() => setTagFilter(tagFilter === tag ? null : tag)}
+              >
+                {tag}
+              </Button>
+            ))}
+          </div>
+        )}
+
         {pageLoading ? (
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
             {Array.from({ length: 4 }).map((_, i) => (
@@ -2657,7 +3020,7 @@ export function ModulesPage() {
           </Card>
         ) : (
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-            {modules.map((m) => renderModuleCard(m))}
+            {visibleModules.map((m) => renderModuleCard(m))}
           </div>
         )}
       </div>
@@ -2687,6 +3050,38 @@ export function ModulesPage() {
         onClose={() => setExportOpen(false)}
         models={models}
         io={packIo}
+      />
+
+      {/* ── 模型级上传 / 本地路径导入（§6.3）── */}
+      <ModelUploadDialog
+        open={uploadTarget !== null}
+        moduleId={uploadTarget?.moduleId ?? ''}
+        moduleName={uploadTarget?.moduleName ?? ''}
+        modelId={uploadTarget?.model.model_id ?? ''}
+        modelName={uploadTarget?.model.name ?? ''}
+        onClose={() => setUploadTarget(null)}
+        onSettled={() => void refreshAll()}
+      />
+
+      {/* ── 删除模型确认（§5.1 卡内删除）── */}
+      <ConfirmDialog
+        open={deleteTarget !== null}
+        onOpenChange={(open) => {
+          if (!open && !deleting) setDeleteTarget(null)
+        }}
+        variant="destructive"
+        title={t('modelDelete.confirmTitle', {
+          defaultValue: '删除模型「{{name}}」？',
+          name: deleteTarget?.model.name ?? '',
+        })}
+        description={t('modelDelete.confirmDescription', {
+          defaultValue:
+            '将删除模块「{{module}}」的模型文件与本机缓存（{{id}}），不可恢复',
+          module: deleteTarget?.moduleName ?? '',
+          id: deleteTarget?.model.model_id ?? '',
+        })}
+        confirmLabel={t('common:action.delete')}
+        onConfirm={() => confirmDeleteModel()}
       />
 
       {/* ── 停止模块确认 ── */}

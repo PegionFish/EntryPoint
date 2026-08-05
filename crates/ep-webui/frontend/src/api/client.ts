@@ -75,6 +75,28 @@ export const api = {
       body: JSON.stringify(req),
     }),
 
+  /**
+   * 浏览器上传模型文件（§6.3：文件夹多文件 / 单个 .zip/.tar.gz/.tgz 归档）。
+   * 本地网络场景不做尺寸限制（后端 DefaultBodyLimit 已禁用，模型可达数 GB）。
+   */
+  uploadModel: (
+    moduleId: string,
+    modelId: string,
+    files: File[],
+    paths?: string[],
+  ) => {
+    const form = new FormData()
+    form.append('model_id', modelId)
+    for (const f of files) form.append('files', f)
+    if (paths) {
+      for (const p of paths) form.append('paths', p)
+    }
+    return apiFetch<{ ok: boolean }>(`/models/${moduleId}/upload`, {
+      method: 'POST',
+      body: form,
+    })
+  },
+
   /** 启动模型下载（source 缺省时由后端选择默认来源） */
   downloadModel: (
     moduleId: string,
