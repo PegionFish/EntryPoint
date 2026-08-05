@@ -272,12 +272,22 @@ export interface WsPackImportMessage {
   message?: string
 }
 
+/** 后台自动更新检查发现可用更新（P1-10/P2-1：general.check_updates 自动检查广播） */
+export interface WsModelUpdateMessage {
+  type: 'model_update'
+  module_id: string
+  model_id: string
+  /** 本地化说明（daemon 按服务器语言渲染，含远端更新时间） */
+  reason: string
+}
+
 /** /ws 聚合消息（按 type 判别） */
 export type WsMessage =
   | WsLogMessage
   | WsProgressMessage
   | WsModelDownloadMessage
   | WsPackImportMessage
+  | WsModelUpdateMessage
 
 // ===== Tasks =====
 export interface TaskSummary {

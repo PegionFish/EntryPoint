@@ -9,6 +9,7 @@ import { TooltipProvider } from '@/components/ui/tooltip'
 import { Toaster } from '@/components/ui/sonner'
 import { api } from '@/api/client'
 import { wsManager } from '@/api/ws'
+import { useModelUpdateToast } from '@/hooks/use-model-update-toast'
 import { DashboardPage } from '@/pages/dashboard'
 import { ModulesPage } from '@/pages/modules'
 import ModuleDetailPage from '@/pages/module-detail'
@@ -26,6 +27,9 @@ export default function App() {
     wsManager.connect()
     return () => wsManager.disconnect()
   }, [])
+
+  // 全局常驻订阅 WS model_update（后台自动更新检查发现可用更新 → toast 提示）
+  useModelUpdateToast()
 
   // 挂载时以服务器 config.general.language 为全局真源校准界面语言
   // （i18n 初始化时已用 localStorage 缓存防首屏闪烁，这里纠正偏差并回写缓存）
