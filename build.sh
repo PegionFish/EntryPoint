@@ -29,7 +29,7 @@ usage() {
 选项:
   -t, --target debug|release   构建类型（默认 release）
   -d, --distro <name>          目标发行版（默认 auto：自动检测当前发行版）
-                               具体发行版适配详见项目 TODO
+                               已适配 glibc 约束/依赖包名/包格式；未知发行版仅 tar.gz
       --skip-test              跳过 cargo test
       --skip-clippy            跳过 cargo clippy
       --clean                  cargo clean 后重建
@@ -71,7 +71,65 @@ done
 
 case "$TARGET" in debug|release) ;; *) die "无效 target: $TARGET" ;; esac
 
-# ── 目标发行版（默认自动检测当前发行版；显式指定时仅决定包格式，具体适配见 TODO）──
+# ── 目标发行版（默认自动检测当前发行版；显式指定时按发行版知识表适配）──
+# 知识表：<distro> → family + 最低 glibc + 运行时依赖包名
+# glibc 语义：Rust 二进制链接构建机 glibc，目标机 glibc 必须 ≥ 构建机。
+#   故构建机 glibc ≤ 目标发行版最低 glibc 才安全；否则产出的二进制在目标
+#   发行版可能无法启动（构建更高 glibc 发行版时需在 CI/容器中构建）。
+DISTRO_GLIBC_MIN="
+debian-11|2.31|ffmpeg, python3, python3-venv
+debian-12|2.36|ffmpeg, python3, python3-venv
+debian-13|2.41|ffmpeg, python3, python3-venv
+ubuntu-20.04|2.31|ffmpeg, python3, python3-venv
+ubuntu-22.04|2.35|ffmpeg, python3, python3-venv
+ubuntu-23.04|2.37|ffmpeg, python3, python3-venv
+ubuntu-23.10|2.38|ffmpeg, python3, python3-venv
+ubuntu-24.04|2.39|ffmpeg, python3, python3-venv
+ubuntu-24.10|2.39|ffmpeg, python3, python3-venv
+linuxmint-21|2.35|ffmpeg, python3, python3-venv
+linuxmint-22|2.39|ffmpeg, python3, python3-venv
+mint-21|2.35|ffmpeg, python3, python3-venv
+rhel-8|2.28|ffmpeg, python3
+rhel-9|2.34|ffmpeg, python3
+centos-7|2.17|ffmpeg, python3
+centos-8|2.28|ffmpeg, python3
+centos-9|2.34|ffmpeg, python3
+fedora-38|2.37|ffmpeg, python3
+fedora-39|2.38|ffmpeg, python3
+fedora-40|2.38|ffmpeg, python3
+fedora-41|2.39|ffmpeg, python3
+rocky-8|2.28|ffmpeg, python3
+rocky-9|2.34|ffmpeg, python3
+almalinux-8|2.28|ffmpeg, python3
+almalinux-9|2.34|ffmpeg, python3
+oraclelinux-8|2.28|ffmpeg, python3
+oraclelinux-9|2.34|ffmpeg, python3
+arch|2.38|ffmpeg, python
+manjaro|2.38|ffmpeg, python
+endeavouros|2.38|ffmpeg, python
+archlinux|2.38|ffmpeg, python
+"
+
+# 发行版知识查询：$1=<id>-<version> 或 <id>，输出 "family|glibc_min|deps"（未知 → "generic|"）
+distro_profile_of() {
+    local key="$1"
+    local glibc=""
+    local deps=""
+    # 精确 <id>-<version> 匹配优先
+    while IFS='|' read -r k g d; do
+        [ -z "$k" ] && continue
+        if [ "$k" = "$key" ]; then glibc="$g"; deps="$d"; break; fi
+    done <<< "$DISTRO_GLIBC_MIN"
+    # 无版本匹配 → 退化为 <id> 前缀（取同 ID 最后一行）
+    if [ -z "$glibc" ]; then
+        while IFS='|' read -r k g d; do
+            [ -z "$k" ] && continue
+            if [ "$k" = "$key" ] || [ "${k%%-*}" = "$key" ]; then glibc="$g"; deps="$d"; fi
+        done <<< "$DISTRO_GLIBC_MIN"
+    fi
+    echo "$(distro_family_of "$key")|$glibc|$deps"
+}
+
 distro_family_of() {
     case "$1" in
         debian*|ubuntu*|mint)                     echo "deb" ;;
@@ -91,13 +149,41 @@ detect_distro() {
     fi
 }
 
+# 语义化版本比较（a <= b?）：仅比较 X.Y.Z 前两段，patch 忽略
+ver_le() { printf '%s\n%s\n' "$1" "$2" | sort -V -C; }
+
+# 构建机 glibc vs 目标发行版最低 glibc 兼容性检查
+check_glibc_compat() {
+    local target_min="$1"
+    [ -z "$target_min" ] && return 0
+    local build_glibc
+    build_glibc="$(ldd --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)"
+    if [ -z "$build_glibc" ]; then
+        info "提示: 无法检测构建机 glibc 版本，跳过 glibc 兼容性检查"
+        return 0
+    fi
+    if ver_le "$build_glibc" "$target_min"; then
+        ok "glibc 兼容: 构建机 $build_glibc ≤ 目标 $target_min（二进制可在目标发行版运行）"
+    else
+        info "警告: 构建机 glibc $build_glibc > 目标发行版最低 $target_min — 产出的二进制"
+        info "       在 $DISTRO 上可能因 glibc 版本不足无法启动；建议在 glibc ≤ $target_min 的"
+        info "       环境构建（如对应发行版的容器/CI）"
+    fi
+}
+
 if [ "$DISTRO" = "auto" ]; then
     DISTRO="$(detect_distro)"
 fi
-DISTRO_FAMILY="$(distro_family_of "$DISTRO")"
+DISTRO_PROFILE="$(distro_profile_of "$DISTRO")"
+DISTRO_FAMILY="${DISTRO_PROFILE%%|*}"
+DISTRO_GLIBC_MIN="${DISTRO_PROFILE#*|}"
+DISTRO_DEPS="${DISTRO_GLIBC_MIN#*|}"
+DISTRO_GLIBC_MIN="${DISTRO_GLIBC_MIN%%|*}"
 step "目标发行版: $DISTRO (family: $DISTRO_FAMILY)"
 if [ "$DISTRO_FAMILY" = "generic" ]; then
-    info "提示: 发行版 $DISTRO 的包格式暂未适配（详见项目 TODO），将仅产出 tar.gz 兑底包"
+    info "提示: 发行版 $DISTRO 的包格式/依赖/glibc 约束暂未适配（可在 build.sh DISTRO_GLIBC_MIN 知识表补充），仅产出 tar.gz 兑底包"
+else
+    check_glibc_compat "$DISTRO_GLIBC_MIN"
 fi
 
 # ── 平台检测 ──────────────────────────────────────────────────────────────────
@@ -392,6 +478,7 @@ Version: $VERSION
 Section: utils
 Priority: optional
 Architecture: amd64
+Depends: ${DISTRO_DEPS:-ffmpeg, python3, python3-venv}
 Maintainer: EntryPoint <https://github.com/PegionFish/EntryPoint>
 Description: $desc
 EOF
@@ -424,6 +511,7 @@ Release: 1
 Summary: $desc
 License: MIT
 BuildArch: x86_64
+Requires: $(echo "${DISTRO_DEPS:-ffmpeg, python3}" | tr ',' ' ')
 
 %description
 $desc
