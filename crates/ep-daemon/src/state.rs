@@ -88,6 +88,17 @@ pub enum WsMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
+    /// 后台自动更新检查发现可用更新（P1-10/P2-1：`general.check_updates` 接线）。
+    ///
+    /// 生产者：`updates.rs` 后台任务——仅发现更新时广播（开关关闭时永不产生）。
+    /// 经 `model_download_tx`（通用 WsMessage 通道）投递到 GET /ws；
+    /// 前端暂无消费者（未知 `type` 按现有协议忽略），预留展示位。
+    ModelUpdate {
+        module_id: String,
+        model_id: String,
+        /// 本地化说明（`apiModels.updateAvailable`，含远端更新时间）
+        reason: String,
+    },
 }
 
 // ─── Wave 2 预置类型 ────────────────────────────────────────────────────────
@@ -275,6 +286,21 @@ mod tests {
         assert!(v.get("percent").is_none());
         assert!(v.get("state").is_none());
         assert!(v.get("message").is_none());
+    }
+
+    // WS model_update 形状（P1-10/P2-1：后台自动更新检查发现可用更新）
+    #[test]
+    fn ws_message_serde_model_update() {
+        let msg = WsMessage::ModelUpdate {
+            module_id: "faster-whisper".into(),
+            model_id: "large-v3".into(),
+            reason: "有新版本可用（远端更新于 2026-08-01T00:00:00Z）".into(),
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["type"], "model_update");
+        assert_eq!(v["module_id"], "faster-whisper");
+        assert_eq!(v["model_id"], "large-v3");
+        assert!(v["reason"].as_str().unwrap().contains("2026-08-01"));
     }
 
     // lang()：读取 config.general.language 并归一化

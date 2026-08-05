@@ -5,6 +5,8 @@
 //!   缺省字段保留原值，显式字段覆盖，`active_models` 按键合并（仲裁 #7：未知键忽略）
 //! - 合并成功 → 落盘 config/app.toml → 内存态（`state.config`，全体读者共享真源）更新
 //! - 响应为合并后的完整配置 + `requires_restart`（重启敏感项是否被改动，§8.2）
+//! - `general.log_level` 改动另经 tracing reload handle 运行期动态生效
+//!   （P2-1；不再计入 `requires_restart`；`RUST_LOG` 设置时优先于配置）
 //! - patch 非法（JSON 语法错误 / 非对象 / 字段类型不匹配）→ 400，内存配置保持不变
 //! - 落盘失败 → 500（内存已合并，持久化成功前重启会丢失，与迁移前语义一致）
 
@@ -69,11 +71,14 @@ impl std::ops::Deref for PutConfigResponse {
 /// | `pipeline.workspace_dir` | 启动期 resolve_paths + 任务产物 ServeDir 根启动期固定（tasks.rs） |
 /// | `compute.refresh_interval_secs` | 设备轮询任务启动期取间隔（不热跟随） |
 /// | `compute.cuda_libs_dir` | AppState 构造期注入 ProcessManager |
-/// | `general.log_level` | tracing subscriber 启动期初始化（接线待 main.rs 仲裁） |
 /// | `network.*` | AppState 构造期固化 ProcessManager network_env（模块子进程环境） |
 ///
 /// 其余字段为运行期实时读取（执行闸门 / 下载闸门 / VRAM 预算 / EnvManager /
 /// packs staging / active_models / language / theme 等），改动保存即生效。
+/// 其中两项由专门接线实现运行期动态生效（P1-10/P2-1）：
+/// - `general.log_level`：经 tracing-subscriber reload handle 热切换
+///   （crate::logging::apply_log_level；`RUST_LOG` 设置时优先于配置）；
+/// - `general.check_updates`：后台更新检查循环每轮实时读取开关。
 fn restart_sensitive_changed(before: &AppConfig, after: &AppConfig) -> bool {
     before.server.host != after.server.host
         || before.server.port != after.server.port
@@ -82,7 +87,6 @@ fn restart_sensitive_changed(before: &AppConfig, after: &AppConfig) -> bool {
         || before.pipeline.workspace_dir != after.pipeline.workspace_dir
         || before.compute.refresh_interval_secs != after.compute.refresh_interval_secs
         || before.compute.cuda_libs_dir != after.compute.cuda_libs_dir
-        || before.general.log_level != after.general.log_level
         || before.network.http_proxy != after.network.http_proxy
         || before.network.https_proxy != after.network.https_proxy
         || before.network.no_proxy != after.network.no_proxy
@@ -128,6 +132,7 @@ where
             // Box 以平衡枚举变体尺寸（clippy::large_enum_variant）
             snapshot: Box<AppConfig>,
             requires_restart: bool,
+            log_level_changed: bool,
         },
         InvalidPatch(anyhow::Error),
         SaveFailed(anyhow::Error),
@@ -139,10 +144,12 @@ where
         match config.merge_partial(&patch) {
             Ok(()) => {
                 let requires_restart = restart_sensitive_changed(&before, &config);
+                let log_level_changed = before.general.log_level != config.general.log_level;
                 match config.save(&config_dir) {
                     Ok(()) => Outcome::Merged {
                         snapshot: Box::new(config.clone()),
                         requires_restart,
+                        log_level_changed,
                     },
                     Err(e) => Outcome::SaveFailed(e),
                 }
@@ -155,7 +162,17 @@ where
         Outcome::Merged {
             snapshot,
             requires_restart,
+            log_level_changed,
         } => {
+            // P2-1：log_level 动态生效——写锁已释放，此处经 reload handle 热切换
+            // tracing 过滤器。无 reload 环境（测试/未装 subscriber）静默降级：
+            // 配置已落盘，重启后生效。
+            if log_level_changed && crate::logging::apply_log_level(&snapshot.general.log_level) {
+                tracing::info!(
+                    log_level = %snapshot.general.log_level,
+                    "log level reloaded dynamically (no restart required)"
+                );
+            }
             tracing::debug!(requires_restart, "config patch merged and persisted");
             Ok(Json(PutConfigResponse {
                 config: *snapshot,
@@ -440,6 +457,57 @@ mod tests {
             body["requires_restart"], true,
             "network.* 为重启敏感项（ProcessManager 构造期固化）"
         );
+    }
+
+    // log_level 运行期动态生效（P2-1）：改动不再要求重启，配置值照常落盘
+    #[tokio::test]
+    async fn oneshot_put_log_level_dynamic_no_restart() {
+        let state = seq_state("zh-CN");
+
+        let (status, body) = route_put(
+            state.clone(),
+            r#"{"general":{"log_level":"debug"}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["general"]["log_level"], "debug");
+        assert_eq!(
+            body["requires_restart"], false,
+            "log_level 经 tracing reload handle 动态生效，不再是重启敏感项"
+        );
+
+        // 内存与磁盘一致
+        assert_eq!(state.config.read().await.general.log_level, "debug");
+        let loaded = AppConfig::load(state.root.join("config").as_path()).expect("reload");
+        assert_eq!(loaded.general.log_level, "debug");
+    }
+
+    // check_updates 开关运行期实时读取（P1-10）：改动即生效，不要求重启
+    #[tokio::test]
+    async fn oneshot_put_check_updates_toggle_no_restart() {
+        let state = seq_state("zh-CN");
+        assert!(state.config.read().await.general.check_updates, "默认 true");
+
+        let (status, body) = route_put(
+            state.clone(),
+            r#"{"general":{"check_updates":false}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["general"]["check_updates"], false);
+        assert_eq!(body["requires_restart"], false);
+        assert!(!state.config.read().await.general.check_updates);
+
+        // 再切回 true 同样非重启敏感
+        let (status, body) = route_put(
+            state.clone(),
+            r#"{"general":{"check_updates":true}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["general"]["check_updates"], true);
+        assert_eq!(body["requires_restart"], false);
+        assert!(state.config.read().await.general.check_updates);
     }
 
     // 非法 patch → 400，内存配置保持不变

@@ -1873,6 +1873,31 @@ mod tests {
         assert_eq!(json.0["reason"], "缺少下载元数据，无法比较");
     }
 
+    #[tokio::test]
+    async fn test_check_update_manual_unaffected_by_check_updates_switch() {
+        // P1-10 接线语义：check_updates 只控制后台自动/定时检查；
+        // 用户手动触发的 check-update 端点不受开关约束（false 时照常可用）
+        let state = test_state();
+        state.config.write().await.general.check_updates = false;
+
+        let (status, json) = check_model_update(
+            State(state.clone()),
+            Path((MODULE_ID.to_string(), URL_MODEL_ID.to_string())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json.0["available"], false);
+        assert_eq!(json.0["reason"], "URL 来源不支持更新检查");
+
+        let (status, json) = check_model_update(
+            State(state),
+            Path((MODULE_ID.to_string(), MODEL_ID.to_string())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json.0["reason"], "缺少下载元数据，无法比较");
+    }
+
     // language=en → 下载错误返回英文文案（404 模块不存在 / 400 非法下载源）
     #[tokio::test]
     async fn test_download_errors_in_english_when_language_en() {
