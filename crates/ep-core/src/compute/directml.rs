@@ -87,6 +87,11 @@ pub(crate) fn build_directml_devices(
         if lower.contains("virtual display") || lower.contains("remote display") {
             continue;
         }
+        // Indirect Display Driver 虚拟显卡（向日葵 OrayIddDriver / ToDesk 等
+        // 远程工具的 Idd 虚拟显示器）：同属无物理 GPU 的虚拟适配器
+        if lower.contains("idd driver") || lower.contains("oray") {
+            continue;
+        }
         if known_normalized.contains(&normalize_device_name(&name)) {
             continue; // 已被 CUDA/ROCm/OpenVINO 覆盖
         }
@@ -198,6 +203,21 @@ mod tests {
             "Microsoft Basic Render Device".to_string(),
             "Parsec Virtual Display Adapter".to_string(), // 虚拟适配器无物理 GPU
             "Microsoft Remote Display Adapter".to_string(),
+            "Intel(R) Graphics".to_string(),
+        ];
+        let devices = build_directml_devices(adapters, &[]);
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "Intel(R) Graphics");
+    }
+
+    #[test]
+    fn test_idd_and_oray_virtual_adapters_skipped() {
+        // 远程工具的 Indirect Display Driver 虚拟显卡（向日葵 OrayIddDriver、
+        // ToDesk 等），无物理 GPU，DirectML 不可用（真机实测存在）
+        let adapters = vec![
+            "OrayIddDriver Device".to_string(),
+            "ToDesk Idd Driver".to_string(),
+            "Parsec Virtual Display Adapter".to_string(),
             "Intel(R) Graphics".to_string(),
         ];
         let devices = build_directml_devices(adapters, &[]);

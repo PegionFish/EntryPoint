@@ -522,6 +522,19 @@ pub(crate) fn parse_lspci_devices(output: &str) -> Vec<ComputeDevice> {
     let mut gpu_seq = 0u32;
     for line in output.lines() {
         let lower = line.to_ascii_lowercase();
+        // 虚拟化/软件渲染设备：无物理 GPU，OpenVINO 不可用（VM 内 QEMU/VMware
+        // 模拟设备、llvmpipe 软件渲染等，真机/VM 实测存在）
+        if lower.contains("virtual")
+            || lower.contains("llvmpipe")
+            || lower.contains("vmware")
+            || lower.contains("qxl")
+            || lower.contains("bochs")
+            || lower.contains("cirrus")
+            || lower.contains("virtio gpu")
+            || lower.contains("vbox")
+        {
+            continue;
+        }
         // lspci 行形如 "<slot> <class>: <vendor device>"，名称取 ": " 之后
         let name = line
             .split_once(": ")
@@ -884,6 +897,21 @@ NPU 0: Intel(R) AI Boost, Memory: 2048 MB, Utilization: 3%
         );
         assert_eq!(devices[1].id, DeviceId::OpenVINO("NPU.0".to_string()));
         assert_eq!(devices[1].name, "Intel Corporation Meteor Lake NPU");
+    }
+
+    #[test]
+    fn test_parse_lspci_skips_virtual_and_software_renderers() {
+        // 虚拟化/软件渲染设备不得被当作 OpenVINO GPU（VM 内 QEMU/VMware 模拟
+        // Intel 显示设备、llvmpipe 软件渲染等）
+        let output = "\
+00:02.0 VGA compatible controller: Intel Corporation QEMU Virtual GPU
+00:05.0 VGA compatible controller: VMware SVGA II Adapter
+00:06.0 VGA compatible controller: llvmpipe (LLVM 18.1.8, 256 bits)
+00:07.0 VGA compatible controller: Intel Corporation UHD Graphics 770
+";
+        let devices = parse_lspci_devices(output);
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "Intel Corporation UHD Graphics 770");
     }
 
     #[test]

@@ -316,26 +316,138 @@ fn cpu_name() -> String {
 #[cfg(unix)]
 fn platform_cpu_name() -> Option<String> {
     let content = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    parse_cpuinfo_name(&content)
+}
+
+/// 解析 `/proc/cpuinfo` 的 CPU 名称：
+/// - 优先 `model name`（x86/主流发行版）
+/// - ARM（树莓派等）/部分容器无 `model name` → 回退 `model`/`Hardware`/`Processor` 行
+#[cfg(any(unix, test))]
+pub(crate) fn parse_cpuinfo_name(content: &str) -> Option<String> {
+    let mut fallback: Option<String> = None;
     for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("model name") {
-            let name = rest.trim_start_matches(':').trim();
-            if !name.is_empty() {
-                return Some(name.to_string());
-            }
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = rest.trim();
+        if key == "model name" && !value.is_empty() {
+            return Some(value.to_string());
+        }
+        if fallback.is_none()
+            && !value.is_empty()
+            && (key == "model" || key == "Hardware" || key == "Processor")
+        {
+            fallback = Some(value.to_string());
         }
     }
-    None
+    fallback
 }
 
 #[cfg(windows)]
 fn platform_cpu_name() -> Option<String> {
-    // 免子进程来源：Windows 进程环境自带 PROCESSOR_IDENTIFIER
+    // 首选注册表 ProcessorNameString（营销型号，如 "Intel(R) Core(TM) Ultra 7 270HX"）。
+    // 纯 FFI 免子进程——避免 wmic/powershell 子进程在 daemon 无控制台环境下挂死
+    // （真机实测：Win11 24H2 无 wmic，PowerShell Get-CimInstance 在子进程环境可卡启动）。
+    if let Some(name) = registry_cpu_name() {
+        return Some(name);
+    }
+    // 兜底：进程环境自带 PROCESSOR_IDENTIFIER（标识符格式，非营销型号）
     let name = std::env::var("PROCESSOR_IDENTIFIER").ok()?;
     let name = name.trim();
     if name.is_empty() {
         None
     } else {
         Some(name.to_string())
+    }
+}
+
+/// 读注册表 `HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0\ProcessorNameString`
+/// （免子进程；缺失/失败返回 None）。Windows 专用 FFI。
+#[cfg(windows)]
+fn registry_cpu_name() -> Option<String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+
+    /// 注册表句柄（预定义根键或已打开键）
+    type Hkey = *mut core::ffi::c_void;
+    type Lstatus = i32;
+
+    // 预定义根键（Windows SDK winreg.h）：HKEY_LOCAL_MACHINE = (HKEY)0x80000002
+    const HKEY_LOCAL_MACHINE: Hkey = 0x80000002usize as Hkey;
+    const KEY_READ: u32 = 0x0002_0019;
+    const REG_SZ: u32 = 1;
+    const ERROR_SUCCESS: Lstatus = 0;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegOpenKeyExW(
+            h_key: Hkey,
+            lp_sub_key: *const u16,
+            ul_options: u32,
+            sam_desired: u32,
+            phk_result: *mut Hkey,
+        ) -> Lstatus;
+        fn RegQueryValueExW(
+            h_key: Hkey,
+            lp_value_name: *const u16,
+            lp_reserved: *mut u32,
+            lp_type: *mut u32,
+            lp_data: *mut u8,
+            lpcb_data: *mut u32,
+        ) -> Lstatus;
+        fn RegCloseKey(h_key: Hkey) -> Lstatus;
+    }
+
+    const SUB_KEY: &str =
+        r"HARDWARE\DESCRIPTION\System\CentralProcessor\0";
+    const VALUE: &str = "ProcessorNameString";
+
+    let sub_key: Vec<u16> = OsString::from(SUB_KEY)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let value_name: Vec<u16> = OsString::from(VALUE)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let mut key: Hkey = ptr::null_mut();
+        if RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            sub_key.as_ptr(),
+            0,
+            KEY_READ,
+            &mut key,
+        ) != ERROR_SUCCESS
+        {
+            return None;
+        }
+        let mut buf = [0u16; 256];
+        let mut buf_bytes = (buf.len() * 2) as u32;
+        let mut kind: u32 = 0;
+        let status = RegQueryValueExW(
+            key,
+            value_name.as_ptr(),
+            ptr::null_mut(),
+            &mut kind,
+            buf.as_mut_ptr() as *mut u8,
+            &mut buf_bytes,
+        );
+        let _ = RegCloseKey(key);
+        if status != ERROR_SUCCESS || kind != REG_SZ || buf_bytes < 2 {
+            return None;
+        }
+        let len = (buf_bytes as usize) / 2 - 1; // 去结尾 NUL
+        let name = String::from_utf16_lossy(&buf[..len.min(buf.len())]);
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
     }
 }
 
@@ -528,5 +640,58 @@ SwapFree:        8388604 kB
         std::env::remove_var("EP_CPU_NAME");
         // 回退到平台来源或 "CPU"，不得为空
         assert!(!cpu_name().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_registry_cpu_name_is_real_marketing_name() {
+        // 真机冒烟：注册表 ProcessorNameString 应是非空营销型号（如
+        // "Intel(R) Core(TM) ..."），且不得是 PROCESSOR_IDENTIFIER 标识符格式
+        let name = registry_cpu_name().expect("Windows 应有 ProcessorNameString");
+        assert!(!name.trim().is_empty());
+        // 标识符格式特征（"Family/Model/Stepping/GenuineIntel"）不应出现
+        assert!(!name.contains("Family"), "注册表应返回营销型号而非标识符: {name}");
+        assert!(!name.contains("GenuineIntel"), "注册表应返回营销型号而非标识符: {name}");
+    }
+
+    #[cfg(any(unix, test))]
+    #[test]
+    fn test_parse_cpuinfo_name_prefers_model_name() {
+        let content = "\
+processor\t: 0
+model name\t: Intel(R) Core(TM) Ultra 7 270HX Plus
+vendor_id\t: GenuineIntel
+";
+        assert_eq!(
+            parse_cpuinfo_name(content).as_deref(),
+            Some("Intel(R) Core(TM) Ultra 7 270HX Plus")
+        );
+    }
+
+    #[cfg(any(unix, test))]
+    #[test]
+    fn test_parse_cpuinfo_name_arm_fallback() {
+        // ARM（树莓派等）无 model name 行 → 回退 model/Hardware/Processor
+        let content = "\
+processor\t: 0
+model\t: Raspberry Pi 5 Model B Rev 1.0
+Hardware\t: BCM2712
+";
+        assert_eq!(
+            parse_cpuinfo_name(content).as_deref(),
+            Some("Raspberry Pi 5 Model B Rev 1.0")
+        );
+        // 仅有 Hardware
+        let hw_only = "Hardware : BCM2712\n";
+        assert_eq!(parse_cpuinfo_name(hw_only).as_deref(), Some("BCM2712"));
+    }
+
+    #[cfg(any(unix, test))]
+    #[test]
+    fn test_parse_cpuinfo_name_missing_returns_none() {
+        assert_eq!(parse_cpuinfo_name(""), None);
+        assert_eq!(parse_cpuinfo_name("vendor_id : GenuineIntel\n"), None);
+        // 空值行不得命中
+        assert_eq!(parse_cpuinfo_name("model : \n"), None);
     }
 }
