@@ -140,10 +140,13 @@ journalctl -u entrypoint -n 100
 ## 桌面端构建
 
 ```bash
-./scripts/build-desktop.sh
+# Linux / macOS
+./build.sh gui
+# Windows
+./build.ps1 gui
 ```
 
-产物：`target/release/entrypoint`（egui 原生窗口应用）
+产物：`target/release/entrypoint`（egui 原生窗口应用；Linux 另含 tar.gz/deb/rpm/PKGBUILD，macOS 为 .app+zip）
 
 功能：模型管理（下载/上传/导入三路径、双源自选下载、实时进度）、可视化管线编辑器（节点画布+贝塞尔连线+在线执行）、任务中心（节点级状态+产物下载）、实时日志、仪表盘（统计卡片+依赖检测）、深色/浅色主题切换、Toast 通知。
 
