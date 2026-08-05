@@ -329,15 +329,17 @@ Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平�
 ### 已知限制（如实记录）
 - workspace 级 Linux target 交叉 check 被 openssl-sys 卡死（需系统 OpenSSL+交叉 C 工具链）；Linux 编译面靠 cfg 纪律保障，真验证留 Linux 环境
 - video-to-srt 真实执行/真实模块推理/真实下载链需 ffmpeg+venv 环境（D1 条件回归测试已就绪，环境满足即自动运行）
-- keep_workspace 清理实现延后（UI 已如实标注）；scripts/build-desktop.sh 保留待裁撤
 - 桌面 GUI 自动化点击注入受限（见上）
+- deep-filter 模块首次启动健康检查慢（torch+CUDA 首次导入）：超时值可在 module.toml `[interface] ready_timeout_secs` 配置（默认 30s）
+- 桌面端 check_updates 运行期改动重启生效（启动时读取；daemon 端热跟随）
+- WS model_update toast 去重为会话级内存态，刷新页面后同一更新会再次提示
 
 ### 信息架构终稿（用户裁决，2026-08-05 执行）
 - **模型=模块**同一概念：WebUI/桌面均单页「模块管理」；旧「模型」「整合包」页与导航删除（无重定向）
 - 模块卡 = 模型家族 + 变体选择器（变体不独立成模型行）；激活变体以后端 `active_model_id` 为权威
 - 顶部工具栏「导入模块/导出模块」：导入 = .epzip 三来源 + WS 进度；导出 = 勾选模块(变体)+管线，**每模块许可证模式二选一**（随包附带权重 bundle / 仅元数据从指定渠道下载 reference）
 - 已装包管理无独立视图：pack 来源徽章菜单「卸载来源整合包」
-- 随重构移除的存量 UI 入口（后端端点仍在，待用户裁决是否恢复）：按模型本机上传/本地路径导入/检查更新/删除模型/tag 筛选 chips；导出产物离开页面无重下入口
+- 随重构移除的存量 UI 入口：**已按设计文档并回统一模块页（用户裁决 2026-08-05）**——按模型本机上传/本地路径导入（MODULE_SPEC §6.3）、检查更新、删除模型（§5.1 卡内删除）、tag 列表级筛选 chips（§5.1）全部恢复；导出产物离开页面无重下入口（任务页/直跑抽屉内产物下载已覆盖，页面级入口确认移除）
 - 同期修复：配置持久化相对路径分离（#48）、build.ps1 测试计数误报（#49）、log_level 动态 reload + check_updates 自动检查（P1-10/P2-1 关闭）
 
 #### Git
@@ -345,11 +347,42 @@ Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平�
 
 ---
 
+## 后续收口批（2026-08-05）— ✅ 完成
+
+> 目标：PROGRESS TODO 清零 + #50 旧入口裁决落地 + 已知限制收口。
+> 方式：主代理完成 A/B 项（含 4 波提交），C 组 3 项并行子代理（C3/C4/C5）+ 主代理串行 C1/C2/C6 + 全量门禁 D。
+
+### A — build.sh --distro 发行版适配 ✅
+- [x] `build.sh` 支持 `--distro`：发行版知识表（debian/ubuntu/mint/rhel/centos/fedora/rocky/alma/ol/arch/manjaro/endeavouros 17 项：family + 最低 glibc + 运行时依赖包名）
+- [x] glibc 兼容性检查：构建机 glibc ≤ 目标发行版最低 glibc 才安全，超出打印警告（建议容器/CI 构建）；`ldd --version` 自动检测
+- [x] 依赖包名差异落地：deb `Depends:`（ffmpeg/python3/python3-venv）、rpm `Requires:`；未知发行版 tar.gz 兜底 + 提示补知识表
+- Git: `b6ff950` — "feat(pkg): build.sh --distro 发行版适配…"
+
+### B — #50 统一页补齐（用户裁决：按设计文档并回统一页）✅
+- [x] WebUI：模型级上传（文件夹多文件/zip/tar.gz，§6.3 协议 model_id+files+paths）、本地路径导入、卡内删除模型（确认框）、卡内检查更新、tag 列表级筛选 chips（§5.1）；i18n 键落盘 zh/en
+- [x] 桌面端镜像：卡内「导入模型」（rfd 选文件/目录 → AppCmd::ImportModel）+「删除模型」（danger 确认框 → AppCmd::DeleteModel）；i18n 键落盘
+- Git: `b92b006`（WebUI+static 重建）、`bd1a5ed`（桌面端）
+
+### C — 已知限制收口 ✅
+- [x] C1 daemon 优雅退出回收模块子进程：`stop_all_modules`（逐 stop_module + 端口释放），axum graceful shutdown 后执行；2 测试（真实子进程回收/空载 noop）
+- [x] C2 `keep_workspace=false` 任务工作目录中间文件清理：终态后清理 task_dir（保留 `files/` 产物归集目录，下载不受影响）；2 测试
+- [x] C3 裁撤 `scripts/build-desktop.sh`（已被 build.sh/build.ps1 gui 覆盖，#46）；README 引用改为 build.sh gui / build.ps1 gui
+- [x] C4 桌面端 check_updates 接线（#51）：设置页新增「启动时检查更新」开关 + 启动 15s 后按开关自动 CheckAllUpdates（复用既有 handler）
+- [x] C5 WS model_update 前端消费（#51）：`WsModelUpdateMessage` 类型 + 全局 hook（任意页面 toast 提示更新可用 + 跳转模块页，去重）
+- [x] C6 本文档勘误：并发闸（models.rs `download_gate`）与 ready_timeout_secs 配置化早已实现，已知限制剔除过时项
+- Git: `9d0e55b`（C1）、`e602bf4`（C2）、`e7527c8`（C3）、`f803ba3`（C4）、`ba117fc`（C5）
+
+### 验证
+- cargo clippy --workspace --all-targets 零警告；cargo test --workspace 全过（数量见下节统计）
+- 前端 tsc + vite build 通过；桌面 cargo check 通过
+
+---
+
 ## 最终统计
 
 | 指标 | 值 |
 |---|---|
-| Rust 测试数 | 978（2026-08-05 IA 重构+修复批后；含单元/集成/E2E/桌面端/CLI） |
+| Rust 测试数 | 984（2026-08-05 收口批后：stop_all 回收 2 + keep_workspace 清理 2 + 既有 978；含单元/集成/E2E/桌面端/CLI） |
 | Clippy warnings | 0（--workspace --all-targets） |
 | Rust 源文件数 | ~90 .rs files |
 | 前端源文件数 | 58 (.ts/.tsx) |
@@ -365,6 +398,4 @@ Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平�
 
 ## TODO（待办）
 
-- [ ] `build.sh` 支持 `--distro <发行版>` 参数：默认自动检测当前发行版选择包格式，用户可显式指定目标发行版
-  - 当前实现：`--distro` 仅用于决定包格式（deb / rpm / PKGBUILD），未识别时只产出 tar.gz 兜底包
-  - 待实现：具体发行版适配（glibc 版本约束、依赖包名差异、系统服务与安全策略等）
+- 无遗留 TODO（build.sh --distro 已收口；#50 已裁决并落地；已知限制按上节如实记录）
