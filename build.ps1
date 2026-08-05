@@ -93,9 +93,17 @@ if (-not $SkipTest) {
         $testOutput | Where-Object { $_ -match "FAILED|failures:|error\[" } | ForEach-Object { Write-Host "  [FAIL] $_" -ForegroundColor Red }
         Write-Err "测试失败"
     }
-    $failCount = ($testOutput | Select-String "test result:" | Select-String "failed" |
-        ForEach-Object { if ($_ -match "(\d+) failed") { [int]$matches[1] } }).Count
-    if ($failCount -gt 0) { Write-Err "测试失败: $failCount 个" }
+    # 修复：原实现把「摘要行含 failed 字样的套件数」误计为失败测试数——
+    # cargo 每条 `test result:` 摘要恒含 "N failed"（全绿时为 "0 failed"），
+    # 导致全绿也必定误报「测试失败: <套件总数> 个」（本工作区为 18）。
+    # 现改为对各套件摘要的真实失败数求和；全绿时为 0。
+    $failCount = ($testOutput | Select-String "test result:" |
+        ForEach-Object { if ($_ -match "(\d+) failed") { [int]$matches[1] } else { 0 } } |
+        Measure-Object -Sum).Sum
+    if ($failCount -gt 0) {
+        $testOutput | Where-Object { $_ -match "FAILED|failures:" } | ForEach-Object { Write-Host "  [FAIL] $_" -ForegroundColor Red }
+        Write-Err "测试失败: $failCount 个"
+    }
     Write-Ok "所有测试通过"
 } else {
     Write-Info "跳过测试 (-SkipTest)"
