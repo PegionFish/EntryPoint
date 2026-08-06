@@ -156,6 +156,9 @@ pub fn build_module_env(
         root.join("workspace").to_string_lossy().to_string(),
     );
     vars.insert("LOG_LEVEL".to_string(), "info".to_string());
+    // HOST（最终环境变量名 EP_HOST）：adapter 绑定地址固定回环，避免 0.0.0.0
+    // 触发 Windows 防火墙弹窗；adapter 侧 os.getenv("EP_HOST", "127.0.0.1") 回退同值。
+    vars.insert("HOST".to_string(), "127.0.0.1".to_string());
     vars.insert("DEVICE".to_string(), device.to_string());
     vars.insert("BACKEND".to_string(), device.backend().to_string());
     vars.insert(
@@ -1309,12 +1312,40 @@ mod tests {
             &root.join("workspace").to_string_lossy().to_string()
         );
         assert_eq!(vars.get("LOG_LEVEL").unwrap(), "info");
+        // EP_HOST 注入：裸键 HOST=127.0.0.1（start_module 统一加 EP_ 前缀后为 EP_HOST）
+        assert_eq!(vars.get("HOST").unwrap(), "127.0.0.1");
         assert_eq!(vars.get("DEVICE").unwrap(), "cuda:1");
         assert_eq!(vars.get("BACKEND").unwrap(), "cuda");
         assert_eq!(vars.get("DEVICE_INDEX").unwrap(), "1");
 
         // 键必须是裸占位符名（EP_ 前缀由 start_module 统一加一次）
         assert!(vars.keys().all(|k| !k.starts_with("EP_")));
+    }
+
+    // ─── 防火墙根治：build_module_env 必须注入 HOST（子进程最终得 EP_HOST） ───
+
+    #[test]
+    fn test_build_module_env_injects_host_loopback() {
+        // 无论何种设备/模块，HOST 固定 127.0.0.1：start_module 的
+        // `format!("EP_{}", key.to_uppercase())` 前缀机制将其装配为 EP_HOST，
+        // adapter 读之绑定回环，根治 0.0.0.0 触发的 Windows 防火墙弹窗。
+        let manifest = test_manifest(None);
+        let root = if cfg!(windows) {
+            PathBuf::from("C:/ep")
+        } else {
+            PathBuf::from("/opt/ep")
+        };
+        let vars = build_module_env(
+            &root,
+            &crate::config::AppConfig::default(),
+            "test-mod",
+            &manifest,
+            &DeviceId::Cpu,
+        );
+        assert_eq!(vars.get("HOST").map(String::as_str), Some("127.0.0.1"));
+        // 前缀归一：HOST 不带 EP_ 前缀，经 start_module 只产生一层 EP_HOST
+        let env_key = format!("EP_{}", "HOST".to_uppercase());
+        assert_eq!(env_key, "EP_HOST");
     }
 
     #[test]
