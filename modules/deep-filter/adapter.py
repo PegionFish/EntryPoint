@@ -376,4 +376,6 @@ async def predict_denoise(
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     log.info("启动 %s 服务, 端口 %d", EP_MODULE_ID, EP_PORT)
-    uvicorn.run(app, host="0.0.0.0", port=EP_PORT, log_level="info")
+    # 绑定地址读 EP_HOST（daemon 注入，缺省回环）——硬编码 0.0.0.0 会触发
+    # Windows 防火墙弹窗，见 ep-core process.rs build_module_env（EP_HOST=127.0.0.1）
+    uvicorn.run(app, host=os.getenv("EP_HOST", "127.0.0.1"), port=EP_PORT, log_level="info")
