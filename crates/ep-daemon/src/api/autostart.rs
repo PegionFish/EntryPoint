@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
-use ep_core::module::manifest::{ModuleManifest, RuntimeType};
+use ep_core::module::manifest::ModuleManifest;
 use ep_core::types::{DeviceId, ServiceStatus};
 
 use crate::state::AppState;
@@ -202,13 +202,12 @@ async fn start_via_existing_path(
         }
     }
 
-    // 2. venv 准备前置（P0-5 教训：执行前 venv 必须就绪；下载路径已有同款逻辑，
-    //    自动拉起常发生在无人值守场景，不能假设 venv 已备好）。仅 Python 运行时需要。
-    if manifest.runtime.runtime_type == RuntimeType::Python
-        && !venv_python_path(&state.root, module_id).exists()
-    {
-        prepare_venv(state, module_id, manifest).await?;
-    }
+    // 2. venv 就绪门禁（P0-5 教训 + 任务 #10）：与手动启动（modules.rs）同源
+    //    的共享助手——is_venv_ready 哈希门禁修复"半壳 venv"（只有解释器、
+    //    未装依赖）误判就绪；未就绪才准备。仅 Python 运行时实际生效。
+    super::ensure_module_venv_ready(state, module_id, manifest)
+        .await
+        .map_err(AutoStartError::VenvPrepFailed)?;
 
     // 3. 分配端口
     let port = {
@@ -245,43 +244,6 @@ async fn start_via_existing_path(
         }
     }
     Ok(())
-}
-
-/// venv 准备（阻塞操作放入 spawn_blocking；模式同 api/models.rs 下载前置）
-async fn prepare_venv(
-    state: &Arc<AppState>,
-    module_id: &str,
-    manifest: &ModuleManifest,
-) -> Result<(), AutoStartError> {
-    let (python_cfg, network_cfg) = {
-        let cfg = state.config.read().await;
-        (cfg.python.clone(), cfg.network.clone())
-    };
-    let root = state.root.clone();
-    let mid = module_id.to_string();
-    let py_ver = manifest.runtime.python_version.clone().unwrap_or_default();
-    let req_rel = manifest
-        .runtime
-        .requirements
-        .clone()
-        .unwrap_or_else(|| "requirements.txt".to_string());
-
-    info!(module_id, "autostart: venv missing, preparing Python environment before start");
-    let prep = tokio::task::spawn_blocking(move || {
-        let env_mgr =
-            ep_core::env::EnvManager::new(&root, &python_cfg).with_network(&network_cfg);
-        let req_path = root.join("modules").join(&mid).join(req_rel);
-        env_mgr.ensure_venv(&mid, &py_ver, &req_path)
-    })
-    .await;
-
-    match prep {
-        Ok(Ok(_path)) => Ok(()),
-        Ok(Err(e)) => Err(AutoStartError::VenvPrepFailed(format!("{e:#}"))),
-        Err(e) => Err(AutoStartError::VenvPrepFailed(format!(
-            "venv prep task panicked: {e}"
-        ))),
-    }
 }
 
 /// 模块启动环境变量（与 api/modules.rs 保持一致：ROOT/MODULE_DIR/MODEL_DIR/
@@ -321,17 +283,6 @@ fn build_env_vars(
         root.join("workspace").to_string_lossy().to_string(),
     );
     vars
-}
-
-/// 模块 venv python 解释器路径（双平台：Windows `Scripts/python.exe`、
-/// 其他平台 `bin/python`；与 api/models.rs 及 ep-desktop 口径一致）
-fn venv_python_path(root: &std::path::Path, module_id: &str) -> std::path::PathBuf {
-    let venv_dir = root.join("runtime").join("venvs").join(module_id);
-    if cfg!(target_os = "windows") {
-        venv_dir.join("Scripts").join("python.exe")
-    } else {
-        venv_dir.join("bin").join("python")
-    }
 }
 
 // ─── 健康等待 ────────────────────────────────────────────────────────────────
@@ -801,6 +752,73 @@ ready_timeout_secs = 30
         );
 
         cleanup(&state, "retry-mod", Some(server)).await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── 7. 半壳 venv 回归（任务 #10）：只有假解释器、有 requirements、无哈希 →
+    //    旧存在性门禁会误判就绪直接拉起；新门禁必须触发准备并确定性失败
+    //    （假解释器无法承载 uv pip install；失败在端口分配前，无端口泄漏）
+
+    #[tokio::test]
+    async fn ensure_half_shell_venv_triggers_prep_and_fails() {
+        let root = unique_root("half-shell");
+        let toml = format!(
+            r#"
+[module]
+id = "halfpy-mod"
+name = "半壳 Python 模块"
+version = "0.1.0"
+description = "half-shell venv regression"
+category = "asr"
+genre = "test"
+
+[runtime]
+type = "python"
+start_command = "{cmd}"
+
+[compute]
+backends = ["cpu"]
+
+[interface]
+type = "http"
+ready_timeout_secs = 5
+"#,
+            cmd = keepalive_command()
+        );
+        let state = test_state(
+            root.clone(),
+            vec![module_from_toml(&root, &toml)],
+            (39231, 39240),
+        );
+
+        // 预置半壳 venv：假 python + requirements（无 .ep_deps_hash）
+        let py = crate::api::module_venv_python_path(&root, "halfpy-mod");
+        std::fs::create_dir_all(py.parent().unwrap()).unwrap();
+        std::fs::write(&py, b"fake").unwrap();
+        let req = root.join("modules/halfpy-mod/requirements.txt");
+        std::fs::create_dir_all(req.parent().unwrap()).unwrap();
+        std::fs::write(&req, "ep-halfshell-nonexistent-pkg==1.0\n").unwrap();
+
+        let err = ensure_module_running_with_timeout(&state, "halfpy-mod", Duration::from_secs(10))
+            .await
+            .expect_err("半壳 venv 必须触发准备并失败");
+        assert!(
+            matches!(&err, AutoStartError::VenvPrepFailed(d) if !d.is_empty()),
+            "应为 VenvPrepFailed: {err}"
+        );
+        // 未拉起进程、未占用端口（venv 门禁先于端口分配）
+        assert!(state
+            .process_manager
+            .read()
+            .await
+            .get_instance("halfpy-mod")
+            .is_none());
+        assert!(state
+            .port_manager
+            .read()
+            .await
+            .get_port("halfpy-mod")
+            .is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

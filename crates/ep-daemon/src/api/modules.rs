@@ -271,6 +271,20 @@ pub async fn start_module(
         }
     }
 
+    // 3.5 venv 就绪门禁（任务 #10）：手动启动此前完全不做 venv 准备，与自动拉起
+    //     （autostart.rs）路径不一致；现统一走共享助手（is_venv_ready 哈希门禁，
+    //     修复"半壳 venv"误判；未就绪才 ensure_venv）。非 Python 运行时 no-op。
+    if let Err(detail) = super::ensure_module_venv_ready(&state, &id, &manifest).await {
+        warn!(module_id = %id, error = %detail, "venv prep failed before start");
+        return err_response(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "apiModels.venvPrepFailed",
+            &[("detail", detail)],
+        )
+        .await;
+    }
+
     // 4. 分配端口
     let port = {
         let mut pm = state.port_manager.write().await;
@@ -705,6 +719,90 @@ mod tests {
         let (status, body) = stop_module(State(state), Path("ghost".to_string())).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body.0["error"], "Module not found: ghost");
+    }
+
+    // ── 任务 #10 回归：手动启动触发 venv 准备（此前手动路径完全不做 venv 准备）
+    //    半壳 venv（假解释器 + requirements 无哈希）→ 500 + venvPrepFailed 文案，
+    //    失败先于端口分配 → 无端口泄漏
+    #[tokio::test]
+    async fn start_module_half_shell_venv_triggers_prep_and_500() {
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!(
+            "ep-api-modules-half-{}-{seq}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let manifest: ModuleManifest = toml::from_str(
+            r#"
+[module]
+id = "half-start-mod"
+name = "半壳手动启动测试"
+version = "0.1.0"
+description = "half-shell manual start regression"
+category = "asr"
+genre = "test"
+
+[runtime]
+type = "python"
+
+[compute]
+backends = ["cpu"]
+
+[interface]
+type = "http"
+"#,
+        )
+        .unwrap();
+        let module = DiscoveredModule {
+            path: root.join("modules/half-start-mod"),
+            manifest: Some(manifest),
+            status: DiscoveryStatus::Valid,
+        };
+        let state = Arc::new(AppState::new(
+            root.clone(),
+            AppConfig::default(),
+            vec![],
+            vec![module],
+            ep_core::port::PortManager::new(18000, 19000),
+        ));
+
+        // 预置半壳 venv：假 python + requirements（无 .ep_deps_hash）
+        let py = crate::api::module_venv_python_path(&root, "half-start-mod");
+        std::fs::create_dir_all(py.parent().unwrap()).unwrap();
+        std::fs::write(&py, b"fake").unwrap();
+        let req = root.join("modules/half-start-mod/requirements.txt");
+        std::fs::create_dir_all(req.parent().unwrap()).unwrap();
+        std::fs::write(&req, "ep-halfshell-nonexistent-pkg==1.0\n").unwrap();
+
+        let (status, body) = start_module(
+            State(state.clone()),
+            Path("half-start-mod".to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body.0["error"]
+                .as_str()
+                .unwrap()
+                .contains("Python 环境准备失败"),
+            "应为 venvPrepFailed 文案: {}",
+            body.0["error"]
+        );
+        // 门禁先于端口分配：无端口泄漏、无进程实例
+        assert!(state
+            .port_manager
+            .read()
+            .await
+            .get_port("half-start-mod")
+            .is_none());
+        assert!(state
+            .process_manager
+            .read()
+            .await
+            .get_instance("half-start-mod")
+            .is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // logs 同一请求双语对照
