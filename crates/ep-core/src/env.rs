@@ -414,6 +414,9 @@ impl EnvManager {
         }
 
         // 1. 创建 venv（如果不存在）
+        //    created_now：本次新建的 venv 若安装失败须拆除（半壳 venv 只剩
+        //    python 解释器，会让仅看 python.exe 存在性的调用方误判就绪）。
+        let mut created_now = false;
         if !venv_dir.exists() {
             info!(module = module_id, path = %venv_dir.display(), "creating venv");
             std::fs::create_dir_all(&venv_dir).with_context(|| {
@@ -431,6 +434,7 @@ impl EnvManager {
                 &uv_env,
             )
             .with_context(|| format!("failed to create venv for module '{module_id}'"))?;
+            created_now = true;
             debug!(module = module_id, output = %output, "venv created");
         } else {
             debug!(module = module_id, "venv already exists");
@@ -480,6 +484,13 @@ impl EnvManager {
                 venv_py_str,
                 "--link-mode",
                 UV_LINK_MODE,
+                // 跨索引最优匹配：requirements 内联 --extra-index-url（如 torch
+                // cu130）时，uv 默认 first-index 策略会把包锁死在首个命中的
+                // 索引（cu130 索引残留的 packaging==24.0 即导致 deepfilternet
+                // 解析无解），干净安装必现失败；索引均为受信源，放开跨索引
+                // 取最优版本（与 deps.rs 指引文案推荐的策略一致）。
+                "--index-strategy",
+                "unsafe-best-match",
             ];
             let constraints_str;
             if let Some(c) = &constraints_file {
@@ -492,8 +503,32 @@ impl EnvManager {
                 uv.to_str().unwrap_or("uv"),
                 &install_args,
                 &uv_env,
-            )
-            .with_context(|| format!("failed to install dependencies for module '{module_id}'"))?;
+            );
+            let output = match output {
+                Ok(output) => output,
+                Err(e) => {
+                    // 本次新建的 venv 安装失败 → 拆除半壳，下次从零重来，
+                    // 避免残留只有解释器的空 venv 误导就绪判定。
+                    if created_now {
+                        if let Err(rm_err) = std::fs::remove_dir_all(&venv_dir) {
+                            warn!(
+                                module = module_id,
+                                path = %venv_dir.display(),
+                                error = %rm_err,
+                                "failed to remove half-initialized venv"
+                            );
+                        } else {
+                            info!(
+                                module = module_id,
+                                "removed half-initialized venv after install failure"
+                            );
+                        }
+                    }
+                    return Err(e).with_context(|| {
+                        format!("failed to install dependencies for module '{module_id}'")
+                    });
+                }
+            };
             debug!(module = module_id, output = %output, "dependencies installed");
 
             // 4. 写入新哈希
