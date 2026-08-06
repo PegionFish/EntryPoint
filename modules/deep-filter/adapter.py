@@ -122,8 +122,12 @@ def _load_model() -> None:
             log.info("使用本地模型目录: %s", model_path)
 
         _model, _df_state, _suffix = init_df(model_path)
+        try:
+            _sr = int(_df_state.sr())
+        except Exception:
+            _sr = 48000
         _backend_used = "deepfilternet"
-        log.info("DeepFilterNet 模型加载成功 (model=%s)", _suffix)
+        log.info("DeepFilterNet 模型加载成功 (model=%s, sr=%d)", _suffix, _sr)
         return
     except Exception as exc:
         log.warning("DeepFilterNet 加载失败: %s", exc)
@@ -147,7 +151,13 @@ def _load_model() -> None:
 def _denoise_deepfilternet(
     audio: np.ndarray, sr: int, attenuation: int, min_db: float
 ) -> np.ndarray:
-    """使用 DeepFilterNet 进行降噪。"""
+    """使用 DeepFilterNet 进行降噪。
+
+    注意：deepfilternet 0.5.6 的 enhance() 签名为
+    enhance(model, df_state, audio, pad=True, atten_lim_db=None)，不接受
+    min_db 参数（传入会 TypeError 导致推理 500）。min_db（最小增益下限）
+    改由 adapter 在 enhance 之后通过 _apply_gain_floor 实现，API 语义不变。
+    """
     import torch
     from df.enhance import enhance
 
@@ -169,11 +179,63 @@ def _denoise_deepfilternet(
             _df_state,
             tensor,
             atten_lim_db=float(attenuation),
-            min_db=min_db,
         )
 
     result = enhanced.squeeze(0).cpu().numpy()
+    # min_db：增益下限后处理，防止过度抑制把弱语音压成静音
+    result = _apply_gain_floor(result, audio_f32, min_db)
     return result
+
+
+def _apply_gain_floor(
+    enhanced: np.ndarray, original: np.ndarray, min_db: float
+) -> np.ndarray:
+    """实现 min_db 增益下限：任一频点增益不低于 floor（相对原始信号）。
+
+    频谱幅度钳制 max(|enhanced|, floor * |original|)，与 _denoise_scipy
+    fallback 的 min_db 语义一致。min_db=0 时 floor=1，等效输出原始信号。
+    """
+    if min_db >= 0:
+        return enhanced
+    from scipy.signal import istft, stft
+
+    floor = 10.0 ** (min_db / 20.0)
+    if enhanced.ndim == 1:
+        channels_e, channels_o = [enhanced], [original]
+    else:
+        channels_e = [enhanced[:, ch] for ch in range(enhanced.shape[1])]
+        channels_o = [original[:, ch] for ch in range(original.shape[1])]
+
+    processed = []
+    for enh, orig in zip(channels_e, channels_o):
+        n = min(len(enh), len(orig))
+        nperseg = min(2048, n)
+        if nperseg < 64:
+            processed.append(enh)
+            continue
+
+        _, _, Zxx_e = stft(enh[:n], nperseg=nperseg, noverlap=nperseg // 2)
+        _, _, Zxx_o = stft(orig[:n], nperseg=nperseg, noverlap=nperseg // 2)
+
+        mag_e = np.abs(Zxx_e)
+        target_mag = np.maximum(mag_e, floor * np.abs(Zxx_o))
+        scale = np.divide(
+            target_mag, mag_e, out=np.ones_like(target_mag), where=mag_e > 1e-10
+        )
+
+        _, result = istft(Zxx_e * scale, nperseg=nperseg, noverlap=nperseg // 2)
+
+        # istft 输出长度可能与输入略有差异，对齐
+        if len(result) > n:
+            result = result[:n]
+        elif len(result) < n:
+            result = np.pad(result, (0, n - len(result)))
+
+        processed.append(result)
+
+    if enhanced.ndim == 1:
+        return processed[0].astype(np.float32)
+    return np.stack(processed, axis=1).astype(np.float32)
 
 
 def _denoise_scipy(

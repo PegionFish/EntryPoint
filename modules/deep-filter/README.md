@@ -31,6 +31,8 @@
 | `attenuation` | int | 100 | 降噪强度 (dB)，0–100 |
 | `min_db` | float | -60.0 | 最小增益 (dB)，-100–0 |
 
+> 注：deepfilternet 0.5.6 的 `enhance()` 不接受 `min_db` 参数，该参数由 adapter 在 enhance 后以频谱增益下限（幅度钳制 `floor × |原信号|`）实现，API 语义不变。
+
 响应示例：
 
 ```json
