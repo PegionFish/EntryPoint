@@ -16,8 +16,8 @@ use ep_core::port::PortManager;
 use ep_core::process::ProcessManager;
 use ep_core::task_registry::{NodeRecord, TaskRecord, TaskRegistry, TaskState};
 use ep_core::types::{
-    Artifact, ComputeBackend, ComputeDevice, DeviceId, DeviceScheduler, PipelineRunner,
-    SchedulingStrategy, ServiceStatus, TaskStatus,
+    Artifact, ComputeBackend, ComputeDevice, DeviceScheduler, PipelineRunner,
+    ServiceStatus, TaskStatus,
 };
 
 /// 启动后首轮自动更新检查延迟：避开启动高峰的 I/O 与网络争用
@@ -148,26 +148,20 @@ fn manifests_from(
 
 // ─── Wave 3 C4：设备调度 / 任务 / 直跑 纯函数助手 ───────────────────────────
 
-/// 配置策略 → 调度器策略（`[compute].strategy` 接线 ComputeScheduler，P1-1）
-fn scheduling_strategy_for(config: &AppConfig) -> SchedulingStrategy {
-    match config.compute.resolved_strategy() {
-        ep_core::config::AssignStrategy::Manual => SchedulingStrategy::Manual,
-        ep_core::config::AssignStrategy::LeastMemory => SchedulingStrategy::LeastMemory,
-        ep_core::config::AssignStrategy::RoundRobin => SchedulingStrategy::RoundRobin,
-        ep_core::config::AssignStrategy::Single(_) => SchedulingStrategy::Single,
-    }
-}
-
-/// 以当前设备列表构建调度器（least_memory 等四策略 + allow_overcommit，P1-1）
+/// 以当前设备列表构建调度器（least_memory 等四策略 + allow_overcommit，P1-1）。
+///
+/// D-4 去重：策略映射下沉 ep-core 共享助手；全局 `disabled_backends` 清单
+/// 同步注入调度器，模块级选择（`assign_module_device`）与 daemon 语义同源。
 fn make_scheduler(
     devices: &[ComputeDevice],
     config: &AppConfig,
 ) -> ep_core::compute::scheduler::ComputeScheduler {
     let mut scheduler = ep_core::compute::scheduler::ComputeScheduler::new(
         devices.to_vec(),
-        scheduling_strategy_for(config),
+        ep_core::compute::scheduler::scheduling_strategy_for(config),
     );
     scheduler.set_allow_overcommit(config.compute.allow_overcommit);
+    scheduler.set_disabled_backends(config.compute.disabled_backends.clone());
     scheduler
 }
 
@@ -175,50 +169,6 @@ fn make_scheduler(
 /// 避免周期刷新（利用率/显存采样）把已记录的显存分配清零。
 fn device_ids_key(devices: &[ComputeDevice]) -> BTreeSet<String> {
     devices.iter().map(|d| d.id.to_string()).collect()
-}
-
-/// 调度器 VRAM 请求量（MB）：激活变体级估算优先、模块级兜底（§6.3 同源口径，
-/// `resolve_vram_estimate` 在变体未命中时自动回退模块级），未知 → 0（不参与显存闸门）。
-fn scheduler_vram_mb(config: &AppConfig, manifest: &ModuleManifest) -> u32 {
-    let variant = ep_core::model::active_model_for(config, manifest).unwrap_or("");
-    let mb = manifest.resolve_vram_estimate(variant).unwrap_or(0);
-    u32::try_from(mb).unwrap_or(u32::MAX)
-}
-
-/// 为模块分配设备（P1-1：manifest backends 过滤 + least_memory + allow_overcommit）。
-///
-/// 加速后端优先：先以 manifest 声明的**非 CPU** 后端请求调度器（多 GPU 时按
-/// 剩余显存最大者落位）；调度器拒绝（无兼容设备 / Manual / 显存超限且
-/// 未开超分）时，manifest 声明了 CPU → CPU 保底，否则 None。
-fn assign_module_device(
-    scheduler: &ep_core::compute::scheduler::ComputeScheduler,
-    manifest: &ModuleManifest,
-    config: &AppConfig,
-) -> Option<DeviceId> {
-    let accel: Vec<ComputeBackend> = manifest
-        .compute
-        .backends
-        .iter()
-        .copied()
-        .filter(|b| *b != ComputeBackend::Cpu)
-        .collect();
-    let assigned = if accel.is_empty() {
-        // 纯 CPU 模块：直接走 CPU 后端分配（CPU 设备 total_memory_mb=None → 不受显存闸门约束）
-        scheduler.assign(&manifest.module.id, &[ComputeBackend::Cpu], 0)
-    } else {
-        scheduler.assign(
-            &manifest.module.id,
-            &accel,
-            scheduler_vram_mb(config, manifest),
-        )
-    };
-    assigned.or_else(|| {
-        manifest
-            .compute
-            .backends
-            .contains(&ComputeBackend::Cpu)
-            .then_some(DeviceId::Cpu)
-    })
 }
 
 /// 任务工作区根目录（`[pipeline].workspace_dir`，相对路径基于应用根）
@@ -1363,8 +1313,13 @@ async fn ensure_module_ready(
         let port = port_manager
             .allocate(module_id)
             .map_err(|e| format!("port allocation failed: {e}"))?;
-        // 4. 设备（P1-1 调度器：manifest backends 过滤 + least_memory + allow_overcommit）
-        let device = match assign_module_device(scheduler, &manifest, config) {
+        // 4. 设备（D-4 去重：ep-core 共享选择 —— disabled_backends 过滤 +
+        //    策略 + VRAM 闸门 + Cpu 兜底，与 daemon 同源）
+        let device = match scheduler.assign_module_device(
+            &manifest.module.id,
+            &manifest,
+            ep_core::compute::scheduler::module_vram_request(config, &manifest),
+        ) {
             Some(d) => d,
             None => {
                 port_manager.release(module_id);
@@ -1634,11 +1589,16 @@ async fn background_loop(
                         if let Some(manifest) = manifest {
                             match port_manager.allocate(&module_id) {
                                 Ok(port) => {
-                                    // P1-1（桌面侧）：设备选择走 ComputeScheduler
-                                    // （manifest backends 过滤 + least_memory +
-                                    // allow_overcommit），不再"首个非 CPU"盲选
-                                    let device =
-                                        assign_module_device(&scheduler, &manifest, &config);
+                                    // D-4 去重：ep-core 共享选择（disabled_backends
+                                    // 过滤 + 策略 + VRAM 闸门 + Cpu 兜底），不再
+                                    // "首个非 CPU"盲选，亦不绕过全局禁用清单
+                                    let device = scheduler.assign_module_device(
+                                        &manifest.module.id,
+                                        &manifest,
+                                        ep_core::compute::scheduler::module_vram_request(
+                                            &config, &manifest,
+                                        ),
+                                    );
 
                                     match device {
                                         Some(device) => {
@@ -2563,6 +2523,7 @@ mod tests {
     use super::*;
     use ep_core::pipeline::runner::TaskSummary;
     use ep_core::task_registry::TaskState;
+    use ep_core::types::DeviceId;
 
     fn task_record(id: &str, pipeline_id: &str, status: TaskState) -> TaskRecord {
         TaskRecord {
@@ -2841,6 +2802,19 @@ type = "http"
         .unwrap()
     }
 
+    /// 桌面侧设备选择测试入口：委托 ep-core 共享选择（与正式路径同源）
+    fn assign(
+        scheduler: &ep_core::compute::scheduler::ComputeScheduler,
+        mf: &ModuleManifest,
+        config: &AppConfig,
+    ) -> Option<DeviceId> {
+        scheduler.assign_module_device(
+            &mf.module.id,
+            mf,
+            ep_core::compute::scheduler::module_vram_request(config, mf),
+        )
+    }
+
     #[test]
     fn scheduler_assigns_accelerator_with_least_memory_and_cpu_fallback() {
         let devices = vec![cuda_device(0, 4096), cuda_device(1, 8192), cpu_device()];
@@ -2853,20 +2827,17 @@ type = "http"
             vec![ComputeBackend::Cuda, ComputeBackend::Cpu],
         );
         assert_eq!(
-            assign_module_device(&scheduler, &mf, &config),
+            assign(&scheduler, &mf, &config),
             Some(DeviceId::Cuda(1))
         );
 
         // 纯 CPU 模块 → CPU
         let mf_cpu = manifest_with_backends("mod-b", vec![ComputeBackend::Cpu]);
-        assert_eq!(
-            assign_module_device(&scheduler, &mf_cpu, &config),
-            Some(DeviceId::Cpu)
-        );
+        assert_eq!(assign(&scheduler, &mf_cpu, &config), Some(DeviceId::Cpu));
 
         // 仅声明 rocm（本机无 rocm 设备、无 cpu 声明）→ None
         let mf_rocm = manifest_with_backends("mod-c", vec![ComputeBackend::Rocm]);
-        assert_eq!(assign_module_device(&scheduler, &mf_rocm, &config), None);
+        assert_eq!(assign(&scheduler, &mf_rocm, &config), None);
     }
 
     #[test]
@@ -2882,19 +2853,36 @@ type = "http"
             vec![ComputeBackend::Cuda, ComputeBackend::Cpu],
         );
         mf.compute.vram_estimate_mb = Some(8000);
-        assert_eq!(
-            assign_module_device(&scheduler, &mf, &config),
-            Some(DeviceId::Cpu)
-        );
+        assert_eq!(assign(&scheduler, &mf, &config), Some(DeviceId::Cpu));
 
         // 开启超分 → 放行 cuda:0
         let mut config_oc = AppConfig::default();
         config_oc.compute.allow_overcommit = true;
         let scheduler_oc = make_scheduler(&devices, &config_oc);
         assert_eq!(
-            assign_module_device(&scheduler_oc, &mf, &config_oc),
+            assign(&scheduler_oc, &mf, &config_oc),
             Some(DeviceId::Cuda(0))
         );
+    }
+
+    #[test]
+    fn scheduler_consumes_disabled_backends() {
+        let devices = vec![cuda_device(0, 8192), cpu_device()];
+
+        // 禁用 cuda：加速后端被剔除 → cuda+cpu 模块回落 CPU（不再选 cuda:0）
+        let mut config = AppConfig::default();
+        config.compute.disabled_backends = vec![ComputeBackend::Cuda];
+        let scheduler = make_scheduler(&devices, &config);
+        let mf = manifest_with_backends(
+            "mod-d",
+            vec![ComputeBackend::Cuda, ComputeBackend::Cpu],
+        );
+        assert_eq!(assign(&scheduler, &mf, &config), Some(DeviceId::Cpu));
+
+        // cuda + cpu 全禁用：无可用后端 → None（不再无视禁用清单兜底 CPU）
+        config.compute.disabled_backends = vec![ComputeBackend::Cuda, ComputeBackend::Cpu];
+        let scheduler = make_scheduler(&devices, &config);
+        assert_eq!(assign(&scheduler, &mf, &config), None);
     }
 
     // ── 注册表/工作区助手 ──────────────────────────────────────────────────
