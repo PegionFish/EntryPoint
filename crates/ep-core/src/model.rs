@@ -205,6 +205,9 @@ pub struct ModelManager {
     cache_dir: PathBuf,
     /// HuggingFace 镜像站 URL（空字符串 = 官方源）
     hf_endpoint: String,
+    /// ModelScope API 基址（默认官方站；经 [`Self::with_modelscope_endpoint`]
+    /// 覆盖——更新检查测试注入本地 mock 端点用）
+    modelscope_endpoint: String,
     /// 默认下载源（huggingface / modelscope）
     default_source: String,
     /// 本地模型缓存搜索路径（按优先级排序）
@@ -253,6 +256,7 @@ impl ModelManager {
         Self {
             cache_dir,
             hf_endpoint: config.hf_endpoint.clone(),
+            modelscope_endpoint: "https://modelscope.cn".to_string(),
             default_source: config.default_source.clone(),
             cache_paths,
             download_child: None,
@@ -267,6 +271,15 @@ impl ModelManager {
     /// 下载子进程的代理环境变量由 `execute_download*` 的 AppConfig 参数提供。
     pub fn with_network(mut self, network: NetworkConfig) -> Self {
         self.network = network;
+        self
+    }
+
+    /// 覆盖 ModelScope API 基址（链式调用；缺省官方站 `https://modelscope.cn`）。
+    ///
+    /// 更新检查的 ModelScope 请求 URL 形如 `{endpoint}/api/v1/models/{repo_id}`；
+    /// 尾斜杠自动去除。
+    pub fn with_modelscope_endpoint(mut self, endpoint: &str) -> Self {
+        self.modelscope_endpoint = endpoint.trim_end_matches('/').to_string();
         self
     }
 
@@ -499,7 +512,7 @@ impl ModelManager {
     ///
     /// 比较远端仓库最后修改时间与本地 `.ep_meta.json` 的 `downloaded_at`：
     /// - HuggingFace：GET `{hf_endpoint或官方}/api/models/{repo_id}`，字段 `lastModified`（RFC 3339）
-    /// - ModelScope：GET `https://modelscope.cn/api/v1/models/{repo_id}`，
+    /// - ModelScope：GET `{modelscope_endpoint，默认官方}/api/v1/models/{repo_id}`，
     ///   字段 `Data.LastUpdatedTime`（Unix 秒），回退 `Data.GmtModified`
     /// - URL 来源 / url="auto"：不支持更新检查
     /// - 无 meta 文件：返回"缺少下载元数据"，不误报
@@ -572,7 +585,9 @@ impl ModelManager {
                 };
                 fetch_hf_modified(&client, &endpoint, &repo_id).await
             }
-            ModelSource::Modelscope => fetch_modelscope_modified(&client, &repo_id).await,
+            ModelSource::Modelscope => {
+                fetch_modelscope_modified(&client, &self.modelscope_endpoint, &repo_id).await
+            }
             ModelSource::Url => unreachable!("url source handled above"),
         };
 
@@ -1781,16 +1796,19 @@ async fn fetch_hf_modified(
     Ok((dt.with_timezone(&chrono::Utc), last_modified.to_string()))
 }
 
-/// 查询 ModelScope 仓库最后修改时间：GET https://modelscope.cn/api/v1/models/{repo_id}
+/// 查询 ModelScope 仓库最后修改时间：GET {endpoint}/api/v1/models/{repo_id}
+///
+/// `endpoint` 缺省官方站 `https://modelscope.cn`（见 [`ModelManager::with_modelscope_endpoint`]）。
 ///
 /// 主字段 `Data.LastUpdatedTime`（Unix 秒），回退 `Data.GmtModified`。
 /// ModelScope 对不存在的仓库可能返回 HTTP 200 + Success=false 的错误包装，
 /// 需要检查响应体。
 async fn fetch_modelscope_modified(
     client: &reqwest::Client,
+    endpoint: &str,
     repo_id: &str,
 ) -> Result<(chrono::DateTime<chrono::Utc>, String)> {
-    let url = format!("https://modelscope.cn/api/v1/models/{repo_id}");
+    let url = format!("{endpoint}/api/v1/models/{repo_id}");
     let resp = client
         .get(&url)
         .send()
