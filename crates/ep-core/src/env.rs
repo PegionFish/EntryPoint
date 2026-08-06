@@ -911,6 +911,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // ── 半壳 venv 回归（E2E 任务 #10）：只有解释器、未装依赖的 venv 不得误判就绪 ──
+
+    #[test]
+    fn is_venv_ready_half_shell_returns_false() {
+        let root = std::env::temp_dir().join(format!("ep_env_half_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let mgr = EnvManager {
+            root: root.clone(),
+            python_path: None,
+            uv_path: None,
+            network_env: Vec::new(),
+            uv_cache_dir: String::new(),
+            constraints: String::new(),
+        };
+
+        let module_id = "half-shell-mod";
+        // 半壳 venv：预置假 python 解释器（文件存在但从未安装依赖）
+        let py = mgr.venv_python_path(module_id);
+        std::fs::create_dir_all(py.parent().unwrap()).unwrap();
+        std::fs::write(&py, b"fake").unwrap();
+        // requirements 存在
+        let req = root.join("modules").join(module_id).join("requirements.txt");
+        std::fs::create_dir_all(req.parent().unwrap()).unwrap();
+        std::fs::write(&req, "fastapi>=0.100.0\n").unwrap();
+
+        // 1) 无哈希文件（半壳）→ 不得误判就绪
+        assert!(
+            !mgr.is_venv_ready(module_id, &req),
+            "半壳 venv（有解释器、无哈希）必须判定未就绪"
+        );
+
+        // 2) 写入匹配哈希 → 就绪
+        let hash = compute_deps_hash(&req, None).unwrap();
+        std::fs::write(mgr.deps_hash_path(module_id), &hash).unwrap();
+        assert!(mgr.is_venv_ready(module_id, &req));
+
+        // 3) requirements 变更 → 哈希失配 → 未就绪
+        std::fs::write(&req, "fastapi>=0.110.0\n").unwrap();
+        assert!(!mgr.is_venv_ready(module_id, &req));
+
+        // 4) 无 requirements 文件 → venv 存在即就绪（保持旧语义）
+        let no_req = root.join("modules").join(module_id).join("no-such-req.txt");
+        assert!(mgr.is_venv_ready(module_id, &no_req));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn hash_file_deterministic() {
         let dir = std::env::temp_dir().join(format!("ep_hash_test_{}", std::process::id()));

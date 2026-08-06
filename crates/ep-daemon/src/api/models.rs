@@ -150,15 +150,11 @@ fn parse_model_source(s: &str) -> Option<ModelSource> {
     }
 }
 
-/// 模块 venv python 解释器路径（与 ep-desktop 一致：
-/// Windows 为 `Scripts/python.exe`，其他平台为 `bin/python`）
+/// 模块 venv python 解释器路径：统一转发共享助手（任务 #10 去重，
+/// 双平台口径见 [`super::module_venv_python_path`]）；仅测试 fixture 使用
+#[cfg(test)]
 fn venv_python_path(root: &std::path::Path, module_id: &str) -> PathBuf {
-    let venv_dir = root.join("runtime").join("venvs").join(module_id);
-    if cfg!(target_os = "windows") {
-        venv_dir.join("Scripts").join("python.exe")
-    } else {
-        venv_dir.join("bin").join("python")
-    }
+    super::module_venv_python_path(root, module_id)
 }
 
 /// DownloadState → downloads 表 / WS 消息使用的字符串状态
@@ -639,12 +635,26 @@ async fn download_model(
         )
         .await;
     }
-    let mut venv_python = venv_python_path(&state.root, &module_id);
-    if !venv_python.exists() {
-        // 自动准备 Python 环境：化解全新安装"下载需要 venv、启动又需要模型"的死锁
-        let manifest = match find_module_manifest(&state, &module_id).await {
-            Some(mf) => mf,
-            None => {
+    // venv 就绪门禁（任务 #10，与手动启动/自动拉起同源的共享助手）：
+    // is_venv_ready 哈希门禁修复"半壳 venv"误判；venv 缺失自动准备，
+    // 化解全新安装"下载需要 venv、启动又需要模型"的死锁。
+    // 模块未被发现时保留旧语义：venv 存在 → 继续用既有解释器；否则 → 404。
+    let venv_python = match find_module_manifest(&state, &module_id).await {
+        Some(mf) => match super::ensure_module_venv_ready(&state, &module_id, &mf).await {
+            Ok(path) => path,
+            Err(detail) => {
+                return err_response(
+                    &state,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "apiModels.venvPrepFailed",
+                    &[("detail", detail)],
+                )
+                .await;
+            }
+        },
+        None => {
+            let legacy = super::module_venv_python_path(&state.root, &module_id);
+            if !legacy.exists() {
                 return err_response(
                     &state,
                     StatusCode::NOT_FOUND,
@@ -653,49 +663,9 @@ async fn download_model(
                 )
                 .await;
             }
-        };
-        let (python_cfg, network_cfg) = {
-            let cfg = state.config.read().await;
-            (cfg.python.clone(), cfg.network.clone())
-        };
-        let root = state.root.clone();
-        let mid = module_id.clone();
-        let py_ver = manifest.runtime.python_version.clone().unwrap_or_default();
-        let req_rel = manifest
-            .runtime
-            .requirements
-            .clone()
-            .unwrap_or_else(|| "requirements.txt".to_string());
-        info!(module_id = %module_id, "venv missing, preparing Python environment before download");
-        let prep = tokio::task::spawn_blocking(move || {
-            let env_mgr =
-                ep_core::env::EnvManager::new(&root, &python_cfg).with_network(&network_cfg);
-            let req_path = root.join("modules").join(&mid).join(req_rel);
-            env_mgr.ensure_venv(&mid, &py_ver, &req_path)
-        })
-        .await;
-        match prep {
-            Ok(Ok(path)) => venv_python = path,
-            Ok(Err(e)) => {
-                return err_response(
-                    &state,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "apiModels.venvPrepFailed",
-                    &[("detail", format!("{e:#}"))],
-                )
-                .await;
-            }
-            Err(e) => {
-                return err_response(
-                    &state,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "apiModels.venvPrepPanicked",
-                    &[("detail", e.to_string())],
-                )
-                .await;
-            }
+            legacy
         }
-    }
+    };
     // 请求未指定 source 时回退配置 models.default_source（仅当该源在模型可用源内）
     let source = match source {
         Some(s) => Some(s),

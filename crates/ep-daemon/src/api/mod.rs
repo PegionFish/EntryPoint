@@ -99,6 +99,75 @@ pub(crate) async fn select_module_device(
     .unwrap_or(ep_core::types::DeviceId::Cpu)
 }
 
+/// 模块 venv python 解释器路径（双平台口径与 ep-core [`ep_core::env::EnvManager::venv_python_path`]
+/// 一致：Windows `runtime/venvs/<id>/Scripts/python.exe`、其他平台 `bin/python`）
+pub(crate) fn module_venv_python_path(
+    root: &std::path::Path,
+    module_id: &str,
+) -> std::path::PathBuf {
+    let venv_dir = root.join("runtime").join("venvs").join(module_id);
+    if cfg!(target_os = "windows") {
+        venv_dir.join("Scripts").join("python.exe")
+    } else {
+        venv_dir.join("bin").join("python")
+    }
+}
+
+/// venv 就绪门禁（任务 #10）：手动启动（modules.rs）、自动拉起（autostart.rs）、
+/// 模型下载（models.rs / packs.rs）四条路径共用的唯一入口。
+///
+/// 先经 ep-core [`ep_core::env::EnvManager::is_venv_ready`] 判定：python 存在且
+/// 无 requirements 即就绪；否则要求 `.ep_deps_hash` 与依赖栈哈希匹配。修复
+/// 旧门禁仅看 python.exe 存在性导致"半壳 venv"（只有解释器、未装依赖）误判
+/// 就绪的问题；未就绪才调 `ensure_venv` 准备。非 Python 运行时直接返回
+/// 常规路径（no-op）。成功返回 venv python 路径；失败返回英文技术细节，
+/// 调用方经 i18n 键 `apiModels.venvPrepFailed` 生成用户文案。
+pub(crate) async fn ensure_module_venv_ready(
+    state: &Arc<AppState>,
+    module_id: &str,
+    manifest: &ep_core::module::manifest::ModuleManifest,
+) -> Result<std::path::PathBuf, String> {
+    use ep_core::module::manifest::RuntimeType;
+    use tracing::info;
+
+    if manifest.runtime.runtime_type != RuntimeType::Python {
+        return Ok(module_venv_python_path(&state.root, module_id));
+    }
+    let (python_cfg, network_cfg) = {
+        let cfg = state.config.read().await;
+        (cfg.python.clone(), cfg.network.clone())
+    };
+    let root = state.root.clone();
+    let mid = module_id.to_string();
+    let py_ver = manifest.runtime.python_version.clone().unwrap_or_default();
+    let req_rel = manifest
+        .runtime
+        .requirements
+        .clone()
+        .unwrap_or_else(|| "requirements.txt".to_string());
+
+    let prep = tokio::task::spawn_blocking(move || {
+        let env_mgr =
+            ep_core::env::EnvManager::new(&root, &python_cfg).with_network(&network_cfg);
+        let req_path = root.join("modules").join(&mid).join(&req_rel);
+        if env_mgr.is_venv_ready(&mid, &req_path) {
+            return Ok(env_mgr.venv_python_path(&mid));
+        }
+        info!(
+            module_id = %mid,
+            "venv not ready (missing or deps hash mismatch), preparing Python environment"
+        );
+        env_mgr.ensure_venv(&mid, &py_ver, &req_path)
+    })
+    .await;
+
+    match prep {
+        Ok(Ok(path)) => Ok(path),
+        Ok(Err(e)) => Err(format!("{e:#}")),
+        Err(e) => Err(format!("venv prep task panicked: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +378,115 @@ type = "http"
         )
         .unwrap();
         assert_eq!(select_module_device(&state, &mf).await, DeviceId::Cpu);
+    }
+
+    // ── 任务 #10：ensure_module_venv_ready（venv 就绪门禁共享助手） ────────
+
+    fn python_manifest_toml(id: &str) -> String {
+        format!(
+            r#"
+[module]
+id = "{id}"
+name = "t"
+version = "0.1.0"
+description = "t"
+category = "asr"
+genre = "test"
+
+[runtime]
+type = "python"
+
+[compute]
+backends = ["cpu"]
+
+[interface]
+type = "http"
+"#
+        )
+    }
+
+    fn state_at(root: std::path::PathBuf) -> Arc<AppState> {
+        Arc::new(AppState::new(
+            root,
+            ep_core::config::AppConfig::default(),
+            vec![],
+            vec![],
+            ep_core::port::PortManager::new(18000, 19000),
+        ))
+    }
+
+    fn unique_venv_root(tag: &str) -> std::path::PathBuf {
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!(
+            "ep-api-venv-{tag}-{}-{seq}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    // 非 Python 运行时 → no-op，直接返回常规路径（不触发任何准备）
+    #[tokio::test]
+    async fn ensure_module_venv_ready_non_python_noop() {
+        let root = unique_venv_root("native");
+        let state = state_at(root.clone());
+        let mf = manifest_with_backends("native-mod", &[ep_core::types::ComputeBackend::Cpu]);
+        let path = ensure_module_venv_ready(&state, "native-mod", &mf)
+            .await
+            .expect("非 Python 运行时应直接返回");
+        assert_eq!(path, module_venv_python_path(&root, "native-mod"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 就绪 venv（哈希匹配）→ 直接返回解释器路径，不重跑准备
+    #[tokio::test]
+    async fn ensure_module_venv_ready_ready_venv_returns_python() {
+        let root = unique_venv_root("ready");
+        let state = state_at(root.clone());
+        let mf: ep_core::module::manifest::ModuleManifest =
+            toml::from_str(&python_manifest_toml("ready-mod")).unwrap();
+
+        // 预置假 python + requirements + 匹配哈希 → is_venv_ready 命中
+        let py = module_venv_python_path(&root, "ready-mod");
+        std::fs::create_dir_all(py.parent().unwrap()).unwrap();
+        std::fs::write(&py, b"fake").unwrap();
+        let req = root.join("modules/ready-mod/requirements.txt");
+        std::fs::create_dir_all(req.parent().unwrap()).unwrap();
+        std::fs::write(&req, "fastapi>=0.100.0\n").unwrap();
+        let hash = ep_core::env::compute_deps_hash(&req, None).unwrap();
+        std::fs::write(
+            root.join("runtime/venvs/ready-mod/.ep_deps_hash"),
+            &hash,
+        )
+        .unwrap();
+
+        let path = ensure_module_venv_ready(&state, "ready-mod", &mf)
+            .await
+            .expect("哈希匹配的 venv 应判就绪");
+        assert_eq!(path, py);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 半壳 venv（只有假解释器、有 requirements、无哈希）→ 门禁判未就绪 →
+    // 触发 ensure_venv；假解释器无法承载 uv pip install（或宿主无 uv）→ 确定性失败
+    #[tokio::test]
+    async fn ensure_module_venv_ready_half_shell_triggers_prep_failure() {
+        let root = unique_venv_root("halfshell");
+        let state = state_at(root.clone());
+        let mf: ep_core::module::manifest::ModuleManifest =
+            toml::from_str(&python_manifest_toml("half-mod")).unwrap();
+
+        let py = module_venv_python_path(&root, "half-mod");
+        std::fs::create_dir_all(py.parent().unwrap()).unwrap();
+        std::fs::write(&py, b"fake").unwrap();
+        let req = root.join("modules/half-mod/requirements.txt");
+        std::fs::create_dir_all(req.parent().unwrap()).unwrap();
+        std::fs::write(&req, "ep-halfshell-nonexistent-pkg==1.0\n").unwrap();
+
+        let err = ensure_module_venv_ready(&state, "half-mod", &mf)
+            .await
+            .expect_err("半壳 venv 必须触发准备并失败");
+        assert!(!err.is_empty(), "失败必须携带技术细节");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

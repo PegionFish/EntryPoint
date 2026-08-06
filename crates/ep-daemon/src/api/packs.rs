@@ -1484,41 +1484,17 @@ async fn start_one_pending_download(
         }
     }
 
-    // 2. venv 准备（同 models.rs：化解"下载需要 venv、启动需要模型"死锁）
-    let mut venv_python = crate_venv_python_path(&state.root, &req.module_id);
-    if !venv_python.exists() {
-        let (python_cfg, network_cfg) = {
-            let cfg = state.config.read().await;
-            (cfg.python.clone(), cfg.network.clone())
-        };
-        let root = state.root.clone();
-        let mid = req.module_id.clone();
-        let py_ver = manifest.runtime.python_version.clone().unwrap_or_default();
-        let req_rel = manifest
-            .runtime
-            .requirements
-            .clone()
-            .unwrap_or_else(|| "requirements.txt".to_string());
-        info!(module_id = %req.module_id, "pack reference download: preparing venv");
-        let prep = tokio::task::spawn_blocking(move || {
-            let env_mgr =
-                ep_core::env::EnvManager::new(&root, &python_cfg).with_network(&network_cfg);
-            let req_path = root.join("modules").join(&mid).join(req_rel);
-            env_mgr.ensure_venv(&mid, &py_ver, &req_path)
-        })
-        .await;
-        match prep {
-            Ok(Ok(path)) => venv_python = path,
-            Ok(Err(e)) => {
-                warn!(module_id = %req.module_id, error = ?e, "pending download: venv prep failed");
-                return;
-            }
-            Err(e) => {
-                warn!(module_id = %req.module_id, error = %e, "pending download: venv prep panicked");
-                return;
-            }
+    // 2. venv 就绪门禁（任务 #10：与 models.rs / modules.rs / autostart.rs 同源
+    //    的共享助手，哈希门禁修复"半壳 venv"误判；失败仅告警并跳过本次下载）
+    let venv_python = match super::ensure_module_venv_ready(&state, &req.module_id, &manifest)
+        .await
+    {
+        Ok(path) => path,
+        Err(e) => {
+            warn!(module_id = %req.module_id, error = %e, "pending download: venv prep failed");
+            return;
         }
-    }
+    };
 
     // 3. 启动下载（ep-core spawn python 子进程 + 进度广播）
     let config = state.config.read().await.clone();
@@ -1728,17 +1704,6 @@ fn download_state_string(state: &DownloadState) -> String {
         DownloadState::Completed => "completed".to_string(),
         DownloadState::Failed(_) => "failed".to_string(),
         DownloadState::Cancelled => "cancelled".to_string(),
-    }
-}
-
-/// 模块 venv python 解释器路径（与 api/models.rs / ep-desktop 一致：
-/// Windows 为 `Scripts/python.exe`，其他平台为 `bin/python`）
-fn crate_venv_python_path(root: &Path, module_id: &str) -> PathBuf {
-    let venv_dir = root.join("runtime").join("venvs").join(module_id);
-    if cfg!(target_os = "windows") {
-        venv_dir.join("Scripts").join("python.exe")
-    } else {
-        venv_dir.join("bin").join("python")
     }
 }
 
