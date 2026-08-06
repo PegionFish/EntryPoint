@@ -49,3 +49,98 @@ pub async fn list_devices(
     let resp: Vec<DeviceResponse> = devices.iter().map(DeviceResponse::from).collect();
     Json(resp)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    use ep_core::config::AppConfig;
+    use ep_core::port::PortManager;
+    use ep_core::types::{ComputeBackend, ComputeDevice, DeviceId};
+
+    use crate::state::AppState;
+
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    fn devices_state(devices: Vec<ComputeDevice>) -> Arc<AppState> {
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!(
+            "ep-api-devices-test-{}-{seq}",
+            std::process::id()
+        ));
+        Arc::new(AppState::new(
+            root,
+            AppConfig::default(),
+            devices,
+            vec![],
+            PortManager::new(18000, 19000),
+        ))
+    }
+
+    async fn get_devices(state: Arc<AppState>) -> Value {
+        let app = super::router().with_state(state);
+        let req = Request::builder().uri("/devices").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    // 字段映射：id/backend 的规范串形式（cuda:0 / cuda / cpu）与
+    // 显存/利用率/温度透传；未探测到的指标序列化为 null（前端契约）。
+    #[tokio::test]
+    async fn list_devices_maps_ids_backends_and_metrics() {
+        let devices = vec![
+            ComputeDevice {
+                id: DeviceId::Cuda(0),
+                backend: ComputeBackend::Cuda,
+                name: "Test GPU".into(),
+                total_memory_mb: Some(24576),
+                used_memory_mb: Some(1024),
+                utilization: Some(42),
+                temperature: Some(55),
+            },
+            ComputeDevice {
+                id: DeviceId::Cpu,
+                backend: ComputeBackend::Cpu,
+                name: "Test CPU".into(),
+                total_memory_mb: Some(16384),
+                used_memory_mb: None,
+                utilization: None,
+                temperature: None,
+            },
+        ];
+        let body = get_devices(devices_state(devices)).await;
+        let arr = body.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+
+        assert_eq!(arr[0]["id"], "cuda:0");
+        assert_eq!(arr[0]["backend"], "cuda");
+        assert_eq!(arr[0]["name"], "Test GPU");
+        assert_eq!(arr[0]["total_memory_mb"], 24576);
+        assert_eq!(arr[0]["used_memory_mb"], 1024);
+        assert_eq!(arr[0]["utilization"], 42);
+        assert_eq!(arr[0]["temperature"], 55);
+
+        assert_eq!(arr[1]["id"], "cpu");
+        assert_eq!(arr[1]["backend"], "cpu");
+        assert_eq!(arr[1]["total_memory_mb"], 16384);
+        assert!(arr[1]["used_memory_mb"].is_null());
+        assert!(arr[1]["utilization"].is_null());
+        assert!(arr[1]["temperature"].is_null());
+    }
+
+    // 无设备状态 → 空数组（新装机/探测失败场景前端不崩）
+    #[tokio::test]
+    async fn list_devices_empty_returns_empty_array() {
+        let body = get_devices(devices_state(vec![])).await;
+        assert_eq!(body, serde_json::json!([]));
+    }
+}

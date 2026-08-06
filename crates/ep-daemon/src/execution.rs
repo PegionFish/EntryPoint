@@ -1733,9 +1733,11 @@ to = ["output", "input"]
     #[tokio::test]
     async fn test_submit_builtin_pipeline_runs_to_completion() {
         let _guard = lock_for_tests();
-        clear_registry_for_tests();
 
         let root = unique_root("ok");
+        // 本测试断言持久化落盘，属持久化敏感：原子重置 + 绑定，防止并发
+        // AppState::new 在 clear 与 bind 之间拐走落盘点（同测试 12 做法）
+        reset_and_bind_for_tests(&root);
         let state = test_state(root.clone());
 
         let src = root.join("source.txt");

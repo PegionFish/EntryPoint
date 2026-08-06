@@ -866,7 +866,10 @@ mod tests {
                 path: PathBuf::from("modules/demo-asr"),
                 status: DiscoveryStatus::Valid,
             }],
-            ep_core::port::PortManager::new(18000, 19000),
+            // 独立区间（避开生产默认 18000-19000）：拉起 keepalive 的测试
+            // 依赖 Starting/状态机断言，若与并发真实 daemon 的 adapter 端口
+            // 重叠，健康探测可能误判就绪（环境性 flake）。
+            ep_core::port::PortManager::new(48400, 49000),
         ));
         (root, state)
     }
@@ -1191,5 +1194,169 @@ mod tests {
             active_model_dir(&cfg, &no_models, &root, &module_dir),
             module_dir
         );
+    }
+
+    // ─── GAP-2：handler 错误路径与状态机边界补测 ──────────────────────
+
+    /// 已发现但未启动的模块 → 404 notRunning（与「模块不存在」的 404 语义区分：
+    /// 前者文案携带 notRunning i18n 键，前端据此区分提示）
+    #[tokio::test]
+    async fn stop_not_running_module_returns_not_running_404() {
+        let (_root, state) = module_test_state(AppConfig::default(), fixture_manifest(None));
+        let app = super::router().with_state(state);
+        let resp = app.oneshot(post_req("/modules/demo-asr/stop")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = collect_json(resp).await;
+        assert_eq!(body["error"], "模块未在运行：demo-asr");
+    }
+
+    /// 未启动模块的状态查询：200 + stopped/port=null/uptime=0（前端轮询契约，
+    /// 不是 404——模块存在即有状态）
+    #[tokio::test]
+    async fn module_status_not_started_reports_stopped_shape() {
+        let (_root, state) = module_test_state(AppConfig::default(), fixture_manifest(None));
+        let app = super::router().with_state(state);
+        let resp = app
+            .oneshot(get_req("/modules/demo-asr/status"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = collect_json(resp).await;
+        assert_eq!(body["module_id"], "demo-asr");
+        assert_eq!(body["status"], "stopped");
+        assert!(body["port"].is_null());
+        assert_eq!(body["uptime_secs"], 0);
+    }
+
+    /// 未启动模块的日志查询：200 + 空行列表（不是 404，同 status 语义）
+    #[tokio::test]
+    async fn module_logs_not_started_returns_empty_lines() {
+        let (_root, state) = module_test_state(AppConfig::default(), fixture_manifest(None));
+        let app = super::router().with_state(state);
+        let resp = app.oneshot(get_req("/modules/demo-asr/logs")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = collect_json(resp).await;
+        assert_eq!(body["module_id"], "demo-asr");
+        assert_eq!(body["lines"], json!([]));
+    }
+
+    /// 运行中实例的缓冲日志经 handler 可见（log_buffer → lines 数组保序）
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn module_logs_running_instance_returns_buffered_lines() {
+        let cmd = if cfg!(windows) {
+            "ping -n 15 127.0.0.1"
+        } else {
+            "sleep 15"
+        };
+        let manifest = fixture_manifest(Some(cmd));
+        let (root, state) = module_test_state(AppConfig::default(), manifest.clone());
+
+        {
+            let mut pm = state.process_manager.write().await;
+            pm.start_module("demo-asr", &manifest, DeviceId::Cpu, 18125, HashMap::new())
+                .await
+                .unwrap();
+            // 模拟 reader task 回传的日志行（不经宿主环境子进程输出，双平台确定）
+            pm.append_log("demo-asr", "ep-log-line-1".to_string());
+            pm.append_log("demo-asr", "ep-log-line-2".to_string());
+        }
+
+        let app = super::router().with_state(state.clone());
+        let resp = app.oneshot(get_req("/modules/demo-asr/logs")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = collect_json(resp).await;
+        assert_eq!(body["lines"], json!(["ep-log-line-1", "ep-log-line-2"]));
+
+        // 清理：终止子进程
+        state
+            .process_manager
+            .write()
+            .await
+            .stop_module("demo-asr")
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 状态机边界：实例处于 Starting（运行中/启动中/准备中同集合）时重复
+    /// start → 409 + 携带当前状态串，而非二次拉起进程
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_module_state_conflict_409_when_starting() {
+        let cmd = if cfg!(windows) {
+            "ping -n 15 127.0.0.1"
+        } else {
+            "sleep 15"
+        };
+        let manifest = fixture_manifest(Some(cmd));
+        let (root, state) = module_test_state(AppConfig::default(), manifest.clone());
+
+        {
+            let mut pm = state.process_manager.write().await;
+            pm.start_module("demo-asr", &manifest, DeviceId::Cpu, 18126, HashMap::new())
+                .await
+                .unwrap();
+        }
+
+        let app = super::router().with_state(state.clone());
+        let resp = app.oneshot(post_req("/modules/demo-asr/start")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = collect_json(resp).await;
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("已在运行或正在启动"), "{error}");
+        assert!(error.contains("starting"), "错误应携带当前状态串: {error}");
+
+        // 清理：终止子进程
+        state
+            .process_manager
+            .write()
+            .await
+            .stop_module("demo-asr")
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 端口区间耗尽 → 500 portAllocationFailed（单端口区间被预占，
+    /// 模型预检放行：预置激活变体 small Ready）
+    #[tokio::test]
+    async fn start_module_port_exhaustion_500() {
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!(
+            "ep-api-modules-portex-{}-{seq}",
+            std::process::id()
+        ));
+        // 激活变体 small Ready → 越过模型预检，直达端口分配
+        let dir = root.join("models").join("demo-small");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.bin"), b"weights").unwrap();
+
+        // 单端口区间：先被 occupant 占走 → demo-asr 分配必然耗尽
+        let port_manager = ep_core::port::PortManager::new(39910, 39910);
+        let state = Arc::new(AppState::new(
+            root.clone(),
+            AppConfig::default(),
+            vec![],
+            vec![DiscoveredModule {
+                manifest: Some(fixture_manifest(None)),
+                path: PathBuf::from("modules/demo-asr"),
+                status: DiscoveryStatus::Valid,
+            }],
+            port_manager,
+        ));
+        state
+            .port_manager
+            .write()
+            .await
+            .allocate("occupant")
+            .expect("单端口区间首次分配应成功");
+
+        let app = super::router().with_state(state);
+        let resp = app.oneshot(post_req("/modules/demo-asr/start")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = collect_json(resp).await;
+        let error = body["error"].as_str().unwrap();
+        assert!(error.starts_with("端口分配失败"), "{error}");
+        assert!(error.contains("exhausted"), "应透传耗尽细节: {error}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
