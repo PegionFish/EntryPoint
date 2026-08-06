@@ -30,11 +30,12 @@
 #   版本 wheel 时请通过上述途径补充索引。
 #
 # 【torch 全家桶】
-# 统一锁定同族版本（对齐 deep-filter venv 现行基线 torch 2.13.0+cu130，
-# PACK_UNIFY_PLAN §3.2 实测基准）。torch / torchvision / torchaudio 三者
-# 必须成族同版本升级，单独升其中一个会因 ABI 配对断裂导致解析失败或
-# 运行时错误；升级时三行一起改。
+# 统一锁定 torch 版本。
+# 选型依据（2026-08-06 实测核实）：cu130 索引上 Windows cp312 wheel，
+# torch 最高 2.13.0+cu130，但 torchaudio 最高仅 2.11.0+cu130；PyPI 上
+# torchaudio 最高 2.9.1（PyTorch 2.10 起域库独立发版）。torchaudio C++
+# 扩展与特定 torch 版本硬配对，跨版本混装导入即断；因此 torch 锁在
+# torchaudio 仍有同版本 cu130 Windows wheel 的最高家族版本 2.11.0
+# （cu130 含 sm_120 内核，RTX 5090 D / Blackwell 可用）。
 # ─────────────────────────────────────────────────────────────────────────────
-torch==2.13.0
-torchvision==2.13.0
-torchaudio==2.13.0
+torch==2.11.0

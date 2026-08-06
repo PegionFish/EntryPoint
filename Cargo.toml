@@ -8,6 +8,9 @@ members = [
     "crates/ep-pack-cli",
     "crates/ep-webui",
 ]
+# runtime/.uv-cache 下的 sdist 构建（如 deepfilterlib 经 maturin 调 cargo）
+# 会向上探测到本 workspace 导致 "believes it's in a workspace" 错误，排除。
+exclude = ["runtime"]
 
 [workspace.package]
 version = "0.1.0"

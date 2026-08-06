@@ -28,7 +28,13 @@ MODULE_DIR = Path(os.environ.get("EP_MODULE_DIR", Path(__file__).resolve().paren
 MODEL_DIR = Path(os.environ.get("EP_MODEL_DIR", MODULE_DIR / "models"))
 WORKSPACE = Path(os.environ.get("EP_WORKSPACE", "."))
 PORT = int(os.environ.get("EP_PORT", "8000"))
-DEVICE = os.environ.get("EP_DEVICE", "cuda").lower()
+DEVICE = os.environ.get("EP_DEVICE", "cuda").strip().lower()
+# 设备判定以 EP_BACKEND（裸后端名，如 "cuda"）为准 —— daemon 注入的
+# EP_DEVICE 形如 "cuda:0"（ep-core process.rs build_module_env），
+# 直接 `== "cuda"` 比较恒为 False。EP_BACKEND 缺省时回退取 EP_DEVICE 冒号前缀。
+BACKEND = os.environ.get("EP_BACKEND", "").strip().lower() or (
+    DEVICE.split(":")[0] if DEVICE else "cuda"
+)
 MODEL_ID = os.environ.get("EP_MODEL_ID", "1.7b")
 
 # 模型 ID → 子目录名映射
@@ -47,9 +53,34 @@ logger = logging.getLogger("qwen3-tts")
 # 全局状态
 # ---------------------------------------------------------------------------
 _model: Any = None
-_tokenizer: Any = None
 _engine: str = "none"  # "qwen3-tts" | "edge-tts" | "none"
 _load_error: Optional[str] = None
+
+# 0.6B/1.7B CustomVoice 变体支持的音色（模型卡 Speakers 表）
+_SPEAKERS: tuple[str, ...] = (
+    "Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric",
+    "Ryan", "Aiden", "Ono_Anna", "Sohee",
+)
+
+
+def _map_speaker(voice: str) -> str:
+    """将 API voice 参数映射为 CustomVoice 音色名。"""
+    v = (voice or "").strip()
+    if not v or v.lower() in ("default", "xiaoxiao"):
+        return "Vivian"
+    for s in _SPEAKERS:
+        if s.lower() == v.lower():
+            return s
+    logger.warning("未知音色 %r，回退默认音色 Vivian", voice)
+    return "Vivian"
+
+
+def _detect_language(text: str) -> str:
+    """粗略语种检测：含 CJK → Chinese，否则 English。"""
+    for ch in text:
+        if "\u4e00" <= ch <= "\u9fff":
+            return "Chinese"
+    return "English"
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +93,10 @@ def _resolve_model_path() -> Optional[Path]:
         candidate = MODEL_DIR / subdir
         if candidate.is_dir():
             return candidate
+    # daemon 布局：EP_MODEL_DIR 直指变体目录（ep-core model.rs local_dir=target_dir，
+    # snapshot_download 将 config.json 平铺其下），此时 MODEL_DIR 本身即模型目录
+    if (MODEL_DIR / "config.json").is_file():
+        return MODEL_DIR
     # 回退：扫描 MODEL_DIR 下任何包含 config.json 的子目录
     if MODEL_DIR.is_dir():
         for child in sorted(MODEL_DIR.iterdir()):
@@ -71,8 +106,8 @@ def _resolve_model_path() -> Optional[Path]:
 
 
 def _load_qwen3_tts() -> bool:
-    """尝试加载 Qwen3-TTS 模型，成功返回 True。"""
-    global _model, _tokenizer, _engine, _load_error
+    """尝试加载 Qwen3-TTS 模型（官方 qwen-tts 推理库），成功返回 True。"""
+    global _model, _engine, _load_error
 
     model_path = _resolve_model_path()
     if model_path is None:
@@ -82,28 +117,36 @@ def _load_qwen3_tts() -> bool:
 
     try:
         import torch
-        from transformers import AutoModel, AutoTokenizer
+        from qwen_tts import Qwen3TTSModel
 
-        device_map = "auto" if DEVICE == "cuda" and torch.cuda.is_available() else "cpu"
-        dtype = torch.float16 if device_map != "cpu" else torch.float32
+        # 设备选择：EP_BACKEND=="cuda" 且 CUDA 可用 → cuda:<EP_DEVICE_INDEX>，
+        # 否则回退 CPU（保持既有回退语义）。
+        device_index = os.environ.get("EP_DEVICE_INDEX", "")
+        if BACKEND == "cuda" and torch.cuda.is_available():
+            device_map = f"cuda:{int(device_index or 0)}"
+            dtype = torch.bfloat16  # 模型卡推荐精度（sm_120 原生支持 bf16）
+        else:
+            if BACKEND == "cuda":
+                logger.warning("CUDA 不可用，回退到 CPU")
+            device_map = "cpu"
+            dtype = torch.float32
 
-        logger.info("正在加载 Qwen3-TTS 模型: %s (device=%s, dtype=%s)", model_path, device_map, dtype)
-        _tokenizer = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
-        _model = AutoModel.from_pretrained(
-            str(model_path),
-            trust_remote_code=True,
-            torch_dtype=dtype,
-            device_map=device_map,
+        logger.info(
+            "正在加载 Qwen3-TTS 模型: %s (backend=%s, device_map=%s, dtype=%s)",
+            model_path, BACKEND, device_map, dtype,
         )
-        _model.eval()
+        _model = Qwen3TTSModel.from_pretrained(
+            str(model_path),
+            device_map=device_map,
+            dtype=dtype,
+        )
         _engine = "qwen3-tts"
-        logger.info("Qwen3-TTS 模型加载完成")
+        logger.info("Qwen3-TTS 模型加载完成 (device_map=%s)", device_map)
         return True
     except Exception as exc:
         _load_error = f"Qwen3-TTS 加载失败: {exc}"
         logger.warning("%s", _load_error)
         _model = None
-        _tokenizer = None
         return False
 
 
@@ -143,22 +186,36 @@ def _synthesize_qwen3(
     sample_rate: int,
     output_path: Path,
 ) -> float:
-    """使用 Qwen3-TTS 模型合成语音，返回时长（秒）。"""
+    """使用 Qwen3-TTS 模型合成语音（官方 generate_custom_voice 接口），返回时长（秒）。"""
+    import inspect
+
     import numpy as np
     import soundfile as sf
 
-    # Qwen3-TTS 的 synthesize 接口（trust_remote_code 模型自定义方法）
-    result = _model.synthesize(text, voice=voice, speed=speed)
+    speaker = _map_speaker(voice)
+    language = _detect_language(text)
 
-    # 处理不同返回格式
-    if isinstance(result, dict):
-        audio_data = result.get("audio", result.get("waveform", result.get("output")))
-        sr = result.get("sample_rate", result.get("sampling_rate", sample_rate))
-    elif isinstance(result, (tuple, list)) and len(result) >= 2:
-        audio_data, sr = result[0], result[1]
+    generate = _model.generate_custom_voice
+    kwargs: dict[str, Any] = {
+        "text": text,
+        "language": language,
+        "speaker": speaker,
+    }
+    # speed 仅在库版本支持时透传（不同 qwen-tts 版本签名可能有差异）
+    if "speed" in inspect.signature(generate).parameters:
+        kwargs["speed"] = speed
+
+    logger.info("合成: speaker=%s, language=%s, %d 字符", speaker, language, len(text))
+    result = generate(**kwargs)
+
+    # 模型卡接口：wavs, sr = model.generate_custom_voice(...)
+    if isinstance(result, (tuple, list)) and len(result) >= 2:
+        wavs, sr = result[0], result[1]
     else:
-        audio_data = result
-        sr = sample_rate
+        wavs, sr = result, sample_rate
+
+    # wavs 为波形列表；取第一条
+    audio_data = wavs[0] if isinstance(wavs, (list, tuple)) else wavs
 
     # 转为 numpy 数组
     if not isinstance(audio_data, np.ndarray):
@@ -298,6 +355,7 @@ async def health():
         "engine": _engine,
         "model_id": MODEL_ID,
         "device": DEVICE,
+        "backend": BACKEND,
     }
 
 
@@ -311,6 +369,7 @@ async def info():
         "model_id": MODEL_ID,
         "model_dir": str(MODEL_DIR),
         "device": DEVICE,
+        "backend": BACKEND,
         "workspace": str(WORKSPACE),
         "capabilities": ["synthesize"],
         "load_error": _load_error,
@@ -384,8 +443,8 @@ async def predict_synthesize(req: SynthesizeRequest):
 @app.on_event("startup")
 async def on_startup():
     logger.info(
-        "Qwen3-TTS adapter 启动 | MODEL_DIR=%s | WORKSPACE=%s | DEVICE=%s | MODEL_ID=%s",
-        MODEL_DIR, WORKSPACE, DEVICE, MODEL_ID,
+        "Qwen3-TTS adapter 启动 | MODEL_DIR=%s | WORKSPACE=%s | DEVICE=%s | BACKEND=%s | MODEL_ID=%s",
+        MODEL_DIR, WORKSPACE, DEVICE, BACKEND, MODEL_ID,
     )
     _init_engine()
 

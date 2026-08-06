@@ -26,22 +26,25 @@ min_vram_mb = 2048
 [compute.env]
 cuda = { CUDA_VISIBLE_DEVICES = "{device_index}" }
 
+# ModelScope 实际仓库名为 Qwen3-TTS-12Hz-*（2026-08-05 经
+# https://modelscope.cn/api/v1/models/<repo_id> 逐一核实；
+# 旧 repo_id "Qwen/Qwen3-TTS-{1.7B,0.6B}" 均返回 record not found）。
 [[models]]
 id = "1.7b"
 name = "Qwen3-TTS 1.7B (高质量)"
 source = "modelscope"
-repo_id = "Qwen/Qwen3-TTS-1.7B"
+repo_id = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 target_dir = "qwen3-tts-1.7b"
-size_estimate_mb = 3500
+size_estimate_mb = 4500
 default = true
 
 [[models]]
 id = "0.6b"
 name = "Qwen3-TTS 0.6B (轻量)"
 source = "modelscope"
-repo_id = "Qwen/Qwen3-TTS-0.6B"
+repo_id = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 target_dir = "qwen3-tts-0.6b"
-size_estimate_mb = 1300
+size_estimate_mb = 2500
 
 [interface]
 type = "http"

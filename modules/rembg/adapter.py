@@ -23,9 +23,19 @@ from fastapi.responses import JSONResponse
 EP_HOST: str = os.getenv("EP_HOST", "127.0.0.1")
 EP_PORT: int = int(os.getenv("EP_PORT", "8900"))
 EP_WORKSPACE: str = os.getenv("EP_WORKSPACE", os.path.join(os.getcwd(), "workspace"))
-EP_MODEL_NAME: str = os.getenv("EP_MODEL_NAME", "u2net")
+# daemon 注入的模型键名是 EP_MODEL_ID（ep-core process.rs build_module_env，
+# 取激活变体 id，如 "u2net"）；旧实现读 EP_MODEL_NAME（daemon 从不注入该键），
+# 导致变体切换静默失效、恒用默认值。
+EP_MODEL_NAME: str = os.getenv("EP_MODEL_ID", os.getenv("EP_MODEL_NAME", "u2net"))
 EP_DEVICE_INDEX: str = os.getenv("EP_DEVICE_INDEX", "0")
 EP_LOG_LEVEL: str = os.getenv("EP_LOG_LEVEL", "INFO")
+
+# daemon 将模型下载到 EP_MODEL_DIR（models/<target_dir>/<model>.onnx）。
+# rembg 按 <model>.onnx 文件名在其模型主目录查找/下载；将该目录指向
+# EP_MODEL_DIR，使 daemon 预下载的模型被真正消费、变体切换端到端生效。
+EP_MODEL_DIR: str = os.getenv("EP_MODEL_DIR", "")
+if EP_MODEL_DIR:
+    os.environ.setdefault("U2NET_HOME", EP_MODEL_DIR)
 
 # ---------------------------------------------------------------------------
 # 日志
@@ -108,7 +118,8 @@ async def info():
         "model": _session_model,
         "ready": _ready,
         "capabilities": ["remove_bg"],
-        "backends": ["cuda", "cpu"],
+        # 与 module.toml [compute].backends 保持一致：rembg[cpu] 栈仅 CPU
+        "backends": ["cpu"],
     }
 
 

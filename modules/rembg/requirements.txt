@@ -3,3 +3,8 @@ uvicorn[standard]>=0.23.0
 python-multipart>=0.0.6
 rembg[cpu]>=2.0.50
 Pillow>=10.0.0
+# pymatting 1.1.14 声明 numba!=0.49.0（无下界），与 rembg>=2.0.77 的
+# numpy>=2.3 联合解析时 uv 会回溯到 numba==0.53.1（仅支持 py<3.10，
+# 在 py3.12 venv 中 llvmlite 源码构建必然失败）。
+# pymatting 1.1.15 起声明 numba>=0.60.0（有 cp312 wheel），显式保底。
+pymatting>=1.1.15

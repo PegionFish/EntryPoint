@@ -1,7 +1,19 @@
+# torch cu130 wheel 索引（RTX 5090 D / Blackwell sm_120 需 cu128+ 构建）。
+# 机制依据：config/constraints.txt 头部【wheel 索引提示】a) requirements 内联。
+--extra-index-url https://download.pytorch.org/whl/cu130
+
 fastapi>=0.100.0
 uvicorn[standard]>=0.23.0
 python-multipart>=0.0.6
+# Qwen3-TTS 官方推理库（模型卡指定 pip install -U qwen-tts），
+# 提供 Qwen3TTSModel.generate_custom_voice；其 pin transformers==4.57.3
+# 与下方 transformers>=4.40.0 相容收敛。
+qwen-tts>=0.1.1
 transformers>=4.40.0
-torch>=2.0.0
+# torch/torchaudio 与 config/constraints.txt 对齐：锁 2.11.0 使 uv 在 cu130
+# 索引命中同族 +cu130 Windows wheel（torchaudio C++ 扩展与 torch 硬配对，
+# 选型依据见 constraints.txt【torch 全家桶】）。qwen-tts 依赖 torchaudio。
+torch==2.11.0
+torchaudio==2.11.0
 soundfile>=0.12.0
 edge-tts>=6.1.0

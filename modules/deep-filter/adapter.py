@@ -26,7 +26,10 @@ from pydantic import BaseModel
 # ---------------------------------------------------------------------------
 EP_PORT = int(os.environ.get("EP_PORT", "8900"))
 EP_MODEL_DIR = os.environ.get("EP_MODEL_DIR", ".")
+# EP_DEVICE 形如 "cuda:0"/"cpu"（ep-core process.rs build_module_env）；
+# 设备序号单独走 EP_DEVICE_INDEX（CPU 设备时为空串）。
 EP_DEVICE = os.environ.get("EP_DEVICE", "0")
+EP_DEVICE_INDEX = os.environ.get("EP_DEVICE_INDEX", "")
 EP_BACKEND = os.environ.get("EP_BACKEND", "cpu")
 EP_WORKSPACE = os.environ.get("EP_WORKSPACE", "")
 EP_MODULE_ID = os.environ.get("EP_MODULE_ID", "deep-filter")
@@ -56,33 +59,71 @@ def _load_model() -> None:
         try:
             import torch
             if torch.cuda.is_available():
-                torch.cuda.set_device(int(EP_DEVICE))
-                log.info("CUDA 设备 %s 可用", EP_DEVICE)
+                # 旧实现 int(EP_DEVICE) 对 "cuda:0" 恒抛 ValueError → 静默回退 CPU。
+                # 设备序号改读 EP_DEVICE_INDEX（daemon 注入；缺省/空串按 0 处理）。
+                device_index = int(EP_DEVICE_INDEX or 0)
+                torch.cuda.set_device(device_index)
+                log.info(
+                    "CUDA 设备 %d (%s) 可用", device_index, torch.cuda.get_device_name()
+                )
             else:
                 log.warning("CUDA 不可用，回退到 CPU")
         except Exception as exc:
             log.warning("CUDA 初始化失败: %s，回退到 CPU", exc)
 
     try:
+        # deepfilterlib 0.5.6 的 df/io.py 硬导入 torchaudio.backend.common.AudioMetaData，
+        # 该路径在新版 torchaudio（≥2.6）已移除；注入同名 shim 模块后再导入 df，
+        # 避免 ModuleNotFoundError（adapter 自身 I/O 走 soundfile，shim 仅满足导入链）。
+        import sys as _sys
+        import types as _types
+        try:
+            from torchaudio.backend.common import AudioMetaData  # noqa: F401
+        except ImportError:
+            import torchaudio as _ta
+            _backend = _types.ModuleType("torchaudio.backend")
+            _common = _types.ModuleType("torchaudio.backend.common")
+            _common.AudioMetaData = getattr(_ta, "AudioMetaData", type(
+                "AudioMetaData", (), {}
+            ))
+            _backend.common = _common
+            _sys.modules.setdefault("torchaudio.backend", _backend)
+            _sys.modules["torchaudio.backend.common"] = _common
+
         from df.enhance import init_df
 
         model_path = None
         # 检查 EP_MODEL_DIR 下是否有解压后的模型
         model_dir = Path(EP_MODEL_DIR)
-        candidate = model_dir / "deep-filter-df3"
-        if candidate.is_dir():
-            # tar.gz 解压后可能带嵌套前缀（如 tmp/export/），定位到含 enc.onnx 的真实目录
-            if not (candidate / "enc.onnx").exists():
-                hits = sorted(candidate.rglob("enc.onnx"))
-                if hits:
-                    candidate = hits[0].parent
+
+        # daemon 布局：EP_MODEL_DIR 直指模型目录（ep-core build_module_env
+        # MODEL_DIR = models/<target_dir>，即 models/deep-filter-df3）。
+        # tar.gz 解压后可能带嵌套前缀（如 tmp/export/），rglob 定位到含
+        # enc.onnx 的真实目录。
+        if (model_dir / "enc.onnx").exists():
+            candidate = model_dir
+        else:
+            hits = sorted(model_dir.rglob("enc.onnx"))
+            candidate = hits[0].parent if hits else None
+
+        if candidate is None:
+            # 兼容旧布局：EP_MODEL_DIR 为 models 根，模型在 <root>/deep-filter-df3 子目录
+            legacy = model_dir / "deep-filter-df3"
+            if legacy.is_dir():
+                if (legacy / "enc.onnx").exists():
+                    candidate = legacy
+                else:
+                    hits = sorted(legacy.rglob("enc.onnx"))
+                    candidate = hits[0].parent if hits else None
+
+        if candidate is not None:
             # DeepFilterNet init_df 接受模型目录或 .tar.gz 路径
             model_path = str(candidate)
             log.info("使用本地模型目录: %s", model_path)
 
-        _model, _df_state, _sr = init_df(model_path)
+        _model, _df_state, _suffix = init_df(model_path)
         _backend_used = "deepfilternet"
-        log.info("DeepFilterNet 模型加载成功 (sr=%d)", _sr)
+        log.info("DeepFilterNet 模型加载成功 (model=%s)", _suffix)
         return
     except Exception as exc:
         log.warning("DeepFilterNet 加载失败: %s", exc)

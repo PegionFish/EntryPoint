@@ -17,14 +17,15 @@ requirements = "requirements.txt"
 entrypoint = "adapter.py"
 start_command = "{venv_python} {MODULE_DIR}/{entrypoint}"
 
+# 诚实声明：requirements.txt 安装 rembg[cpu]（onnxruntime CPU-only），
+# 实际推理只走 CPU。此前 backends 含 cuda 导致设备账本记 GPU、实际跑 CPU。
+# GPU 化途径（未来工作）见 modules/rembg/README.md：
+# rembg[gpu] + onnxruntime CUDAExecutionProvider。
 [compute]
-backends = ["cuda", "cpu"]
-default_backend = "cuda"
-vram_estimate_mb = 1024
-min_vram_mb = 512
-
-[compute.env]
-cuda = { CUDA_VISIBLE_DEVICES = "{device_index}" }
+backends = ["cpu"]
+default_backend = "cpu"
+vram_estimate_mb = 0
+min_vram_mb = 0
 
 [[models]]
 id = "u2net"

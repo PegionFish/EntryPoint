@@ -26,9 +26,21 @@ python adapter.py
 | `EP_HOST` | `127.0.0.1` | 监听地址 |
 | `EP_PORT` | `8900` | 监听端口 |
 | `EP_WORKSPACE` | `./workspace` | 输出目录 |
-| `EP_MODEL_NAME` | `u2net` | 默认模型 |
-| `EP_DEVICE_INDEX` | `0` | GPU 设备索引 |
+| `EP_MODEL_ID` | `u2net` | 默认模型变体（daemon 注入，对应 module.toml `[[models]].id`；兼容旧键 `EP_MODEL_NAME` 作回退） |
+| `EP_MODEL_DIR` | 空 | 模型目录（daemon 注入）；非空时映射为 rembg 的 `U2NET_HOME`，消费 daemon 预下载的 `<model>.onnx` |
+| `EP_DEVICE_INDEX` | `0` | 预留（当前 CPU-only 栈未使用） |
 | `EP_LOG_LEVEL` | `INFO` | 日志级别 |
+
+## 计算后端：当前仅 CPU（诚实声明）
+
+本模块依赖为 `rembg[cpu]`（onnxruntime CPU-only），module.toml `[compute].backends`
+声明为 `["cpu"]` —— 设备账本与实际执行一致。
+
+**GPU 化途径（未来工作）**：
+
+1. `requirements.txt` 改为 `rembg[gpu]`（安装 `onnxruntime-gpu`，需与本机 CUDA/cuDNN 版本匹配的 wheel）；
+2. onnxruntime 会话经 `CUDAExecutionProvider` 执行（rembg 在检测到 GPU 版 onnxruntime 时自动启用）；
+3. module.toml `[compute].backends` 恢复 `["cuda", "cpu"]` 并按需配置 `[compute.env].cuda`。
 
 ## API
 
