@@ -778,6 +778,33 @@ mod tests {
         assert!(body.0["error"].as_str().unwrap().contains("ghost"));
     }
 
+    // ── 5b. inputs 节点值非对象 → 400（handler 层 InputsNotObject 映射面，
+    //         execution 层直调已有覆盖，此处防路由接线漂移） ─────────────
+
+    #[tokio::test]
+    async fn test_execute_inputs_not_object_400() {
+        let root = unique_root("notobj");
+        let dir = root.join("config").join("pipelines");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("p.toml"),
+            "[pipeline]\nid = \"p-no\"\nname = \"NO\"\n\n[[nodes]]\nid = \"input\"\nkind = \"builtin\"\nbuiltin = \"file_input\"\n",
+        )
+        .unwrap();
+        let state = test_state(root);
+        let (status, body) = execute_pipeline(
+            State(state),
+            Json(exec_request(json!({
+                "pipeline_id": "p-no",
+                "inputs": { "input": "just-a-string" }
+            }))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let error = body.0["error"].as_str().unwrap();
+        assert!(error.contains("input"), "{error}");
+    }
+
     // ── 6. pipeline_id 命中 → 202 + 后台真实执行（纯 builtin 管线） ─────────
 
     #[tokio::test]
@@ -1015,7 +1042,10 @@ mode = {{ type = "string", default = "fast", enum = ["fast", "slow"] }}
             AppConfig::default(),
             vec![],
             vec![module],
-            PortManager::new(18000, 18010),
+            // 独立区间（避开生产默认 18000-19000）：本组测试断言"无服务
+            // 响应 /health → 504/任务 Failed"，与并发真实 daemon 的 adapter
+            // 端口区间重叠时探测可能误判就绪（环境性 flake）。
+            PortManager::new(48330, 48340),
         ))
     }
 

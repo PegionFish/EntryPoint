@@ -648,7 +648,10 @@ beam_size = {{ type = "integer", min = 1, max = 20 }}
             AppConfig::default(),
             vec![],
             vec![module],
-            PortManager::new(18000, 18020),
+            // 独立区间（避开生产默认 18000-19000）：本测试断言"无服务响应
+            // /health → 504"，若与并发真实 daemon 的 adapter 端口区间重叠，
+            // 探测可能命中真实 /health 返回 200，误判模块就绪（环境性 flake）。
+            PortManager::new(48300, 48320),
         ))
     }
 
