@@ -475,16 +475,31 @@ impl ModelManager {
                         local_dir_str
                     )
                 } else if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
-                    // 下载 .tar.gz 并解压到目标目录
+                    // 下载 .tar.gz 并解压到目标目录；随后展平包装目录：
+                    // 若解压结果只含单个顶层目录（如 df3 的 tmp/export/ 嵌套
+                    // 打包），逐层上提内容，使模型文件直接落在 target_dir 下。
+                    // 多行代码（python -c 参数支持换行）：展平循环需要 def/while。
                     format!(
-                        "import urllib.request, tarfile, os, sys; \
-                         os.makedirs('{dir}', exist_ok=True); \
-                         tmp = os.path.join('{dir}', '_download.tar.gz'); \
-                         print('Downloading {url} ...'); \
-                         urllib.request.urlretrieve('{url}', tmp); \
-                         print('Extracting...'); \
-                         t = tarfile.open(tmp); t.extractall('{dir}'); t.close(); \
-                         os.remove(tmp); \
+                        "import urllib.request, tarfile, os, shutil\n\
+                         os.makedirs('{dir}', exist_ok=True)\n\
+                         tmp = os.path.join('{dir}', '_download.tar.gz')\n\
+                         print('Downloading {url} ...')\n\
+                         urllib.request.urlretrieve('{url}', tmp)\n\
+                         print('Extracting...')\n\
+                         t = tarfile.open(tmp); t.extractall('{dir}'); t.close()\n\
+                         os.remove(tmp)\n\
+                         def _ep_flatten(d):\n\
+                         \x20   while True:\n\
+                         \x20       entries = [e for e in os.listdir(d) if not e.startswith('.') and e != '_download.tar.gz']\n\
+                         \x20       if len(entries) != 1:\n\
+                         \x20           break\n\
+                         \x20       inner = os.path.join(d, entries[0])\n\
+                         \x20       if not os.path.isdir(inner):\n\
+                         \x20           break\n\
+                         \x20       for name in os.listdir(inner):\n\
+                         \x20           shutil.move(os.path.join(inner, name), os.path.join(d, name))\n\
+                         \x20       os.rmdir(inner)\n\
+                         _ep_flatten('{dir}')\n\
                          print('Done.')",
                         dir = local_dir_str,
                         url = url
@@ -2171,6 +2186,21 @@ mod tests {
         assert!(code.contains(&format!("urlretrieve('{url}'")), "code: {code}");
         assert!(code.contains("extractall("), "must extract the archive: {code}");
         assert!(code.contains("os.remove(tmp)"), "must clean up the temp archive: {code}");
+        
+        // 解压后必须展平包装目录（如 df3 的 tmp/export/ 嵌套），
+        // 使模型文件直接落在 target_dir 下，adapter 无需再 rglob 兼容
+        assert!(
+            code.contains("def _ep_flatten(d):"),
+            "must flatten wrapper dirs: {code}"
+        );
+        assert!(
+            code.contains("shutil.move("),
+            "flatten must hoist contents: {code}"
+        );
+        assert!(
+            code.contains("_ep_flatten('G:/EntryPoint/models/url-model')"),
+            "flatten must target the model dir: {code}"
+        );
 
         // .tgz 同走解压分支
         let (_program, args) = mgr.build_download_command(
