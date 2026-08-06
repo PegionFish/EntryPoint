@@ -12,6 +12,11 @@ node_modules/
 *.swp
 *.swo
 .qwen/
+.qoder/
+
+# 会话/导出产物（不入仓库）
+HF
+qwen-code-export-*.md
 
 # 会话交接记录（不入仓库）
 session-*.md
@@ -39,3 +44,4 @@ config/gpu_assignments.toml
 
 # Python 缓存
 __pycache__/
+*.pyc
