@@ -308,6 +308,35 @@ pub fn check_torch_cuda(
     }
 }
 
+/// 判断 requirements.txt 是否声明了 `torch` 依赖
+///
+/// 仅当某需求行的包名为 `torch`（忽略大小写，PEP 503 名称归一前缀）时计为声明；
+/// `torchaudio` / `torchvision` 等衍生包不算。跳过注释、空行与 `-` 开头的
+/// 选项行（`-r` / `--index-url` 等）。文件缺失/不可读 → `false`。
+///
+/// 供 `/api/deps` 过滤 torch_cuda 项：未声明 torch 的模块（如 ctranslate2 /
+/// onnxruntime 栈）不应输出 "torch is not installed" 误导提示（任务 #10）。
+pub fn requirements_declare_torch(requirements: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(requirements) else {
+        return false;
+    };
+    for raw in content.lines() {
+        // 行内注释（PEP 508：空白 + # 之后为注释）先截断
+        let line = raw.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() || line.starts_with('-') {
+            continue;
+        }
+        // 包名 = 行首标识符段（止于版本约束符 / extras / 空白等首个非法字符）
+        let name_end = line
+            .find(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '-' | '_' | '.'))
+            .unwrap_or(line.len());
+        if line[..name_end].eq_ignore_ascii_case("torch") {
+            return true;
+        }
+    }
+    false
+}
+
 /// 扫描所有模块 venv，生成完整依赖报告
 ///
 /// torch 检测注入默认共享 CUDA 库目录（`runtime/cuda-libs`，§3.1），
@@ -473,5 +502,66 @@ mod tests {
         let report = DepReport::check_all(&root);
         // ffmpeg 可能通过系统 PATH 找到，但 torch_cuda 应为空（无 venvs 目录）
         assert!(report.torch_cuda.is_empty());
+    }
+
+    // ── requirements_declare_torch（任务 #10：非 torch 模块不输出 torch_cuda 项）──
+
+    fn write_reqs(content: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "ep_deps_torch_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let req = dir.join("requirements.txt");
+        std::fs::write(&req, content).unwrap();
+        (dir, req)
+    }
+
+    #[test]
+    fn test_requirements_declare_torch_positive_forms() {
+        for content in [
+            "torch==2.11.0\n",
+            "torch>=2.0\n",
+            "TORCH\n",
+            "torch[cu121]==2.1.0\n",
+            "  torch == 2.1.0  # pinned\n",
+            "# comment\n\n-r base.txt\ntorch\n",
+            "torch @ https://example.invalid/torch.whl\n",
+        ] {
+            let (dir, req) = write_reqs(content);
+            assert!(
+                requirements_declare_torch(&req),
+                "应识别 torch 声明: {content:?}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn test_requirements_declare_torch_negative_forms() {
+        for content in [
+            "torchaudio==2.11.0\n",
+            "torchvision\n",
+            "ctranslate2>=4.0\n",
+            "onnxruntime\n",
+            "# torch 仅出现在注释中\n",
+            "",
+            "-r other.txt\n",
+        ] {
+            let (dir, req) = write_reqs(content);
+            assert!(
+                !requirements_declare_torch(&req),
+                "不应误报 torch 声明: {content:?}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        // 文件不存在 → false
+        assert!(!requirements_declare_torch(Path::new(
+            "/nonexistent/requirements.txt"
+        )));
     }
 }
