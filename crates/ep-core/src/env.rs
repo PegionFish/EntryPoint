@@ -84,26 +84,54 @@ impl EnvManager {
     pub fn new(root: &Path, config: &PythonConfig) -> Self {
         // 先检测 uv，detect_python 需要借助 uv python find 查找兼容版本
         let uv_path = if !config.uv_path.is_empty() {
-            let p = PathBuf::from(&config.uv_path);
-            if p.exists() {
-                debug!(path = %p.display(), "using configured uv path");
-                Some(p)
+            if Self::is_bare_command_name(&config.uv_path) {
+                // 裸命令名（如 "uv"）：走 PATH 解析，而非文件存在性检查
+                match Self::which(&config.uv_path) {
+                    Some(resolved) => {
+                        debug!(path = %resolved.display(), "resolved configured uv command via PATH");
+                        Some(resolved)
+                    }
+                    None => {
+                        warn!(cmd = %config.uv_path, "configured uv command not found in PATH, falling back to detection");
+                        Self::detect_uv()
+                    }
+                }
             } else {
-                warn!(path = %p.display(), "configured uv path does not exist, falling back to detection");
-                Self::detect_uv()
+                let p = PathBuf::from(&config.uv_path);
+                if p.exists() {
+                    debug!(path = %p.display(), "using configured uv path");
+                    Some(p)
+                } else {
+                    warn!(path = %p.display(), "configured uv path does not exist, falling back to detection");
+                    Self::detect_uv()
+                }
             }
         } else {
             Self::detect_uv()
         };
 
         let python_path = if !config.path.is_empty() {
-            let p = PathBuf::from(&config.path);
-            if p.exists() {
-                debug!(path = %p.display(), "using configured python path");
-                Some(p)
+            if Self::is_bare_command_name(&config.path) {
+                // 裸命令名（如 "python"）：走 PATH 解析，而非文件存在性检查
+                match Self::which(&config.path) {
+                    Some(resolved) => {
+                        debug!(path = %resolved.display(), "resolved configured python command via PATH");
+                        Some(resolved)
+                    }
+                    None => {
+                        warn!(cmd = %config.path, "configured python command not found in PATH, falling back to detection");
+                        Self::detect_python(uv_path.as_deref())
+                    }
+                }
             } else {
-                warn!(path = %p.display(), "configured python path does not exist, falling back to detection");
-                Self::detect_python(uv_path.as_deref())
+                let p = PathBuf::from(&config.path);
+                if p.exists() {
+                    debug!(path = %p.display(), "using configured python path");
+                    Some(p)
+                } else {
+                    warn!(path = %p.display(), "configured python path does not exist, falling back to detection");
+                    Self::detect_python(uv_path.as_deref())
+                }
             }
         } else {
             Self::detect_python(uv_path.as_deref())
@@ -226,6 +254,14 @@ impl EnvManager {
             }
         }
         None
+    }
+
+    /// 判断配置值是否为裸命令名（如 `uv` / `python`，不含路径分隔符）。
+    ///
+    /// 裸命令名必须走 PATH 解析；直接 `Path::exists()` 会按相对当前目录语义
+    /// 恒判不存在，误触发 "does not exist, falling back" 告警。
+    fn is_bare_command_name(s: &str) -> bool {
+        !s.contains('/') && !s.contains('\\')
     }
 
     /// 简易 which：在 PATH 环境变量中查找可执行文件
@@ -727,6 +763,40 @@ pub fn run_command_with_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_bare_command_name_classification() {
+        assert!(EnvManager::is_bare_command_name("uv"));
+        assert!(EnvManager::is_bare_command_name("python"));
+        assert!(!EnvManager::is_bare_command_name("C:\\uv\\uv.exe"));
+        assert!(!EnvManager::is_bare_command_name("/usr/bin/uv"));
+        assert!(!EnvManager::is_bare_command_name("tools/uv"));
+    }
+
+    #[test]
+    fn new_with_bare_command_names_resolves_via_path() {
+        // 本机 PATH 同时含 python 与 uv（安装前置条件）；
+        // 裸命令名配置不得触发 exists() 回退，而应解析为 PATH 中的真实可执行文件。
+        if EnvManager::which("python").is_none() || EnvManager::which("uv").is_none() {
+            return;
+        }
+        let config = PythonConfig {
+            path: "python".to_string(),
+            uv_path: "uv".to_string(),
+            ..Default::default()
+        };
+        let mgr = EnvManager::new(Path::new("/fake/root"), &config);
+        let uv = mgr.uv_path().expect("uv should resolve via PATH");
+        assert!(
+            uv.to_string_lossy().to_lowercase().contains("uv"),
+            "resolved uv path unexpected: {}",
+            uv.display()
+        );
+        assert!(
+            mgr.python_path().is_some(),
+            "python should resolve via PATH for bare command name"
+        );
+    }
 
     #[test]
     fn venv_python_path_windows_style() {
