@@ -230,7 +230,16 @@ async fn list_task_artifacts(
     };
     let mut out = Vec::new();
     for node_id in &record.node_order {
-        let Some(path) = record.artifacts.get(node_id) else {
+        // 优先归集副本（served_artifacts，finalize 后恒在 files/{node_id}/ 下），
+        // 回退原始产物路径：任务终结后 workspace 清理会删除原始文件
+        // （keep_workspace=false），旧实现只读 record.artifacts → metadata 失败
+        // 全被跳过 → 返回空数组（任务 #10：与任务记录 json 不一致的根因）。
+        let Some(path) = record
+            .served_artifacts
+            .get(node_id)
+            .filter(|p| p.is_file())
+            .or_else(|| record.artifacts.get(node_id))
+        else {
             continue;
         };
         let Ok(meta) = std::fs::metadata(path) else {
@@ -641,7 +650,52 @@ params = { path = "/nonexistent/missing-art.txt" }
         assert!(body.0["error"].as_str().unwrap().contains("任务不存在"));
     }
 
-    // ── 6. 下载重定向：302 + Location；未知任务/节点/产物 → 404 ─────────────
+    // ── 5b. 回归（任务 #10）：原始产物文件被清理后，列表仍返回真实产物 ──────
+    //     （旧实现只读 record.artifacts 原始路径 → metadata 失败 → 空数组；
+    //      修复后优先读 served_artifacts 归集副本）
+
+    #[tokio::test]
+    async fn test_artifacts_list_survives_original_cleanup() {
+        let _guard = lock_for_tests();
+        execution::clear_registry_for_tests();
+
+        let root = unique_root("arts-served");
+        let state = test_state(root.clone());
+        let src = root.join("served-in.txt");
+        let dest = root.join("served-out.txt");
+        std::fs::write(&src, "served-body").unwrap();
+        let task_id = run_copy_task(&state, "served-pipe", &src, &dest).await;
+
+        // 前置：任务记录中两类产物路径均已登记
+        let record = execution::snapshot(&task_id).expect("任务应存在");
+        assert!(!record.artifacts.is_empty(), "原始产物应有登记");
+        assert!(!record.served_artifacts.is_empty(), "归集副本应有登记");
+        drop(record);
+
+        // 模拟 workspace 清理：删除原始产物文件，保留 files/{node_id}/ 归集副本
+        let record = execution::snapshot(&task_id).unwrap();
+        for path in record.artifacts.values() {
+            let _ = std::fs::remove_file(path);
+        }
+
+        let (status, body) =
+            list_task_artifacts(State(state.clone()), Path(task_id.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        let arr = body.0.as_array().unwrap();
+        assert_eq!(
+            arr.len(),
+            2,
+            "原始文件被清理后仍应从归集副本读出完整列表"
+        );
+        let names: Vec<&str> = arr.iter().map(|a| a["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"served-in.txt"));
+        assert!(names.contains(&"served-out.txt"));
+        for artifact in arr {
+            assert!(artifact["size"].as_u64().unwrap() > 0);
+        }
+    }
+
+    // ── 6. 下载重定向：302 + Location；未知任务/节点/产物 → 404 ───────────
 
     #[tokio::test]
     async fn test_artifact_download_redirect_and_404s() {
