@@ -10,14 +10,13 @@
 //! 主动轮询 `monitor_process` 直到 Running/Error/超时，而不依赖
 //! main.rs 的后台监控循环（其轮询节奏对提交路径太慢）。
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
 use ep_core::module::manifest::ModuleManifest;
-use ep_core::types::{DeviceId, ServiceStatus};
+use ep_core::types::ServiceStatus;
 
 use crate::state::AppState;
 
@@ -155,7 +154,7 @@ pub async fn ensure_module_running_with_timeout(
     };
 
     if needs_start {
-        start_via_existing_path(state, module_id, &manifest, &module.path).await?;
+        start_via_existing_path(state, module_id, &manifest).await?;
     }
 
     // 3. 轮询等待健康（失败时清理已拉起的进程与端口）
@@ -175,7 +174,6 @@ async fn start_via_existing_path(
     state: &Arc<AppState>,
     module_id: &str,
     manifest: &ModuleManifest,
-    module_path: &std::path::Path,
 ) -> Result<(), AutoStartError> {
     // 1. 模型前置检查（与手动启动端点同语义：default/首个模型缺失 → 拒绝）
     if !manifest.models.is_empty() {
@@ -221,8 +219,11 @@ async fn start_via_existing_path(
     //    核心统一分配，语义见 [`super::select_module_device`]（无兼容设备时 Cpu 兜底）
     let device = super::select_module_device(state, manifest).await;
 
-    // 5. 构建环境变量（与 modules.rs::start_module 同款集合）
-    let env_vars = build_env_vars(state, manifest, module_path, port, &device);
+    // 5. 构建环境变量（缺陷 #4 残余修复）：与手动启动（modules.rs）同走
+    //    [`super::module_start_env_vars`] 统一委托 ep-core build_module_env，
+    //    注入 MODELS_ROOT（装配为 EP_MODELS_ROOT）等全量键，不再手写漂移。
+    let env_vars =
+        super::module_start_env_vars(state, module_id, manifest, &device, port).await;
 
     info!(module_id, %port, %device, "autostart: starting module");
 
@@ -244,45 +245,6 @@ async fn start_via_existing_path(
         }
     }
     Ok(())
-}
-
-/// 模块启动环境变量（与 api/modules.rs 保持一致：ROOT/MODULE_DIR/MODEL_DIR/
-/// PORT/DEVICE/BACKEND/DEVICE_INDEX/WORKSPACE）
-fn build_env_vars(
-    state: &AppState,
-    manifest: &ModuleManifest,
-    module_path: &std::path::Path,
-    port: u16,
-    device: &DeviceId,
-) -> HashMap<String, String> {
-    let root = &state.root;
-    let model_dir = if let Some(model) = manifest.models.iter().find(|m| m.default) {
-        root.join("models").join(&model.target_dir)
-    } else if let Some(model) = manifest.models.first() {
-        root.join("models").join(&model.target_dir)
-    } else {
-        module_path.to_path_buf()
-    };
-
-    let mut vars = HashMap::new();
-    vars.insert("ROOT".to_string(), root.to_string_lossy().to_string());
-    vars.insert(
-        "MODULE_DIR".to_string(),
-        module_path.to_string_lossy().to_string(),
-    );
-    vars.insert("MODEL_DIR".to_string(), model_dir.to_string_lossy().to_string());
-    vars.insert("PORT".to_string(), port.to_string());
-    vars.insert("DEVICE".to_string(), device.to_string());
-    vars.insert("BACKEND".to_string(), device.backend().to_string());
-    vars.insert(
-        "DEVICE_INDEX".to_string(),
-        device.index().map(|i| i.to_string()).unwrap_or_default(),
-    );
-    vars.insert(
-        "WORKSPACE".to_string(),
-        root.join("workspace").to_string_lossy().to_string(),
-    );
-    vars
 }
 
 // ─── 健康等待 ────────────────────────────────────────────────────────────────

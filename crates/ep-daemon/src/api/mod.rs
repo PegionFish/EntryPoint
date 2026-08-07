@@ -99,6 +99,34 @@ pub(crate) async fn select_module_device(
     .unwrap_or(ep_core::types::DeviceId::Cpu)
 }
 
+/// 模块启动环境变量统一构建（缺陷 #4 残余修复）：手动启动（modules.rs）与
+/// 自动拉起（autostart.rs）两条路径共用 ep-core 公共构建函数
+/// [`ep_core::process::build_module_env`]（与 daemon 独立模式 `--run-module`、
+/// 桌面端同一入口），消除旧手写 env 的三处漂移：
+/// - 缺 `MODELS_ROOT`（装配为 `EP_MODELS_ROOT`，指向模型缓存根目录）——
+///   params.model 覆盖为非激活变体时 adapter 据此解析变体子目录的本地权重；
+/// - 缺 `HOST`（EP_HOST 回环绑定，防火墙根治）/ `MODULE_ID` / `LOG_LEVEL`；
+/// - MODEL_DIR 变体选择与 cache_dir 解析口径不一（autostart 旧版死取
+///   default/首个且硬编码 root/models）。
+///
+/// 唯一追加项是调用方已分配的 `PORT`（build_module_env 不感知端口；
+/// [`ep_core::process::ProcessManager::start_module`] 统一加一次 `EP_`
+/// 前缀装配为 `EP_PORT`，占位符 `{port}` 亦由其内置注入）。
+pub(crate) async fn module_start_env_vars(
+    state: &AppState,
+    module_id: &str,
+    manifest: &ep_core::module::manifest::ModuleManifest,
+    device: &ep_core::types::DeviceId,
+    port: u16,
+) -> std::collections::HashMap<String, String> {
+    let mut vars = {
+        let config = state.config.read().await;
+        ep_core::process::build_module_env(&state.root, &config, module_id, manifest, device)
+    };
+    vars.insert("PORT".to_string(), port.to_string());
+    vars
+}
+
 /// 模块 venv python 解释器路径（双平台口径与 ep-core [`ep_core::env::EnvManager::venv_python_path`]
 /// 一致：Windows `runtime/venvs/<id>/Scripts/python.exe`、其他平台 `bin/python`）
 pub(crate) fn module_venv_python_path(
@@ -487,6 +515,138 @@ type = "http"
             .await
             .expect_err("半壳 venv 必须触发准备并失败");
         assert!(!err.is_empty(), "失败必须携带技术细节");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── 缺陷 #4 残余：module_start_env_vars（手动启动/自动拉起两路共用） ────
+
+    /// 双变体清单 fixture（仿 rembg：default 变体 + 非激活变体）
+    fn models_manifest() -> ep_core::module::manifest::ModuleManifest {
+        toml::from_str(
+            r#"
+[module]
+id = "demo-mod"
+name = "t"
+version = "0.1.0"
+description = "t"
+category = "image"
+genre = "test"
+
+[runtime]
+type = "native"
+binaries = { "x" = "x" }
+
+[compute]
+backends = ["cpu"]
+
+[[models]]
+id = "small"
+name = "Demo small"
+source = "url"
+url = "https://example.com/small.bin"
+target_dir = "demo-small"
+default = true
+
+[[models]]
+id = "large"
+name = "Demo large"
+source = "url"
+url = "https://example.com/large.bin"
+target_dir = "demo-large"
+
+[interface]
+type = "http"
+"#,
+        )
+        .unwrap()
+    }
+
+    fn state_with_config(
+        root: std::path::PathBuf,
+        config: ep_core::config::AppConfig,
+    ) -> Arc<AppState> {
+        Arc::new(AppState::new(
+            root,
+            config,
+            vec![],
+            vec![],
+            ep_core::port::PortManager::new(18000, 19000),
+        ))
+    }
+
+    // 缺陷 #4 残余断言：两条启动路径（modules.rs 手动 / autostart.rs 自动）
+    // 共用的 env 构建必须包含 MODELS_ROOT（start_module 装配为 EP_MODELS_ROOT），
+    // 指向模型缓存根目录（不含变体子目录），PORT 追加不丢失。
+    #[tokio::test]
+    async fn module_start_env_injects_models_root_and_port() {
+        use ep_core::types::DeviceId;
+        let root = unique_venv_root("env-default");
+        let state = state_at(root.clone());
+        let mf = models_manifest();
+
+        let vars = module_start_env_vars(&state, "demo-mod", &mf, &DeviceId::Cpu, 18901).await;
+
+        // MODELS_ROOT = 默认模型缓存根 root/models（缺陷 #4：adapter 据此解析变体子目录）
+        let expected_root = root.join("models").to_string_lossy().to_string();
+        assert_eq!(vars.get("MODELS_ROOT").map(String::as_str), Some(expected_root.as_str()));
+        // MODEL_DIR = 激活（default）变体目录，与 MODELS_ROOT 语义分离
+        let expected_dir = root
+            .join("models")
+            .join("demo-small")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(vars.get("MODEL_DIR").map(String::as_str), Some(expected_dir.as_str()));
+        // 调用方端口追加（装配为 EP_PORT）
+        assert_eq!(vars.get("PORT").map(String::as_str), Some("18901"));
+        // 旧手写 env 同时缺失的键一并补齐
+        assert_eq!(vars.get("MODULE_ID").map(String::as_str), Some("demo-mod"));
+        assert_eq!(vars.get("HOST").map(String::as_str), Some("127.0.0.1"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // MODELS_ROOT 跟随 config.models.cache_dir（相对/绝对）与激活变体选择，
+    // 与 ep-core build_module_env 单一真源口径一致（原 active_model_dir 矩阵迁移于此）。
+    #[tokio::test]
+    async fn module_start_env_models_root_follows_cache_dir_and_active_variant() {
+        use ep_core::types::DeviceId;
+        let root = unique_venv_root("env-cache");
+
+        // 自定义相对 cache_dir + active_models 指定非 default 变体
+        let mut config = ep_core::config::AppConfig::default();
+        config.models.cache_dir = "custom-models".into();
+        config.active_models.insert("demo-mod".into(), "large".into());
+        let state = state_with_config(root.clone(), config);
+        let mf = models_manifest();
+
+        let vars = module_start_env_vars(&state, "demo-mod", &mf, &DeviceId::Cpu, 18902).await;
+        let expected_root = root.join("custom-models").to_string_lossy().to_string();
+        assert_eq!(vars.get("MODELS_ROOT").map(String::as_str), Some(expected_root.as_str()));
+        let expected_dir = root
+            .join("custom-models")
+            .join("demo-large")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(vars.get("MODEL_DIR").map(String::as_str), Some(expected_dir.as_str()));
+        assert_eq!(vars.get("MODEL_ID").map(String::as_str), Some("large"));
+
+        // 陈旧 active_models（manifest 无此变体）→ 回退 default 变体，MODELS_ROOT 不受影响
+        let mut stale = ep_core::config::AppConfig::default();
+        stale.active_models.insert("demo-mod".into(), "no-such".into());
+        let state2 = state_with_config(root.clone(), stale);
+        let default_root = root.join("models").to_string_lossy().to_string();
+        let vars2 = module_start_env_vars(&state2, "demo-mod", &mf, &DeviceId::Cpu, 18903).await;
+        assert_eq!(vars2.get("MODELS_ROOT").map(String::as_str), Some(default_root.as_str()));
+        let fallback_dir = root.join("models").join("demo-small").to_string_lossy().to_string();
+        assert_eq!(vars2.get("MODEL_DIR").map(String::as_str), Some(fallback_dir.as_str()));
+
+        // 无模型模块 → 仍有 MODELS_ROOT，MODEL_DIR 回退模块目录
+        let mut no_models = models_manifest();
+        no_models.models.clear();
+        let vars3 = module_start_env_vars(&state2, "demo-mod", &no_models, &DeviceId::Cpu, 18904).await;
+        assert_eq!(vars3.get("MODELS_ROOT").map(String::as_str), Some(default_root.as_str()));
+        let module_dir = root.join("modules").join("demo-mod").to_string_lossy().to_string();
+        assert_eq!(vars3.get("MODEL_DIR").map(String::as_str), Some(module_dir.as_str()));
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

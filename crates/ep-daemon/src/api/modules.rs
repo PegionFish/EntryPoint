@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
@@ -71,22 +69,6 @@ fn active_model_decl<'a>(
 ) -> Option<&'a ModelDecl> {
     active_model_for(config, manifest)
         .and_then(|id| manifest.models.iter().find(|m| m.id == id))
-}
-
-/// 解析激活变体的 MODEL_DIR（P2-9：走 `config.models.cache_dir`，不硬编码 root/models）。
-///
-/// 相对 cache_dir 基于 root 解析、绝对路径原样使用（[`AppConfig::resolve_model_cache_dir`]）；
-/// 未声明任何模型的模块（native 服务等）回退模块目录。
-fn active_model_dir(
-    config: &AppConfig,
-    manifest: &ModuleManifest,
-    root: &std::path::Path,
-    module_dir: &std::path::Path,
-) -> PathBuf {
-    match active_model_decl(config, manifest) {
-        Some(model) => config.resolve_model_cache_dir(root).join(&model.target_dir),
-        None => module_dir.to_path_buf(),
-    }
 }
 
 /// 服务状态 → 规范小写串（供 list_modules / module_status 共用）
@@ -306,35 +288,11 @@ pub async fn start_module(
     //    语义见 [`super::select_module_device`]（无兼容设备时 Cpu 兜底）
     let device = super::select_module_device(&state, &manifest).await;
 
-    // 6. 构建环境变量（MODEL_DIR 经激活变体 + config.models.cache_dir 解析，P2-9）
-    let env_vars = {
-        let root = &state.root;
-        let module_dir = &module.path;
-        let (model_dir, active_model_id) = {
-            let config = state.config.read().await;
-            let dir = active_model_dir(&config, &manifest, root, module_dir);
-            let active_id = active_model_decl(&config, &manifest).map(|m| m.id.clone());
-            (dir, active_id)
-        };
-
-        let mut vars = HashMap::new();
-        vars.insert("ROOT".to_string(), root.to_string_lossy().to_string());
-        vars.insert("MODULE_DIR".to_string(), module_dir.to_string_lossy().to_string());
-        vars.insert("MODEL_DIR".to_string(), model_dir.to_string_lossy().to_string());
-        // 激活变体 id 透传子进程（与 ep_core::process::build_module_env 的 MODEL_ID 对齐）
-        if let Some(model_id) = active_model_id {
-            vars.insert("MODEL_ID".to_string(), model_id);
-        }
-        vars.insert("PORT".to_string(), port.to_string());
-        vars.insert("DEVICE".to_string(), device.to_string());
-        vars.insert("BACKEND".to_string(), device.backend().to_string());
-        vars.insert(
-            "DEVICE_INDEX".to_string(),
-            device.index().map(|i| i.to_string()).unwrap_or_default(),
-        );
-        vars.insert("WORKSPACE".to_string(), root.join("workspace").to_string_lossy().to_string());
-        vars
-    };
+    // 6. 构建环境变量（缺陷 #4 残余修复）：统一委托 ep-core 公共构建函数
+    //    （手动启动/自动拉起/独立模式/桌面端同一真源），注入 MODELS_ROOT
+    //    （装配为 EP_MODELS_ROOT，adapter 在 params.model 覆盖非激活变体时
+    //    据此解析变体子目录本地权重），消除旧手写 env 的键集漂移。
+    let env_vars = super::module_start_env_vars(&state, &id, &manifest, &device, port).await;
 
     info!(module_id = %id, %port, %device, "starting module");
 
@@ -658,6 +616,8 @@ pub async fn set_model_variant(
 mod tests {
     use super::*;
     use ep_core::types::DeviceId;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -1224,70 +1184,9 @@ type = "http"
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // P2-9：MODEL_DIR 解析矩阵（active 变体选择 × cache_dir × 回退）
-    #[test]
-    fn active_model_dir_matrix() {
-        let manifest = fixture_manifest(None);
-        let root = PathBuf::from(if cfg!(windows) {
-            "C:\\ep-root"
-        } else {
-            "/ep-root"
-        });
-        let module_dir = root.join("modules").join("demo-asr");
-
-        // 默认配置 → default 变体 small + 默认 cache_dir（models/）
-        let cfg = AppConfig::default();
-        assert_eq!(
-            active_model_dir(&cfg, &manifest, &root, &module_dir),
-            root.join("models").join("demo-small")
-        );
-
-        // active_models 指定 large（单槽位 §5.2 优先于 default）
-        let mut cfg2 = AppConfig::default();
-        cfg2.active_models.insert("demo-asr".into(), "large".into());
-        assert_eq!(
-            active_model_dir(&cfg2, &manifest, &root, &module_dir),
-            root.join("models").join("demo-large")
-        );
-
-        // 陈旧 active_models（manifest 无此变体）→ 回退 default 变体
-        let mut cfg3 = AppConfig::default();
-        cfg3.active_models
-            .insert("demo-asr".into(), "no-such-variant".into());
-        assert_eq!(
-            active_model_dir(&cfg3, &manifest, &root, &module_dir),
-            root.join("models").join("demo-small")
-        );
-
-        // 自定义相对 cache_dir（P2-9：不再硬编码 root/models）
-        let mut cfg4 = AppConfig::default();
-        cfg4.models.cache_dir = "custom-models".into();
-        assert_eq!(
-            active_model_dir(&cfg4, &manifest, &root, &module_dir),
-            root.join("custom-models").join("demo-small")
-        );
-
-        // 绝对 cache_dir 原样使用
-        let abs = PathBuf::from(if cfg!(windows) {
-            "C:\\ep-models"
-        } else {
-            "/srv/ep-models"
-        });
-        let mut cfg5 = AppConfig::default();
-        cfg5.models.cache_dir = abs.to_string_lossy().to_string();
-        assert_eq!(
-            active_model_dir(&cfg5, &manifest, &root, &module_dir),
-            abs.join("demo-small")
-        );
-
-        // 无模型模块 → 回退模块目录
-        let mut no_models = fixture_manifest(None);
-        no_models.models.clear();
-        assert_eq!(
-            active_model_dir(&cfg, &no_models, &root, &module_dir),
-            module_dir
-        );
-    }
+    // P2-9 的 MODEL_DIR 解析矩阵（active 变体选择 × cache_dir × 回退）已随
+    // 缺陷 #4 残余修复迁移至 api/mod.rs 的 module_start_env_vars 测试
+    // （启动路径 env 统一委托 ep-core build_module_env）。
 
     // ─── GAP-2：handler 错误路径与状态机边界补测 ──────────────────────
 
