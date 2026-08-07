@@ -88,6 +88,7 @@ modules/<module-id>/
 | `{ROOT}` | 应用根目录绝对路径 | `/opt/EntryPoint` |
 | `{MODULE_DIR}` | 模块目录绝对路径 | `.../modules/faster-whisper` |
 | `{MODEL_DIR}` | 当前选中模型的目录 | `.../models/faster-whisper-large-v3` |
+| `{models_root}` | 模型缓存根目录（含所有变体子目录，与激活变体无关） | `.../models` |
 | `{WORKSPACE}` | 任务工作区目录 | `.../workspace` |
 | `{port}` | 分配的端口号 | `18001` |
 | `{device}` | 计算设备标识 | `cuda:0` / `cpu` / `npu:0` |
@@ -354,7 +355,8 @@ requirements_by_backend = { cuda = "requirements-cuda.txt", rocm = "requirements
 | `EP_ROOT` | 应用根目录 | `G:\AI_Applications\EntryPoint` |
 | `EP_MODULE_DIR` | 模块目录 | `...\modules\faster-whisper` |
 | `EP_MODULE_ID` | 模块 ID | `faster-whisper` |
-| `EP_MODEL_DIR` | 当前模型目录 | `D:\AI_Models\faster-whisper-large-v3` |
+| `EP_MODEL_DIR` | 当前（激活变体）模型目录 | `D:\AI_Models\faster-whisper-large-v3` |
+| `EP_MODELS_ROOT` | 模型缓存根目录（含所有变体子目录，供 `params.model` 变体覆盖解析，见 ADAPTER_API.md §1.3） | `D:\AI_Models` |
 | `EP_MODEL_ID` | 当前模型 ID | `large-v3` |
 | `EP_PORT` | 分配端口 | `18001` |
 | `EP_DEVICE` | 设备标识 | `cuda:0` / `cpu` / `npu:0` |
@@ -477,7 +479,9 @@ if output_format == "srt" and output_path:
 
 - 同一模块声明多个 `[[models]]` 时，用户在 UI 中选择使用哪个
 - 切换模型需重启模块进程（模型加载到内存/显存）
-- `EP_MODEL_DIR` 和 `EP_MODEL_ID` 随选择变化
+- `EP_MODEL_DIR` 和 `EP_MODEL_ID` 随选择变化；`EP_MODELS_ROOT` 恒指模型缓存根目录，
+  供 adapter 在 `params.model` 临时覆盖时解析非激活变体的本地权重（无需重启，
+  参照实现：rembg adapter；契约见 ADAPTER_API.md §1.3）
 
 ### 6.6 已知限制
 

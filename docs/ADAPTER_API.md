@@ -26,6 +26,27 @@ EntryPoint 核心仅通过此标准接口与模块通信，不感知底层框架
 | 字符编码 | UTF-8 |
 | 超时 | 由调用方控制（管线引擎设置 per-node 超时） |
 
+### 1.3 模型环境变量与变体覆盖
+
+平台（ep-core `build_module_env`）向模块子进程注入以下模型相关环境变量
+（均带 `EP_` 前缀）：
+
+| 环境变量 | 含义 |
+|---|---|
+| `EP_MODEL_DIR` | **激活变体**的模型目录（`models/<target_dir>`，受 `config.models.cache_dir` 影响）；`EP_MODEL_ID` 为其模型 ID |
+| `EP_MODELS_ROOT` | **模型缓存根目录**（`models/` 本身的绝对路径），含所有变体子目录，与激活变体无关 |
+
+**变体覆盖行为（`params.model`）**：`EP_MODEL_DIR` 恒指激活变体，端到端
+切换激活变体仍走 `PUT /api/models/{module}/{model}/variant` + 重启模块。
+但当请求参数以 `params.model` 临时覆盖为其它变体时，支持此行为的 adapter
+应从 `EP_MODELS_ROOT` 下按 `module.toml [[models]]` 的 `model_id → target_dir`
+约定解析对应变体子目录，命中本地权重则直接使用（参照实现：rembg adapter）。
+
+**本地缺失时的契约**：请求的模型在本地（变体目录与激活目录）均无权重时，
+adapter **不得静默联网下载**，应返回 `MODEL_NOT_LOADED`（503），错误信息
+指出缺失的预期文件路径与获取方式（平台模型管理器下载，或经 variant API
+切换激活变体后重启模块）。
+
 ---
 
 ## 2. 端点定义
@@ -331,6 +352,7 @@ import uvicorn
 # ── 环境变量 ──────────────────────────────────────────────
 EP_PORT = int(os.environ.get("EP_PORT", "18000"))
 EP_MODEL_DIR = os.environ.get("EP_MODEL_DIR", "")
+EP_MODELS_ROOT = os.environ.get("EP_MODELS_ROOT", "")  # 模型缓存根目录（§1.3）
 EP_MODEL_ID = os.environ.get("EP_MODEL_ID", "")
 EP_DEVICE = os.environ.get("EP_DEVICE", "cpu")
 EP_BACKEND = os.environ.get("EP_BACKEND", "cpu")

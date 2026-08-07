@@ -35,6 +35,67 @@ EP_LOG_LEVEL: str = os.getenv("EP_LOG_LEVEL", "INFO")
 # rembg 按 <model>.onnx 文件名在其模型主目录查找/下载；将该目录指向
 # EP_MODEL_DIR，使 daemon 预下载的模型被真正消费、变体切换端到端生效。
 EP_MODEL_DIR: str = os.getenv("EP_MODEL_DIR", "")
+# 模型缓存根目录（缺陷 #4）：EP_MODEL_DIR 恒指激活变体目录，params.model
+# 覆盖为非激活变体时 rembg 在激活目录找不到权重会静默联网下载。据
+# EP_MODELS_ROOT 按下方映射解析变体子目录，命中本地权重则直接用。
+EP_MODELS_ROOT: str = os.getenv("EP_MODELS_ROOT", "")
+
+# 与 module.toml [[models]] 的 id → target_dir 约定对齐（rembg 会话名即 model id，
+# 权重文件名为 <model id>.onnx，见 rembg sessions 各 download_models 实现）。
+MODEL_TARGET_DIRS: dict[str, str] = {
+    "u2net": "rembg-u2net",
+    "isnet-general-use": "rembg-isnet",
+    "birefnet-general": "rembg-birefnet",
+}
+
+
+class ModelLocalMissingError(RuntimeError):
+    """请求的模型本地权重缺失：明确报错而非让 rembg 静默联网下载。"""
+
+
+def resolve_local_model_dir(model_name: str) -> Optional[Path]:
+    """解析 model_name 的本地权重目录（目录内须有 <model_name>.onnx）。
+
+    优先级：EP_MODELS_ROOT 下按 target_dir 映射解析的变体目录 →
+    激活变体目录 EP_MODEL_DIR（仅当请求的就是激活模型）。均未命中返回 None。
+    """
+    expected = f"{model_name}.onnx"
+    candidates: list[Path] = []
+    target = MODEL_TARGET_DIRS.get(model_name)
+    if target and EP_MODELS_ROOT:
+        candidates.append(Path(EP_MODELS_ROOT) / target)
+    if EP_MODEL_DIR:
+        candidates.append(Path(EP_MODEL_DIR))
+    for d in candidates:
+        if (d / expected).is_file():
+            return d
+    return None
+
+
+def _activate_model_dir(model_name: str) -> Path:
+    """定位并激活模型的本地权重目录；缺失时报错指出目录与获取方式。"""
+    found = resolve_local_model_dir(model_name)
+    if found is None:
+        target = MODEL_TARGET_DIRS.get(model_name, f"rembg-{model_name}")
+        expected_dir = (
+            Path(EP_MODELS_ROOT) / target
+            if EP_MODELS_ROOT
+            else Path("<EP_MODELS_ROOT>") / target
+        )
+        raise ModelLocalMissingError(
+            f"Local weights for model '{model_name}' not found: expected "
+            f"{expected_dir / f'{model_name}.onnx'}. Obtain it via the platform model "
+            f"manager, or switch the active variant with "
+            f"PUT /api/models/rembg/{model_name}/variant and restart the module."
+        )
+    # rembg sessions 统一读 U2NET_HOME 定位 <model>.onnx
+    os.environ["U2NET_HOME"] = str(found)
+    logger.info("Using local weights dir for '%s': %s", model_name, found)
+    return found
+
+
+# 启动时先将激活变体目录设为 U2NET_HOME（保持旧行为：预加载走激活变体）；
+# 请求级变体覆盖时再按需切换（见 _activate_model_dir）。
 if EP_MODEL_DIR:
     os.environ.setdefault("U2NET_HOME", EP_MODEL_DIR)
 
@@ -65,12 +126,17 @@ app = FastAPI(
 # 模型加载
 # ---------------------------------------------------------------------------
 def _load_session(model_name: str):
-    """懒加载 rembg session，按需切换模型。"""
+    """懒加载 rembg session，按需切换模型。
+
+    加载前先解析本地权重目录并将 U2NET_HOME 指向它（缺陷 #4）：
+    缺失时抛 ModelLocalMissingError，绝不让 rembg 静默联网下载。
+    """
     global _session, _session_model, _ready
     if _session is not None and _session_model == model_name:
         return _session
 
-    logger.info("Loading rembg session: model=%s ...", model_name)
+    local_dir = _activate_model_dir(model_name)
+    logger.info("Loading rembg session: model=%s (weights=%s) ...", model_name, local_dir)
     t0 = time.time()
     try:
         from rembg import new_session
@@ -93,6 +159,9 @@ def _load_session(model_name: str):
 async def _startup():
     try:
         _load_session(EP_MODEL_NAME)
+    except ModelLocalMissingError as exc:
+        # 激活变体权重缺失：保持 not ready，待请求时给出明确错误
+        logger.warning("Preload skipped (local weights missing): %s", exc)
     except Exception:
         logger.warning("Preload failed; will retry on first request.")
 
@@ -283,6 +352,11 @@ async def predict_remove_bg(
             alpha_matting=alpha_matting,
             post_process=post_process,
         )
+    except ModelLocalMissingError as exc:
+        # 本地权重缺失：按契约 MODEL_NOT_LOADED（503）明确报错（缺失目录 +
+        # 获取方式），绝不让 rembg 静默联网下载
+        logger.error("Model weights missing: %s", exc)
+        return _error(503, "MODEL_NOT_LOADED", str(exc))
     except Exception as exc:
         logger.exception("Inference failed")
         return _error(500, "INFERENCE_ERROR", f"Inference error: {exc}")
