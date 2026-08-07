@@ -25,6 +25,7 @@ kind = "module"
 module_id = "faster-whisper"
 capability = "transcribe"
 label = "语音识别"
+timeout_secs = 7200
 
 [nodes.params]
 language = "zh"
