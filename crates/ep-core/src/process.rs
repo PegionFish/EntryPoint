@@ -157,8 +157,9 @@ pub fn build_module_env(
     // MODEL_DIR 走 config.models.cache_dir 解析（修 P2-9 同款硬编码）。
     let active_model = crate::model::active_model_for(config, manifest)
         .and_then(|id| manifest.models.iter().find(|m| m.id == id));
+    let models_root = config.resolve_model_cache_dir(root);
     let model_dir = match active_model {
-        Some(model) => config.resolve_model_cache_dir(root).join(&model.target_dir),
+        Some(model) => models_root.join(&model.target_dir),
         None => module_dir.clone(),
     };
 
@@ -172,6 +173,14 @@ pub fn build_module_env(
     vars.insert(
         "MODEL_DIR".to_string(),
         model_dir.to_string_lossy().to_string(),
+    );
+    // 模型缓存根目录（缺陷 #4）：MODEL_DIR 恒指激活变体目录，请求参数覆盖
+    // 为非激活变体时 adapter 看不到其它变体的本地权重。MODELS_ROOT
+    // （装配为 EP_MODELS_ROOT）指向 models/ 根，供 adapter 按
+    // module.toml [[models]].target_dir 约定自行解析变体子目录。
+    vars.insert(
+        "MODELS_ROOT".to_string(),
+        models_root.to_string_lossy().to_string(),
     );
     vars.insert(
         "WORKSPACE".to_string(),
@@ -219,6 +228,7 @@ fn prepare_template_vars(
         ("ROOT", "root"),
         ("MODULE_DIR", "module_dir"),
         ("MODEL_DIR", "model_dir"),
+        ("MODELS_ROOT", "models_root"),
         ("MODULE_ID", "module_id"),
         ("MODEL_ID", "model_id"),
         ("WORKSPACE", "workspace"),
@@ -665,7 +675,7 @@ impl ProcessManager {
 
     /// 构建启动命令：对 manifest.runtime.start_command 模板执行变量替换。
     ///
-    /// 支持的变量：`{root}`, `{module_dir}`, `{model_dir}`, `{port}`, `{device}`,
+    /// 支持的变量：`{root}`, `{module_dir}`, `{model_dir}`, `{models_root}`, `{port}`, `{device}`,
     /// `{device_index}`, `{backend}`, `{entrypoint}`, `{binary}`, `{input}`, `{output}`
     pub fn build_start_command(manifest: &ModuleManifest, vars: &HashMap<String, String>) -> String {
         let template = manifest
@@ -1329,6 +1339,12 @@ mod tests {
         // 无 models → MODEL_DIR 回退 MODULE_DIR，且无 MODEL_ID
         assert_eq!(vars.get("MODEL_DIR").unwrap(), vars.get("MODULE_DIR").unwrap());
         assert!(!vars.contains_key("MODEL_ID"));
+        // MODELS_ROOT（装配为 EP_MODELS_ROOT）恒为模型缓存根目录，
+        // 与激活变体无关（缺陷 #4：params.model 覆盖变体时 adapter 据此解析）
+        assert_eq!(
+            vars.get("MODELS_ROOT").unwrap(),
+            &root.join("models").to_string_lossy().to_string()
+        );
         assert_eq!(
             vars.get("WORKSPACE").unwrap(),
             &root.join("workspace").to_string_lossy().to_string()
@@ -1421,6 +1437,11 @@ mod tests {
         assert_eq!(
             vars.get("MODEL_DIR").unwrap(),
             &root.join("models").join("large-dir").to_string_lossy().to_string()
+        );
+        // MODELS_ROOT 是根目录本身（不含变体子目录），MODEL_DIR 才是激活变体目录
+        assert_eq!(
+            vars.get("MODELS_ROOT").unwrap(),
+            &root.join("models").to_string_lossy().to_string()
         );
     }
 
