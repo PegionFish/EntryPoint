@@ -24,7 +24,37 @@ use ep_core::types::{
 ///（语义对齐 daemon updates.rs STARTUP_CHECK_DELAY）
 const STARTUP_CHECK_DELAY: Duration = Duration::from_secs(15);
 
+// ─── Windows 错误弹窗根治（0xc0000142 静默降级） ───────────────────────
+//
+// 桌面向导进程拉起 python/uv 探测时，若解释器 DLL 初始化失败
+//（STATUS_DLL_INIT_FAILED = 0xc0000142），Windows 默认会弹「应用程序无法正常
+// 启动」系统错误对话框。`SetErrorMode` 的错误模式会被子进程继承，在启动
+// 早期置位后，探测失败仅返回非零退出码 / spawn 错误，由调用侧降级分支
+// 静默处理（仅日志 + UI 友好状态），不再弹窗。
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+extern "system" {
+    fn SetErrorMode(u_mode: u32) -> u32;
+}
+
+/// 抑制本进程及子进程的严重错误对话框（仅 Windows；其他平台 no-op）。
+#[cfg(target_os = "windows")]
+fn suppress_error_dialogs() {
+    const SEM_FAILCRITICALERRORS: u32 = 0x0001;
+    const SEM_NOGPFAULTERRORBOX: u32 = 0x0002;
+    const SEM_NOOPENFILEERRORBOX: u32 = 0x8000;
+    unsafe {
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn suppress_error_dialogs() {}
+
 fn main() -> anyhow::Result<()> {
+    // 在任何子进程拉起前尽早置位，确保探测/模块子进程继承无弹错误模式
+    suppress_error_dialogs();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -72,11 +102,21 @@ fn main() -> anyhow::Result<()> {
     });
 
     // eframe runs on the main thread
+    // P3-1：恢复上次退出时的窗口位置/尺寸（runtime/window-state.json，
+    // 全局多显示器坐标空间，副屏位置原样恢复；若记录的显示器已断开，
+    // Windows 会自动将窗口拉回可见区域，不会丢失）
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("EntryPoint")
+        .with_inner_size([1280.0, 800.0])
+        .with_min_inner_size([720.0, 480.0]);
+    if let Some((pos, size)) = load_window_state(&root) {
+        viewport = viewport.with_position(pos);
+        if size.x >= 320.0 && size.y >= 240.0 {
+            viewport = viewport.with_inner_size([size.x, size.y]);
+        }
+    }
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("EntryPoint")
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([720.0, 480.0]),
+        viewport,
         ..Default::default()
     };
 
@@ -92,6 +132,26 @@ fn main() -> anyhow::Result<()> {
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
+}
+
+/// 读取窗口状态（P3-1）：返回 (窗口外框左上角, 内容尺寸)。
+/// 文件缺失/损坏/字段不全均返回 None（默认位置启动，与旧行为一致）。
+fn load_window_state(root: &Path) -> Option<(egui::Pos2, egui::Vec2)> {
+    let path = root.join("runtime").join("window-state.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let x = v["outer"]["x"].as_f64()? as f32;
+    let y = v["outer"]["y"].as_f64()? as f32;
+    let w = v["inner"]["width"].as_f64()? as f32;
+    let h = v["inner"]["height"].as_f64()? as f32;
+    // 防御异常值：坐标有限、尺寸合理（超大/负尺寸不回退默认）
+    if !x.is_finite() || !y.is_finite() || !w.is_finite() || !h.is_finite() {
+        return None;
+    }
+    if !(160.0..=30000.0).contains(&w) || !(120.0..=30000.0).contains(&h) {
+        return None;
+    }
+    Some((egui::pos2(x, y), egui::vec2(w, h)))
 }
 
 /// Load CJK fonts so Chinese text renders correctly.

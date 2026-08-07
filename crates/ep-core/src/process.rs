@@ -113,6 +113,28 @@ pub fn venv_python_path(root: &Path, module_id: &str) -> PathBuf {
     }
 }
 
+/// 为短命令/探测进程附加 Windows `CREATE_NO_WINDOW` 创建标志。
+///
+/// 桌面 GUI（无控制台）拉起 python/uv/ffmpeg 探测时：
+/// - 不闪控制台窗口（`CREATE_NO_WINDOW` 抑制隐式控制台分配）；
+/// - 避免探测进程以交互方式附加到父控制台而放大 DLL 初始化失败
+///   （`0xc0000142`）时的错误弹窗面。
+///
+/// 探测均为一次性捕获输出（`.output()` / `.status()`），无需控制台。
+/// 非 Windows 为 no-op。配合调用侧对 spawn/退出失败的降级分支实现「静默降级」。
+pub fn apply_no_window(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
 /// 构建模块子进程的标准 env 模板变量（P0-4 公共构建函数，daemon API / --run-module / 桌面端共用）。
 ///
 /// 返回的键是**裸占位符名**（无前缀）：既用于 `start_command` 占位符替换

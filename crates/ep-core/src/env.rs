@@ -12,6 +12,7 @@ use anyhow::{bail, Context, Result};
 use tracing::{debug, info, warn};
 
 use crate::config::PythonConfig;
+use crate::process::apply_no_window;
 
 // ─── 公共类型 ────────────────────────────────────────────────────────────────
 
@@ -160,7 +161,9 @@ impl EnvManager {
     fn detect_python(uv: Option<&Path>) -> Option<PathBuf> {
         // 1. 尝试 PATH 中的 python3 / python
         for name in ["python3", "python"] {
-            if let Ok(output) = Command::new(name).arg("--version").output() {
+            let mut probe = Command::new(name);
+            apply_no_window(&mut probe);
+            if let Ok(output) = probe.arg("--version").output() {
                 if output.status.success() {
                     if let Some(path) = Self::which(name) {
                         debug!(python = %path.display(), "detected python in PATH");
@@ -173,10 +176,9 @@ impl EnvManager {
         // 2. 借助 uv python find 查找兼容版本（优先 3.12，其次 3.11/3.10）
         let uv_exe = uv.map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("uv"));
         for ver in ["3.12", "3.11", "3.10"] {
-            if let Ok(output) = Command::new(&uv_exe)
-                .args(["python", "find", ver])
-                .output()
-            {
+            let mut probe = Command::new(&uv_exe);
+            apply_no_window(&mut probe);
+            if let Ok(output) = probe.args(["python", "find", ver]).output() {
                 if output.status.success() {
                     let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     if !path_str.is_empty() {
@@ -197,7 +199,9 @@ impl EnvManager {
     /// 检测系统 PATH 中的 uv，并扫描 Windows 常见 Python Scripts 目录作为后备
     fn detect_uv() -> Option<PathBuf> {
         // 1. 尝试 PATH
-        if let Ok(output) = Command::new("uv").arg("--version").output() {
+        let mut probe = Command::new("uv");
+        apply_no_window(&mut probe);
+        if let Ok(output) = probe.arg("--version").output() {
             if output.status.success() {
                 if let Some(path) = Self::which("uv") {
                     debug!(uv = %path.display(), "detected uv in PATH");
@@ -313,7 +317,9 @@ impl EnvManager {
 
     /// 获取 python 版本字符串
     fn get_python_version(path: &Path) -> String {
-        match Command::new(path).arg("--version").output() {
+        let mut cmd = Command::new(path);
+        apply_no_window(&mut cmd);
+        match cmd.arg("--version").output() {
             Ok(output) if output.status.success() => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -331,7 +337,9 @@ impl EnvManager {
 
     /// 获取 uv 版本字符串
     fn get_uv_version(path: &Path) -> String {
-        match Command::new(path).arg("--version").output() {
+        let mut cmd = Command::new(path);
+        apply_no_window(&mut cmd);
+        match cmd.arg("--version").output() {
             Ok(output) if output.status.success() => {
                 String::from_utf8_lossy(&output.stdout).trim().to_string()
             }
@@ -763,6 +771,8 @@ pub fn run_command_with_env(
     debug!(cmd = cmd, args = ?args, "executing command");
 
     let mut command = Command::new(cmd);
+    // 探测/安装子进程不弹控制台窗口（Windows），失败走调用方降级分支
+    apply_no_window(&mut command);
     command.args(args);
     for (key, value) in extra_env {
         if !value.is_empty() {
