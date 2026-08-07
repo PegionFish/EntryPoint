@@ -41,6 +41,10 @@ pub struct PipelineMeta {
     /// TOML `[pipeline]` 段 `max_instances` 键，执行层（B3）消费。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_instances: Option<u32>,
+    /// 管线级节点硬超时缺省（秒，缺陷 #3）：null/缺省 = 跟随全局配置。
+    /// TOML `[pipeline]` 段 `node_timeout_secs` 键，执行层消费（长媒体管线据此放宽）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_timeout_secs: Option<u32>,
 }
 
 /// spec 节点类型判别（前端契约 `kind: "builtin" | "module"`）
@@ -151,6 +155,7 @@ pub fn spec_to_pipeline(spec: &PipelineSpec) -> Result<Pipeline> {
         nodes,
         edges: spec.edges.clone(),
         max_instances: spec.pipeline.max_instances,
+        node_timeout_secs: spec.pipeline.node_timeout_secs,
     })
 }
 
@@ -240,6 +245,7 @@ pub fn pipeline_to_spec(pipeline: &Pipeline) -> Result<PipelineSpec> {
             name: pipeline.name.clone(),
             description: pipeline.description.clone(),
             max_instances: pipeline.max_instances,
+            node_timeout_secs: pipeline.node_timeout_secs,
         },
         nodes,
         edges: pipeline.edges.clone(),
@@ -367,6 +373,10 @@ fn spec_to_toml(spec: &PipelineSpec) -> Result<String> {
     // §6.8 管线级并发上限（缺省不写出该键）
     if let Some(max_instances) = spec.pipeline.max_instances {
         out.push_str(&format!("max_instances = {max_instances}\n"));
+    }
+    // 缺陷 #3：管线级节点硬超时缺省（缺省不写出该键）
+    if let Some(node_timeout_secs) = spec.pipeline.node_timeout_secs {
+        out.push_str(&format!("node_timeout_secs = {node_timeout_secs}\n"));
     }
 
     for node in &spec.nodes {
@@ -553,6 +563,7 @@ mod tests {
                 name: "测试管线".into(),
                 description: "桥接测试".into(),
                 max_instances: None,
+                node_timeout_secs: None,
             },
             nodes: vec![
                 SpecNode {

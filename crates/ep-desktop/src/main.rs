@@ -349,6 +349,7 @@ fn build_direct_pipeline(
             },
         ],
         max_instances: None,
+        node_timeout_secs: None,
     }
 }
 
@@ -1263,8 +1264,9 @@ async fn submit_pipeline_task(
         .collect();
 
     // 7. spawn 引擎执行（blocking 线程）+ 异步收尾
-    let default_node_timeout = (config.pipeline.default_timeout_secs > 0)
-        .then(|| Duration::from_secs(config.pipeline.default_timeout_secs as u64));
+    // 节点级硬超时缺省（缺陷 #3 拆分）：管线级 node_timeout_secs > 全局
+    // default_node_timeout_secs > 回退 default_timeout_secs（旧配置行为不变）
+    let default_node_timeout = pipeline.effective_default_node_timeout(&config.pipeline);
     let registry_bg = Arc::clone(task_registry);
     let registry_fin = Arc::clone(task_registry);
     let tx_bg = tx.clone();

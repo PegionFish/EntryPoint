@@ -2,10 +2,12 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::time::Duration;
 
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::config::PipelineConfig;
 use crate::types::DeviceId;
 
 // ─── 错误类型 ────────────────────────────────────────────────────────────────
@@ -272,6 +274,12 @@ pub struct Pipeline {
     /// GPU 重管线可锁 `1` 防显存打架。执行层（B3）消费。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_instances: Option<u32>,
+    /// 管线级节点硬超时缺省（秒，缺陷 #3 拆分）：本管线内未声明
+    /// `timeout_secs` 的节点以此作为 wall-clock 硬超时；`None` = 回退全局
+    /// `[pipeline] default_node_timeout_secs` / `default_timeout_secs`。
+    /// 长媒体管线（如 video-to-srt 的 ASR 节点）可据此声明更长超时。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_timeout_secs: Option<u32>,
 }
 
 /// TOML 文件顶层结构（用于反序列化）
@@ -293,6 +301,9 @@ struct PipelineMeta {
     /// §6.8 管线级并发上限；`[pipeline]` 段可选键
     #[serde(default)]
     max_instances: Option<u32>,
+    /// 缺陷 #3：管线级节点硬超时缺省；`[pipeline]` 段可选键
+    #[serde(default)]
+    node_timeout_secs: Option<u32>,
 }
 
 impl Pipeline {
@@ -315,7 +326,29 @@ impl Pipeline {
             nodes: file.nodes,
             edges: file.edges,
             max_instances: file.pipeline.max_instances,
+            node_timeout_secs: file.pipeline.node_timeout_secs,
         })
+    }
+
+    /// 节点级硬超时缺省解析（缺陷 #3 拆分，纯函数可测）。
+    ///
+    /// 优先级（高→低）：
+    /// 1. 管线级 `[pipeline] node_timeout_secs`（本管线内未声明 `timeout_secs`
+    ///    的节点以此为准，长媒体管线据此放宽）；
+    /// 2. 全局 `default_node_timeout_secs`（>0 时生效）；
+    /// 3. 回退 `default_timeout_secs`（旧配置行为不变，向后兼容）。
+    ///
+    /// 返回 `None` = 三者均无效（0）→ 节点仅受执行器客户端级超时约束。
+    /// 节点自身 `timeout_secs` 始终优先于本缺省值（由执行层应用）。
+    pub fn effective_default_node_timeout(&self, cfg: &PipelineConfig) -> Option<Duration> {
+        let secs = self
+            .node_timeout_secs
+            .filter(|&v| v > 0)
+            .or(Some(cfg.default_node_timeout_secs))
+            .filter(|&v| v > 0)
+            .or(Some(cfg.default_timeout_secs))
+            .filter(|&v| v > 0)?;
+        Some(Duration::from_secs(u64::from(secs)))
     }
 
     /// 验证管线 DAG 合法性
@@ -650,6 +683,49 @@ to = ["save", "input"]
         assert_eq!(layers[0], vec!["input"]);
         assert_eq!(layers[1], vec!["process"]);
         assert_eq!(layers[2], vec!["save"]);
+    }
+
+    #[test]
+    fn test_effective_default_node_timeout_priority() {
+        let pipeline = Pipeline::from_toml_str(sample_toml()).unwrap();
+        assert!(pipeline.node_timeout_secs.is_none(), "缺省 TOML 不含该键");
+
+        // 1) 管线未声明 + 全局缺省为 0 → 回退 default_timeout_secs（旧配置行为不变）
+        let cfg = PipelineConfig::default(); // default_timeout_secs=600
+        assert_eq!(
+            pipeline.effective_default_node_timeout(&cfg),
+            Some(Duration::from_secs(600))
+        );
+
+        // 2) 全局 default_node_timeout_secs > 0 优先于回退值
+        let cfg_global = PipelineConfig {
+            default_node_timeout_secs: 1200,
+            ..PipelineConfig::default()
+        };
+        assert_eq!(
+            pipeline.effective_default_node_timeout(&cfg_global),
+            Some(Duration::from_secs(1200))
+        );
+
+        // 3) 管线级 node_timeout_secs 优先级最高（长媒体管线据此放宽）
+        let toml_str = sample_toml().replace(
+            "description = \"For unit tests\"",
+            "description = \"For unit tests\"\nnode_timeout_secs = 3600",
+        );
+        let p3 = Pipeline::from_toml_str(&toml_str).unwrap();
+        assert_eq!(p3.node_timeout_secs, Some(3600));
+        assert_eq!(
+            p3.effective_default_node_timeout(&cfg_global),
+            Some(Duration::from_secs(3600))
+        );
+
+        // 4) 三者均为 0 → None（节点仅受执行器客户端级超时约束）
+        let cfg_zero = PipelineConfig {
+            default_timeout_secs: 0,
+            default_node_timeout_secs: 0,
+            ..PipelineConfig::default()
+        };
+        assert_eq!(pipeline.effective_default_node_timeout(&cfg_zero), None);
     }
 
     #[test]

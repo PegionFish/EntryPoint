@@ -885,6 +885,8 @@ to = ["output", "input"]
                 // B7（wave-2 返工）PipelineMeta 新增 §6.8 max_instances 后的
                 // 机械补齐（仲裁 #11 同款模式，测试字面量无行为含义）
                 max_instances: None,
+                // 缺陷 #3 PipelineMeta 新增 node_timeout_secs 后的同款机械补齐
+                node_timeout_secs: None,
             },
             nodes: vec![
                 SpecNode {

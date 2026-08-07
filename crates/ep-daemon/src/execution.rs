@@ -43,16 +43,21 @@
 //!   绑定并回读，daemon 重启不丢索引（遗留 running/queued 加载时改判 failed）；
 //! - 节点回调实时更新内存记录（高频路径不落盘），终态收尾时统一持久化。
 //!
-//! ## 超时与取消（P0-6/P1-11 执行层部分）
+//! ## 超时与取消（P0-6/P1-11；缺陷 #3 拆分：心跳看门狗 ≠ 节点硬超时）
 //!
-//! - **任务级超时**：`config.pipeline.default_timeout_secs` 的看门狗在任务
-//!   开始运行时启动，超时后任务被判 `failed`（错误注明超时）。
+//! - **任务级空闲看门狗**：`config.pipeline.default_timeout_secs` 的看门狗
+//!   周期性检查“是否仍有节点进度/心跳”（节点开始/完成/失败回调 bump
+//!   `last_activity_ms`；任一节点 `running` = 在飞调用 = 有心跳），持续
+//!   无心跳达阈值才判 `failed`（错误注明超时）。长媒体任务（ASR 转写等）
+//!   不再被任务总时长误杀。
+//! - **节点级硬超时**（与看门狗解耦）：优先级为 节点自身 `timeout_secs`
+//!   → 管线 `[pipeline] node_timeout_secs` → 全局 `default_node_timeout_secs`
+//!   → 回退 `default_timeout_secs`（旧配置行为不变），由执行器包裹单节点
+//!   wall-clock 执行。
 //! - **取消**：[`request_cancel`]（`POST /api/tasks/{id}/cancel`）——排队中取消
 //!   立即终结且不执行；运行中取消立即判 `cancelled`（逻辑终态）。
-//! - **边界（诚实声明）**：引擎 `execute` 无法从外部中断（executor.rs 归
-//!   Wave 2 B7 所有），超时/取消后引擎线程仍在后台收尾，其后续状态写入因
-//!   记录已终态而被忽略；节点级 `timeout_secs` 的真正生效需要执行器支持
-//!   （已提仲裁请求 → B7：HTTP/子进程超时参数 + 层间取消检查点）。
+//! - **边界（诚实声明）**：引擎 `execute` 无法从外部中断，超时/取消后引擎
+//!   线程仍在后台收尾，其后续状态写入因记录已终态而被忽略。
 //!
 //! ## wait 同步模式 + callback_url（§6.5）
 //!
@@ -70,7 +75,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -177,12 +182,46 @@ struct TaskExtras {
     /// 写终态 + 释放闸门 + 触发回调
     finalize_done: Arc<AtomicBool>,
     callback_url: Option<String>,
+    /// 最近一次节点进度时刻（epoch 毫秒，缺陷 #3）：节点开始/完成/失败回调
+    /// 实时更新。任务级空闲看门狗据此判定“无心跳/无进度”而非任务总时长。
+    last_activity_ms: Arc<AtomicU64>,
 }
 
 static EXTRAS: OnceLock<Mutex<HashMap<String, TaskExtras>>> = OnceLock::new();
 
 fn extras() -> &'static Mutex<HashMap<String, TaskExtras>> {
     EXTRAS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// ─── 任务级空闲看门狗（缺陷 #3 拆分：心跳/进度看门狗 ≠ 节点硬超时） ───────
+
+/// 看门狗轮询间隔（秒）：周期性检查“是否仍有节点进度/心跳”，而非一次性
+/// 到点判死。取 1s 以兼容小 `default_timeout_secs` 的测试与生产快速响应。
+const WATCHDOG_TICK_SECS: u64 = 1;
+
+/// 当前时刻（epoch 毫秒；系统时钟早于纪元时钳为 0，避免负值转 u64 溢出）。
+fn now_epoch_ms() -> u64 {
+    Utc::now().timestamp_millis().max(0) as u64
+}
+
+/// 看门狗单次判定（纯函数，可单测）：任务是否因“长时间无心跳/无进度”该被判死。
+///
+/// 语义（缺陷 #3 拆分后）：
+/// - 任一节点处于 `running` = 模块调用在飞，视为有心跳 → **不判死**
+///   （长媒体节点如 ASR 转写 >5min 不会被任务看门狗误杀，其真正时限由
+///   节点级硬超时缺省 `effective_default_node_timeout` 管辖）；
+/// - 无节点在跑且距最近一次进度（`last_activity_ms`）≥ `timeout_secs` → 判死。
+fn watchdog_idle_exceeded(
+    record: &TaskRecord,
+    last_activity_ms: u64,
+    now_ms: u64,
+    timeout_secs: u32,
+) -> bool {
+    if record.nodes.values().any(|n| n.state == "running") {
+        return false; // 节点执行在飞 = 活跃心跳
+    }
+    let timeout_ms = u64::from(timeout_secs) * 1000;
+    now_ms.saturating_sub(last_activity_ms) >= timeout_ms
 }
 
 // ─── 快照查询（永不阻塞：注册表锁内全是短临界区） ───────────────────────────
@@ -679,6 +718,8 @@ fn start_task(
         cancel: Arc::new(AtomicBool::new(false)),
         finalize_done: Arc::new(AtomicBool::new(false)),
         callback_url: task.callback_url.clone(),
+        // 初始化进度基准时刻；后续由节点回调 bump（缺陷 #3 心跳看门狗）
+        last_activity_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
     };
     extras()
         .lock()
@@ -738,34 +779,47 @@ fn start_task(
         }
     }
 
-    // 任务级超时看门狗（default_timeout_secs；0 = 停用）
+    // 任务级空闲看门狗（default_timeout_secs；0 = 停用）——缺陷 #3 拆分后为
+    // “心跳/进度看门狗”：周期性检查是否仍有节点进度/在飞节点，而非任务总时长
+    // 到点判死。长媒体节点（ASR 转写等）在飞期间有心跳，不会被误杀。
     if timeout_secs > 0 {
         let state_w = state.clone();
         let extras_w = task_extras.clone();
         let task_id_w = task_id.clone();
         let pipeline_id_w = task.pipeline.id.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(timeout_secs as u64)).await;
-            let still_running = registry()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&task_id_w)
-                .map(|r| r.status == TaskState::Running)
-                .unwrap_or(false);
-            if !still_running {
+            loop {
+                tokio::time::sleep(Duration::from_secs(WATCHDOG_TICK_SECS)).await;
+                // 记录缺失（测试清表）→ 无事可做
+                let Some(record) = registry()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&task_id_w)
+                    .cloned()
+                else {
+                    return;
+                };
+                // 已非运行中（引擎/取消已终结）→ 看门狗退场
+                if record.status != TaskState::Running {
+                    return;
+                }
+                let last = extras_w.last_activity_ms.load(Ordering::SeqCst);
+                if !watchdog_idle_exceeded(&record, last, now_epoch_ms(), timeout_secs) {
+                    continue; // 仍有心跳/进度，继续守候
+                }
+                warn!(task_id = %task_id_w, timeout_secs, "task idle watchdog fired: no node progress/heartbeat; marking failed (engine thread may finish in background)");
+                extras_w.cancel.store(true, Ordering::SeqCst);
+                finalize_task(
+                    &state_w,
+                    &task_id_w,
+                    &pipeline_id_w,
+                    TerminalCause::Timeout(timeout_secs),
+                    None,
+                    extras_w.callback_url.clone(),
+                )
+                .await;
                 return;
             }
-            warn!(task_id = %task_id_w, timeout_secs, "task timed out; marking failed (engine thread may finish in background)");
-            extras_w.cancel.store(true, Ordering::SeqCst);
-            finalize_task(
-                &state_w,
-                &task_id_w,
-                &pipeline_id_w,
-                TerminalCause::Timeout(timeout_secs),
-                None,
-                extras_w.callback_url.clone(),
-            )
-            .await;
         });
     }
 
@@ -773,12 +827,12 @@ fn start_task(
     let state_bg = state.clone();
     let extras_bg = task_extras.clone();
     let pipeline_id = task.pipeline.id.clone();
-    // 节点级 wall-clock 超时缺省值（P0-6：任务级 default_timeout_secs 下沉为
-    // 节点默认超时，经 runner 包裹 execute_node；节点自身 timeout_secs 优先）
-    let default_node_timeout = if timeout_secs > 0 {
-        Some(Duration::from_secs(timeout_secs as u64))
-    } else {
-        None
+    // 节点级 wall-clock 硬超时缺省（缺陷 #3 拆分：与任务看门狗解耦）。
+    // 解析优先级：节点自身 timeout_secs（runner 内）> 管线 node_timeout_secs
+    // > 全局 default_node_timeout_secs > default_timeout_secs（向后兼容回退）。
+    let default_node_timeout = {
+        let cfg = state.config.read().await;
+        task.pipeline.effective_default_node_timeout(&cfg.pipeline)
     };
     tokio::spawn(async move {
         let PendingTask {
@@ -787,6 +841,7 @@ fn start_task(
         let progress_tx = state_bg.progress_tx.clone();
         let task_id_bg = task_id.clone();
         let cancel_flag = extras_bg.cancel.clone();
+        let activity_ms = extras_bg.last_activity_ms.clone();
         let joined = tokio::task::spawn_blocking(move || {
             run_task(
                 task_id_bg,
@@ -795,6 +850,7 @@ fn start_task(
                 module_ports,
                 progress_tx,
                 cancel_flag,
+                activity_ms,
                 default_node_timeout,
             )
         })
@@ -1384,6 +1440,7 @@ pub fn build_direct_pipeline(
             },
         ],
         max_instances: None,
+        node_timeout_secs: None,
     }
 }
 
@@ -1394,7 +1451,9 @@ pub fn build_direct_pipeline(
 ///
 /// - `cancel_flag`：协作取消标志（与 [`TaskExtras::cancel`] 共享），
 ///   runner 在节点边界检查 → 引擎产生 `TaskStatus::Cancelled`（P0-6）；
-/// - `default_node_timeout`：节点级 wall-clock 超时缺省值（P0-6/P1-11，
+/// - `activity_ms`：节点进度时刻（缺陷 #3 心跳看门狗）；节点开始/完成/失败
+///   回调均 bump，任务级空闲看门狗据此判定“无心跳”而非任务总时长；
+/// - `default_node_timeout`：节点级 wall-clock 硬超时缺省值（缺陷 #3 拆分，
 ///   节点自身 `timeout_secs` 优先；B7 的执行器客户端级超时互补）。
 #[allow(clippy::too_many_arguments)]
 fn run_task(
@@ -1404,6 +1463,7 @@ fn run_task(
     module_ports: HashMap<String, u16>,
     progress_tx: broadcast::Sender<ProgressMessage>,
     cancel_flag: Arc<AtomicBool>,
+    activity_ms: Arc<AtomicU64>,
     default_node_timeout: Option<Duration>,
 ) -> (anyhow::Result<()>, Option<TaskDetail>) {
     #[cfg(test)]
@@ -1421,7 +1481,9 @@ fn run_task(
         let tx = progress_tx.clone();
         let pid = pipeline_id.clone();
         let tid = task_id.clone();
+        let act = activity_ms.clone();
         runner.on_node_start = Some(Arc::new(move |node_id| {
+            act.store(now_epoch_ms(), Ordering::SeqCst);
             let _ = tx.send(ProgressMessage {
                 pipeline_id: pid.clone(),
                 task_id: tid.clone(),
@@ -1436,7 +1498,9 @@ fn run_task(
         let tx = progress_tx.clone();
         let pid = pipeline_id.clone();
         let tid = task_id.clone();
+        let act = activity_ms.clone();
         runner.on_node_complete = Some(Arc::new(move |node_id, artifact| {
+            act.store(now_epoch_ms(), Ordering::SeqCst);
             let _ = tx.send(ProgressMessage {
                 pipeline_id: pid.clone(),
                 task_id: tid.clone(),
@@ -1454,7 +1518,9 @@ fn run_task(
         let tx = progress_tx.clone();
         let pid = pipeline_id.clone();
         let tid = task_id.clone();
+        let act = activity_ms.clone();
         runner.on_node_error = Some(Arc::new(move |node_id, error| {
+            act.store(now_epoch_ms(), Ordering::SeqCst);
             let _ = tx.send(ProgressMessage {
                 pipeline_id: pid.clone(),
                 task_id: tid.clone(),
@@ -2738,5 +2804,56 @@ output_type = "json"
         assert_eq!(a_tasks[0].id, tc, "新任务在前");
         assert_eq!(snapshot_by_pipeline("pipe-b").len(), 1);
         assert!(snapshot_by_pipeline("ghost").is_empty());
+    }
+
+    // ── 21. 空闲看门狗判定（缺陷 #3 拆分：心跳/进度看门狗 ≠ 节点硬超时） ─────
+
+    /// 按给定节点状态构造最小 TaskRecord（纯函数测试用）
+    fn watchdog_record(node_states: &[&str]) -> TaskRecord {
+        let nodes: HashMap<String, NodeRecord> = node_states
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                (
+                    format!("n{i}"),
+                    NodeRecord {
+                        state: (*s).to_string(),
+                        error: None,
+                    },
+                )
+            })
+            .collect();
+        TaskRecord {
+            id: "wd-task".to_string(),
+            pipeline_id: "wd-pipe".to_string(),
+            status: TaskState::Running,
+            error: None,
+            queue_position: None,
+            started_at: Utc::now(),
+            started_running_at: Some(Utc::now()),
+            finished_at: None,
+            node_order: nodes.keys().cloned().collect(),
+            nodes,
+            artifacts: HashMap::new(),
+            served_artifacts: HashMap::new(),
+            work_dir: PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn test_watchdog_idle_exceeded_semantics() {
+        // 节点在飞（长媒体调用中）= 有心跳 → 不判死（拆分后不再按任务总时长误杀）
+        let running = watchdog_record(&["running"]);
+        assert!(!watchdog_idle_exceeded(&running, 0, 999_999_999, 300));
+
+        // 无节点在飞 + 空闲 ≥ 阈值 → 判死
+        let idle = watchdog_record(&["completed", "pending"]);
+        assert!(watchdog_idle_exceeded(&idle, 1_000, 1_000 + 300_000, 300));
+
+        // 无节点在飞但空闲未达阈值（心跳刚刷新）→ 不判死
+        assert!(!watchdog_idle_exceeded(&idle, 1_000, 1_000 + 299_999, 300));
+
+        // 时钟回拨（now < last_activity）→ saturating_sub 钉为 0，不误判
+        assert!(!watchdog_idle_exceeded(&idle, 5_000, 1_000, 300));
     }
 }
