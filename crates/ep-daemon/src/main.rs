@@ -300,7 +300,7 @@ async fn run_server(root: PathBuf, cfg: AppConfig) -> anyhow::Result<()> {
     let cfg = state.config.read().await;
     let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port)
         .parse()
-        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 9800)));
+        .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 9800)));
     drop(cfg);
     tracing::info!("Listening on {}", addr);
 
