@@ -306,8 +306,17 @@ impl NetworkConfig {
 pub struct PipelineConfig {
     #[serde(default = "default_max_parallel")]
     pub max_parallel: u32,
+    /// 任务级**空闲看门狗**超时（秒）：任务持续此时长无任何节点进度/心跳
+    /// 才判死（0 = 停用看门狗）。注意不再是任务总时长硬上限——只要执行器
+    /// 持续产生心跳（节点开始/完成/失败，及长调用期间的周期心跳），任务可
+    /// 运行任意时长（缺陷 #3 拆分：原值同时充当节点硬超时，长媒体任务被误杀）。
     #[serde(default = "default_timeout")]
     pub default_timeout_secs: u32,
+    /// 节点级**硬超时**全局缺省（秒）：节点未声明 `timeout_secs` 且管线未声明
+    /// `[pipeline] node_timeout_secs` 时，作为单节点 wall-clock 硬超时。
+    /// `0`（缺省）= 跟随 [`Self::default_timeout_secs`]（旧配置行为不变）。
+    #[serde(default)]
+    pub default_node_timeout_secs: u32,
     #[serde(default = "default_true")]
     pub keep_workspace: bool,
     #[serde(default = "default_workspace_dir")]
@@ -319,6 +328,7 @@ impl Default for PipelineConfig {
         Self {
             max_parallel: 4,
             default_timeout_secs: 600,
+            default_node_timeout_secs: 0,
             keep_workspace: true,
             workspace_dir: default_workspace_dir(),
         }

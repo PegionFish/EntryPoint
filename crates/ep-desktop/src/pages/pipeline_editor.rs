@@ -2744,6 +2744,7 @@ fn new_pipeline(st: &mut VizState) {
         nodes: vec![input, output],
         edges: vec![edge],
         max_instances: None,
+        node_timeout_secs: None,
     });
     st.positions.clear();
     st.drafts.clear();
