@@ -167,10 +167,16 @@ Content-Type: application/json
 
 | 字段 | 类型 | 必须 | 说明 |
 |---|---|---|---|
-| `input_text` | string | 条件 | 文本输入（input_type=text） |
-| `input_json` | object | 条件 | JSON 输入（input_type=json） |
+| `input` | any | 条件 | 文本/JSON 输入（ep-core executor 文本类产物实际使用的键名） |
+| `input_text` | string | 条件 | 文本输入（input_type=text，兼容别名） |
+| `input_json` | object | 条件 | JSON 输入（input_type=json，兼容别名） |
 | `input_path` | string | 条件 | 文件路径（文本文件） |
 | `params` | object | ❌ | 参数字典 |
+
+> 注：管线执行器（ep-core executor）对文本/JSON 类上游产物发送
+> `{"input": <文本或JSON>, "params": {...}}`；adapter 应同时兼容
+> `input` 与 `input_text`。文件类上游产物则走 multipart `file` 字段
+> （即便是文本文件），adapter 可按需读取文件内容。
 
 ---
 
@@ -204,16 +210,19 @@ Content-Type: application/json
 | `output_path` | string \| null | 输出文件路径（output_type 为文件类时） |
 | `elapsed_seconds` | float | 推理耗时 |
 
-**result 字段规则（按 output_type）：**
+**result 字段规则（按 output_type，以 ep-core executor 实际解析为准）：**
 
-| output_type | result 内容 | output_path |
+| output_type | result 内容 | 说明 |
 |---|---|---|
-| `text` | 字符串 | null |
-| `json` | JSON 对象 | null |
-| `audio` | null | 输出音频文件绝对路径 |
-| `video` | null | 输出视频文件绝对路径 |
-| `image` | null | 输出图片文件绝对路径 |
-| `file` | null | 输出文件绝对路径 |
+| `text` | 字符串 | → 文本产物 |
+| `json`（或缺省） | JSON 值 | → JSON 产物 |
+| `file` | **输出文件绝对路径（字符串）** | → 文件产物；可同时携带 `output_path` 冗余字段 |
+
+> **注意**：执行器只识别 `file` / `text` / `json` 三种 output_type，
+> 其余取值（如 `audio` / `image`）会被警告并按 JSON 处理；执行器**不读取**
+> 顶层 `output_path` 字段。因此文件类输出（音频/视频/图片）必须返回
+> `output_type: "file"` 且 `result` 为路径字符串，参照实现：
+> faster-whisper / paddleocr / rembg / deep-filter / qwen3-tts adapter。
 
 **文件输出约定：**
 - 输出文件写入 `EP_WORKSPACE/<node_id>/` 目录（管线运行时）

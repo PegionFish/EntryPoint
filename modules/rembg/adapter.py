@@ -6,6 +6,7 @@ RemBG 智能去背景 — EntryPoint adapter
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
 import time
@@ -14,7 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 # ---------------------------------------------------------------------------
@@ -145,48 +146,134 @@ def _run_remove_bg(
     return output_bytes
 
 
+def _error(status_code: int, error_code: str, message: str, detail: Optional[str] = None):
+    """构造 ADAPTER_API.md §2.3 定义的错误响应。"""
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": "error",
+            "error_code": error_code,
+            "message": message,
+            "detail": detail,
+        },
+    )
+
+
+def _parse_bool(value, default: bool) -> bool:
+    """宽容解析布尔参数（JSON bool / 字符串 "true"/"false"）。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "1", "yes"):
+            return True
+        if v in ("false", "0", "no"):
+            return False
+    return default
+
+
 @app.post("/predict/remove_bg")
 async def predict_remove_bg(
+    request: Request,
     file: Optional[UploadFile] = File(None),
-    input_path: Optional[str] = Form(None),
-    model: Optional[str] = Form(None),
-    alpha_matting: bool = Form(False),
-    post_process: bool = Form(True),
+    input_path_form: Optional[str] = Form(None, alias="input_path"),
+    params_form: Optional[str] = Form(None, alias="params"),
+    model_form: Optional[str] = Form(None, alias="model"),
+    alpha_matting_form: Optional[str] = Form(None, alias="alpha_matting"),
+    post_process_form: Optional[str] = Form(None, alias="post_process"),
 ):
     """
     移除图片背景，输出透明 PNG。
 
-    支持两种输入方式（二选一）：
-    - multipart file 上传
-    - input_path 指定服务器端文件路径
-    """
-    # ---- 解析输入 ----
-    input_bytes: bytes
-    source_name: str
+    支持三种输入方式：
+    - multipart file 上传（ep-core executor 文件类产物路径）
+    - multipart/JSON 的 input_path 指定服务器端文件路径
+    - JSON body {"input_path": ...}（ADAPTER_API.md 格式 B）
 
-    if file is not None and file.filename:
-        input_bytes = await file.read()
-        source_name = file.filename
-    elif input_path:
-        p = Path(input_path)
-        if not p.is_file():
-            raise HTTPException(status_code=400, detail=f"input_path not found: {input_path}")
-        input_bytes = p.read_bytes()
-        source_name = p.name
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="Provide either a multipart 'file' or an 'input_path' form field.",
-        )
+    参数来源：`params` 字段（JSON 对象/字符串，executor 契约）优先，
+    兼容旧版平铺表单字段（model/alpha_matting/post_process）。
+
+    响应契约（ep-core executor 权威）：
+    {status:"completed", output_type:"file", result:<输出路径>,
+     output_path:<输出路径>, metadata:{...}, elapsed_seconds:<float>}
+    """
+    t0 = time.time()
+
+    # ---- 解析输入与参数 ----
+    input_bytes: bytes = b""
+    source_name: str = ""
+    params: dict = {}
+    model_override: Optional[str] = None
+    alpha_matting = False
+    post_process = True
+
+    content_type = request.headers.get("content-type", "")
+    try:
+        if "application/json" in content_type:
+            # JSON body：路径输入（格式 B）
+            body = await request.json()
+            params = body.get("params") or {}
+            if not isinstance(params, dict):
+                params = {}
+            input_path = body.get("input_path")
+            if not input_path:
+                return _error(
+                    400, "INVALID_INPUT",
+                    "No input provided (need 'input_path' in JSON body or 'file' in multipart)",
+                )
+            p = Path(input_path)
+            if not p.is_file():
+                return _error(400, "FILE_NOT_FOUND", f"input_path not found: {input_path}")
+            input_bytes = p.read_bytes()
+            source_name = p.name
+        else:
+            # multipart/form-data：params 为 JSON 字符串（executor 契约）
+            if params_form:
+                try:
+                    parsed = json.loads(params_form)
+                    if isinstance(parsed, dict):
+                        params = parsed
+                except json.JSONDecodeError:
+                    pass
+            input_path = input_path_form
+            model_override = model_form
+            alpha_matting = _parse_bool(alpha_matting_form, False)
+            post_process = _parse_bool(post_process_form, True)
+
+            if file is not None and file.filename:
+                input_bytes = await file.read()
+                source_name = file.filename
+            elif input_path:
+                p = Path(input_path)
+                if not p.is_file():
+                    return _error(400, "FILE_NOT_FOUND", f"input_path not found: {input_path}")
+                input_bytes = p.read_bytes()
+                source_name = p.name
+            else:
+                return _error(
+                    400, "INVALID_INPUT",
+                    "Provide either a multipart 'file' or an 'input_path' field.",
+                )
+    except Exception as exc:
+        logger.exception("Failed to parse request")
+        return _error(400, "INVALID_INPUT", f"Failed to parse request: {exc}")
+
+    # params（executor 注入/用户参数）覆盖平铺表单默认值
+    if "model" in params:
+        model_override = str(params.get("model") or model_override)
+    if "alpha_matting" in params:
+        alpha_matting = _parse_bool(params.get("alpha_matting"), False)
+    if "post_process" in params:
+        post_process = _parse_bool(params.get("post_process"), True)
 
     if not input_bytes:
-        raise HTTPException(status_code=400, detail="Empty input image.")
+        return _error(400, "INVALID_INPUT", "Empty input image.")
 
     # 大小限制 50 MB
     if len(input_bytes) > 50 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Input exceeds 50 MB limit.")
+        return _error(413, "INVALID_INPUT", "Input exceeds 50 MB limit.")
 
-    model_name = model or EP_MODEL_NAME
+    model_name = model_override or EP_MODEL_NAME
 
     # ---- 推理 ----
     try:
@@ -198,30 +285,39 @@ async def predict_remove_bg(
         )
     except Exception as exc:
         logger.exception("Inference failed")
-        raise HTTPException(status_code=500, detail=f"Inference error: {exc}")
+        return _error(500, "INFERENCE_ERROR", f"Inference error: {exc}")
 
-    # ---- 写出到 workspace ----
+    # ---- 写出：params.output_path（模块产物协议注入）优先，否则 workspace ----
     try:
-        ws = Path(EP_WORKSPACE)
-        ws.mkdir(parents=True, exist_ok=True)
-
-        stem = Path(source_name).stem or "output"
-        out_name = f"{stem}_{uuid.uuid4().hex[:8]}.png"
-        out_path = ws / out_name
+        injected = params.get("output_path")
+        if injected:
+            out_path = Path(str(injected))
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            ws = Path(EP_WORKSPACE)
+            ws.mkdir(parents=True, exist_ok=True)
+            stem = Path(source_name).stem or "output"
+            out_path = ws / f"{stem}_{uuid.uuid4().hex[:8]}.png"
         out_path.write_bytes(output_bytes)
     except Exception as exc:
         logger.exception("Failed to write output")
-        raise HTTPException(status_code=500, detail=f"Output write error: {exc}")
+        return _error(500, "INTERNAL_ERROR", f"Output write error: {exc}")
 
-    logger.info("Done: %s -> %s (%d bytes)", source_name, out_path, len(output_bytes))
+    elapsed = round(time.time() - t0, 3)
+    logger.info("Done: %s -> %s (%d bytes, %.2fs)", source_name, out_path, len(output_bytes), elapsed)
 
     return {
-        "status": "ok",
+        "status": "completed",
+        "output_type": "file",
+        "result": str(out_path),
         "output_path": str(out_path),
-        "model": model_name,
-        "alpha_matting": alpha_matting,
-        "post_process": post_process,
-        "output_size_bytes": len(output_bytes),
+        "metadata": {
+            "model": model_name,
+            "alpha_matting": alpha_matting,
+            "post_process": post_process,
+            "output_size_bytes": len(output_bytes),
+        },
+        "elapsed_seconds": elapsed,
     }
 
 

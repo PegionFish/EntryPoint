@@ -9,6 +9,7 @@ Qwen3-TTS 语音合成模块 — EntryPoint adapter
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -18,8 +19,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi.responses import JSONResponse
 
 # ---------------------------------------------------------------------------
 # 环境变量
@@ -335,17 +336,30 @@ app = FastAPI(
 )
 
 
-class SynthesizeRequest(BaseModel):
-    input_text: str = Field(..., min_length=1, max_length=5000, description="待合成文本")
-    params: dict[str, Any] = Field(default_factory=dict, description="合成参数")
+def _error(status_code: int, error_code: str, message: str, detail: Optional[str] = None):
+    """构造 ADAPTER_API.md §2.3 定义的错误响应。"""
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": "error",
+            "error_code": error_code,
+            "message": message,
+            "detail": detail,
+        },
+    )
 
 
-class SynthesizeResponse(BaseModel):
-    status: str
-    output_path: str
-    sample_rate: int
-    duration_secs: float
-    engine: str
+def _parse_params(raw: Any) -> dict:
+    """解析参数，支持 dict 或 JSON 字符串（multipart params 字段为字符串）。"""
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return raw if isinstance(raw, dict) else {}
 
 
 @app.get("/health")
@@ -376,34 +390,96 @@ async def info():
     }
 
 
-@app.post("/predict/synthesize", response_model=SynthesizeResponse)
-async def predict_synthesize(req: SynthesizeRequest):
-    if _engine == "none":
-        raise HTTPException(
-            status_code=503,
-            detail=f"无可用合成引擎: {_load_error or '未知错误'}",
-        )
+@app.post("/predict/synthesize")
+async def predict_synthesize(
+    request: Request,
+    file: Optional[UploadFile] = File(None),
+    params_form: Optional[str] = Form(None, alias="params"),
+):
+    """文本转语音。
 
-    text = req.input_text.strip()
+    请求侧兼容三种输入形态（以 ep-core executor 行为为准）：
+    1. multipart `file`（直跑/管线 file_input 上传文本文件，读内容作文本）
+    2. JSON body `input`（executor 文本产物路径）或 `input_text`（ADAPTER_API.md 格式 C）
+    3. JSON body `input_path`（文本文件路径）
+
+    响应契约（ep-core executor 权威）：
+    {status:"completed", output_type:"file", result:<输出路径>,
+     output_path:<输出路径>, metadata:{engine,sample_rate,duration_secs},
+     elapsed_seconds:<float>}
+    """
+    if _engine == "none":
+        return _error(503, "MODEL_NOT_LOADED", f"无可用合成引擎: {_load_error or '未知错误'}")
+
+    # ---- 解析输入文本与参数 ----
+    text = ""
+    params: dict = {}
+    content_type = request.headers.get("content-type", "")
+    try:
+        if "multipart/form-data" in content_type:
+            params = _parse_params(params_form)
+            if file is not None and file.filename:
+                raw = await file.read()
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    text = raw.decode("gbk", errors="replace")
+        else:
+            body = await request.json()
+            params = _parse_params(body.get("params"))
+            raw_input = body.get("input")
+            if raw_input is None:
+                raw_input = body.get("input_text")
+            if isinstance(raw_input, str):
+                text = raw_input
+            elif raw_input is not None:
+                text = json.dumps(raw_input, ensure_ascii=False)
+            if not text.strip():
+                input_path = body.get("input_path")
+                if input_path:
+                    p = Path(input_path)
+                    if not p.is_file():
+                        return _error(400, "FILE_NOT_FOUND", f"input_path 不存在: {input_path}")
+                    text = p.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        return _error(400, "INVALID_INPUT", f"请求解析失败: {exc}")
+
+    text = text.strip()
     if not text:
-        raise HTTPException(status_code=400, detail="input_text 不能为空")
+        return _error(
+            400, "INVALID_INPUT",
+            "缺少输入文本（需 multipart 'file' 文本文件或 JSON 'input'/'input_text'/'input_path'）",
+        )
+    if len(text) > 5000:
+        return _error(400, "INVALID_INPUT", f"文本超长（{len(text)} > 5000 字符）")
 
     # 解析参数
-    params = req.params or {}
     voice: str = str(params.get("voice", "default"))
-    speed: float = float(params.get("speed", 1.0))
-    sample_rate: int = int(params.get("sample_rate", 24000))
+    try:
+        speed: float = float(params.get("speed", 1.0))
+    except (TypeError, ValueError):
+        speed = 1.0
+    try:
+        sample_rate: int = int(params.get("sample_rate", 24000))
+    except (TypeError, ValueError):
+        sample_rate = 24000
 
     # 参数校验
     speed = max(0.5, min(2.0, speed))
     if sample_rate not in (8000, 16000, 22050, 24000, 44100, 48000):
         sample_rate = 24000
 
-    # 准备输出路径
-    WORKSPACE.mkdir(parents=True, exist_ok=True)
-    filename = f"tts_{int(time.time())}_{uuid.uuid4().hex[:8]}.wav"
-    output_path = WORKSPACE / filename
+    # 准备输出路径：params.output_path（模块产物协议注入）优先，否则 workspace
+    injected = params.get("output_path")
+    if injected:
+        output_path = Path(str(injected))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        WORKSPACE.mkdir(parents=True, exist_ok=True)
+        filename = f"tts_{int(time.time())}_{uuid.uuid4().hex[:8]}.wav"
+        output_path = WORKSPACE / filename
 
+    t0 = time.time()
     try:
         if _engine == "qwen3-tts":
             duration = await asyncio.get_event_loop().run_in_executor(
@@ -414,18 +490,28 @@ async def predict_synthesize(req: SynthesizeRequest):
         else:
             duration = await _synthesize_edge_tts(text, voice, sample_rate, output_path)
 
+        # edge-tts 无法转 WAV 时可能降级输出同名 .mp3
         if not output_path.exists():
-            raise RuntimeError("合成完成但输出文件不存在")
+            alt = output_path.with_suffix(".mp3")
+            if alt.exists():
+                output_path = alt
+            else:
+                raise RuntimeError("合成完成但输出文件不存在")
 
-        return SynthesizeResponse(
-            status="ok",
-            output_path=str(output_path.resolve()),
-            sample_rate=sample_rate,
-            duration_secs=round(duration, 3),
-            engine=_engine,
-        )
-    except HTTPException:
-        raise
+        elapsed = round(time.time() - t0, 3)
+        return {
+            "status": "completed",
+            "output_type": "file",
+            "result": str(output_path.resolve()),
+            "output_path": str(output_path.resolve()),
+            "metadata": {
+                "engine": _engine,
+                "sample_rate": sample_rate,
+                "duration_secs": round(duration, 3),
+                "voice": voice,
+            },
+            "elapsed_seconds": elapsed,
+        }
     except Exception as exc:
         logger.exception("语音合成失败")
         # 清理可能的残留文件
@@ -434,7 +520,7 @@ async def predict_synthesize(req: SynthesizeRequest):
                 output_path.unlink()
             except OSError:
                 pass
-        raise HTTPException(status_code=500, detail=f"语音合成失败: {exc}") from exc
+        return _error(500, "INFERENCE_ERROR", f"语音合成失败: {exc}")
 
 
 # ---------------------------------------------------------------------------

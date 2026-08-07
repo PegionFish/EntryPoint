@@ -1,12 +1,18 @@
 """
 PaddleOCR adapter for EntryPoint module runtime.
 
-Exposes PP-OCRv4 detection + recognition + angle classification
+Exposes PP-OCR detection + recognition + textline orientation classification
 through a FastAPI HTTP service.
+
+Targeting paddleocr 3.x (paddlex pipeline): constructor uses `device` /
+`use_textline_orientation` (2.x `use_gpu` / `use_angle_cls` / `show_log` are
+rejected with "Unknown argument"); results are OCRResult dicts with
+`rec_texts` / `rec_scores` / `rec_polys`.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -16,8 +22,14 @@ import traceback
 from pathlib import Path
 from typing import Any, Optional
 
+# paddlepaddle 3.3.x Windows CPU 下 PIR + oneDNN 推理存在已知崩溃
+# （ConvertPirAttribute2RuntimeAttribute not support ... onednn_instruction）；
+# paddlex 默认在 CPU 上启用 MKLDNN，关闭后回退原生 CPU 内核，规避该缺陷。
+# GPU 路径不受影响（runner 对 GPU 本就 disable_mkldnn）。
+os.environ.setdefault("PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT", "0")
+
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -50,10 +62,21 @@ _ocr_engine_angle_cls: bool | None = None
 
 
 def _get_ocr(lang: str = "ch", use_angle_cls: bool = True, det_db_thresh: float = 0.3):
-    """Return a (cached) PaddleOCR instance, recreating it when params change."""
+    """Return a (cached) PaddleOCR 3.x instance, recreating it when params change.
+
+    3.x API 适配：`use_gpu` → `device`；`use_angle_cls` →
+    `use_textline_orientation`；`show_log` 移除（日志走标准 logging）；
+    `det_db_thresh` 语义最接近的 3.x 参数为 `text_det_box_thresh`。
+    """
     global _ocr_engine, _ocr_engine_lang, _ocr_engine_angle_cls
 
-    use_gpu = EP_BACKEND == "cuda"
+    device = "cpu"
+    if EP_BACKEND == "cuda":
+        # 3.x 在 GPU 不可用时自动回退 CPU（仅警告）；paddlepaddle 为 CPU 轮子时同理
+        try:
+            device = f"gpu:{int(EP_DEVICE_INDEX)}"
+        except (TypeError, ValueError):
+            device = "gpu"
 
     if (
         _ocr_engine is not None
@@ -63,34 +86,42 @@ def _get_ocr(lang: str = "ch", use_angle_cls: bool = True, det_db_thresh: float 
         return _ocr_engine
 
     logger.info(
-        "Initialising PaddleOCR  lang=%s  angle_cls=%s  gpu=%s  det_db_thresh=%.2f",
+        "Initialising PaddleOCR 3.x  lang=%s  textline_orientation=%s  device=%s  box_thresh=%.2f",
         lang,
         use_angle_cls,
-        use_gpu,
+        device,
         det_db_thresh,
     )
 
     from paddleocr import PaddleOCR  # heavy import – keep lazy
 
     kwargs: dict[str, Any] = dict(
-        use_angle_cls=use_angle_cls,
         lang=lang,
-        use_gpu=use_gpu,
-        det_db_thresh=det_db_thresh,
-        show_log=False,
+        use_textline_orientation=use_angle_cls,
+        # 文档预处理子模型默认开启，纯 OCR 场景关闭以降低开销
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        device=device,
     )
+    try:
+        if 0.0 <= float(det_db_thresh) <= 1.0:
+            kwargs["text_det_box_thresh"] = float(det_db_thresh)
+    except (TypeError, ValueError):
+        pass
 
-    # Point to pre-downloaded model directory when provided
+    # Point to pre-downloaded model directory when provided.
+    # 3.x 参数名：text_detection_model_dir / text_recognition_model_dir /
+    # textline_orientation_model_dir（旧布局 cls/ 映射到行方向分类模型）。
     if EP_MODEL_DIR and Path(EP_MODEL_DIR).is_dir():
         det_dir = Path(EP_MODEL_DIR) / "det"
         rec_dir = Path(EP_MODEL_DIR) / "rec"
         cls_dir = Path(EP_MODEL_DIR) / "cls"
         if det_dir.is_dir():
-            kwargs["det_model_dir"] = str(det_dir)
+            kwargs["text_detection_model_dir"] = str(det_dir)
         if rec_dir.is_dir():
-            kwargs["rec_model_dir"] = str(rec_dir)
+            kwargs["text_recognition_model_dir"] = str(rec_dir)
         if cls_dir.is_dir():
-            kwargs["cls_model_dir"] = str(cls_dir)
+            kwargs["textline_orientation_model_dir"] = str(cls_dir)
 
     _ocr_engine = PaddleOCR(**kwargs)
     _ocr_engine_lang = lang
@@ -115,6 +146,20 @@ class RecognizeRequest(BaseModel):
     lang: str = "ch"
     use_angle_cls: bool = True
     det_db_thresh: float = 0.3
+    params: dict = {}
+
+
+def _parse_params(raw: Any) -> dict:
+    """解析参数，支持 dict 或 JSON 字符串（multipart params 字段为字符串）。"""
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return raw if isinstance(raw, dict) else {}
 
 
 # ---- health / info --------------------------------------------------------
@@ -150,71 +195,147 @@ async def info():
 # ---- predict --------------------------------------------------------------
 
 
-def _run_ocr(image_path: str, lang: str, use_angle_cls: bool, det_db_thresh: float) -> dict:
-    """Run OCR on a single image and return the structured result dict."""
+def _run_ocr(image_path: str, lang: str, use_angle_cls: bool, det_db_thresh: float, params: dict | None = None) -> dict:
+    """Run OCR on a single image and return the structured result dict.
+
+    3.x result shape: list of OCRResult (dict-like) with keys
+    `rec_texts` / `rec_scores` / `rec_polys` (fallback `dt_polys`).
+
+    直跑/管线文件产物模式（MODULE_SPEC §5）：params 含 `output_format`
+    （非 json）与执行器注入的 `output_path` 时，将识别结果写入该文件
+    （`output_format="text"` 仅写文本，其余格式写完整 JSON），返回
+    output_type="file" + result=路径 —— 使 JSON 型能力在直跑退化 DAG
+    （file_input → module → file_output）中也能产出可归集文件产物。
+    """
     ocr = _get_ocr(lang=lang, use_angle_cls=use_angle_cls, det_db_thresh=det_db_thresh)
-    raw = ocr.ocr(image_path, cls=use_angle_cls)
+    raw = ocr.predict(image_path)
 
     lines: list[dict] = []
     full_texts: list[str] = []
 
-    # PaddleOCR returns list-of-pages; each page is a list of detections
-    pages = raw if isinstance(raw, list) else [raw]
-    for page in pages:
-        if not page:
+    results = raw if isinstance(raw, (list, tuple)) else [raw]
+    for res in results:
+        if res is None:
             continue
-        for det in page:
+        try:
+            texts = res["rec_texts"] or []
+            scores = res.get("rec_scores") or []
+            polys = res.get("rec_polys")
+            if polys is None:
+                polys = res.get("dt_polys")
+        except (TypeError, KeyError, IndexError) as exc:
+            logger.warning("Skipping malformed result: %s", exc)
+            continue
+
+        for idx, text in enumerate(texts):
             try:
-                bbox = [[float(pt[0]), float(pt[1])] for pt in det[0]]
-                text = str(det[1][0])
-                confidence = round(float(det[1][1]), 6)
+                confidence = round(float(scores[idx]), 6) if idx < len(scores) else 0.0
+                bbox: list = []
+                if polys is not None and idx < len(polys):
+                    poly = polys[idx]
+                    pts = getattr(poly, "tolist", lambda: poly)()
+                    bbox = [[float(pt[0]), float(pt[1])] for pt in pts]
                 lines.append(
-                    {"text": text, "confidence": confidence, "bbox": bbox}
+                    {"text": str(text), "confidence": confidence, "bbox": bbox}
                 )
-                full_texts.append(text)
+                full_texts.append(str(text))
             except (IndexError, TypeError, ValueError) as exc:
                 logger.warning("Skipping malformed detection: %s", exc)
+
+    result_payload = {
+        "text": "\n".join(full_texts),
+        "lines": lines,
+        "language": lang,
+    }
+
+    # ── 文件产物模式（MODULE_SPEC §5.2：执行器注入 output_path）──
+    params = params or {}
+    output_format = str(params.get("output_format") or "json").strip().lower()
+    output_path = params.get("output_path")
+    if output_format != "json" and output_path:
+        try:
+            p = Path(str(output_path))
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if output_format == "text":
+                p.write_text(result_payload["text"], encoding="utf-8")
+            else:
+                p.write_text(
+                    json.dumps(result_payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            logger.info("OCR result written to %s (format=%s)", p, output_format)
+            return {
+                "status": "completed",
+                "output_type": "file",
+                "result": str(p),
+                "output_path": str(p),
+            }
+        except Exception as exc:
+            logger.warning("Failed to write result file (%s); falling back to JSON", exc)
 
     return {
         "status": "completed",
         "output_type": "json",
-        "result": {
-            "text": "\n".join(full_texts),
-            "lines": lines,
-            "language": lang,
-        },
+        "result": result_payload,
     }
 
 
 @app.post("/predict/recognize")
 async def predict_recognize(
+    request: Request,
     file: Optional[UploadFile] = File(None),
-    input_path: Optional[str] = Form(None),
-    lang: str = Form("ch"),
-    use_angle_cls: bool = Form(True),
-    det_db_thresh: float = Form(0.3),
+    input_path_form: Optional[str] = Form(None, alias="input_path"),
+    params_form: Optional[str] = Form(None, alias="params"),
+    lang_form: str = Form("ch", alias="lang"),
+    use_angle_cls_form: bool = Form(True, alias="use_angle_cls"),
+    det_db_thresh_form: float = Form(0.3, alias="det_db_thresh"),
 ):
     """Recognise text in an image.
 
-    Accepts either a multipart file upload or a JSON body with ``input_path``.
+    Accepts a multipart request (file 上传或 input_path 表单字段；参数走
+    `params` JSON 字符串 — ep-core executor 契约，兼容旧版平铺表单字段），
+    或 JSON body（见 /predict/recognize/json）。
     """
     tmp_path: str | None = None
 
+    # 参数：params JSON 优先，平铺表单字段兼容
+    params = _parse_params(params_form)
+    lang = str(params.get("lang", lang_form))
+    use_angle_cls = bool(params.get("use_angle_cls", use_angle_cls_form))
+    try:
+        det_db_thresh = float(params.get("det_db_thresh", det_db_thresh_form))
+    except (TypeError, ValueError):
+        det_db_thresh = det_db_thresh_form
+
     try:
         # --- resolve image source ------------------------------------------
-        if file is not None and file.filename:
+        content_type = request.headers.get("content-type", "")
+        image_path: str | None = None
+        if "application/json" in content_type:
+            body = await request.json()
+            params.update(_parse_params(body.get("params")))
+            lang = str(params.get("lang", lang))
+            use_angle_cls = bool(params.get("use_angle_cls", use_angle_cls))
+            try:
+                det_db_thresh = float(params.get("det_db_thresh", det_db_thresh))
+            except (TypeError, ValueError):
+                pass
+            image_path = body.get("input_path")
+            if not image_path:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Provide either a multipart 'file' upload or an 'input_path' field.",
+                )
+        elif file is not None and file.filename:
             suffix = Path(file.filename).suffix or ".png"
             fd, tmp_path = tempfile.mkstemp(suffix=suffix, prefix="ep_ocr_")
             os.close(fd)
             with open(tmp_path, "wb") as f:
                 shutil.copyfileobj(file.file, f)
             image_path = tmp_path
-        elif input_path:
-            image_path = input_path
+        elif input_path_form:
+            image_path = input_path_form
         else:
-            # Maybe the caller sent a JSON body instead of form-data.
-            # FastAPI won't populate Form fields from JSON, so we return a
-            # helpful error.
             raise HTTPException(
                 status_code=422,
                 detail="Provide either a multipart 'file' upload or an 'input_path' field.",
@@ -235,7 +356,7 @@ async def predict_recognize(
             )
 
         # --- run OCR --------------------------------------------------------
-        result = _run_ocr(image_path, lang, use_angle_cls, det_db_thresh)
+        result = _run_ocr(image_path, lang, use_angle_cls, det_db_thresh, params)
         return JSONResponse(content=result)
 
     except HTTPException:

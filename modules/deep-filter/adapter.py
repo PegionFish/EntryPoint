@@ -5,6 +5,7 @@ DeepFilter 音频降噪模块 — EntryPoint adapter
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -17,9 +18,8 @@ from typing import Optional
 import numpy as np
 import soundfile as sf
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
 # 环境变量
@@ -337,18 +337,30 @@ def _get_output_dir() -> Path:
 app = FastAPI(title=f"EntryPoint Module: {EP_MODULE_ID}", version="0.5.6")
 
 
-class DenoiseRequest(BaseModel):
-    input_path: str
-    attenuation: int = 100
-    min_db: float = -60.0
+def _error(status_code: int, error_code: str, message: str, detail: Optional[str] = None):
+    """构造 ADAPTER_API.md §2.3 定义的错误响应。"""
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": "error",
+            "error_code": error_code,
+            "message": message,
+            "detail": detail,
+        },
+    )
 
 
-class DenoiseResponse(BaseModel):
-    status: str
-    output_path: str
-    backend: str
-    sample_rate: int
-    duration_secs: float
+def _parse_params(raw) -> dict:
+    """解析参数，支持 dict 或 JSON 字符串（multipart params 字段为字符串）。"""
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return raw if isinstance(raw, dict) else {}
 
 
 @app.on_event("startup")
@@ -388,52 +400,77 @@ async def info():
     }
 
 
-@app.post("/predict/denoise", response_model=DenoiseResponse)
+@app.post("/predict/denoise")
 async def predict_denoise(
+    request: Request,
     file: Optional[UploadFile] = File(None),
-    input_path: Optional[str] = Form(None),
-    attenuation: int = Form(100),
-    min_db: float = Form(-60.0),
+    input_path_form: Optional[str] = Form(None, alias="input_path"),
+    params_form: Optional[str] = Form(None, alias="params"),
 ):
     """
-    音频降噪。支持两种输入：
-    1. multipart file 上传
-    2. input_path 指定本地文件路径
+    音频降噪。支持三种输入：
+    1. multipart file 上传（ep-core executor 文件类产物路径，params 为 JSON 字符串）
+    2. multipart input_path 表单字段
+    3. JSON body {"input_path": ..., "params": {...}}（ADAPTER_API.md 格式 B）
+
+    响应契约（ep-core executor 权威）：
+    {status:"completed", output_type:"file", result:<输出路径>,
+     output_path:<输出路径>, metadata:{backend,sample_rate,duration_secs},
+     elapsed_seconds:<float>}
     """
     if _backend_used == "none":
-        raise HTTPException(status_code=503, detail="降噪后端不可用")
+        return _error(503, "MODEL_NOT_LOADED", "降噪后端不可用", _model_load_error)
 
-    # 参数校验
-    attenuation = max(0, min(100, attenuation))
-    min_db = max(-100.0, min(0.0, min_db))
-
+    # ---- 解析输入与参数 ----
+    content_type = request.headers.get("content-type", "")
+    params_dict: dict = {}
     tmp_input: Optional[Path] = None
     try:
-        # 确定输入文件
-        if file is not None:
-            # multipart 上传
-            suffix = Path(file.filename or "audio.wav").suffix or ".wav"
-            tmp_input = Path(tempfile.mkdtemp()) / f"upload_{uuid.uuid4().hex[:8]}{suffix}"
-            content = await file.read()
-            tmp_input.write_bytes(content)
-            src_path = tmp_input
-        elif input_path:
+        if "application/json" in content_type:
+            body = await request.json()
+            params_dict = _parse_params(body.get("params"))
+            input_path = body.get("input_path")
+            if not input_path:
+                return _error(
+                    400, "INVALID_INPUT",
+                    "No input provided (need 'input_path' in JSON body or 'file' in multipart)",
+                )
             src_path = Path(input_path)
             if not src_path.is_file():
-                raise HTTPException(status_code=400, detail=f"文件不存在: {input_path}")
+                return _error(400, "FILE_NOT_FOUND", f"文件不存在: {input_path}")
         else:
-            raise HTTPException(
-                status_code=400,
-                detail="请提供 file (multipart) 或 input_path 参数",
-            )
+            params_dict = _parse_params(params_form)
+            if file is not None:
+                suffix = Path(file.filename or "audio.wav").suffix or ".wav"
+                tmp_input = Path(tempfile.mkdtemp()) / f"upload_{uuid.uuid4().hex[:8]}{suffix}"
+                content = await file.read()
+                tmp_input.write_bytes(content)
+                src_path = tmp_input
+            elif input_path_form:
+                src_path = Path(input_path_form)
+                if not src_path.is_file():
+                    return _error(400, "FILE_NOT_FOUND", f"文件不存在: {input_path_form}")
+            else:
+                return _error(
+                    400, "INVALID_INPUT",
+                    "请提供 file (multipart) 或 input_path 参数",
+                )
+
+        # 参数提取（executor params 注入；含模块产物协议的 output_path）
+        try:
+            attenuation = max(0, min(100, int(params_dict.get("attenuation", 100))))
+        except (TypeError, ValueError):
+            attenuation = 100
+        try:
+            min_db = max(-100.0, min(0.0, float(params_dict.get("min_db", -60.0))))
+        except (TypeError, ValueError):
+            min_db = -60.0
 
         # 读取音频
         try:
             audio, sr = sf.read(str(src_path), dtype="float32")
         except Exception as exc:
-            raise HTTPException(
-                status_code=400, detail=f"无法读取音频文件: {exc}"
-            )
+            return _error(400, "INVALID_INPUT", f"无法读取音频文件: {exc}")
 
         duration = len(audio) / sr if audio.ndim == 1 else len(audio[:, 0]) / sr
 
@@ -446,25 +483,35 @@ async def predict_denoise(
         elapsed = time.time() - t0
         log.info("降噪完成: %.2fs 音频, 耗时 %.2fs", duration, elapsed)
 
-        # 写入输出
-        out_dir = _get_output_dir()
-        out_name = f"denoised_{uuid.uuid4().hex[:8]}.wav"
-        out_path = out_dir / out_name
-        sf.write(str(out_path), enhanced, sr if _backend_used == "scipy" else _sr)
+        # 写入输出：params.output_path（模块产物协议注入）优先，否则 workspace/临时目录
+        out_sr = sr if _backend_used == "scipy" else _sr
+        injected = params_dict.get("output_path")
+        if injected:
+            out_path = Path(str(injected))
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            out_dir = _get_output_dir()
+            out_path = out_dir / f"denoised_{uuid.uuid4().hex[:8]}.wav"
+        sf.write(str(out_path), enhanced, out_sr)
 
-        return DenoiseResponse(
-            status="ok",
-            output_path=str(out_path),
-            backend=_backend_used,
-            sample_rate=sr if _backend_used == "scipy" else _sr,
-            duration_secs=round(duration, 3),
-        )
+        return {
+            "status": "completed",
+            "output_type": "file",
+            "result": str(out_path),
+            "output_path": str(out_path),
+            "metadata": {
+                "backend": _backend_used,
+                "sample_rate": out_sr,
+                "duration_secs": round(duration, 3),
+                "attenuation": attenuation,
+                "min_db": min_db,
+            },
+            "elapsed_seconds": round(elapsed, 3),
+        }
 
-    except HTTPException:
-        raise
     except Exception as exc:
         log.exception("降噪处理失败")
-        raise HTTPException(status_code=500, detail=f"降噪处理失败: {exc}")
+        return _error(500, "INFERENCE_ERROR", f"降噪处理失败: {exc}")
     finally:
         # 清理临时上传文件
         if tmp_input and tmp_input.exists():
