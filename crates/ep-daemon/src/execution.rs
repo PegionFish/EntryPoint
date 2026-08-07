@@ -55,9 +55,17 @@
 //!   → 回退 `default_timeout_secs`（旧配置行为不变），由执行器包裹单节点
 //!   wall-clock 执行。
 //! - **取消**：[`request_cancel`]（`POST /api/tasks/{id}/cancel`）——排队中取消
-//!   立即终结且不执行；运行中取消立即判 `cancelled`（逻辑终态）。
-//! - **边界（诚实声明）**：引擎 `execute` 无法从外部中断，超时/取消后引擎
-//!   线程仍在后台收尾，其后续状态写入因记录已终态而被忽略。
+//!   立即终结且不执行；运行中取消立即判 `cancelled`（逻辑终态），并经
+//!   协作取消标志传播到引擎（缺陷 #5，见下）。
+//! - **取消/超时 → 引擎传播（缺陷 #5）**：看门狗判死与用户取消均置位
+//!   协作取消标志；runner 在节点边界与**在飞期间**两类检查点响应——
+//!   在飞节点的执行任务被 `abort()`：模块 HTTP 请求（/predict/*）future
+//!   被丢弃、连接立即断开，ffmpeg 子进程经 kill_on_drop 终止；引擎线程
+//!   随之快速退出，不再“标记终态后任请求挂到自然结束”。
+//! - **行为边界（诚实声明）**：模块侧（uvicorn 单 worker）推理线程为同步
+//!   CPU/GPU 密集执行，平台断开连接后**无法从平台侧中断**，推理可能仍在
+//!   收尾，worker 短暂占用属预期（平台侧不再等待/重试，任务资源立即回收）；
+//!   引擎线程被 abort 后残余的状态写入因记录已终态而被忽略。
 //!
 //! ## wait 同步模式 + callback_url（§6.5）
 //!
@@ -176,7 +184,8 @@ fn pending() -> &'static Mutex<HashMap<String, PendingTask>> {
 /// 运行中任务的协作标志与回调配置
 #[derive(Clone)]
 struct TaskExtras {
-    /// 取消请求标志（执行器层取消检查点预留，当前供后台收尾判重）
+    /// 取消请求标志：与 runner 共享；置位后经节点边界/在飞中断两类检查点
+    /// 传播到引擎（缺陷 #5：在飞模块 HTTP 请求被 abort、引擎线程快速退出）
     cancel: Arc<AtomicBool>,
     /// 终结 CAS：超时看门狗 / 用户取消 / 引擎收尾三方竞争，唯一赢家
     /// 写终态 + 释放闸门 + 触发回调
@@ -807,7 +816,7 @@ fn start_task(
                 if !watchdog_idle_exceeded(&record, last, now_epoch_ms(), timeout_secs) {
                     continue; // 仍有心跳/进度，继续守候
                 }
-                warn!(task_id = %task_id_w, timeout_secs, "task idle watchdog fired: no node progress/heartbeat; marking failed (engine thread may finish in background)");
+                warn!(task_id = %task_id_w, timeout_secs, "task idle watchdog fired: no node progress/heartbeat; marking failed (cancellation propagated to engine: in-flight calls will be aborted)");
                 extras_w.cancel.store(true, Ordering::SeqCst);
                 finalize_task(
                     &state_w,
@@ -868,7 +877,10 @@ fn start_task(
             }
         };
 
-        finalize_task(
+        // 终态已由看门狗/取消写入时（CAS 输家）：引擎收尾结果被忽略。
+        // 缺陷 #5 后引擎通常已因取消传播快速退出；若模块侧推理仍在收尾，
+        // worker 短暂占用属预期（见模块文档“行为边界”）。
+        if finalize_task(
             &state_bg,
             &task_id,
             &pipeline_id,
@@ -876,7 +888,11 @@ fn start_task(
             detail.as_ref(),
             extras_bg.callback_url.clone(),
         )
-        .await;
+        .await
+        .is_none()
+        {
+            info!(task_id = %task_id, "engine finished after task already terminal (watchdog/cancel won the race); engine result ignored");
+        }
     });
     })
 }
@@ -1076,8 +1092,9 @@ pub enum CancelOutcome {
 /// 请求取消任务（`POST /api/tasks/{id}/cancel`）。
 ///
 /// - 排队中：移出队列，立即 `cancelled`，引擎从不启动；
-/// - 运行中：立即 `cancelled`（逻辑终态；引擎线程无外部中断点，
-///   后台收尾时的状态写入因记录已终态而被忽略，见模块文档）。
+/// - 运行中：立即 `cancelled`（逻辑终态），并置位协作取消标志传播到
+///   引擎（缺陷 #5）：在飞节点被 abort（模块 HTTP 连接断开、子进程终止），
+///   引擎线程快速退出；其残余状态写入因记录已终态而被忽略（见模块文档）。
 pub async fn request_cancel(state: &Arc<AppState>, task_id: &str) -> CancelOutcome {
     // 1) 排队中 → 出队 + 终态（不占闸门，无需 finalize CAS）
     let was_queued = {
@@ -1450,7 +1467,9 @@ pub fn build_direct_pipeline(
 /// （终态写入统一由 [`finalize_task`] 完成）。
 ///
 /// - `cancel_flag`：协作取消标志（与 [`TaskExtras::cancel`] 共享），
-///   runner 在节点边界检查 → 引擎产生 `TaskStatus::Cancelled`（P0-6）；
+///   runner 在节点边界与在飞期间两类检查点响应：在飞节点的执行任务被
+///   abort（模块 HTTP 请求连接断开、ffmpeg 子进程终止）→ 引擎产生
+///   `TaskStatus::Cancelled`（P0-6；缺陷 #5 在飞中断）；
 /// - `activity_ms`：节点进度时刻（缺陷 #3 心跳看门狗）；节点开始/完成/失败
 ///   回调均 bump，任务级空闲看门狗据此判定“无心跳”而非任务总时长；
 /// - `default_node_timeout`：节点级 wall-clock 硬超时缺省值（缺陷 #3 拆分，

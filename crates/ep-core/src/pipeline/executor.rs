@@ -2258,6 +2258,9 @@ async fn execute_builtin_ffmpeg(
 
     let ffmpeg_bin = resolve_ffmpeg_path();
     let mut cmd = tokio::process::Command::new(&ffmpeg_bin);
+    // 缺陷 #5：取消/超时 abort 执行任务时，future 被丢弃 → Child 被 drop
+    // → 子进程一并终止；否则 ffmpeg 会脱离任务继续跑到自然结束。
+    cmd.kill_on_drop(true);
     cmd.arg("-y"); // overwrite output
 
     // args 已通过 -i 或 {input} 自行声明输入时，不再前置上游文件

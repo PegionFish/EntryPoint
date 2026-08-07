@@ -83,15 +83,48 @@ pub struct PipelineRunnerImpl {
     /// 节点失败时回调
     #[allow(clippy::type_complexity)]
     pub on_node_error: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
-    /// 协作取消标志（P0-6/B3）：执行层置位后，下一个节点开始前任务终结为
-    /// `Cancelled`。节点内部无中断点（进行中的节点会先完成其客户端级超时），
-    /// 标志检查粒度 = 节点边界。
+    /// 协作取消标志（P0-6/B3；缺陷 #5 起支持在飞中断）：置位后两类检查点
+    /// 均生效——① 节点边界：下一个节点不再启动；② 节点在飞期间：取消
+    /// 监视器赢得竞争后 `abort()` 执行任务（在飞的模块 HTTP 请求 future
+    /// 被丢弃、连接立即断开；ffmpeg 子进程经 kill_on_drop 一并终止），
+    /// 任务终结为 `Cancelled`。轮询粒度 = [`CANCEL_POLL_INTERVAL_MS`]。
     cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// 默认节点 wall-clock 超时（P0-6/B3）：节点未声明 `timeout_secs` 时使用；
     /// None = 无默认（仅受节点自身 timeout_secs 与执行器客户端级超时约束）。
     /// 与执行器的 HTTP 客户端超时互补（B7：executor `node_timeout_secs`）：
-    /// 此处包裹整个 `execute_node` future，覆盖 ffmpeg 子进程等非 HTTP 节点。
+    /// 此处包裹整个 `execute_node` future，覆盖 ffmpeg 子进程等非 HTTP 节点；
+    /// 超时触发时同样 `abort()` 执行任务（缺陷 #5：不只是标记失败任请求
+    /// 挂到自然结束，在飞 HTTP 连接立即断开、子进程立即终止）。
     default_node_timeout: Option<std::time::Duration>,
+}
+
+/// 取消标志轮询间隔（毫秒）：在飞节点中断的检测粒度。
+const CANCEL_POLL_INTERVAL_MS: u64 = 100;
+
+/// 监视协作取消标志：置位即返回（缺陷 #5）。与在飞节点执行竞速，
+/// 赢得竞争后由调用方 `abort()` 执行任务，使平台侧不再等待/重试该请求。
+async fn wait_for_cancel_flag(flag: Arc<std::sync::atomic::AtomicBool>) {
+    loop {
+        if flag.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(CANCEL_POLL_INTERVAL_MS)).await;
+    }
+}
+
+/// 在飞节点的中断原因（缺陷 #5：硬超时 / 协作取消均走 abort 路径）
+enum NodeInterrupt {
+    /// 节点级 wall-clock 硬超时触发
+    Timeout(u64),
+    /// 协作取消标志置位
+    Cancelled,
+}
+
+/// 单节点执行竞速结果：自然完成 / 硬超时中断 / 取消中断
+enum NodeRunOutcome {
+    Done(anyhow::Result<Artifact>),
+    TimedOut(u64),
+    Cancelled,
 }
 
 impl PipelineRunnerImpl {
@@ -223,8 +256,8 @@ impl PipelineRunnerImpl {
                 }
 
                 // 取消检查点（P0-6/B3）：节点边界检查协作取消标志，
-                // 置位 → 任务终结为 Cancelled（进行中的节点不会被中断，
-                // 其自身受执行器客户端级超时约束 — B7 executor）
+                // 置位 → 任务终结为 Cancelled（下一节点不再启动；若标志在
+                // 节点在飞期间置位，由下方取消监视器中断在飞执行 — 缺陷 #5）
                 if self
                     .cancel_flag
                     .as_ref()
@@ -260,22 +293,102 @@ impl PipelineRunnerImpl {
                     .map(u64::from)
                     .or_else(|| self.default_node_timeout.map(|d| d.as_secs()))
                     .filter(|&secs| secs > 0);
-                let exec_result = match timeout_secs {
-                    Some(secs) => {
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(secs),
-                            execute_node(node, pipeline, &task, work_dir, &self.module_ports),
-                        )
-                        .await
-                        {
-                            Ok(result) => result,
-                            Err(_elapsed) => Err(anyhow::anyhow!(
-                                "node '{node_id}' timed out after {secs}s"
+
+                // ── 可中断执行（缺陷 #5）────────────────────────────────────
+                // execute_node 派生为独立 tokio 任务，与「硬超时 / 取消标志」
+                // 竞速：超时或取消赢得竞争时 abort() 执行任务——在飞的模块
+                // HTTP 请求（/predict/*）future 被丢弃、连接立即断开（模块侧
+                // 尽快收到断开）；ffmpeg 子进程经 kill_on_drop 一并终止。
+                // 不再「标记失败而任请求挂到自然结束」。
+                let node_owned = node.clone();
+                let pipeline_owned = pipeline.clone();
+                let task_owned = task.clone();
+                let work_dir_owned = work_dir.to_path_buf();
+                let ports_owned = self.module_ports.clone();
+                let mut exec_handle = tokio::spawn(async move {
+                    execute_node(
+                        &node_owned,
+                        &pipeline_owned,
+                        &task_owned,
+                        &work_dir_owned,
+                        &ports_owned,
+                    )
+                    .await
+                });
+
+                // 中断竞速：硬超时与取消标志任一先到即中断在飞节点；
+                // 两者皆未配置时为永不就绪分支，等价于只等执行完成。
+                let timeout_owned = timeout_secs;
+                let flag_owned = self.cancel_flag.clone();
+                let interrupt = async move {
+                    let timeout_branch = async move {
+                        match timeout_owned {
+                            Some(secs) => {
+                                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                                NodeInterrupt::Timeout(secs)
+                            }
+                            None => std::future::pending::<NodeInterrupt>().await,
+                        }
+                    };
+                    let cancel_branch = async move {
+                        match flag_owned {
+                            Some(flag) => {
+                                wait_for_cancel_flag(flag).await;
+                                NodeInterrupt::Cancelled
+                            }
+                            None => std::future::pending::<NodeInterrupt>().await,
+                        }
+                    };
+                    tokio::select! {
+                        i = timeout_branch => i,
+                        i = cancel_branch => i,
+                    }
+                };
+
+                let outcome = tokio::select! {
+                    res = &mut exec_handle => {
+                        // 任务自然完成（或 join 异常）→ 走既有成败处理
+                        NodeRunOutcome::Done(match res {
+                            Ok(inner) => inner,
+                            Err(join_err) => Err(anyhow::anyhow!(
+                                "node '{node_id}' execution task aborted: {join_err}"
                             )),
+                        })
+                    }
+                    i = interrupt => {
+                        exec_handle.abort();
+                        match i {
+                            NodeInterrupt::Timeout(secs) => NodeRunOutcome::TimedOut(secs),
+                            NodeInterrupt::Cancelled => NodeRunOutcome::Cancelled,
                         }
                     }
-                    None => {
-                        execute_node(node, pipeline, &task, work_dir, &self.module_ports).await
+                };
+
+                let exec_result = match outcome {
+                    NodeRunOutcome::Done(result) => result,
+                    NodeRunOutcome::TimedOut(secs) => Err(anyhow::anyhow!(
+                        "node '{node_id}' timed out after {secs}s (in-flight call aborted)"
+                    )),
+                    NodeRunOutcome::Cancelled => {
+                        // 与节点边界取消同语义：节点判 failed、任务终结
+                        // Cancelled。行为边界：模块侧推理线程为同步 CPU/GPU
+                        // 密集执行，客户端断开后可能仍在收尾，worker 短暂
+                        // 占用属预期；平台侧不再等待/重试该请求。
+                        tracing::info!(
+                            node_id,
+                            "task cancelled: in-flight node aborted (module HTTP connection closed); \
+                             module-side inference may still finish its current request \
+                             (brief worker occupation is expected)"
+                        );
+                        let err_msg = "task cancelled (in-flight node aborted)".to_string();
+                        if let Some(ref cb) = self.on_node_error {
+                            cb(node_id, &err_msg);
+                        }
+                        task.mark_failed_with_pipeline(node_id, err_msg, false, pipeline);
+                        task.status = TaskStatus::Cancelled;
+                        self.tasks.insert(task.id.clone(), task.clone());
+                        self.task = Some(task);
+                        return Err(anyhow::anyhow!("pipeline execution cancelled"));
                     }
                 };
 
@@ -948,9 +1061,9 @@ to = ["output", "input"]
         cleanup_dir(&work_dir);
     }
 
-    /// 执行中置位取消 → 当前节点完成后、下一节点边界终结
+    /// 节点完成后置位取消 → 下一节点边界终结（边界检查点语义）
     #[tokio::test]
-    async fn test_cancel_flag_mid_execution_at_next_boundary() {
+    async fn test_cancel_flag_at_boundary_after_node_complete() {
         let work_dir = temp_work_dir("cancel-mid");
         let input_file = work_dir.join("source.txt");
         let mid_file = work_dir.join("mid.txt");
@@ -998,27 +1111,241 @@ to = ["final", "input"]
 
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         runner.set_cancel_flag(flag.clone());
-        // 首节点开始时置位 → 第二节点边界触发取消
+        // 首节点完成时置位 → 第二节点边界触发取消（确定性：边界检查在
+        // mid 启动前；在飞中断路径由下方 hang 服务器测试覆盖）
         let flag_for_cb = flag.clone();
-        runner.on_node_start = Some(Arc::new(move |_node_id| {
+        runner.on_node_complete = Some(Arc::new(move |_node_id, _artifact| {
             flag_for_cb.store(true, std::sync::atomic::Ordering::SeqCst);
         }));
 
         let result = runner.execute_async(&pipeline, &work_dir).await;
         assert!(result.is_err());
         assert_eq!(*runner.task_status(), TaskStatus::Cancelled);
-        // 取消在 mid 边界触发：input（置位前开始的节点）已完成，
+        // 取消在 mid 边界触发：input（置位前完成的节点）已完成，
         // mid/final 不再执行
         assert!(!mid_file.exists(), "取消边界起的节点不应执行");
         assert!(!final_file.exists(), "取消后的节点不应执行");
         let detail = runner.get_task_detail(&runner.list_tasks()[0].id).unwrap();
         let input = detail.nodes.iter().find(|n| n.node_id == "input").unwrap();
-        assert_eq!(input.state, "completed", "取消前进行中的节点应完成");
+        assert_eq!(input.state, "completed", "取消前完成的节点应保持完成");
         let mid = detail.nodes.iter().find(|n| n.node_id == "mid").unwrap();
         assert_eq!(mid.state, "failed");
         assert!(mid.error.as_deref().unwrap().contains("cancelled"));
         let final_node = detail.nodes.iter().find(|n| n.node_id == "final").unwrap();
         assert_eq!(final_node.state, "skipped");
+
+        cleanup_dir(&work_dir);
+    }
+
+    // ─── 缺陷 #5：在飞节点可中断（abort 在飞 HTTP 请求） ────────────────
+
+    /// 永不响应的 mock 模块端点：客户端连入时置位 `connected`，
+    /// 客户端断开（EOF/RST）时置位 `disconnected`，用于断言 abort
+    /// 确实关闭了在飞连接。
+    struct HangServer {
+        port: u16,
+        connected: Arc<std::sync::atomic::AtomicBool>,
+        disconnected: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl HangServer {
+        async fn start() -> Self {
+            use tokio::io::AsyncReadExt;
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind 127.0.0.1 random port");
+            let port = listener.local_addr().unwrap().port();
+            let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let conn = connected.clone();
+            let disc = disconnected.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    conn.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let disc = disc.clone();
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 4096];
+                        // 只读不答：直到客户端断开（EOF/错误）
+                        loop {
+                            match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => {
+                                    disc.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    break;
+                                }
+                                Ok(_) => {}
+                            }
+                        }
+                    });
+                }
+            });
+            Self {
+                port,
+                connected,
+                disconnected,
+            }
+        }
+
+        /// 等待断开被观察到（超时 panic）
+        async fn wait_disconnected(&self) {
+            for _ in 0..50 {
+                if self.disconnected.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            panic!("模块侧未观察到客户端断开：在飞请求未被 abort");
+        }
+    }
+
+    /// file_input → 永不响应的模块节点 → file_output 的管线 TOML
+    fn hang_module_pipeline_toml(input_path: &Path, output_path: &Path) -> String {
+        format!(
+            r#"
+[pipeline]
+id = "test-hang"
+name = "Hang Module Test"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = {{ path = "{}" }}
+
+[[nodes]]
+id = "slow"
+kind = "module"
+module_id = "mock-hang"
+capability = "slow_cap"
+
+[[nodes]]
+id = "output"
+kind = "builtin"
+builtin = "file_output"
+params = {{ path = "{}" }}
+
+[[edges]]
+from = ["input", "output"]
+to = ["slow", "input"]
+
+[[edges]]
+from = ["slow", "output"]
+to = ["output", "input"]
+"#,
+            input_path.to_string_lossy().replace('\\', "/"),
+            output_path.to_string_lossy().replace('\\', "/"),
+        )
+    }
+
+    /// 硬超时触发 → abort 在飞模块 HTTP 请求（缺陷 #5）：
+    /// 节点未声明 timeout_secs，default_node_timeout=1s 包裹在飞调用；
+    /// 超时后平台侧立即终结（不等满 reqwest 客户端 300s 缺省超时），
+    /// 且模块侧观察到连接断开。
+    #[tokio::test]
+    async fn test_node_timeout_aborts_inflight_module_request() {
+        let work_dir = temp_work_dir("timeout-abort");
+        let input_file = work_dir.join("source.txt");
+        let output_file = work_dir.join("out.txt");
+        std::fs::write(&input_file, "timeout abort").unwrap();
+
+        let server = HangServer::start().await;
+        let toml_str = hang_module_pipeline_toml(&input_file, &output_file);
+        let pipeline = Pipeline::from_toml_str(&toml_str).unwrap();
+        let mut runner = PipelineRunnerImpl::new(work_dir.clone());
+        runner.set_module_port("mock-hang", server.port);
+        runner.set_default_node_timeout(Some(std::time::Duration::from_secs(1)));
+
+        let started = std::time::Instant::now();
+        let result = runner.execute_async(&pipeline, &work_dir).await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "超时节点应使管线失败");
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "超时应在 1s 附近生效而非等满客户端超时（elapsed: {elapsed:?}）"
+        );
+        // 在飞请求被 abort：模块侧观察到连接断开
+        server.wait_disconnected().await;
+        // 任务状态与资源回收：失败终态、无下游产物
+        assert!(matches!(*runner.task_status(), TaskStatus::Failed(_)));
+        assert!(!output_file.exists(), "超时中断后不应产生下游产物");
+        let detail = runner.get_task_detail(&runner.list_tasks()[0].id).unwrap();
+        let slow = detail.nodes.iter().find(|n| n.node_id == "slow").unwrap();
+        assert_eq!(slow.state, "failed");
+        assert!(
+            slow.error.as_deref().unwrap_or("").contains("timed out"),
+            "错误应注明超时: {:?}",
+            slow.error
+        );
+        let output = detail.nodes.iter().find(|n| n.node_id == "output").unwrap();
+        assert_eq!(output.state, "skipped");
+
+        cleanup_dir(&work_dir);
+    }
+
+    /// 在飞期间置位取消 → abort 在飞模块 HTTP 请求、任务终结 Cancelled
+    /// （缺陷 #5：不再等在飞请求自然结束）
+    #[tokio::test]
+    async fn test_cancel_aborts_inflight_module_request() {
+        let work_dir = temp_work_dir("cancel-inflight");
+        let input_file = work_dir.join("source.txt");
+        let output_file = work_dir.join("out.txt");
+        std::fs::write(&input_file, "cancel inflight").unwrap();
+
+        let server = HangServer::start().await;
+        let toml_str = hang_module_pipeline_toml(&input_file, &output_file);
+        let pipeline = Pipeline::from_toml_str(&toml_str).unwrap();
+        let mut runner = PipelineRunnerImpl::new(work_dir.clone());
+        runner.set_module_port("mock-hang", server.port);
+
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        runner.set_cancel_flag(flag.clone());
+        // 模块节点启动后：先等 TCP 连接建立（请求确实在飞），再置位取消
+        //（spawn 异步置位，避免同步回调内阻塞 runtime）
+        let flag_for_cb = flag.clone();
+        let connected_for_cb = server.connected.clone();
+        runner.on_node_start = Some(Arc::new(move |node_id| {
+            if node_id == "slow" {
+                let flag = flag_for_cb.clone();
+                let conn = connected_for_cb.clone();
+                tokio::spawn(async move {
+                    while !conn.load(std::sync::atomic::Ordering::SeqCst) {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+        }));
+
+        let started = std::time::Instant::now();
+        let result = runner.execute_async(&pipeline, &work_dir).await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err());
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "取消应中断在飞请求而非等满客户端 300s 超时（elapsed: {elapsed:?}）"
+        );
+        // 任务状态：Cancelled；资源回收：无下游产物、下游节点 skipped
+        assert_eq!(*runner.task_status(), TaskStatus::Cancelled);
+        assert!(!output_file.exists(), "取消后不应产生下游产物");
+        let detail = runner.get_task_detail(&runner.list_tasks()[0].id).unwrap();
+        let input = detail.nodes.iter().find(|n| n.node_id == "input").unwrap();
+        assert_eq!(input.state, "completed", "取消前完成的节点应保持完成");
+        let slow = detail.nodes.iter().find(|n| n.node_id == "slow").unwrap();
+        assert_eq!(slow.state, "failed");
+        assert!(
+            slow.error.as_deref().unwrap_or("").contains("cancelled"),
+            "在飞节点错误应注明取消: {:?}",
+            slow.error
+        );
+        let output = detail.nodes.iter().find(|n| n.node_id == "output").unwrap();
+        assert_eq!(output.state, "skipped");
+        // 在飞请求被 abort：模块侧观察到连接断开
+        server.wait_disconnected().await;
 
         cleanup_dir(&work_dir);
     }
