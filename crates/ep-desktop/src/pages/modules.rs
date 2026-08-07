@@ -32,8 +32,10 @@ use crate::pages::{
     ParamDraft,
 };
 use crate::ui::{
-    badge, card, confirm_dialog_with_lang, danger_button, empty_state, page_header, primary_button,
-    responsive_columns, section_title, service_status, subtle_button, Palette, CONTROL_ROUNDING,
+    badge, card, card_grid, confirm_dialog_with_lang, danger_button, empty_state,
+    keyboard_scroll, page_header, primary_button, responsive_columns, section_title,
+    service_status, subtle_button, Palette,
+    CONTROL_ROUNDING,
 };
 
 // ─── 页面持久状态 ────────────────────────────────────────────────────────────
@@ -159,7 +161,8 @@ pub fn show(
     );
     ui.add_space(8.0);
 
-    egui::ScrollArea::vertical().show(ui, |ui| {
+    // 主滚动区启用键盘滚动（P2-1）
+    keyboard_scroll(ui, "modules_main", egui::ScrollArea::vertical(), |ui| {
         // ── 进行中的整合包导入进度（导入模块链路，原整合包页迁移） ──
         import_progress_strip(ui, lang, &pal, pack_imports);
 
@@ -561,29 +564,17 @@ fn render_module_grid(
     summary_bar(ui, lang, pal, modules, &visible_indices);
     ui.add_space(8.0);
 
+    // 等宽列网格：列数按可用宽度计算（单卡最小 360px），窄窗口逐级降列、
+    // 最窄时单列纵向堆叠。单元格经 card_grid 在独立垂直布局作用域内渲染
+    // 并固定列宽，消除 scope 继承父级 horizontal 布局导致的横向溢出（P1-2 加固）。
     let cols = responsive_columns(ui.available_width(), 360.0, 12.0);
-    let spacing = ui.spacing().item_spacing.x;
-    let mut row_start = 0;
-    while row_start < visible_indices.len() {
-        let row_end = (row_start + cols).min(visible_indices.len());
-        let row = &visible_indices[row_start..row_end];
-        ui.horizontal(|ui| {
-            let avail = ui.available_width();
-            let n = row.len().max(1) as f32;
-            let col_w = ((avail - spacing * (n - 1.0)) / n).max(80.0);
-            for &idx in row {
-                let module_models = by_module.get(&modules[idx].id).cloned().unwrap_or_default();
-                ui.scope(|ui| {
-                    ui.set_width(col_w);
-                    module_card(
-                        ui, lang, pal, config, &mut modules[idx], &module_models, data,
-                        downloads, updates, download_sources, packs, cmd_tx, st,
-                    );
-                });
-            }
-        });
-        row_start = row_end;
-    }
+    card_grid(ui, cols, &visible_indices, |ui, &idx| {
+        let module_models = by_module.get(&modules[idx].id).cloned().unwrap_or_default();
+        module_card(
+            ui, lang, pal, config, &mut modules[idx], &module_models, data,
+            downloads, updates, download_sources, packs, cmd_tx, st,
+        );
+    });
 }
 
 /// 可见模块的状态计数徽章（0 不显示）
@@ -677,9 +668,9 @@ fn module_card(
     card(ui, pal, |ui| {
         ui.set_width(ui.available_width());
 
-        // ── 卡头：名称 + 类别 + 运行状态徽章 ──
+        // ── 卡头：名称 + 类别 + 运行状态徽章（窄列时自动换行，不溢出） ──
         let meta = service_status(&m.status, pal);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new(&m.name).strong());
             ui.label(
                 egui::RichText::new(format!("v{}", m.version))
@@ -795,7 +786,7 @@ fn variant_section(
     for decl in &mf.models {
         let mv = module_models.iter().find(|v| v.model_id == decl.id);
         let chosen = selected == decl.id;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.radio(chosen, "").clicked() && !chosen {
                 st.sel_variant.insert(m.id.clone(), decl.id.clone());
             }
@@ -854,8 +845,8 @@ fn variant_section(
                 egui::RichText::new(qid).monospace().small().color(pal.text_faint),
             );
         }
-        // 来源 + VRAM + 大小
-        ui.horizontal(|ui| {
+        // 来源 + VRAM + 大小（窄列时自动换行）
+        ui.horizontal_wrapped(|ui| {
             let source_text = if mv.repo_id.is_empty() {
                 mv.source.clone()
             } else {
@@ -997,8 +988,8 @@ fn action_row(
         .map(|u| u.available)
         .unwrap_or(false);
 
-    // 行 2：直跑 + tag（模块级）
-    ui.horizontal(|ui| {
+    // 行 2：直跑 + tag（模块级；按钮超宽时换行，不出屏）
+    ui.horizontal_wrapped(|ui| {
         // 直跑（需选中变体就绪）
         let run_btn = ui.add_enabled(
             sel_ready,
@@ -1112,8 +1103,8 @@ fn action_row(
     });
     ui.add_space(4.0);
 
-    // 行 3：选中变体下载 + 激活变体应用
-    ui.horizontal(|ui| {
+    // 行 3：选中变体下载 + 激活变体应用（窄列时换行，激活按钮不丢失）
+    ui.horizontal_wrapped(|ui| {
         if let Some(dl) = downloading {
             // 下载进度 + 取消（复用模型页进度组件语义）
             download_progress_compact(ui, lang, pal, dl, &selected, cmd_tx);

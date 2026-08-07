@@ -36,6 +36,7 @@
   "settings.field.httpProxy": "HTTP proxy",
   "settings.field.httpsProxy": "HTTPS proxy",
   "settings.field.noProxy": "Proxy bypass",
+  "settings.field.cacheDirResolved": "Resolved path",
   "settings.network.note": "Applies to: model downloads, Python dependency installs (uv/pip), and module processes; leave empty to follow system environment variables",
   "settings.python.pathHint": "python (leave empty to use PATH)",
   "settings.python.uvPathHint": "uv (leave empty to use PATH)",

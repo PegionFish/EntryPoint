@@ -25,7 +25,8 @@ use crate::i18n::tr;
 use crate::pages::modules::{category_label, service_label};
 use crate::pages::{format_size, open_path, publish_tasks_snapshot, trfb};
 use crate::ui::{
-    badge, card, empty_state, page_header, section_title, service_status, subtle_button, Palette,
+    badge, card, empty_state, keyboard_scroll, page_header, section_title, service_status,
+    subtle_button, Palette,
 };
 
 /// 产物目录递归扫描的最大深度（`files/{node_id}/…` 布局足够，防御深目录）
@@ -63,7 +64,8 @@ pub fn show_full(
     // queued（S2 形状下为 Pending）任务的队列位置映射：task_id → 位置（1 起）
     let queue_positions = compute_queue_positions(tasks);
 
-    egui::ScrollArea::vertical().show(ui, |ui| {
+    // 主滚动区启用键盘滚动（P2-1）
+    keyboard_scroll(ui, "tasks_main", egui::ScrollArea::vertical(), |ui| {
         // ── 管线任务 ──
         section_title(ui, &tr(lang, "tasks.stats.pipelineTasks", &[]));
         ui.add_space(6.0);
