@@ -8,8 +8,8 @@ use crate::app::ModuleEntry;
 use crate::i18n::tr;
 use crate::pages::modules::{category_label, service_label};
 use crate::ui::{
-    badge, card, card_grid, empty_state, page_header, responsive_columns, section_title,
-    service_status, Palette,
+    badge, card, card_grid, empty_state, grid_columns, keyboard_scroll, page_header,
+    section_title, service_status, Palette,
 };
 
 /// 页面内容四周的留白（px）
@@ -34,7 +34,8 @@ pub fn show(
     // app.rs 的 `&[ModuleEntry]`（协调记录 #47），不再经模块快照桥。
     crate::pages::publish_device_snapshot(ui.ctx(), devices);
 
-    egui::ScrollArea::vertical().show(ui, |ui| {
+    // 主滚动区启用键盘滚动（P2-1）
+    keyboard_scroll(ui, "dashboard_main", egui::ScrollArea::vertical(), |ui| {
         ui.add_space(16.0);
         ui.horizontal(|ui| {
             ui.add_space(PAGE_MARGIN);
@@ -45,13 +46,15 @@ pub fn show(
                 stats_section(ui, lang, &pal, devices, modules);
                 ui.add_space(SECTION_GAP);
 
-                dep_section(ui, lang, &pal, dep_report);
-                ui.add_space(SECTION_GAP);
-
+                // 区块顺序对齐 WebUI 仪表盘基准（webui-verify-01-dashboard.png）：
+                // 计算设备 → 模块状态 → 系统依赖
                 device_section(ui, lang, &pal, devices);
                 ui.add_space(SECTION_GAP);
 
                 module_section(ui, lang, &pal, modules);
+                ui.add_space(SECTION_GAP);
+
+                dep_section(ui, lang, &pal, dep_report);
                 ui.add_space(8.0);
             });
             ui.add_space(PAGE_MARGIN);
@@ -104,14 +107,15 @@ fn stats_section(
         },
     ];
 
-    let cols = responsive_columns(ui.available_width(), 170.0, 12.0);
+    // 列数封顶于卡片数：铺满可用宽度，不产生右侧空槽（P1-1 统一宽度策略）
+    let cols = grid_columns(ui.available_width(), 170.0, 12.0, stats.len());
     card_grid(ui, cols, &stats, |ui, s| {
         card(ui, pal, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(s.value.as_str())
-                        .size(28.0)
+                        .size(36.0)
                         .strong()
                         .color(s.color),
                 );
@@ -218,7 +222,8 @@ fn device_section(ui: &mut egui::Ui, lang: &str, pal: &Palette, devices: &[Compu
         return;
     }
 
-    let cols = responsive_columns(ui.available_width(), 260.0, 12.0);
+    // 等宽列铺满：列数封顶于设备数，避免单卡独占行宽/后续卡片被右缘裁切（P1-1）
+    let cols = grid_columns(ui.available_width(), 260.0, 12.0, devices.len());
     card_grid(ui, cols, devices, |ui, dev| {
         card(ui, pal, |ui| {
             // 名称 + 后端徽章
@@ -300,36 +305,131 @@ fn module_section(ui: &mut egui::Ui, lang: &str, pal: &Palette, modules: &[Modul
         tr(lang, "desktopPages.dashboard.col.device", &[]),
         tr(lang, "desktopPages.dashboard.col.port", &[]),
     ];
+    let rows: Vec<[String; 5]> = modules
+        .iter()
+        .map(|m| {
+            [
+                m.name.clone(),
+                category_label(lang, &m.category),
+                service_label(lang, &m.status),
+                m.device.clone().unwrap_or_else(|| "-".into()),
+                m.port
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "-".into()),
+            ]
+        })
+        .collect();
 
-    egui::ScrollArea::horizontal().show(ui, |ui| {
-        egui::Grid::new("dashboard_modules")
-            .striped(true)
-            .min_col_width(64.0)
-            .spacing([18.0, 8.0])
-            .show(ui, |ui| {
-                for head in &headers {
-                    ui.strong(head.as_str());
-                }
-                ui.end_row();
+    // 内容加权列宽：按自然宽度铺满可用宽度（P1-1 统一宽度策略）；
+    // 内容超宽时退化为横向滚动，绝不裁切
+    let col_x = 18.0_f32;
+    let avail = ui.available_width();
+    let widths = module_table_widths(ui, &headers, &rows, col_x, avail);
+    let total_w = widths.iter().sum::<f32>() + col_x * (widths.len() - 1) as f32;
 
-                for m in modules {
-                    ui.label(&m.name);
-                    ui.label(category_label(lang, &m.category));
-                    let meta = service_status(&m.status, pal);
-                    badge(ui, pal, meta.color, service_label(lang, &m.status));
-                    ui.label(
-                        egui::RichText::new(m.device.as_deref().unwrap_or("-")).monospace(),
-                    );
-                    ui.label(
-                        egui::RichText::new(
-                            m.port
-                                .map(|p| p.to_string())
-                                .unwrap_or_else(|| "-".into()),
-                        )
-                        .monospace(),
-                    );
-                    ui.end_row();
+    let render = |ui: &mut egui::Ui| {
+        // 表头
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = col_x;
+            for (c, w) in widths.iter().enumerate() {
+                ui.scope(|ui| {
+                    ui.set_min_width(*w);
+                    ui.set_max_width(*w);
+                    ui.strong(headers[c].as_str());
+                });
+            }
+        });
+        ui.add_space(4.0);
+        // 数据行（隔行条纹，对齐原 Grid striped 呈现）
+        for (i, row) in rows.iter().enumerate() {
+            egui::Frame::new()
+                .fill(if i % 2 == 1 {
+                    ui.visuals().extreme_bg_color
+                } else {
+                    egui::Color32::TRANSPARENT
+                })
+                .inner_margin(egui::Margin::symmetric(6, 4))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = col_x;
+                        for (c, w) in widths.iter().enumerate() {
+                            ui.scope(|ui| {
+                                ui.set_min_width(*w);
+                                ui.set_max_width(*w);
+                                match c {
+                                    2 => {
+                                        let meta = service_status(&modules[i].status, pal);
+                                        badge(ui, pal, meta.color, row[c].as_str());
+                                    }
+                                    3 | 4 => {
+                                        ui.label(
+                                            egui::RichText::new(row[c].as_str()).monospace(),
+                                        );
+                                    }
+                                    _ => {
+                                        ui.label(row[c].as_str());
+                                    }
+                                }
+                            });
+                        }
+                    });
+                });
+        }
+    };
+
+    if total_w <= avail + 0.5 {
+        render(ui);
+    } else {
+        egui::ScrollArea::horizontal().show(ui, |ui| render(ui));
+    }
+}
+
+/// 模块概览表列宽：表头与全部行中最宽内容作为每列自然宽度；
+/// 总和小于可用宽度时按自然宽度比例分配剩余空间以铺满整行；
+/// 总和超出时返回自然宽度（调用方退化为横向滚动，不裁切）。
+fn module_table_widths(
+    ui: &egui::Ui,
+    headers: &[String; 5],
+    rows: &[[String; 5]],
+    col_x: f32,
+    avail: f32,
+) -> Vec<f32> {
+    let body = ui.style().text_styles[&egui::TextStyle::Body].clone();
+    let mono = ui.style().text_styles[&egui::TextStyle::Monospace].clone();
+    // 每列下限（px）：名称 / 类别 / 状态(徽章) / 设备 / 端口
+    let mut natural: Vec<f32> = vec![120.0, 96.0, 108.0, 84.0, 64.0];
+    /// 徽章胶囊附加宽度：色点 7 + 间距 5 + 内边距 16 + 描边余量
+    const BADGE_PAD: f32 = 30.0;
+    ui.fonts(|fonts| {
+        for (c, h) in headers.iter().enumerate() {
+            let w = fonts
+                .layout_no_wrap(h.clone(), body.clone(), egui::Color32::WHITE)
+                .rect
+                .width();
+            natural[c] = natural[c].max(w);
+        }
+        for row in rows {
+            for (c, text) in row.iter().enumerate() {
+                let font = if c >= 3 { mono.clone() } else { body.clone() };
+                let mut w = fonts
+                    .layout_no_wrap(text.clone(), font, egui::Color32::WHITE)
+                    .rect
+                    .width();
+                if c == 2 {
+                    w += BADGE_PAD;
                 }
-            });
+                natural[c] = natural[c].max(w);
+            }
+        }
     });
+    let spacing_total = col_x * (natural.len() - 1) as f32;
+    let natural_sum: f32 = natural.iter().sum();
+    if natural_sum + spacing_total >= avail {
+        return natural;
+    }
+    let surplus = avail - spacing_total - natural_sum;
+    natural
+        .iter()
+        .map(|w| w + surplus * w / natural_sum)
+        .collect()
 }

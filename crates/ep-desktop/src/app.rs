@@ -285,6 +285,17 @@ const NAV_ROW_HEIGHT: f32 = 36.0;
 /// 紧凑模式（仅图标）的窗口宽度阈值
 const COMPACT_WIDTH_THRESHOLD: f32 = 1000.0;
 
+/// 重绘看门狗截止时间：每帧无条件挂起一个 ≤2s 的重绘请求。
+///
+/// 背景线程的消息通道（std mpsc）无法唤醒 winit 事件循环，重绘请求是
+/// 唯一的帧心跳。eframe 0.31 在 Windows 的 resize 同步重绘路径
+///（`EventResult::RepaintNow`）存在丢帧缺陷（官方于 0.32 修复，
+/// 见 emilk/egui#5723）：同步重绘结果吞掉后续调度，一旦该帧未成功
+/// present，事件循环即停摆且永不自愈——这正是最大化冻结/主题切换白屏
+/// 的根因。挂起看门狗截止时间后，任何丢失的重绘请求都会在 2s 内被
+/// 兜底补发，冻结自愈；健康态节奏与原 2s 实时刷新一致，无额外开销。
+const REPAINT_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(2);
+
 // ─── App ────────────────────────────────────────────────────────────────────
 
 pub struct App {
@@ -294,15 +305,24 @@ pub struct App {
     pub state: AppState,
     rx: std::sync::mpsc::Receiver<AppMsg>,
     pub cmd_tx: tokio::sync::mpsc::UnboundedSender<AppCmd>,
-    last_repaint: std::time::Instant,
     /// Toast 通知管理器
     pub toasts: ToastManager,
     /// 深色主题（由 config.general.theme 决定）
     pub dark_theme: bool,
+    /// 已应用的主题（None = 尚未应用；变化时才全量 restyle，避免每帧重复）
+    applied_dark: Option<bool>,
     /// 已应用的缩放（与 config.ui.scale_factor 比对，变化时即时生效）
     applied_scale: f32,
     /// 已应用的字号（与 config.ui.font_size 比对，变化时即时生效）
     applied_font_size: f32,
+    /// 上一帧的视口尺寸（points）。变化时追加即时重绘，确保最大化/
+    /// 还原/拖拽 resize 后布局立刻跟随新尺寸（兜底 eframe 0.31 的
+    /// resize 同步重绘丢帧缺陷，见 REPAINT_WATCHDOG 注释）
+    last_screen_size: Option<egui::Vec2>,
+    /// 最近一次窗口外框/内容矩形（全局多显示器坐标空间，points）。
+    /// 每帧记录，退出时落盘 runtime/window-state.json，下次启动恢复（P3-1）
+    last_window_outer: Option<egui::Rect>,
+    last_window_inner: Option<egui::Rect>,
     /// 是否已执行过首帧窗口尺寸保护
     window_fitted: bool,
     /// 上一帧的紧凑模式状态（切换时重置侧栏宽度缓存，使 default_width 重新生效）
@@ -376,11 +396,14 @@ impl App {
             },
             rx,
             cmd_tx,
-            last_repaint: std::time::Instant::now(),
             toasts: ToastManager::new(),
             dark_theme,
+            applied_dark: None,
             applied_scale,
             applied_font_size,
+            last_screen_size: None,
+            last_window_outer: None,
+            last_window_inner: None,
             window_fitted: false,
             last_compact: None,
         }
@@ -565,6 +588,54 @@ impl App {
         }
     }
 
+    /// 外观同步：主题 / 缩放 / 字号均仅在状态变化时应用。
+    ///
+    /// 主题：切换时一次性全量 restyle（此前每帧无条件 `style_mut`，
+    /// 与 egui 重绘调度路径叠加是主题切换白屏的诱因之一）；
+    /// 缩放 / 字号：设置页修改 config 后即时生效（行为不变）。
+    fn sync_appearance(&mut self, ctx: &egui::Context) {
+        if self.applied_dark != Some(self.dark_theme) {
+            self.applied_dark = Some(self.dark_theme);
+            theme::apply_theme(ctx, self.dark_theme);
+        }
+        if self.state.config.ui.scale_factor != self.applied_scale {
+            self.applied_scale = self.state.config.ui.scale_factor;
+            ctx.set_zoom_factor(self.applied_scale);
+        }
+        if self.state.config.ui.font_size != self.applied_font_size {
+            self.applied_font_size = self.state.config.ui.font_size;
+            theme::apply_font_size(ctx, self.applied_font_size);
+        }
+    }
+
+    /// 视口尺寸变化检测：尺寸与上一帧不同时追加即时重绘（双帧 settle），
+    /// 兜底 eframe 0.31 Windows resize 同步重绘丢帧，保证最大化/还原后
+    /// 布局立刻跟随新窗口尺寸。首帧仅记录基准，不触发。
+    fn track_viewport_size(&mut self, ctx: &egui::Context) {
+        let size = ctx.input(|i| i.screen_rect.size());
+        let changed = self.last_screen_size != Some(size);
+        let first = self.last_screen_size.is_none();
+        self.last_screen_size = Some(size);
+        if changed && !first {
+            ctx.request_repaint();
+        }
+    }
+
+    /// 记录最新窗口外框/内容矩形（含副屏的全局坐标空间；仅在有效值时更新）。
+    /// 退出时写 runtime/window-state.json，下次启动恢复位置/尺寸（P3-1）。
+    fn track_window_rect(&mut self, ctx: &egui::Context) {
+        let (outer, inner) = ctx.input(|i| {
+            let vp = i.viewport();
+            (vp.outer_rect, vp.inner_rect)
+        });
+        if outer.is_some() {
+            self.last_window_outer = outer;
+        }
+        if inner.is_some() {
+            self.last_window_inner = inner;
+        }
+    }
+
     /// 首帧窗口保护：窗口宽/高超过屏幕 92% 时收缩到 92%
     fn fit_window_to_screen(&self, ctx: &egui::Context) {
         // 视口信息暂不可用时跳过（兜底）
@@ -592,22 +663,55 @@ impl App {
         }
     }
 
+    /// 退出时持久化窗口位置/尺寸（P3-1，含副屏全局坐标）→
+    /// `runtime/window-state.json`，启动时由 main.rs 的 ViewportBuilder 恢复。
+    /// 与既有配置持久化同走 `resolve_root()` 根路径；不进 config/app.toml
+    ///（高频变化的窗口状态与业务配置分离，避免干扰配置语义）。
+    fn save_window_state(&self) {
+        let Some(json) = Self::window_state_json(self.last_window_outer, self.last_window_inner)
+        else {
+            return;
+        };
+        let dir = ep_core::config::resolve_root().join("runtime");
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let _ = std::fs::write(dir.join("window-state.json"), json);
+        }
+    }
+
+    /// 构建窗口状态 JSON：outer 为窗口外框左上角（全局坐标，副屏可为
+    /// 负值/超主屏范围），inner 为内容尺寸；inner 缺失时回退 outer 尺寸。
+    fn window_state_json(outer: Option<egui::Rect>, inner: Option<egui::Rect>) -> Option<String> {
+        let outer = outer?;
+        let size = inner.map(|r| r.size()).unwrap_or_else(|| outer.size());
+        Some(
+            serde_json::json!({
+                "outer": { "x": outer.min.x, "y": outer.min.y },
+                "inner": { "width": size.x, "height": size.y },
+            })
+            .to_string(),
+        )
+    }
+
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 应用主题
-        theme::apply_theme(ctx, self.dark_theme);
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // P3-1：退出时记录窗口位置（含副屏场景），下次启动恢复
+        self.save_window_state();
+    }
 
-        // ── 缩放 / 字号即时生效（设置页修改 config 后立即应用） ──
-        if self.state.config.ui.scale_factor != self.applied_scale {
-            self.applied_scale = self.state.config.ui.scale_factor;
-            ctx.set_zoom_factor(self.applied_scale);
-        }
-        if self.state.config.ui.font_size != self.applied_font_size {
-            self.applied_font_size = self.state.config.ui.font_size;
-            theme::apply_font_size(ctx, self.applied_font_size);
-        }
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 外观同步（主题/缩放/字号，仅状态变化时应用）
+        self.sync_appearance(ctx);
+
+        // ── 视口尺寸变化兜底（最大化/还原/resize 后布局即时跟随） ──
+        self.track_viewport_size(ctx);
+
+        // ── 记录窗口位置（退出时持久化，P3-1） ──
+        self.track_window_rect(ctx);
+
+        // ── 重绘看门狗：无条件挂起 ≤2s 的重绘截止时间（见常量注释） ──
+        ctx.request_repaint_after(REPAINT_WATCHDOG);
 
         // ── 窗口尺寸保护（一次性） ──
         if !self.window_fitted {
@@ -631,12 +735,6 @@ impl eframe::App for App {
                 _ => {}
             }
             self.last_page = Some(self.current_page);
-        }
-
-        // Request periodic repaint (~2s) for device/status refresh
-        if self.last_repaint.elapsed() > std::time::Duration::from_secs(2) {
-            ctx.request_repaint();
-            self.last_repaint = std::time::Instant::now();
         }
 
         let lang = self.lang();
@@ -849,6 +947,12 @@ fn nav_item(
         painter.galley(pos, galley, color);
     }
 
+    // 无障碍名称（AX/UIA）：自绘导航行无 label 时为无名 "Custom" 节点，
+    // 补与导航文案一致的 i18n 文本，读屏器可区分五个页面入口
+    ui.ctx().accesskit_node_builder(response.id, |node| {
+        node.set_label(label);
+    });
+
     if compact {
         response.on_hover_text(label)
     } else {
@@ -861,6 +965,22 @@ fn nav_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 构造可无头测试的 App（通道空转，配置默认值）
+    fn test_app() -> App {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(rx, cmd_tx, AppConfig::default())
+    }
+
+    /// 以指定视口尺寸跑一帧（模拟 winit 传入的 screen_rect）
+    fn run_pass(ctx: &egui::Context, size: egui::Vec2, mut f: impl FnMut(&egui::Context)) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| f(ctx));
+    }
 
     /// 信息架构终稿（协调记录 #47）：NAV 收敛为五入口——
     /// 仪表盘/模块/管线/任务/设置；「模型」旧入口与「整合包」已删除。
@@ -890,5 +1010,148 @@ mod tests {
             assert!(key.starts_with("desktopApp.nav."));
             assert!(!fallback.is_empty());
         }
+    }
+
+    /// P0-1 回归：主题切换即时生效且可反复切换（深→浅→深→浅）；
+    /// 每套主题的 visuals 与 Palette 一致（panel_fill = bg，dark_mode 正确）。
+    #[test]
+    fn theme_switch_applies_both_themes_repeatedly() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+
+        for expect_dark in [true, false, true, false] {
+            app.dark_theme = expect_dark;
+            app.sync_appearance(&ctx);
+            let style = ctx.style();
+            assert_eq!(
+                style.visuals.dark_mode, expect_dark,
+                "visuals.dark_mode 应随主题切换"
+            );
+            let pal = Palette::new(expect_dark);
+            assert_eq!(style.visuals.panel_fill, pal.bg, "panel_fill 应取自当前色板");
+            assert_eq!(style.visuals.override_text_color, Some(pal.text));
+        }
+    }
+
+    /// 主题未变化时不重复全量 restyle：外部对 style 的修改不被无谓覆盖；
+    /// 主题切换后才重新应用（spacing 回到设计值）。
+    #[test]
+    fn theme_restyle_only_on_change() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        app.sync_appearance(&ctx);
+
+        // 模拟外部修改 spacing；未切主题时再次同步不应覆盖它
+        ctx.style_mut(|s| s.spacing.item_spacing = egui::vec2(99.0, 99.0));
+        app.sync_appearance(&ctx);
+        assert_eq!(ctx.style().spacing.item_spacing, egui::vec2(99.0, 99.0));
+
+        // 切换主题 → 全量 restyle 重新生效（item_spacing 回到 8x8）
+        app.dark_theme = !app.dark_theme;
+        app.sync_appearance(&ctx);
+        assert_eq!(ctx.style().spacing.item_spacing, egui::vec2(8.0, 8.0));
+    }
+
+    /// 缩放在 config 变化后生效（set_zoom_factor 于下一 pass 起始生效）；
+    /// 未变化时不重复应用（applied_scale 门控）。
+    #[test]
+    fn zoom_factor_applies_on_config_change() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        app.sync_appearance(&ctx); // 首次：与构造值一致，不变更
+
+        app.state.config.ui.scale_factor = 1.5;
+        app.sync_appearance(&ctx);
+        // set_zoom_factor 在下一 pass 起始生效
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        assert!((ctx.zoom_factor() - 1.5).abs() < 1e-6);
+
+        // 再次同步（config 未变）不应重置或报错
+        app.sync_appearance(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        assert!((ctx.zoom_factor() - 1.5).abs() < 1e-6);
+    }
+
+    /// P0-2 回归：视口尺寸变化（模拟最大化/还原）时追加即时重绘请求，
+    /// 尺寸稳定后不再产生新请求。
+    /// 注：egui 新 Context 默认 outstanding=1（启动期自带重绘），且
+    /// request_repaint() 会额外留下一帧 settle，故按“消化后静默”断言。
+    #[test]
+    fn viewport_size_change_requests_repaint() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+
+        // 首帧：仅建立尺寸基准（此时启动期重绘尚未消化，不做断言）
+        run_pass(&ctx, egui::vec2(1280.0, 800.0), |ctx| {
+            app.track_viewport_size(ctx)
+        });
+
+        // 尺寸不变连续两帧：消化启动期重绘后应恢复静默
+        for _ in 0..2 {
+            run_pass(&ctx, egui::vec2(1280.0, 800.0), |ctx| {
+                app.track_viewport_size(ctx)
+            });
+        }
+        assert!(!ctx.has_requested_repaint(), "尺寸稳定后不应再有重绘请求");
+
+        // 模拟最大化：尺寸变化 → 追加即时重绘
+        run_pass(&ctx, egui::vec2(3840.0, 2120.0), |ctx| {
+            app.track_viewport_size(ctx)
+        });
+        assert!(ctx.has_requested_repaint(), "尺寸变化必须触发兜底重绘");
+
+        // 消化 settle 帧后恢复静默
+        for _ in 0..2 {
+            run_pass(&ctx, egui::vec2(3840.0, 2120.0), |ctx| {
+                app.track_viewport_size(ctx)
+            });
+        }
+        assert!(!ctx.has_requested_repaint(), "settle 后应恢复静默");
+
+        // 模拟还原：再次变化 → 再次触发
+        run_pass(&ctx, egui::vec2(1784.0, 1149.0), |ctx| {
+            app.track_viewport_size(ctx)
+        });
+        assert!(ctx.has_requested_repaint(), "还原尺寸变化同样必须触发重绘");
+    }
+
+    /// 看门狗：每帧挂起的重绘截止时间使 ctx 始终持有待处理重绘，
+    /// 保证事件循环不会在丢帧后永久停摆（冻结 ≤2s 自愈）。
+    #[test]
+    fn watchdog_keeps_repaint_pending() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.request_repaint_after(REPAINT_WATCHDOG)
+        });
+        assert!(
+            ctx.has_requested_repaint(),
+            "看门狗必须使重绘请求处于挂起状态"
+        );
+    }
+
+    /// P3-1：窗口状态 JSON 覆盖副屏全局坐标（x/y 可负/超主屏），
+    /// inner 缺失回退 outer 尺寸，outer 缺失不落盘。
+    #[test]
+    fn window_state_json_covers_secondary_monitor_coords() {
+        let outer =
+            egui::Rect::from_min_size(egui::pos2(2560.0, -300.0), egui::vec2(1784.0, 1149.0));
+        let inner =
+            egui::Rect::from_min_size(egui::pos2(2560.0, -292.0), egui::vec2(1784.0, 1118.0));
+        let json: serde_json::Value =
+            serde_json::from_str(&App::window_state_json(Some(outer), Some(inner)).unwrap())
+                .unwrap();
+        assert_eq!(json["outer"]["x"], 2560.0);
+        assert_eq!(json["outer"]["y"], -300.0);
+        assert_eq!(json["inner"]["width"], 1784.0);
+        assert_eq!(json["inner"]["height"], 1118.0);
+
+        // inner 缺失 → 回退 outer 尺寸
+        let fallback: serde_json::Value =
+            serde_json::from_str(&App::window_state_json(Some(outer), None).unwrap()).unwrap();
+        assert_eq!(fallback["inner"]["width"], 1784.0);
+        assert_eq!(fallback["inner"]["height"], 1149.0);
+
+        // outer 缺失 → 不落盘
+        assert!(App::window_state_json(None, None).is_none());
     }
 }

@@ -16,9 +16,49 @@ pub fn show(ui: &mut egui::Ui, config: &mut AppConfig, toasts: &mut ToastManager
     let lang = ep_core::i18n::normalize_language(&config.general.language);
     let pal = Palette::new(ui.style().visuals.dark_mode);
 
-    page_header(ui, &tr(lang, "settings.title", &[]), |_| {});
+    // 页级动作条（P2-2）：「保存配置 / 重新加载」属全局动作，从「界面」卡内
+    // 提升为页头常驻动作区（不再随内容滚动而不可见）。
+    // page_header 动作区为 right_to_left 布局：先加的保存按钮居最右。
+    page_header(ui, &tr(lang, "settings.title", &[]), |ui| {
+        if ui
+            .add(primary_button(&pal, tr(lang, "desktopApp.settings.saveBtn", &[])))
+            .clicked()
+        {
+            if let Err(msg) = validate_network(lang, &config.network) {
+                toasts.error(msg);
+            } else {
+                let config_dir = ep_core::config::resolve_root().join("config");
+                match config.save(&config_dir) {
+                    Ok(()) => toasts.success(tr(lang, "settings.toast.saved", &[])),
+                    Err(e) => toasts.error(tr(
+                        lang,
+                        "desktopApp.settings.error.saveFailed",
+                        &[("detail", &e.to_string())],
+                    )),
+                }
+            }
+        }
+        if ui
+            .add(subtle_button(&pal, tr(lang, "desktopApp.settings.reloadBtn", &[])))
+            .clicked()
+        {
+            let config_dir = ep_core::config::resolve_root().join("config");
+            match AppConfig::load(&config_dir) {
+                Ok(loaded) => {
+                    *config = loaded;
+                    toasts.success(tr(lang, "desktopApp.settings.toast.reloaded", &[]));
+                }
+                Err(e) => toasts.error(tr(
+                    lang,
+                    "desktopApp.settings.error.loadFailed",
+                    &[("detail", &e.to_string())],
+                )),
+            }
+        }
+    });
 
-    egui::ScrollArea::vertical().show(ui, |ui| {
+    // 主滚动区启用键盘滚动（P2-1）
+    crate::ui::keyboard_scroll(ui, "settings_main", egui::ScrollArea::vertical(), |ui| {
         // 各分区卡片间距 12
         ui.spacing_mut().item_spacing.y = 12.0;
 
@@ -156,6 +196,22 @@ pub fn show(ui: &mut egui::Ui, config: &mut AppConfig, toasts: &mut ToastManager
                 ui.add(
                     egui::TextEdit::singleline(&mut config.models.cache_dir)
                         .desired_width(f32::INFINITY),
+                );
+                ui.end_row();
+
+                // 解析后的绝对路径（P2-2）：相对 cache_dir 基于应用根解析，
+                // 与仪表盘/模块页口径一致，避免仅见相对值 `models` 的歧义。
+                field_label(
+                    ui,
+                    pal,
+                    &lbl(lang, "desktopApp.settings.field.cacheDirResolved"),
+                );
+                let resolved =
+                    config.resolve_model_cache_dir(&ep_core::config::resolve_root());
+                ui.label(
+                    egui::RichText::new(resolved.display().to_string())
+                        .monospace()
+                        .color(pal.text_dim),
                 );
                 ui.end_row();
 
@@ -322,45 +378,6 @@ pub fn show(ui: &mut egui::Ui, config: &mut AppConfig, toasts: &mut ToastManager
             );
         });
 
-        // ── 底部操作行 ──
-        ui.horizontal(|ui| {
-            if ui
-                .add(primary_button(&pal, tr(lang, "desktopApp.settings.saveBtn", &[])))
-                .clicked()
-            {
-                if let Err(msg) = validate_network(lang, &config.network) {
-                    toasts.error(msg);
-                } else {
-                    let config_dir = ep_core::config::resolve_root().join("config");
-                    match config.save(&config_dir) {
-                        Ok(()) => toasts.success(tr(lang, "settings.toast.saved", &[])),
-                        Err(e) => toasts.error(tr(
-                            lang,
-                            "desktopApp.settings.error.saveFailed",
-                            &[("detail", &e.to_string())],
-                        )),
-                    }
-                }
-            }
-
-            if ui
-                .add(subtle_button(&pal, tr(lang, "desktopApp.settings.reloadBtn", &[])))
-                .clicked()
-            {
-                let config_dir = ep_core::config::resolve_root().join("config");
-                match AppConfig::load(&config_dir) {
-                    Ok(loaded) => {
-                        *config = loaded;
-                        toasts.success(tr(lang, "desktopApp.settings.toast.reloaded", &[]));
-                    }
-                    Err(e) => toasts.error(tr(
-                        lang,
-                        "desktopApp.settings.error.loadFailed",
-                        &[("detail", &e.to_string())],
-                    )),
-                }
-            }
-        });
         ui.add_space(8.0);
     });
 }

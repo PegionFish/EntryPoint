@@ -36,6 +36,7 @@
   "settings.field.httpProxy": "HTTP 代理",
   "settings.field.httpsProxy": "HTTPS 代理",
   "settings.field.noProxy": "不走代理",
+  "settings.field.cacheDirResolved": "实际路径",
   "settings.network.note": "生效范围：模型下载、Python 依赖安装（uv/pip）、模块进程；留空 = 跟随系统环境变量",
   "settings.python.pathHint": "python（留空则使用 PATH）",
   "settings.python.uvPathHint": "uv（留空则使用 PATH）",
