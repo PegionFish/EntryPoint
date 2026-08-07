@@ -1,5 +1,6 @@
 # Rust
 /target/
+target-*/
 **/*.rs.bk
 Cargo.lock
 
@@ -31,6 +32,9 @@ workspace/
 logs/
 *.log
 runtime/
+
+# 临时验证产物（截图/脚本，不入仓库）
+.desktop-verify/
 
 # Fallback binaries (not in git/release)
 modules/test-ffmpeg/
