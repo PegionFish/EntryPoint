@@ -8,6 +8,7 @@ use std::process::Command;
 use tracing::{debug, info, warn};
 
 use crate::deps_install::{self, InstallResult, SystemDep};
+use crate::process::apply_no_window;
 
 /// 单个依赖的检测结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +226,7 @@ pub fn check_torch_cuda(
     cuda_libs_dir: Option<&Path>,
 ) -> TorchCudaStatus {
     let mut cmd = Command::new(venv_python);
+    apply_no_window(&mut cmd);
     cmd.args([
         "-c",
         "import torch; print(f'{torch.__version__}|{torch.cuda.is_available()}')",
@@ -381,9 +383,10 @@ pub fn find_ffmpeg(root: &Path) -> Option<PathBuf> {
 // ─── 内部工具 ────────────────────────────────────────────────────────────────
 
 fn which(name: &str) -> Option<PathBuf> {
-    let cmd = if cfg!(windows) { "where" } else { "which" };
-    Command::new(cmd)
-        .arg(name)
+    let cmd_name = if cfg!(windows) { "where" } else { "which" };
+    let mut cmd = Command::new(cmd_name);
+    apply_no_window(&mut cmd);
+    cmd.arg(name)
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -397,8 +400,9 @@ fn which(name: &str) -> Option<PathBuf> {
 }
 
 fn get_ffmpeg_version(path: &Path) -> Option<String> {
-    Command::new(path)
-        .arg("-version")
+    let mut cmd = Command::new(path);
+    apply_no_window(&mut cmd);
+    cmd.arg("-version")
         .output()
         .ok()
         .filter(|o| o.status.success())
