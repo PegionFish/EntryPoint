@@ -333,10 +333,15 @@ pub struct App {
     /// 还原/拖拽 resize 后布局立刻跟随新尺寸（兜底 eframe 0.31 的
     /// resize 同步重绘丢帧缺陷，见 REPAINT_WATCHDOG 注释）
     last_screen_size: Option<egui::Vec2>,
-    /// 最近一次窗口外框/内容矩形（全局多显示器坐标空间，points）。
-    /// 每帧记录，退出时落盘 runtime/window-state.json，下次启动恢复（P3-1）
+    /// 最近一次 **normal（非最大化）** 状态的窗口外框/内容矩形
+    ///（全局多显示器坐标空间，points）。每帧记录，退出时落盘
+    /// runtime/window-state.json，下次启动恢复（P3-1）。
+    /// Task #28：最大化期间冻结基准（见 track_window_rect），
+    /// 最大化几何绝不带入下次启动，恢复恒为 normal 态
     last_window_outer: Option<egui::Rect>,
     last_window_inner: Option<egui::Rect>,
+    /// 窗口当前是否最大化（Task #28：持久化基准门控用）
+    last_maximized: bool,
     /// 是否已执行过首帧窗口尺寸保护
     window_fitted: bool,
     /// 上一帧的紧凑模式状态（切换时重置侧栏宽度缓存，使 default_width 重新生效）
@@ -416,6 +421,7 @@ impl App {
             last_screen_size: None,
             last_window_outer: None,
             last_window_inner: None,
+            last_maximized: false,
             window_fitted: false,
             last_compact: None,
         }
@@ -648,25 +654,60 @@ impl App {
 
     /// 记录最新窗口外框/内容矩形（含副屏的全局坐标空间；仅在有效值时更新）。
     /// 退出时写 runtime/window-state.json，下次启动恢复位置/尺寸（P3-1）。
+    ///
+    /// Task #28：**最大化期间冻结基准**——只记录 normal 态矩形。
+    /// 此前最大化退出会把最大化几何（近全屏尺寸 + 负偏移外框位置）落盘，
+    /// 下次启动即以近全屏尺寸建窗，首帧保护再发 InnerSize 收缩，启动期
+    /// 连续 Resized 事件恰好踩中 eframe 0.31 Windows 同步重绘丢帧路径
+    ///（见 REPAINT_WATCHDOG 注释），是最大化冻结/重启白屏的诱因链。
+    /// 修复后恢复恒为 normal 态（main.rs 加载端不使用任何最大化标志）。
+    /// 另加几何兜底：最大化/还原动画过渡帧的 maximized 标志可能滞后，
+    /// inner 超过显示器逻辑尺寸的帧不记录（防过渡值落盘）。
     fn track_window_rect(&mut self, ctx: &egui::Context) {
-        let (outer, inner) = ctx.input(|i| {
+        let (outer, inner, maximized, monitor) = ctx.input(|i| {
             let vp = i.viewport();
-            (vp.outer_rect, vp.inner_rect)
+            (
+                vp.outer_rect,
+                vp.inner_rect,
+                vp.maximized.unwrap_or(false),
+                vp.monitor_size,
+            )
         });
-        if outer.is_some() {
-            self.last_window_outer = outer;
-        }
-        if inner.is_some() {
-            self.last_window_inner = inner;
+        self.last_maximized = maximized;
+        if !maximized {
+            if outer.is_some() {
+                self.last_window_outer = outer;
+            }
+            if let Some(inner) = inner {
+                // 几何兜底：最大化/还原动画过渡帧存在 maximized 标志滞后
+                //（rect 已变大但 is_maximized() 仍为 false），inner 尺寸
+                // 超过所在显示器逻辑尺寸即视为过渡帧不记录；monitor_size
+                // 缺失时退化为只靠标志（保持旧行为）。
+                let within_monitor = monitor
+                    .map(|m| inner.width() <= m.x + 1.0 && inner.height() <= m.y + 1.0)
+                    .unwrap_or(true);
+                if within_monitor {
+                    self.last_window_inner = Some(inner);
+                }
+            }
         }
     }
 
     /// 首帧窗口保护：窗口宽/高超过屏幕 92% 时收缩到 92%
     fn fit_window_to_screen(&self, ctx: &egui::Context) {
         // 视口信息暂不可用时跳过（兜底）
-        let Some(inner) = ctx.input(|i| i.viewport().inner_rect) else {
+        let (inner, maximized) = ctx.input(|i| {
+            let vp = i.viewport();
+            (vp.inner_rect, vp.maximized.unwrap_or(false))
+        });
+        let Some(inner) = inner else {
             return;
         };
+        // Task #28：最大化状态跳过——此时下发 InnerSize 会立刻触发
+        // Resized 事件链，踩 eframe 0.31 Windows 同步重绘丢帧路径
+        if maximized {
+            return;
+        }
         let screen = ctx.screen_rect();
         if screen.width() <= 0.0 || screen.height() <= 0.0 {
             return;
@@ -705,6 +746,10 @@ impl App {
 
     /// 构建窗口状态 JSON：outer 为窗口外框左上角（全局坐标，副屏可为
     /// 负值/超主屏范围），inner 为内容尺寸；inner 缺失时回退 outer 尺寸。
+    ///
+    /// Task #28：落盘的恒为 normal（非最大化）态基准（track_window_rect
+    /// 已门控）；不写也不读最大化标志——恢复永远以 normal 态建窗，
+    /// 杜绝最大化坏状态跨启动传播。旧格式文件（无 maximized 字段）兼容。
     fn window_state_json(outer: Option<egui::Rect>, inner: Option<egui::Rect>) -> Option<String> {
         let outer = outer?;
         let size = inner.map(|r| r.size()).unwrap_or_else(|| outer.size());
@@ -1011,6 +1056,69 @@ mod tests {
         let _ = ctx.run(input, |ctx| f(ctx));
     }
 
+    /// 以指定视口矩形/最大化状态跑一帧（模拟 winit 的 ViewportInfo 填充）
+    fn rect_pass(
+        ctx: &egui::Context,
+        outer: Option<egui::Rect>,
+        inner: Option<egui::Rect>,
+        maximized: bool,
+        mut f: impl FnMut(&egui::Context),
+    ) -> egui::FullOutput {
+        let mut viewports = egui::ViewportIdMap::default();
+        viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                outer_rect: outer,
+                inner_rect: inner,
+                maximized: Some(maximized),
+                ..Default::default()
+            },
+        );
+        let size = inner
+            .or(outer)
+            .map(|r| r.size())
+            .unwrap_or(egui::vec2(1280.0, 800.0));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            viewports,
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| f(ctx))
+    }
+
+    /// 同 rect_pass，但可注入 monitor_size（模拟 egui-winit 填充的
+    /// 显示器逻辑尺寸，用于过渡帧几何兜底测试）
+    fn rect_pass_mon(
+        ctx: &egui::Context,
+        outer: Option<egui::Rect>,
+        inner: Option<egui::Rect>,
+        maximized: bool,
+        monitor: Option<egui::Vec2>,
+        mut f: impl FnMut(&egui::Context),
+    ) -> egui::FullOutput {
+        let mut viewports = egui::ViewportIdMap::default();
+        viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                outer_rect: outer,
+                inner_rect: inner,
+                maximized: Some(maximized),
+                monitor_size: monitor,
+                ..Default::default()
+            },
+        );
+        let size = inner
+            .or(outer)
+            .map(|r| r.size())
+            .unwrap_or(egui::vec2(1280.0, 800.0));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            viewports,
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| f(ctx))
+    }
+
     /// 信息架构终稿（协调记录 #47）：NAV 收敛为五入口——
     /// 仪表盘/模块/管线/任务/设置；「模型」旧入口与「整合包」已删除。
     #[test]
@@ -1182,6 +1290,142 @@ mod tests {
 
         // outer 缺失 → 不落盘
         assert!(App::window_state_json(None, None).is_none());
+    }
+
+    /// Task #28 回归：最大化期间持久化基准冻结——只记录 normal 态矩形。
+    /// 此前最大化退出会把近全屏几何 + 负偏移外框落盘，下次启动以近全屏
+    /// 尺寸建窗 + 首帧收缩，启动期 Resized 风暴踩 eframe 0.31 同步重绘
+    /// 丢帧路径（最大化冻结/重启白屏诱因链）。
+    #[test]
+    fn window_rect_baseline_freezes_while_maximized() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+
+        let normal_outer =
+            egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(1000.0, 700.0));
+        let normal_inner =
+            egui::Rect::from_min_size(egui::pos2(108.0, 131.0), egui::vec2(984.0, 669.0));
+        rect_pass(&ctx, Some(normal_outer), Some(normal_inner), false, |ctx| {
+            app.track_window_rect(ctx)
+        });
+        assert_eq!(app.last_window_outer, Some(normal_outer));
+        assert_eq!(app.last_window_inner, Some(normal_inner));
+        assert!(!app.last_maximized);
+
+        // 最大化：几何变化但基准冻结不变
+        let max_outer =
+            egui::Rect::from_min_size(egui::pos2(-7.33, -7.33), egui::vec2(2574.7, 1400.0));
+        let max_inner =
+            egui::Rect::from_min_size(egui::pos2(0.0, 22.7), egui::vec2(2560.0, 1369.3));
+        rect_pass(&ctx, Some(max_outer), Some(max_inner), true, |ctx| {
+            app.track_window_rect(ctx)
+        });
+        assert!(app.last_maximized, "最大化状态必须被识别");
+        assert_eq!(
+            app.last_window_outer, Some(normal_outer),
+            "最大化期间外框基准不得被覆盖"
+        );
+        assert_eq!(
+            app.last_window_inner, Some(normal_inner),
+            "最大化期间内容尺寸基准不得被覆盖"
+        );
+
+        // 还原后新 normal 几何正常更新基准
+        let restored_outer =
+            egui::Rect::from_min_size(egui::pos2(300.0, 200.0), egui::vec2(1200.0, 800.0));
+        let restored_inner =
+            egui::Rect::from_min_size(egui::pos2(308.0, 231.0), egui::vec2(1184.0, 769.0));
+        rect_pass(
+            &ctx,
+            Some(restored_outer),
+            Some(restored_inner),
+            false,
+            |ctx| app.track_window_rect(ctx),
+        );
+        assert_eq!(app.last_window_outer, Some(restored_outer));
+        assert_eq!(app.last_window_inner, Some(restored_inner));
+
+        // 落盘内容 = normal 基准，不含最大化几何
+        let json: serde_json::Value = serde_json::from_str(
+            &App::window_state_json(app.last_window_outer, app.last_window_inner).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["outer"]["x"], 300.0);
+        assert_eq!(json["inner"]["width"], 1184.0);
+        assert!(json.get("maximized").is_none(), "不持久化最大化标志");
+    }
+
+    /// Task #28 回归：最大化/还原动画过渡帧的 maximized 标志可能滞后
+    ///（rect 已变大但 is_maximized() 仍为 false）；此时 inner 尺寸超过
+    /// 显示器逻辑尺寸的帧不得覆盖持久化基准（实机取证：最大化退出落盘
+    /// 出现 1631×1042 过渡值）。monitor_size 缺失时退化为标志判定。
+    #[test]
+    fn window_rect_baseline_skips_maximize_transition_frames() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        let monitor = Some(egui::vec2(1706.67, 960.0));
+
+        let normal_outer =
+            egui::Rect::from_min_size(egui::pos2(80.0, 60.0), egui::vec2(1206.0, 811.0));
+        let normal_inner =
+            egui::Rect::from_min_size(egui::pos2(87.3, 90.0), egui::vec2(1192.0, 780.0));
+        rect_pass_mon(&ctx, Some(normal_outer), Some(normal_inner), false, monitor, |ctx| {
+            app.track_window_rect(ctx)
+        });
+        assert_eq!(app.last_window_inner, Some(normal_inner));
+
+        // 过渡帧：标志仍 false 但尺寸已超显示器 → 不覆盖基准
+        let trans_outer =
+            egui::Rect::from_min_size(egui::pos2(40.0, 30.0), egui::vec2(2460.0, 1576.0));
+        let trans_inner =
+            egui::Rect::from_min_size(egui::pos2(45.0, 64.0), egui::vec2(1631.3, 1042.0));
+        rect_pass_mon(&ctx, Some(trans_outer), Some(trans_inner), false, monitor, |ctx| {
+            app.track_window_rect(ctx)
+        });
+        assert_eq!(
+            app.last_window_inner, Some(normal_inner),
+            "超显示器尺寸的过渡帧不得覆盖 inner 基准"
+        );
+
+        // monitor_size 缺失：退化为标志判定，normal 帧照常记录
+        let mut app2 = test_app();
+        rect_pass_mon(&ctx, Some(trans_outer), Some(trans_inner), false, None, |ctx| {
+            app2.track_window_rect(ctx)
+        });
+        assert_eq!(app2.last_window_inner, Some(trans_inner));
+    }
+
+    /// Task #28 回归：首帧尺寸保护在最大化状态下不得下发 InnerSize
+    ///（会立刻触发 Resized 事件链，踩 eframe 0.31 同步重绘丢帧路径）；
+    /// normal 态超屏仍照常收缩。
+    #[test]
+    fn fit_window_to_screen_skips_when_maximized() {
+        let app = test_app();
+        let ctx = egui::Context::default();
+        let oversized_inner =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 1400.0));
+
+        // normal 态超屏 → 收缩（有 InnerSize 命令）
+        let out = rect_pass(&ctx, None, Some(oversized_inner), false, |ctx| {
+            app.fit_window_to_screen(ctx)
+        });
+        let cmds = &out.viewport_output[&egui::ViewportId::ROOT].commands;
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, egui::ViewportCommand::InnerSize(_))),
+            "normal 态超屏必须收缩"
+        );
+
+        // 最大化态超屏 → 跳过（无 InnerSize 命令）
+        let out = rect_pass(&ctx, None, Some(oversized_inner), true, |ctx| {
+            app.fit_window_to_screen(ctx)
+        });
+        let cmds = &out.viewport_output[&egui::ViewportId::ROOT].commands;
+        assert!(
+            cmds.iter()
+                .all(|c| !matches!(c, egui::ViewportCommand::InnerSize(_))),
+            "最大化状态下不得下发 InnerSize（避免启动/切换期 resize 风暴）"
+        );
     }
 
     /// P1 回归：窗口关闭（on_exit）必须向后台发出全量停止命令，

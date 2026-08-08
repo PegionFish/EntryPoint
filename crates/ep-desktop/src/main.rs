@@ -104,7 +104,10 @@ fn main() -> anyhow::Result<()> {
     // eframe runs on the main thread
     // P3-1：恢复上次退出时的窗口位置/尺寸（runtime/window-state.json，
     // 全局多显示器坐标空间，副屏位置原样恢复；若记录的显示器已断开，
-    // Windows 会自动将窗口拉回可见区域，不会丢失）
+    // Windows 会自动将窗口拉回可见区域，不会丢失）。
+    // Task #28：恢复**恒为 normal 态**——落盘侧已保证只记录非最大化
+    // 几何，本处不使用任何最大化标志建窗，杜绝最大化坏状态跨启动传播
+    //（近全屏初始尺寸会诱发启动期 resize 风暴，踩 eframe 0.31 同步重绘丢帧）。
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("EntryPoint")
         .with_inner_size([1280.0, 800.0])
@@ -138,6 +141,9 @@ fn main() -> anyhow::Result<()> {
 
 /// 读取窗口状态（P3-1）：返回 (窗口外框左上角, 内容尺寸)。
 /// 文件缺失/损坏/字段不全均返回 None（默认位置启动，与旧行为一致）。
+///
+/// Task #28：只读 outer 位置 + inner 尺寸（normal 态基准）；文件内
+/// 可能存在的历史/额外字段（如 maximized）一律忽略——恢复恒为 normal 态。
 fn load_window_state(root: &Path) -> Option<(egui::Pos2, egui::Vec2)> {
     let path = root.join("runtime").join("window-state.json");
     let text = std::fs::read_to_string(path).ok()?;
@@ -3300,5 +3306,63 @@ type = "http"
             &[("count", "3")],
         );
         assert_eq!(miss, "共 3 个");
+    }
+
+    // ── Task #28：window-state 加载侧（恢复恒为 normal 态） ─────────────
+
+    /// 构造临时 root 并写入 window-state.json，返回 root 路径
+    fn window_state_root(json: &str) -> PathBuf {
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!(
+            "ep-winstate-test-{}-{seq}",
+            std::process::id()
+        ));
+        let dir = root.join("runtime");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("window-state.json"), json).unwrap();
+        root
+    }
+
+    /// Task #28：加载只读 outer 位置 + inner 尺寸；旧格式（无 maximized）
+    /// 与新格式（带 maximized 字段）都能解析，最大化标志一律被忽略
+    ///——恢复恒为 normal 态，不携带最大化坏状态。
+    #[test]
+    fn load_window_state_ignores_maximized_flag() {
+        // 旧格式：无 maximized 字段
+        let legacy = r#"{"outer":{"x":100.0,"y":200.0},"inner":{"width":1200.0,"height":800.0}}"#;
+        let root = window_state_root(legacy);
+        let (pos, size) = load_window_state(&root).expect("旧格式应可解析");
+        assert_eq!((pos.x, pos.y), (100.0, 200.0));
+        assert_eq!((size.x, size.y), (1200.0, 800.0));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // 新格式带 maximized=true：仍按 normal 态解析，标志被忽略
+        let with_flag = r#"{"outer":{"x":12.0,"y":34.0},"inner":{"width":1000.0,"height":700.0},"maximized":true}"#;
+        let root = window_state_root(with_flag);
+        let (pos, size) = load_window_state(&root).expect("带 maximized 字段应可解析");
+        assert_eq!((pos.x, pos.y), (12.0, 34.0));
+        assert_eq!((size.x, size.y), (1000.0, 700.0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Task #28：异常值防御——非有限坐标/超小尺寸返回 None（默认位置启动）
+    #[test]
+    fn load_window_state_rejects_bad_values() {
+        // 尺寸过小 → None
+        let tiny = r#"{"outer":{"x":0.0,"y":0.0},"inner":{"width":100.0,"height":100.0}}"#;
+        let root = window_state_root(tiny);
+        assert!(load_window_state(&root).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+
+        // NaN 坐标 → None
+        let nan = r#"{"outer":{"x":NaN,"y":0.0},"inner":{"width":1200.0,"height":800.0}}"#;
+        let root = window_state_root(nan);
+        assert!(load_window_state(&root).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+
+        // 文件缺失 → None
+        let empty_root = std::env::temp_dir().join(format!("ep-winstate-missing-{}", std::process::id()));
+        assert!(load_window_state(&empty_root).is_none());
     }
 }
