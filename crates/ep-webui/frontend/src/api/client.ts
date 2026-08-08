@@ -34,17 +34,88 @@ import type {
   VramBudgetResponse,
 } from './types'
 
-async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
+/** apiFetch 默认超时（毫秒）：防挂死请求（如慢响应下的轮询堆积） */
+const DEFAULT_TIMEOUT_MS = 30_000
+
+interface ApiFetchOptions extends RequestInit {
+  /**
+   * 请求超时（毫秒）；0 表示不限时（wait 同步执行等长任务显式 opt-out）。
+   * 默认 30s；FormData 上传（可达数 GB）自动跳过超时。
+   */
+  timeoutMs?: number
+}
+
+async function apiFetch<T>(path: string, options?: ApiFetchOptions): Promise<T> {
   const headers = new Headers(options?.headers)
   // FormData（文件上传）不手动设置 Content-Type，由浏览器自动附加 multipart 边界
   if (!(options?.body instanceof FormData) && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
   }
-  const resp = await fetch(`/api${path}`, { ...options, headers })
+  const { timeoutMs = DEFAULT_TIMEOUT_MS, ...init } = options ?? {}
+  // 上传与调用方显式 signal 场景不叠加自动超时
+  const needsTimeout =
+    timeoutMs > 0 && !(init.body instanceof FormData) && init.signal === undefined
+  const signal = needsTimeout ? AbortSignal.timeout(timeoutMs) : init.signal
+  const resp = await fetch(`/api${path}`, { ...init, headers, signal })
   if (!resp.ok) {
     throw new Error(`API ${resp.status}: ${await resp.text()}`)
   }
   return resp.json()
+}
+
+/**
+ * 模型文件上传（XHR 真实进度）。fetch 无上传进度，模型可达数 GB，
+ * 进度反馈必需（参照 use-pack-io 的 XHR 进度模式）。错误形状与
+ * apiFetch 一致（`API <status>: <body>`），便于统一解析。
+ */
+export function uploadModelWithProgress(
+  moduleId: string,
+  modelId: string,
+  files: File[],
+  paths: string[] | undefined,
+  onProgress: (p: { loaded: number; total: number; percent: number }) => void,
+): Promise<{ ok: boolean }> {
+  const form = new FormData()
+  form.append('model_id', modelId)
+  for (const f of files) form.append('files', f)
+  if (paths) {
+    for (const p of paths) form.append('paths', p)
+  }
+  return new Promise<{ ok: boolean }>((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `/api/models/${moduleId}/upload`)
+    xhr.upload.addEventListener('progress', (e) => {
+      if (!e.lengthComputable) return
+      onProgress({
+        loaded: e.loaded,
+        total: e.total,
+        percent: e.total > 0 ? Math.min(100, (e.loaded / e.total) * 100) : 0,
+      })
+    })
+    xhr.addEventListener('load', () => {
+      let body: unknown = null
+      try {
+        body = JSON.parse(xhr.responseText)
+      } catch {
+        // 非 JSON 响应
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve({ ok: true })
+        return
+      }
+      const msg =
+        body && typeof body === 'object' && 'error' in body
+          ? (body as { error: unknown }).error
+          : null
+      reject(
+        new Error(
+          typeof msg === 'string' && msg.trim() ? msg : `HTTP ${xhr.status}`,
+        ),
+      )
+    })
+    xhr.addEventListener('error', () => reject(new Error('network error')))
+    xhr.send(form)
+  })
 }
 
 export const api = {
@@ -98,8 +169,7 @@ export const api = {
   },
 
   /** 启动模型下载（source 缺省时由后端选择默认来源） */
-  downloadModel: (
-    moduleId: string,
+  downloadModel: (    moduleId: string,
     body: { model_id: string; source?: ModelSource },
   ) =>
     apiFetch<{ ok: boolean }>(`/models/${moduleId}/download`, {
@@ -176,9 +246,11 @@ export const api = {
       method: 'DELETE',
     }),
   executePipeline: (body: ExecutePipelineRequest) =>
+    // wait 同步模式请求在服务端阻塞至终态（可数分钟），不走默认 30s 超时
     apiFetch<ExecutePipelineResponse>('/pipelines/execute', {
       method: 'POST',
       body: JSON.stringify(body),
+      timeoutMs: 0,
     }),
 
   /** 管线级任务列表（§6.8，修 P1-5；含 queued 状态与队列位置） */

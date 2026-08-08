@@ -1,9 +1,3 @@
-// ===== Health =====
-export interface HealthResponse {
-  status: string
-  version: string
-}
-
 // ===== Devices =====
 export interface DeviceResponse {
   id: string

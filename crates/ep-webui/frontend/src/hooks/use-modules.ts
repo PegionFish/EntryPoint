@@ -32,8 +32,12 @@ export function useModules(): UseModulesResult {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const mounted = useRef(true)
+  /** 上一轮请求未完成时跳过本轮，避免慢响应下的轮询叠加（复用 useDevices 模式） */
+  const inFlight = useRef(false)
 
   const refresh = useCallback(async () => {
+    if (inFlight.current) return
+    inFlight.current = true
     try {
       const list = await api.modules()
       // 并行获取各模块运行状态（端口 / uptime），失败时静默跳过
@@ -52,6 +56,7 @@ export function useModules(): UseModulesResult {
       if (!mounted.current) return
       setError(e instanceof Error ? e.message : String(e))
     } finally {
+      inFlight.current = false
       if (mounted.current) setLoading(false)
     }
   }, [])

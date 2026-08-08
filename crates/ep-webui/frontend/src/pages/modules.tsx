@@ -30,7 +30,7 @@ import {
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
-import { api } from '@/api/client'
+import { api, uploadModelWithProgress } from '@/api/client'
 import type {
   CapabilityDecl,
   CapabilityParamSchema,
@@ -420,6 +420,13 @@ async function fetchArtifactPreview(
 ): Promise<ArtifactPreview> {
   const resp = await fetch(url)
   if (!resp.ok) throw new Error(`API ${resp.status}`)
+  // P1：先读 Content-Length 预判体积，超限直接取消 body 放弃预览。
+  // 避免 await resp.blob() 把数 GB 产物全量下载进内存造成内存峰值。
+  const headerLen = Number(resp.headers.get('Content-Length'))
+  if (Number.isFinite(headerLen) && headerLen > PREVIEW_MAX_BYTES) {
+    void resp.body?.cancel()
+    return { nodeId, name, kind: 'binary', size: headerLen }
+  }
   const blob = await resp.blob()
   if (blob.size > PREVIEW_MAX_BYTES) {
     return { nodeId, name, kind: 'binary', size: blob.size }
@@ -1999,12 +2006,15 @@ function ModelUploadDialog({
   const [files, setFiles] = useState<File[]>([])
   const [sourcePath, setSourcePath] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  /** 上传进度百分比（null = 未在传输；XHR 不可计算时不更新） */
+  const [uploadPercent, setUploadPercent] = useState<number | null>(null)
 
   useEffect(() => {
     if (!open) {
       setFiles([])
       setSourcePath('')
       setSubmitting(false)
+      setUploadPercent(null)
     }
   }, [open])
 
@@ -2016,15 +2026,20 @@ function ModelUploadDialog({
   async function submitUpload() {
     if (files.length === 0 || submitting) return
     setSubmitting(true)
+    setUploadPercent(0)
     try {
       if (archivePicked) {
-        await api.uploadModel(moduleId, modelId, files)
+        await uploadModelWithProgress(moduleId, modelId, files, undefined, (p) =>
+          setUploadPercent(p.percent),
+        )
       } else {
         const paths = files.map((f) =>
           (f as File & { webkitRelativePath?: string }).webkitRelativePath ||
           f.name,
         )
-        await api.uploadModel(moduleId, modelId, files, paths)
+        await uploadModelWithProgress(moduleId, modelId, files, paths, (p) =>
+          setUploadPercent(p.percent),
+        )
       }
       toast.success(t('modelUpload.succeeded', { defaultValue: '模型文件已上传' }), {
         description: `${moduleName} / ${modelName}`,
@@ -2037,6 +2052,7 @@ function ModelUploadDialog({
       })
     } finally {
       setSubmitting(false)
+      setUploadPercent(null)
     }
   }
 
@@ -2158,6 +2174,15 @@ function ModelUploadDialog({
             </p>
           </TabsContent>
         </Tabs>
+
+        {uploadPercent !== null && (
+          <div className="flex items-center gap-2">
+            <Progress value={uploadPercent} className="h-1.5" />
+            <span className="shrink-0 font-mono text-xs text-muted-foreground">
+              {Math.floor(uploadPercent)}%
+            </span>
+          </div>
+        )}
 
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={submitting}>

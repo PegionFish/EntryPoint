@@ -65,20 +65,24 @@ export function useModuleDetail(moduleId: string | undefined): UseModuleDetailRe
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [acting, setActing] = useState(false)
-  const mounted = useRef(true)
+  /**
+   * 状态请求代数：每次 refreshStatus 自增，返回后与当前代数比对。
+   * 路由 /modules/a→b 复用同一组件实例时，旧 id 的在途响应因代数
+   * 不匹配被丢弃，不再覆盖新页状态（修跨 id 竞态，替代共享 mounted 标志）。
+   */
+  const statusGen = useRef(0)
 
   const refreshStatus = useCallback(async () => {
     if (!id) return
+    const gen = ++statusGen.current
     try {
       const s = await api.moduleStatus(id)
-      if (mounted.current) {
-        setStatus(s)
-        setError(null)
-      }
+      if (gen !== statusGen.current) return
+      setStatus(s)
+      setError(null)
     } catch (e) {
-      if (mounted.current) {
-        setError(e instanceof Error ? e.message : String(e))
-      }
+      if (gen !== statusGen.current) return
+      setError(e instanceof Error ? e.message : String(e))
     }
   }, [id])
 
@@ -130,10 +134,12 @@ export function useModuleDetail(moduleId: string | undefined): UseModuleDetailRe
     }
   }, [id])
 
-  // 状态轮询：3 秒一次，页面不可见时暂停
+  // 状态轮询：3 秒一次，页面不可见时暂停。
+  // 每次 id 变更以本地 cancelled 闭包终止旧轮询；在途响应由
+  // refreshStatus 的代数比对丢弃（修跨 id 竞态）。
   useEffect(() => {
     if (!id) return
-    mounted.current = true
+    let cancelled = false
     let timer: number | null = null
 
     const stop = () => {
@@ -150,7 +156,7 @@ export function useModuleDetail(moduleId: string | undefined): UseModuleDetailRe
     }
 
     void refreshStatus().finally(() => {
-      if (mounted.current) setLoading(false)
+      if (!cancelled) setLoading(false)
     })
     start()
 
@@ -165,7 +171,7 @@ export function useModuleDetail(moduleId: string | undefined): UseModuleDetailRe
     document.addEventListener('visibilitychange', onVisibility)
 
     return () => {
-      mounted.current = false
+      cancelled = true
       stop()
       document.removeEventListener('visibilitychange', onVisibility)
     }
@@ -194,7 +200,7 @@ export function useModuleDetail(moduleId: string | undefined): UseModuleDetailRe
       await refreshStatus() // 以服务端真实状态校正
       throw e instanceof Error ? e : new Error(String(e))
     } finally {
-      if (mounted.current) setActing(false)
+      setActing(false)
     }
   }, [id, refreshStatus, t])
 
@@ -213,7 +219,7 @@ export function useModuleDetail(moduleId: string | undefined): UseModuleDetailRe
       await refreshStatus()
       throw e instanceof Error ? e : new Error(String(e))
     } finally {
-      if (mounted.current) setActing(false)
+      setActing(false)
     }
   }, [id, refreshStatus, t])
 

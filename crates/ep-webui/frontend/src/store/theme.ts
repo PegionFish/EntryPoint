@@ -40,11 +40,21 @@ function initialTheme(): Theme {
  * 主题回写服务器：PUT /api/config 合并单键 `{general:{theme}}`（§8.2）。
  * 本地已先行应用，回写为 best-effort —— 失败仅告警，不打断交互；
  * 服务器仍为权威真源，下次启动同步时对齐（P2-2）。
+ *
+ * 300ms 去抖合并：顶栏 toggle 与设置页 Select 都会触发持久化，
+ * 快速连续切换时合并为最后一次，避免并发 PUT 乱序导致服务器最终值回退（P2）。
  */
+const PERSIST_DEBOUNCE_MS = 300
+let persistTimer: number | null = null
+
 function persistTheme(theme: Theme): void {
-  void putConfigPatch({ general: { theme } }).catch((e: unknown) => {
-    console.warn('[theme] 回写服务器失败（本地已应用）:', e)
-  })
+  if (persistTimer !== null) window.clearTimeout(persistTimer)
+  persistTimer = window.setTimeout(() => {
+    persistTimer = null
+    void putConfigPatch({ general: { theme } }).catch((e: unknown) => {
+      console.warn('[theme] 回写服务器失败（本地已应用）:', e)
+    })
+  }, PERSIST_DEBOUNCE_MS)
 }
 
 /**

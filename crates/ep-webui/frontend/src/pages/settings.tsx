@@ -184,7 +184,13 @@ function NumberField({
         setText(e.target.value)
         const v = e.target.valueAsNumber
         // P2-52：非法 / NaN 输入保留原值，不再写 0
-        if (!Number.isNaN(v)) onValueChange(v)
+        if (Number.isNaN(v)) return
+        // P2：越界值不进 draft，钳制到 [min,max]（文本同步显示钳制结果）
+        let next = v
+        if (min !== undefined && next < min) next = min
+        if (max !== undefined && next > max) next = max
+        onValueChange(next)
+        if (next !== v) setText(String(next))
       }}
       onBlur={() => {
         // 失焦时回退显示为实际配置值，避免无效内容造成误导
