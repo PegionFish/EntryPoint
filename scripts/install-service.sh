@@ -21,6 +21,16 @@ echo "==> WebUI 端口:  $PORT"
 
 # ── 1. 安装 systemd 服务 ─────────────────────────────────────────────────────
 echo "==> 安装 systemd 服务..."
+# unit（scripts/entrypoint.service）面向 /opt/entrypoint 部署布局（bin/ep-daemon）。
+# 先校验目标二进制存在，避免安装出必然启动失败的 unit；若本机是源码检出方式
+# （二进制在 target/release/），请改用 ./build.sh server 产物内 install.sh
+# （自动安装到 /opt/entrypoint 并注册服务）。
+if [[ ! -x /opt/entrypoint/bin/ep-daemon ]]; then
+  echo "!!  未找到 /opt/entrypoint/bin/ep-daemon —— 本 unit 面向 /opt/entrypoint 布局。"
+  echo "!!  请先执行 ./build.sh server 并在产物目录运行 install.sh（安装到 /opt/entrypoint），"
+  echo "!!  或按实际部署路径修改 scripts/entrypoint.service 的 ExecStart/WorkingDirectory 后重试。"
+  exit 1
+fi
 sudo cp "$SCRIPT_DIR/entrypoint.service" /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable entrypoint

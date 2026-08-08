@@ -7,12 +7,13 @@ arch=('x86_64')
 url="https://github.com/PegionFish/EntryPoint"
 license=('MIT')
 
-depends=('gcc-libs' 'libxkbcommon' 'wayland' 'fontconfig')
+# 运行期强依赖（与 deb 侧硬 Depends 对齐）：
+# libglvnd=libGL/libEGL（egui/wgpu 渲染必需）、libx11=X11 后端、
+# libxkbcommon/wayland=Wayland 后端；ffmpeg/uv/python 与 server 侧一致
+depends=('gcc-libs' 'libxkbcommon' 'wayland' 'libglvnd' 'libx11' 'fontconfig' 'ffmpeg' 'uv' 'python')
 makedepends=('rust')
 optdepends=(
     'nvidia-utils: CUDA GPU 支持'
-    'ffmpeg: 视频/音频处理'
-    'uv: Python 环境管理'
 )
 
 source=("$pkgname-$pkgver.tar.gz")
@@ -69,6 +70,12 @@ EOF
 
     # 桌面启动器
     install -Dm644 packaging/entrypoint.desktop "$pkgdir/usr/share/applications/entrypoint.desktop"
+
+    # 图标（entrypoint.desktop 声明 Icon=entrypoint）：安装占位 PNG。
+    # base64 内嵌避免引入额外源文件；替换为正式图标时直接替换下方 base64 即可。
+    install -dm755 "$pkgdir/usr/share/pixmaps"
+    printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAHuSURBVHhe7dGxbQMxDIVhT5IiXWbI/hNkg1SugmyQQIWBww+TR1KkzoBYfI18oh6fb28fn387u/FgN10AD3bTBfBgN10AD3bTBfBgN10AD6q8f/24cUaF0gK40AzOzlJWABfIwDcypBfA0BX45ozUAhi0Et+OSimA4VZiFq/pAhjoCszk0QXwwINBrsRsVuECGOAVMKPFJQV8339F/NaDGS1CBfBhKy6r4V0rZj3jLoAPWnFBC86wYmZNeQFcSluO32jfaphZs7wA/v5M5M4RM2tcBfChMzOLzNwdmF1SVsDsArMzmF2ypAD+5hGdw+ySkgJm/jmKzmJ2SXkB/C0iMo/ZJV0ADyR8QBMJrInMY36JuYCBj0gigTWRecwu6QJ4oOEjkmNgT+hnorOYXVJSwBAJ/Ux0DrNLlhTgDZ8xg9klZQUMMwvwPn87w+wSVwEDHzoTKSFy54iZNcsL0JbiN9q3GmbWlBfwwKUsOMOKmTXuAgY+aMUFNbxrxaxnQgUMfNiDy2YsPjCjxSUFVGFGi3ABAwNcidmspgoYGOQKzOTRBfAggoFWYhavlAIeGK4S345KLWBg0Ap8c0Z6AQ8MnYFvZCgrYOACMzg7S2kBR1zIgjMqLCvgVXUBPNhNF8CD3XQBPNhNF8CD3WxfwD88s87ssnWmMgAAAABJRU5ErkJggg==' | base64 -d > "$pkgdir/usr/share/pixmaps/entrypoint.png"
+    chmod 644 "$pkgdir/usr/share/pixmaps/entrypoint.png"
 
     # License
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE" 2>/dev/null || true

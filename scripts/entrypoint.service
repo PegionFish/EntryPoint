@@ -1,22 +1,37 @@
 [Unit]
-Description=EntryPoint AI Module Daemon
+Description=EntryPoint AI Module Orchestrator
 After=network.target
 
 [Service]
 Type=simple
-User=bob
-WorkingDirectory=/server/EntryPoint
-ExecStart=/server/EntryPoint/target/release/ep-daemon
+User=entrypoint
+Group=entrypoint
+# 泛化路径：/opt/entrypoint 布局（与 packaging/entrypoint.service 约定对齐；
+# 安装到该布局的脚本：build.sh server 产物内 install.sh / scripts/install-service.sh）
+WorkingDirectory=/opt/entrypoint
+ExecStart=/opt/entrypoint/bin/ep-daemon
 Restart=on-failure
 RestartSec=5
-Environment=RUST_LOG=ep_daemon=info,ep_core=info
-# 共享 CUDA 库目录（§3.1）：前置 checkout 内 runtime/cuda-libs（可选目录，缺失时
-# 动态链接器忽略该条目，无副作用）；模块子进程注入另由 daemon 代码负责。
-# systemd 环境无继承值可前置，此行为完整列表写法。
-Environment=LD_LIBRARY_PATH=/server/EntryPoint/runtime/cuda-libs:/usr/local/cuda/lib64
+Environment=RUST_LOG=info
+# 共享 CUDA 库目录（PACK_UNIFY_PLAN §3.1）：
+# - 目录为可选资产（.gitignore 忽略 runtime/，按存在性随包附带）；不存在时动态链接器
+#   忽略缺失路径条目，无副作用。
+# - 模块子进程的 LD_LIBRARY_PATH 前置注入由 daemon 代码负责（ep-core process.rs）。
+# - systemd 无继承环境可前置，需叠加系统 CUDA 库路径时请改写为完整列表（冒号分隔）：
+#   Environment=LD_LIBRARY_PATH=/opt/entrypoint/runtime/cuda-libs:/usr/local/cuda/lib64
+Environment=LD_LIBRARY_PATH=/opt/entrypoint/runtime/cuda-libs
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=entrypoint
+
+# 安全加固（与 packaging/entrypoint.service 一致；EP_ROOT 需可写：
+# config/ 会被 PUT /api/config 更新，workspace/ runtime/ models/ 为运行期产物）
+NoNewPrivileges=true
+ProtectHome=read-only
+ProtectSystem=strict
+PrivateTmp=yes
+UMask=0027
+ReadWritePaths=/opt/entrypoint
 
 [Install]
 WantedBy=multi-user.target

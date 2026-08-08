@@ -11,7 +11,9 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_ROOT"
 
-VERSION="0.1.0"
+# 版本单一来源：Cargo.toml [workspace.package] version（勿在此处另写死版本号）
+VERSION="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' "$PROJECT_ROOT/Cargo.toml" | head -1)"
+[[ -n "$VERSION" ]] || VERSION="0.0.0"
 MODE=""
 TARGET="release"
 SKIP_TEST=0
@@ -132,18 +134,24 @@ distro_profile_of() {
 
 distro_family_of() {
     case "$1" in
-        debian*|ubuntu*|mint)                     echo "deb" ;;
+        debian*|ubuntu*|linuxmint*|mint)      echo "deb" ;;
         rhel*|centos*|fedora*|rocky*|alma*|ol*)  echo "rpm" ;;
-        arch*|manjaro*|endeavouros*)              echo "pkg" ;;
+        arch*|manjaro*|endeavouros*)           echo "pkg" ;;
         *) echo "generic" ;;
     esac
 }
 
 detect_distro() {
     if [ -f /etc/os-release ]; then
-        local id=""
+        local ver=""
         . /etc/os-release 2>/dev/null || true
-        echo "${ID:-unknown}-${VERSION_ID:-}"
+        # VERSION_ID 可能带次版本（如 Linux Mint 21.3）：按 . 截断为主版本再匹配知识表
+        ver="${VERSION_ID%%.*}"
+        if [ -n "$ver" ]; then
+            echo "${ID:-unknown}-${ver}"
+        else
+            echo "${ID:-unknown}"
+        fi
     else
         echo "unknown"
     fi
@@ -199,6 +207,14 @@ case "$ARCH_ID" in
     aarch64|arm64)     ARCH_ID="aarch64" ;;
     *) die "不支持的架构: $ARCH_ID" ;;
 esac
+# 包格式架构映射（无交叉编译假设，按本机架构出包）：
+# deb 用 amd64/arm64，rpm 用 x86_64/aarch64
+DEB_ARCH="amd64"
+RPM_ARCH="x86_64"
+if [[ "$ARCH_ID" == "aarch64" ]]; then
+    DEB_ARCH="arm64"
+    RPM_ARCH="aarch64"
+fi
 
 if [[ "$OS_ID" == "macos" && "$MODE" == "server" ]]; then
     die "macOS 仅支持 GUI 客户端打包（./build.sh gui）"
@@ -217,7 +233,12 @@ MANIFEST="$WORK_DIR/manifest.txt"
 
 # ── 工具检查 ──────────────────────────────────────────────────────────────────
 step "环境检查"
-command -v cargo >/dev/null 2>&1 || { [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; }
+# cargo 缺失时先尝试加载 rustup 环境（~/.cargo/env 存在才 source，避免
+# 原 `|| { ...; }` 组在 env 缺失时返回非零、被 set -e 静默终止、die 提示不执行）
+if ! command -v cargo >/dev/null 2>&1 && [ -f "$HOME/.cargo/env" ]; then
+    # shellcheck disable=SC1090
+    . "$HOME/.cargo/env"
+fi
 command -v cargo >/dev/null 2>&1 || die "cargo 未找到，请先安装 Rust: https://rustup.rs"
 command -v rustc >/dev/null 2>&1 || die "rustc 未找到"
 command -v git >/dev/null 2>&1 || die "git 未找到"
@@ -237,8 +258,8 @@ fi
 # ── Clippy ────────────────────────────────────────────────────────────────────
 if [[ "$SKIP_CLIPPY" != "1" ]]; then
     step "Clippy 检查"
-    clippy_out="$(cargo clippy --manifest-path "$PROJECT_ROOT/Cargo.toml" --workspace --all-targets 2>&1 || true)"
-    if ! cargo clippy --manifest-path "$PROJECT_ROOT/Cargo.toml" --workspace --all-targets >/dev/null 2>&1; then
+    # 单次运行（`if ! cmd; then` 中命令失败不触发 set -e），避免 clippy 编译两遍
+    if ! clippy_out="$(cargo clippy --manifest-path "$PROJECT_ROOT/Cargo.toml" --workspace --all-targets 2>&1)"; then
         echo "$clippy_out" | grep -E "warning:|error" | head -30
         die "Clippy 失败"
     fi
@@ -288,6 +309,33 @@ if [[ "$OS_ID" == "macos" ]]; then
     mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
     cp "$BIN_SRC/$EXE_NAME" "$APP_DIR/Contents/MacOS/entrypoint"
     chmod +x "$APP_DIR/Contents/MacOS/entrypoint"
+    # 缺少 Info.plist 时 Finder 双击无法启动；生成最小 plist（CFBundleExecutable=entrypoint）
+    cat > "$APP_DIR/Contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>EntryPoint</string>
+    <key>CFBundleDisplayName</key>
+    <string>EntryPoint</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.pegionfish.entrypoint</string>
+    <key>CFBundleExecutable</key>
+    <string>entrypoint</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleVersion</key>
+    <string>${VERSION}</string>
+    <key>CFBundleShortVersionString</key>
+    <string>${VERSION}</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+</dict>
+</plist>
+EOF
     RES="$APP_DIR/Contents/Resources"
 else
     # 包内二进制名与角色一致：gui=entrypoint / server=ep-daemon
@@ -477,7 +525,7 @@ Package: $pkgname
 Version: $VERSION
 Section: utils
 Priority: optional
-Architecture: amd64
+Architecture: $DEB_ARCH
 Depends: ${DISTRO_DEPS:-ffmpeg, python3, python3-venv}
 Maintainer: EntryPoint <https://github.com/PegionFish/EntryPoint>
 Description: $desc
@@ -490,16 +538,16 @@ systemctl enable entrypoint 2>/dev/null || true
 EOF
         chmod +x "$root/DEBIAN/postinst"
     fi
-    dpkg-deb --build --root-owner-group "$root" "$DIST_DIR/${pkgname}_${VERSION}-1_amd64.deb" >/dev/null
-    echo "${pkgname}_${VERSION}-1_amd64.deb" >> "$MANIFEST"
-    ok "deb: $DIST_DIR/${pkgname}_${VERSION}-1_amd64.deb"
+    dpkg-deb --build --root-owner-group "$root" "$DIST_DIR/${pkgname}_${VERSION}-1_${DEB_ARCH}.deb" >/dev/null
+    echo "${pkgname}_${VERSION}-1_${DEB_ARCH}.deb" >> "$MANIFEST"
+    ok "deb: $DIST_DIR/${pkgname}_${VERSION}-1_${DEB_ARCH}.deb"
 }
 
 pkg_rpm() {
     command -v rpmbuild >/dev/null 2>&1 || { info "跳过 rpm（未找到 rpmbuild）"; return 0; }
     info "生成 rpm ..."
     local top="$WORK_DIR/rpmbuild"
-    local br="$top/BUILDROOT/entrypoint-${MODE}-${VERSION}-1.x86_64"
+    local br="$top/BUILDROOT/entrypoint-${MODE}-${VERSION}-1.${RPM_ARCH}"
     mkdir -p "$top/BUILD" "$top/RPMS" "$top/SOURCES" "$top/SPECS"
     stage_fhs "$br"
     local desc="EntryPoint AI 模块编排平台"
@@ -510,7 +558,7 @@ Version: ${VERSION}
 Release: 1
 Summary: $desc
 License: MIT
-BuildArch: x86_64
+BuildArch: ${RPM_ARCH}
 Requires: $(echo "${DISTRO_DEPS:-ffmpeg, python3}" | tr ',' ' ')
 
 %description
@@ -537,23 +585,46 @@ EOF
         printf '/usr/bin/entrypoint\n' >> "$top/SPECS/entrypoint-${MODE}.spec"
     fi
     rpmbuild -bb --define "_topdir $top" "$top/SPECS/entrypoint-${MODE}.spec" >/dev/null
-    cp "$top"/RPMS/x86_64/entrypoint-${MODE}-${VERSION}-1.x86_64.rpm "$DIST_DIR/"
-    echo "entrypoint-${MODE}-${VERSION}-1.x86_64.rpm" >> "$MANIFEST"
-    ok "rpm: $DIST_DIR/entrypoint-${MODE}-${VERSION}-1.x86_64.rpm"
+    cp "$top"/RPMS/${RPM_ARCH}/entrypoint-${MODE}-${VERSION}-1.${RPM_ARCH}.rpm "$DIST_DIR/"
+    echo "entrypoint-${MODE}-${VERSION}-1.${RPM_ARCH}.rpm" >> "$MANIFEST"
+    ok "rpm: $DIST_DIR/entrypoint-${MODE}-${VERSION}-1.${RPM_ARCH}.rpm"
 }
 
 pkg_arch() {
     local src="$PROJECT_ROOT/packaging/PKGBUILD"
     [[ "$MODE" == "gui" ]] && src="$PROJECT_ROOT/packaging/PKGBUILD.gui"
     if [[ ! -f "$src" ]]; then info "跳过 Arch（未找到 $src）"; return 0; fi
-    mkdir -p "$DIST_DIR/arch-$MODE"
-    cp "$src" "$DIST_DIR/arch-$MODE/PKGBUILD"
+    local dir="$DIST_DIR/arch-$MODE"
+    mkdir -p "$dir"
+    # PKGBUILD 声明 source=("$pkgname-$pkgver.tar.gz")：必须随附该源包 makepkg 才能构建。
+    # 此前只拷 PKGBUILD 不产源 tar，makepkg 会因缺源包直接失败（修复 P1-4）。
+    local pkgname pkgver stage src_tar sha
+    pkgname="$(awk -F= '/^pkgname=/{print $2; exit}' "$src")"
+    pkgver="$(awk -F= '/^pkgver=/{print $2; exit}' "$src")"
+    stage="$dir/$pkgname-$pkgver"
+    mkdir -p "$stage"
+    # makepkg 构建所需文件（daemon/gui + ep-pack-cli + WebUI 前端 + package() 引用资源）；
+    # 含 Cargo.lock 以支持 PKGBUILD 的 cargo build --locked
+    for f in Cargo.toml Cargo.lock crates modules config packaging LICENSE README.md; do
+        [[ -e "$PROJECT_ROOT/$f" ]] && cp -a "$PROJECT_ROOT/$f" "$stage/"
+    done
+    # 剔除不应进入源包的构建残留/本地产物
+    find "$stage" -name target -type d -prune -exec rm -rf {} + 2>/dev/null || true
+    find "$stage" -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true
+    [[ -d "$stage/modules/test-ffmpeg" ]] && rm -rf "$stage/modules/test-ffmpeg"
+    src_tar="$dir/$pkgname-$pkgver.tar.gz"
+    tar -C "$dir" -czf "$src_tar" "$pkgname-$pkgver"
+    rm -rf "$stage"
+    sha="$(sha256sum "$src_tar" | cut -d' ' -f1)"
+    # 回填真实 sha256sums（与刚产出的源包一一对应；原 'SKIP' 属弱校验，此处做实）
+    sed "s/sha256sums=('SKIP')/sha256sums=('$sha')/" "$src" > "$dir/PKGBUILD"
     # server PKGBUILD 声明 install=entrypoint.install，需随附才能 makepkg
     if [[ "$MODE" == "server" && -f "$PROJECT_ROOT/packaging/entrypoint.install" ]]; then
-        cp "$PROJECT_ROOT/packaging/entrypoint.install" "$DIST_DIR/arch-$MODE/"
+        cp "$PROJECT_ROOT/packaging/entrypoint.install" "$dir/"
     fi
     echo "arch-$MODE/PKGBUILD" >> "$MANIFEST"
-    ok "Arch PKGBUILD: dist/arch-$MODE/PKGBUILD"
+    echo "arch-$MODE/$pkgname-$pkgver.tar.gz" >> "$MANIFEST"
+    ok "Arch: $dir/PKGBUILD (sha256=$sha) + 源包 $pkgname-$pkgver.tar.gz"
 }
 
 if [[ "$OS_ID" == "macos" ]]; then

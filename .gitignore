@@ -49,3 +49,7 @@ config/gpu_assignments.toml
 # Python 缓存
 __pycache__/
 *.pyc
+
+# 解除忽略（追加，覆盖上方 target-* / Cargo.lock 规则）：
+# - Cargo.lock：二进制 workspace 应提交，供 PKGBUILD 的 cargo build --locked 使用
+!Cargo.lock
