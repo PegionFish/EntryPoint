@@ -144,13 +144,8 @@ fn sid() -> egui::Id {
 
 // ── Page entry ────────────────────────────────────────────────────
 
-/// S2 骨架分发入口（app.rs 当前调用形状）。
-pub fn show(ui: &mut egui::Ui, config: &AppConfig) {
-    show_full(ui, config, None);
-}
-
-/// 完整入口：`cmd_tx` 为后台命令通道（门禁期由 app.rs 改分发传入后，
-/// 执行按钮即可提交 [`AppCmd`]；S2 形状下为 None，执行走"待接线"提示）。
+/// 管线编辑器入口：`cmd_tx` 为后台命令通道（执行按钮经它提交
+/// [`AppCmd`]；None 时执行走"待接线"提示）。
 pub fn show_full(
     ui: &mut egui::Ui,
     config: &AppConfig,
@@ -204,7 +199,7 @@ pub fn show_full(
             st.positions = compute_layout(&pipeline);
         }
         // 草稿生命周期：选中节点无草稿则从节点加载；每帧回写（幂等）
-        sync_draft(&mut st, &data, config);
+        sync_draft(&mut st, &data);
         let canvas_size = draw_main(
             ui,
             lang,
@@ -708,7 +703,7 @@ fn set_param_draft(node: &mut PipelineNode, key: &str, draft: &ParamDraft) {
 // ── Draft sync（加载/回写） ───────────────────────────────────────
 
 /// 每帧：选中节点无草稿则从节点加载；有草稿则回写到节点（幂等）。
-fn sync_draft(st: &mut VizState, data: &ModuleData, config: &AppConfig) {
+fn sync_draft(st: &mut VizState, data: &ModuleData) {
     let Some(sel) = st.selected.clone() else { return };
     let Some(pipeline) = st.pipeline.as_mut() else { return };
     let Some(node) = pipeline.nodes.iter().find(|n| n.id == sel) else {
@@ -717,7 +712,7 @@ fn sync_draft(st: &mut VizState, data: &ModuleData, config: &AppConfig) {
     };
 
     if !st.drafts.contains_key(&sel) {
-        let draft = load_draft(node, data, config);
+        let draft = load_draft(node, data);
         st.drafts.insert(sel.clone(), draft);
     }
     if let Some(draft) = st.drafts.get(&sel).cloned() {
@@ -728,7 +723,7 @@ fn sync_draft(st: &mut VizState, data: &ModuleData, config: &AppConfig) {
 }
 
 /// 节点 → 草稿（首次选中时解析，其后以草稿为编辑态）
-fn load_draft(node: &PipelineNode, data: &ModuleData, config: &AppConfig) -> NodeDraft {
+fn load_draft(node: &PipelineNode, data: &ModuleData) -> NodeDraft {
     let mut d = NodeDraft {
         device: "auto".to_string(),
         output_format: "text".to_string(),
@@ -811,7 +806,6 @@ fn load_draft(node: &PipelineNode, data: &ModuleData, config: &AppConfig) -> Nod
         _ => {}
     }
 
-    let _ = config;
     d
 }
 
@@ -872,9 +866,11 @@ fn apply_draft(node: &mut PipelineNode, draft: &NodeDraft) {
             } else {
                 Some(draft.device.clone())
             };
-            // params：清空后按草稿重建（schema 之外的键不保留，MVP 语义）
+            // params：仅覆盖草稿涉及的 schema 键，其余非 schema 键保留
+            //（P2 修复：含 schema 外键的 TOML 一经编辑不再静默丢失）
             if let Some(obj) = node.params.as_object_mut() {
-                obj.clear();
+                let draft_keys: Vec<&str> = draft.params.iter().map(|(k, _)| k.as_str()).collect();
+                obj.retain(|k, _| !draft_keys.contains(&k.as_str()));
             }
             for (key, d) in &draft.params {
                 set_param_draft(node, key, d);
@@ -2514,18 +2510,35 @@ fn draw_grid(painter: &egui::Painter, pal: &Palette, rect: egui::Rect, offset: e
     let br = to_canvas(rect.max, origin, offset, zoom);
     let dot = pal.border;
 
-    let sx = (tl.x / GRID_SPACING).floor() * GRID_SPACING;
-    let sy = (tl.y / GRID_SPACING).floor() * GRID_SPACING;
+    // P2 修复：步长按视口点数自适应（低 zoom / 大画布时放大网格间距），
+    // 避免 4K 画布 + zoom=0.3 下每帧数万 circle_filled
+    let step = grid_step(br.x - tl.x, br.y - tl.y);
+
+    let sx = (tl.x / step).floor() * step;
+    let sy = (tl.y / step).floor() * step;
 
     let mut x = sx;
     while x < br.x {
         let mut y = sy;
         while y < br.y {
             painter.circle_filled(to_screen(egui::pos2(x, y), origin, offset, zoom), 1.0, dot);
-            y += GRID_SPACING;
+            y += step;
         }
-        x += GRID_SPACING;
+        x += step;
     }
+}
+
+/// P2 修复：网格步长自适应 —— 视口内预估点数超过上限时按比例放大步长，
+/// 使每帧绘制的网格点数量有界（返回 ≥ GRID_SPACING 的步长）。
+fn grid_step(canvas_w: f32, canvas_h: f32) -> f32 {
+    const MAX_GRID_DOTS: f32 = 4096.0;
+    let raw_nx = (canvas_w / GRID_SPACING).ceil().max(1.0);
+    let raw_ny = (canvas_h / GRID_SPACING).ceil().max(1.0);
+    if raw_nx * raw_ny <= MAX_GRID_DOTS {
+        return GRID_SPACING;
+    }
+    let mul = (raw_nx * raw_ny / MAX_GRID_DOTS).sqrt().ceil().max(1.0);
+    GRID_SPACING * mul
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2780,6 +2793,18 @@ fn validate_pipeline(st: &mut VizState, lang: &str) {
 /// 变体由 C4 在 app.rs 提供（传内存对象，未保存修改也可执行）。本 worktree
 /// 的 app.rs 尚为 S2 形状（无该变体），故此处保留就绪态提示；门禁期接线：
 /// 在 `Some(tx)` 分支内发送 `AppCmd::ExecutePipeline { pipeline }` 即可。
+/// P1 修复：把执行期选择的输入文件写入管线中全部 file_input 节点的
+/// `params.path`（执行器 `execute_builtin_file_input` 以该键为源文件路径）。
+/// 所选路径不再静默丢弃——提交执行时随管线一起携带。
+fn apply_exec_input(pipeline: &mut Pipeline, file: &std::path::Path) {
+    for node in &mut pipeline.nodes {
+        if matches!(&node.kind, NodeKind::Builtin { builtin } if builtin == "file_input") {
+            // 匿名访问 serde_json::Value（本项目不直接依赖 serde_json，经 Into 推断）
+            node.params["path"] = file.to_string_lossy().into_owned().into();
+        }
+    }
+}
+
 fn execute_pipeline(
     st: &mut VizState,
     lang: &str,
@@ -2792,7 +2817,8 @@ fn execute_pipeline(
         return;
     }
     // 选择输入文件（file_input 节点的执行期输入）
-    if let Some(file) = rfd::FileDialog::new()
+    // P1 修复：所选路径在提交前写入 file_input 节点 params.path
+    let pipeline = match rfd::FileDialog::new()
         .set_title(trfb(
             lang,
             "desktopApp.pipeline.pickInput",
@@ -2801,8 +2827,14 @@ fn execute_pipeline(
         ))
         .pick_file()
     {
-        st.exec_input = Some(file);
-    }
+        Some(file) => {
+            st.exec_input = Some(file.clone());
+            let mut p = pipeline;
+            apply_exec_input(&mut p, &file);
+            p
+        }
+        None => pipeline,
+    };
     match cmd_tx {
         Some(tx) => {
             // 门禁接线完成（C4 冻结入口）：提交内存管线对象执行，进度见任务页
@@ -3217,6 +3249,66 @@ to = ["save", "input"]
         assert_eq!(again.edges, pipeline.edges);
     }
 
+    /// P1 回归：执行期选择的输入文件写入全部 file_input 节点的 params.path，
+    /// 不再静默丢弃（提交执行时随管线携带，执行器以该键为源文件路径）。
+    #[test]
+    fn apply_exec_input_writes_path_to_all_file_input_nodes() {
+        let mut pipeline = Pipeline::from_toml_str(sample_toml()).unwrap();
+        // 追加第二个 file_input 节点（多输入管线），并给首个节点预置旧路径
+        pipeline.nodes[0].params["path"] = "old/path.wav".into();
+        pipeline.nodes.push(PipelineNode {
+            id: "input2".into(),
+            kind: NodeKind::Builtin {
+                builtin: "file_input".into(),
+            },
+            label: String::new(),
+            params: Default::default(),
+            position: None,
+            timeout_secs: None,
+            retry_count: None,
+        });
+
+        apply_exec_input(&mut pipeline, std::path::Path::new("C:\\data\\in.mp3"));
+
+        for node in &pipeline.nodes {
+            if matches!(&node.kind, NodeKind::Builtin { builtin } if builtin == "file_input") {
+                assert_eq!(
+                    node.params["path"].as_str(),
+                    Some("C:\\data\\in.mp3"),
+                    "file_input 节点 {} 的 params.path 必须写入所选输入文件",
+                    node.id
+                );
+            }
+        }
+        // 非 file_input 节点不受影响
+        let module = pipeline.nodes.iter().find(|n| n.id == "process").unwrap();
+        assert!(module.params.get("path").is_none());
+    }
+
+    /// P2 回归：apply_draft 只覆盖草稿涉及的 schema 键，params 中的
+    /// 非 schema 键（TOML 手写扩展键）经编辑后必须保留，不得静默丢失。
+    #[test]
+    fn apply_draft_preserves_non_schema_params_keys() {
+        let mut pipeline = Pipeline::from_toml_str(sample_toml()).unwrap();
+        let node = pipeline.nodes.iter_mut().find(|n| n.id == "process").unwrap();
+        // 预置 schema 外扩展键（模拟用户手写 TOML 的自定义参数）
+        node.params["custom_extra"] = 42.into();
+        node.params["language"] = "en".into();
+
+        let draft = NodeDraft {
+            params: vec![("language".to_string(), ParamDraft::Str("zh".to_string()))],
+            ..Default::default()
+        };
+        apply_draft(node, &draft);
+
+        assert_eq!(node.params["language"].as_str(), Some("zh"));
+        assert_eq!(
+            node.params["custom_extra"].as_i64(),
+            Some(42),
+            "非 schema 键 custom_extra 不得被草稿清空丢弃"
+        );
+    }
+
     #[test]
     fn toml_module_node_uses_contract_keys() {
         let pipeline = Pipeline::from_toml_str(sample_toml()).unwrap();
@@ -3280,6 +3372,27 @@ builtin = "file_input"
         assert!(toml_float(f64::INFINITY).is_err());
         assert_eq!(toml_float(2.5).unwrap(), "2.5");
         assert_eq!(toml_float(7.0).unwrap(), "7.0");
+    }
+
+    /// P2 回归：网格点数有界 —— 4K 画布 + 极小 zoom（画布坐标数万像素）
+    /// 时步长自适应放大，每帧点数不超过 MAX_GRID_DOTS（含取整放大余量）。
+    #[test]
+    fn grid_step_bounds_dot_count_on_huge_canvas() {
+        const MAX_GRID_DOTS: f32 = 4096.0;
+        // zoom=0.3 时 4K 画布 ≈ 12800×7070 画布坐标；再叠加大画布
+        for (w, h) in [(12800.0, 7070.0), (3840.0, 2120.0), (40960.0, 40960.0), (800.0, 600.0)] {
+            let step = grid_step(w, h);
+            let nx = (w / step).ceil().max(1.0);
+            let ny = (h / step).ceil().max(1.0);
+            // ceil 取整的放大余量 ≤ 2 倍（mul 为整数，点数 ≤ 4 * MAX_GRID_DOTS）
+            assert!(
+                nx * ny <= MAX_GRID_DOTS * 4.0,
+                "canvas {w}x{h}: 点数 {nx}x{ny} 超限（step={step}）"
+            );
+        }
+        // 普通画布不受影响：仍用基础间距
+        assert_eq!(grid_step(800.0, 600.0), GRID_SPACING);
+        assert_eq!(grid_step(12800.0, 7070.0) % GRID_SPACING, 0.0);
     }
 
     #[test]

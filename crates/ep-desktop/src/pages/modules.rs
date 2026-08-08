@@ -23,8 +23,8 @@ use ep_core::types::{ModuleCategory, ServiceStatus};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::{
-    AppCmd, DownloadUiState, ModuleEntry, PackEntry, PackExportModule, PackExportSpec,
-    PackImportUiState,
+    download_key, AppCmd, DownloadUiState, ModuleEntry, PackEntry, PackExportModule,
+    PackExportSpec, PackImportUiState,
 };
 use crate::i18n::tr;
 use crate::pages::{
@@ -814,8 +814,8 @@ fn variant_section(
             if let Some(v) = mv {
                 let (color, label) = status_meta(lang, &v.status, pal);
                 badge(ui, pal, color, label);
-                // 下载进度（进行中）
-                if let Some(dl) = downloads.get(&v.model_id) {
+                // 下载进度（进行中）；P1 修复：复合键隔离跨模块同名变体
+                if let Some(dl) = downloads.get(&download_key(&v.module_id, &v.model_id)) {
                     if matches!(dl.state, DownloadState::Downloading) {
                         ui.label(
                             egui::RichText::new(format!("{:.0}%", dl.percent))
@@ -982,9 +982,10 @@ fn action_row(
     let selected = st.sel_variant.get(&m.id).cloned().unwrap_or_default();
     let active = effective_active_variant(config, st, &m.id, mf);
     let sel_ready = sel_mv.map(|v| v.status == ModelStatus::Ready).unwrap_or(false);
-    let downloading = sel_mv.and_then(|v| downloads.get(&v.model_id));
+    // P1 修复：复合键隔离跨模块同名变体（下载进度/更新结果/来源记忆）
+    let downloading = sel_mv.and_then(|v| downloads.get(&download_key(&v.module_id, &v.model_id)));
     let has_update = sel_mv
-        .and_then(|v| updates.get(&v.model_id))
+        .and_then(|v| updates.get(&download_key(&v.module_id, &v.model_id)))
         .map(|u| u.available)
         .unwrap_or(false);
 
@@ -1107,7 +1108,7 @@ fn action_row(
     ui.horizontal_wrapped(|ui| {
         if let Some(dl) = downloading {
             // 下载进度 + 取消（复用模型页进度组件语义）
-            download_progress_compact(ui, lang, pal, dl, &selected, cmd_tx);
+            download_progress_compact(ui, lang, pal, dl, &m.id, &selected, cmd_tx);
         } else if let Some(mv) = sel_mv {
             if mv.status != ModelStatus::Ready {
                 download_action(ui, lang, pal, mv, download_sources, cmd_tx);
@@ -1119,7 +1120,10 @@ fn action_row(
                     ))
                     .clicked()
                 {
-                    let source = download_sources.get(&mv.model_id).copied().unwrap_or(None);
+                    let source = download_sources
+                        .get(&download_key(&mv.module_id, &mv.model_id))
+                        .copied()
+                        .unwrap_or(None);
                     send_download(cmd_tx, download_sources, mv, source);
                 }
                 if ui
@@ -1327,11 +1331,13 @@ fn service_action_row(
 }
 
 /// 下载进度紧凑展示（变体选择器下方操作行内）
+#[allow(clippy::too_many_arguments)]
 fn download_progress_compact(
     ui: &mut egui::Ui,
     lang: &str,
     pal: &Palette,
     dl: &DownloadUiState,
+    module_id: &str,
     model_id: &str,
     cmd_tx: &UnboundedSender<AppCmd>,
 ) {
@@ -1361,7 +1367,10 @@ fn download_progress_compact(
             .add(subtle_button(pal, tr(lang, "common.action.cancel", &[])))
             .clicked()
     {
-        let _ = cmd_tx.send(AppCmd::CancelDownload(model_id.to_string()));
+        let _ = cmd_tx.send(AppCmd::CancelDownload {
+            module_id: module_id.to_string(),
+            model_id: model_id.to_string(),
+        });
     }
 }
 
@@ -1986,7 +1995,7 @@ fn send_download(
     mv: &ModelView,
     source: Option<ModelSource>,
 ) {
-    download_sources.insert(mv.model_id.clone(), source);
+    download_sources.insert(download_key(&mv.module_id, &mv.model_id), source);
     let _ = cmd_tx.send(AppCmd::DownloadModel {
         module_id: mv.module_id.clone(),
         model_id: mv.model_id.clone(),

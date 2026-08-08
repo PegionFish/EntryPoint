@@ -32,19 +32,17 @@ use crate::ui::{
 /// 产物目录递归扫描的最大深度（`files/{node_id}/…` 布局足够，防御深目录）
 const ARTIFACT_SCAN_DEPTH: usize = 4;
 
-/// S2 骨架分发入口（app.rs 当前调用形状）。
-pub fn show(
-    ui: &mut egui::Ui,
-    config: &AppConfig,
-    modules: &[ModuleEntry],
-    tasks: &[TaskSummary],
-) {
-    show_full(ui, config, modules, tasks, None);
+/// P2 修复：产物扫描结果缓存 TTL（展开产物区时避免每帧同步 IO 重扫）
+const ARTIFACT_SCAN_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// P2 修复：单任务产物扫描缓存（egui temp data 存储，需 Clone）
+#[derive(Clone)]
+struct ArtifactScanCache {
+    scanned_at: std::time::Instant,
+    files: Vec<ArtifactEntry>,
 }
 
-/// 完整入口：`cmd_tx` 为后台命令通道。门禁期 C4 提供
-/// `AppCmd::CancelTask { task_id }` 后，app.rs 改调本入口并传入
-/// `Some(&self.cmd_tx)`，queued/running 任务即可在卡片内取消。
+/// 任务中心页入口：`cmd_tx` 为后台命令通道（queued/running 任务卡内取消）。
 pub fn show_full(
     ui: &mut egui::Ui,
     config: &AppConfig,
@@ -315,8 +313,26 @@ fn artifacts_section(
             return;
         }
 
-        let mut files = Vec::new();
-        collect_artifacts(&task_dir, &task_dir, 0, &mut files);
+        // P2 修复：扫描结果按任务缓存（2s TTL），产物区展开时不再每帧同步 IO
+        let scan_key = egui::Id::new(("task_artifacts_scan", task.id.clone()));
+        let cached = ui.ctx().data(|d| d.get_temp::<ArtifactScanCache>(scan_key));
+        let files = match cached {
+            Some(c) if c.scanned_at.elapsed() < ARTIFACT_SCAN_TTL => c.files,
+            _ => {
+                let mut files = Vec::new();
+                collect_artifacts(&task_dir, &task_dir, 0, &mut files);
+                ui.ctx().data_mut(|d| {
+                    d.insert_temp(
+                        scan_key,
+                        ArtifactScanCache {
+                            scanned_at: std::time::Instant::now(),
+                            files: files.clone(),
+                        },
+                    )
+                });
+                files
+            }
+        };
 
         if files.is_empty() {
             ui.label(
@@ -374,6 +390,7 @@ fn artifacts_section(
 }
 
 /// 单个产物文件条目
+#[derive(Clone)]
 struct ArtifactEntry {
     /// 相对任务目录的展示路径（正斜杠统一显示）
     rel_display: String,

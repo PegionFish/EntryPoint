@@ -22,6 +22,16 @@ pub fn apply_theme(ctx: &egui::Context, dark: bool) {
 /// 字号设置基准（Body 字号），用于按比例缩放全部 TextStyle
 pub const BASE_FONT_SIZE: f32 = 14.0;
 
+/// P2 修复：整体缩放钳制 —— config 手改/损坏为 0/NaN/极端值时回退到安全
+/// 区间，避免整个 UI 退化（egui 对非有限缩放无防御）。NaN → 默认 1.0；
+/// ±inf/越界值 clamp 到 0.5~3.0。
+pub fn clamp_scale_factor(v: f32) -> f32 {
+    if v.is_nan() {
+        return 1.0;
+    }
+    v.clamp(0.5, 3.0)
+}
+
 /// 应用字号设置：以 Body=14pt 为基准等比缩放全部 TextStyle（绝对赋值，不叠加）
 pub fn apply_font_size(ctx: &egui::Context, font_size: f32) {
     let factor = (font_size / BASE_FONT_SIZE).clamp(0.7, 2.0);
@@ -117,5 +127,20 @@ mod tests {
         let body = style.text_styles[&egui::TextStyle::Body].size;
         assert!((heading - 30.0).abs() < 0.01);
         assert!((body - 21.0).abs() < 0.01);
+    }
+
+    /// P2 回归：缩放钳制 —— config 手改/损坏为 0、NaN、±inf 或极端值时
+    /// 钳到安全区间 0.5~3.0，整 UI 不退化。
+    #[test]
+    fn clamp_scale_factor_sanitizes_bad_config_values() {
+        assert_eq!(clamp_scale_factor(f32::NAN), 1.0);
+        assert_eq!(clamp_scale_factor(f32::INFINITY), 3.0);
+        assert_eq!(clamp_scale_factor(f32::NEG_INFINITY), 0.5);
+        assert_eq!(clamp_scale_factor(0.0), 0.5);
+        assert_eq!(clamp_scale_factor(-5.0), 0.5);
+        assert_eq!(clamp_scale_factor(100.0), 3.0);
+        // 合法值原样通过
+        assert_eq!(clamp_scale_factor(1.0), 1.0);
+        assert_eq!(clamp_scale_factor(1.5), 1.5);
     }
 }

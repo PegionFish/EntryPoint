@@ -16,6 +16,12 @@ use crate::ui::Palette;
 
 // ─── Messages: background → UI ──────────────────────────────────────────────
 
+/// P1 修复：下载/更新/取消句柄的复合键 —— 跨模块同名模型变体
+///（如两个模块都有 "small" 变体）不再互相覆盖/串扰。
+pub fn download_key(module_id: &str, model_id: &str) -> String {
+    format!("{module_id}:{model_id}")
+}
+
 #[derive(Debug, Clone)]
 pub enum AppMsg {
     DevicesRefreshed(Vec<ComputeDevice>),
@@ -29,18 +35,26 @@ pub enum AppMsg {
     Info(String),
     /// 模型列表刷新
     ModelsRefreshed(Vec<ModelView>),
-    /// 模型下载进度：percent 0.0~100.0，bytes 为已落盘字节，state 含终态
+    /// 模型下载进度：percent 0.0~100.0，bytes 为已落盘字节，state 含终态。
+    /// module_id 随消息携带——跨模块同名模型变体以下游复合键隔离（P1 修复）
     ModelDownloadProgress {
+        module_id: String,
         model_id: String,
         percent: f32,
         bytes: u64,
         state: DownloadState,
     },
-    /// 模型下载结束 (model_id, success)。success=true 完成；false 失败/取消
-    ModelDownloadFinished(String, bool),
+    /// 模型下载结束 (module_id, model_id, success)。success=true 完成；false 失败/取消
+    ModelDownloadFinished {
+        module_id: String,
+        model_id: String,
+        success: bool,
+    },
     /// 单个模型的更新检查结果。notify=true（单个检查）时 UI 弹 Toast；
     /// notify=false（批量检查）时仅更新状态，汇总 Toast 由 UpdatesCheckSummary 负责。
+    /// module_id 随消息携带——跨模块同名变体隔离（P1 修复，与下载复合键同构）
     ModelUpdateChecked {
+        module_id: String,
         model_id: String,
         result: UpdateCheckResult,
         notify: bool,
@@ -84,8 +98,8 @@ pub enum AppCmd {
         model_id: String,
         source: Option<ModelSource>,
     },
-    /// 取消指定模型的下载
-    CancelDownload(String),
+    /// 取消指定模型的下载（P1 修复：携带 module_id，复合键定位句柄）
+    CancelDownload { module_id: String, model_id: String },
     /// 检查单个模型是否有可用更新
     CheckUpdate { module_id: String, model_id: String },
     /// 检查所有 Ready 模型的更新（并发，汇总结果）
@@ -346,8 +360,6 @@ pub struct AppState {
     pub config: AppConfig,
     /// 模型列表（跨模块）
     pub models: Vec<ModelView>,
-    /// 模型缓存目录
-    pub model_cache_dir: String,
     /// 依赖检测报告
     pub dep_report: Option<DepReport>,
     /// 管线任务列表
@@ -373,8 +385,9 @@ impl App {
         config: AppConfig,
     ) -> Self {
         let dark_theme = config.general.theme != "light";
-        let model_cache_dir = config.models.cache_dir.clone();
-        let applied_scale = config.ui.scale_factor;
+        // P2 修复：缩放在构造时即钳制（与 sync_appearance 同口径，避免
+        // config 损坏值导致 applied_scale 与目标值每帧不相等而重复应用）
+        let applied_scale = crate::theme::clamp_scale_factor(config.ui.scale_factor);
         let applied_font_size = config.ui.font_size;
         Self {
             current_page: Page::Dashboard,
@@ -384,7 +397,6 @@ impl App {
                 modules: Vec::new(),
                 config,
                 models: Vec::new(),
-                model_cache_dir,
                 dep_report: None,
                 tasks: Vec::new(),
                 downloads: HashMap::new(),
@@ -468,13 +480,14 @@ impl App {
                     self.state.models = models;
                 }
                 AppMsg::ModelDownloadProgress {
+                    module_id,
                     model_id,
                     percent,
                     bytes,
                     state,
                 } => {
                     self.state.downloads.insert(
-                        model_id,
+                        download_key(&module_id, &model_id),
                         DownloadUiState {
                             percent,
                             bytes,
@@ -482,9 +495,13 @@ impl App {
                         },
                     );
                 }
-                AppMsg::ModelDownloadFinished(model_id, success) => {
+                AppMsg::ModelDownloadFinished {
+                    module_id,
+                    model_id,
+                    success,
+                } => {
                     // 清理该模型的下载进度状态
-                    self.state.downloads.remove(&model_id);
+                    self.state.downloads.remove(&download_key(&module_id, &model_id));
                     if success {
                         self.toasts.success(tr(
                             lang,
@@ -492,13 +509,16 @@ impl App {
                             &[("id", &model_id)],
                         ));
                         // 清除旧的更新检查结果（刚下载完成必然最新）
-                        self.state.updates.remove(&model_id);
+                        self.state
+                            .updates
+                            .remove(&download_key(&module_id, &model_id));
                     }
                     // 失败/取消的具体原因由生产侧另行发送 Error/Info 消息，这里只刷新列表
                     // （状态可能从 Missing → Ready / Incomplete）
                     let _ = self.cmd_tx.send(AppCmd::RefreshModels);
                 }
                 AppMsg::ModelUpdateChecked {
+                    module_id,
                     model_id,
                     result,
                     notify,
@@ -506,7 +526,9 @@ impl App {
                     let available = result.available;
                     // reason 为 ep-core 原始消息，按约定以本地化前缀 + 原文附加
                     let reason = result.reason.clone();
-                    self.state.updates.insert(model_id.clone(), result);
+                    self.state
+                        .updates
+                        .insert(download_key(&module_id, &model_id), result);
                     if notify {
                         if available {
                             self.toasts.success(tr(
@@ -598,9 +620,12 @@ impl App {
             self.applied_dark = Some(self.dark_theme);
             theme::apply_theme(ctx, self.dark_theme);
         }
-        if self.state.config.ui.scale_factor != self.applied_scale {
-            self.applied_scale = self.state.config.ui.scale_factor;
-            ctx.set_zoom_factor(self.applied_scale);
+        // P2 修复：钳制到 0.5~3.0（NaN/0/极端值 → 安全区间）；比对钳制后
+        // 的目标值，损坏 config（如 NaN）也不会每帧重复应用
+        let scale_target = crate::theme::clamp_scale_factor(self.state.config.ui.scale_factor);
+        if scale_target != self.applied_scale {
+            self.applied_scale = scale_target;
+            ctx.set_zoom_factor(scale_target);
         }
         if self.state.config.ui.font_size != self.applied_font_size {
             self.applied_font_size = self.state.config.ui.font_size;
@@ -696,6 +721,10 @@ impl App {
 
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // P1 修复：窗口关闭（X / 退出按钮）时通知后台执行全量停止——
+        // 停止所有模块 + 取消在飞下载，避免后台线程被杀后留下孤儿子进程。
+        // 幂等：后台循环退出后再次 send 静默失败，无害。
+        let _ = self.cmd_tx.send(AppCmd::Shutdown);
         // P3-1：退出时记录窗口位置（含副屏场景），下次启动恢复
         self.save_window_state();
     }
@@ -1153,5 +1182,94 @@ mod tests {
 
         // outer 缺失 → 不落盘
         assert!(App::window_state_json(None, None).is_none());
+    }
+
+    /// P1 回归：窗口关闭（on_exit）必须向后台发出全量停止命令，
+    /// 防止后台线程被杀后模块/下载子进程孤儿化。
+    #[test]
+    fn on_exit_notifies_background_shutdown() {
+        use eframe::App as _; // 引入 eframe::App trait 以调用 on_exit
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(rx, cmd_tx, AppConfig::default());
+        app.on_exit(None);
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(AppCmd::Shutdown)),
+            "on_exit 必须发送 AppCmd::Shutdown 触发后台全量停止"
+        );
+    }
+
+    /// P1 回归：跨模块同名模型变体（如两模块都有 "small"）的下载进度
+    /// 以 (module_id, model_id) 复合键隔离，互不覆盖。
+    #[test]
+    fn download_progress_isolated_by_module_model_composite_key() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(rx, cmd_tx, AppConfig::default());
+
+        tx.send(AppMsg::ModelDownloadProgress {
+            module_id: "whisper-a".into(),
+            model_id: "small".into(),
+            percent: 10.0,
+            bytes: 100,
+            state: DownloadState::Downloading,
+        })
+        .unwrap();
+        tx.send(AppMsg::ModelDownloadProgress {
+            module_id: "whisper-b".into(),
+            model_id: "small".into(),
+            percent: 50.0,
+            bytes: 500,
+            state: DownloadState::Downloading,
+        })
+        .unwrap();
+        app.process_messages();
+
+        assert_eq!(
+            app.state.downloads.len(),
+            2,
+            "同名变体必须按复合键隔离，不得互相覆盖"
+        );
+        assert_eq!(
+            app.state.downloads["whisper-a:small"].percent,
+            10.0
+        );
+        assert_eq!(
+            app.state.downloads["whisper-b:small"].percent,
+            50.0
+        );
+    }
+
+    /// P1 回归：下载终态按复合键清理——只移除对应模块的进度，
+    /// 另一个模块的同名变体进度不受影响。
+    #[test]
+    fn download_finished_removes_only_matching_composite_key() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(rx, cmd_tx, AppConfig::default());
+
+        for (m, pct) in [("a", 20.0), ("b", 30.0)] {
+            tx.send(AppMsg::ModelDownloadProgress {
+                module_id: m.into(),
+                model_id: "small".into(),
+                percent: pct,
+                bytes: 1,
+                state: DownloadState::Downloading,
+            })
+            .unwrap();
+        }
+        tx.send(AppMsg::ModelDownloadFinished {
+            module_id: "a".into(),
+            model_id: "small".into(),
+            success: true,
+        })
+        .unwrap();
+        app.process_messages();
+
+        assert!(!app.state.downloads.contains_key("a:small"));
+        assert!(
+            app.state.downloads.contains_key("b:small"),
+            "b 模块同名变体下载不应被 a 的终态误清理"
+        );
     }
 }
