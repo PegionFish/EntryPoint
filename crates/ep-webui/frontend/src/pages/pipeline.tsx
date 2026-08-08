@@ -3354,24 +3354,27 @@ function PipelineEditor() {
       if (taskId && taskId !== activeTaskId) return
       const nodeId = typeof msg.node_id === 'string' ? msg.node_id : null
       if (!nodeId) return
-      const current = nodesRef.current
-      if (!current.some((n) => n.id === nodeId)) return
       const status = normalizeNodeStatus(typeof msg.status === 'string' ? msg.status : null)
-      const next = current.map((n) =>
-        n.id === nodeId ? ({ ...n, data: { ...n.data, status } } as PipelineFlowNode) : n,
-      )
-      setNodes(next)
-      // 快路径解锁：任一节点失败（管线中止）或全部节点到达终态。
-      // 权威解锁走下方任务终态轮询（WS 断连也不永久锁死）。
-      if (
-        executingRef.current &&
-        (status === 'failed' ||
-          next.every((n) => n.data.status === 'done' || n.data.status === 'failed'))
-      ) {
-        executingRef.current = false
-        setExecuting(false)
-        activeTaskIdRef.current = null
-      }
+      // 函数式更新：基于最新节点集映射，避免与拖动等操作同 tick 时
+      // 用 nodesRef 快照覆盖丢失节点位置（P2）
+      setNodes((nds) => {
+        if (!nds.some((n) => n.id === nodeId)) return nds
+        const next = nds.map((n) =>
+          n.id === nodeId ? ({ ...n, data: { ...n.data, status } } as PipelineFlowNode) : n,
+        )
+        // 快路径解锁：任一节点失败（管线中止）或全部节点到达终态。
+        // 权威解锁走下方任务终态轮询（WS 断连也不永久锁死）。
+        if (
+          executingRef.current &&
+          (status === 'failed' ||
+            next.every((n) => n.data.status === 'done' || n.data.status === 'failed'))
+        ) {
+          executingRef.current = false
+          setExecuting(false)
+          activeTaskIdRef.current = null
+        }
+        return next
+      })
     })
   }, [setNodes])
 
@@ -4106,13 +4109,23 @@ function PipelineEditor() {
         if (opts.wait) body.wait = true
         if (opts.callbackUrl) body.callback_url = opts.callbackUrl
 
+        // P1 wait 同步模式同样上执行锁：请求在服务端阻塞至终态（可能数分钟），
+        // 若不加锁，阻塞期间工具栏执行按钮仍可点，并发提交会同时写同一 workspace。
+        // 提交完成或失败后解锁（下方 wait 分支 / catch 分支）。
+        if (opts.wait) {
+          executingRef.current = true
+          setExecuting(true)
+        }
+
         const resp = await api.executePipeline(body)
         setExecDialogOpen(false)
 
         if (opts.wait) {
-          // 同步模式：请求已阻塞至终态，直接呈现结果（不加执行锁）
-          const status = (resp.status ?? '').trim().toLowerCase()
+          // 同步模式：请求已阻塞至终态，直接呈现结果
+          executingRef.current = false
+          setExecuting(false)
           activeTaskIdRef.current = null
+          const status = (resp.status ?? '').trim().toLowerCase()
           if (status === 'completed') {
             toast.success(t('exec.waitDone', { defaultValue: '任务已完成' }), {
               description: t('exec.taskId', { taskId: resp.task_id }),
@@ -4167,6 +4180,12 @@ function PipelineEditor() {
           },
         })
       } catch (err) {
+        // wait 模式提交失败（超时 / 网络中断）：释放执行锁，避免永久锁死误拦重试
+        if (opts.wait) {
+          executingRef.current = false
+          setExecuting(false)
+          activeTaskIdRef.current = null
+        }
         toast.error(t('exec.submitFailed'), { description: errMsg(err) })
       } finally {
         setExecSubmitting(false)

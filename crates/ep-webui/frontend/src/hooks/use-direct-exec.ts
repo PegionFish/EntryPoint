@@ -98,6 +98,11 @@ export function useDirectExec(): UseDirectExecResult {
   const [artifacts, setArtifacts] = useState<TaskArtifact[]>([])
   const [nodeProgress, setNodeProgress] = useState<Record<string, string>>({})
   const mounted = useRef(true)
+  /**
+   * 提交代数：每次 submit / reset 自增。在途响应返回后与当前代数比对，
+   * 过期（已有更新的提交）直接丢弃，防止旧响应覆盖新提交状态（P1）。
+   */
+  const submitGen = useRef(0)
 
   useEffect(() => {
     mounted.current = true
@@ -107,6 +112,7 @@ export function useDirectExec(): UseDirectExecResult {
   }, [])
 
   const reset = useCallback(() => {
+    submitGen.current += 1
     setSubmitting(false)
     setSubmitError(null)
     setTaskId(null)
@@ -116,6 +122,7 @@ export function useDirectExec(): UseDirectExecResult {
   }, [])
 
   const submit = useCallback(async (req: DirectExecRequest) => {
+    const gen = ++submitGen.current
     setSubmitError(null)
     setTask(null)
     setArtifacts([])
@@ -123,15 +130,15 @@ export function useDirectExec(): UseDirectExecResult {
     setSubmitting(true)
     try {
       const resp = await postExecuteSingle(req)
-      if (!mounted.current) return null
+      if (gen !== submitGen.current || !mounted.current) return null
       setTaskId(resp.task_id)
       return resp.task_id
     } catch (e) {
-      if (!mounted.current) return null
+      if (gen !== submitGen.current || !mounted.current) return null
       setSubmitError(e instanceof Error ? e.message : String(e))
       return null
     } finally {
-      if (mounted.current) setSubmitting(false)
+      if (gen === submitGen.current && mounted.current) setSubmitting(false)
     }
   }, [])
 

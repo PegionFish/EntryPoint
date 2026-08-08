@@ -16,6 +16,14 @@ type StateListener = (state: WsConnectionState) => void
 const MIN_BACKOFF_MS = 1000
 const MAX_BACKOFF_MS = 30000
 
+/** 心跳间隔：每 30s 发送一次应用层 ping（后端忽略，仅作活性探测） */
+const PING_INTERVAL_MS = 30_000
+/**
+ * 活性超时：超过该时长未收到任何 WS 消息，判定为半开死连接
+ * （TCP 中断但 onclose 不触发的场景），主动关闭走 onclose 重连。
+ */
+const PING_TIMEOUT_MS = 90_000
+
 /**
  * WebSocket 连接管理器。
  *
@@ -32,6 +40,9 @@ export class WebSocketManager {
   private reconnectAttempt = 0
   private reconnectTimer: number | null = null
   private shouldReconnect = true
+  private heartbeatTimer: number | null = null
+  /** 最近一次收到消息的时间戳（毫秒），用于心跳超时判死 */
+  private lastActivity = 0
 
   constructor(url?: string) {
     this.url = url ?? WebSocketManager.defaultUrl()
@@ -55,6 +66,7 @@ export class WebSocketManager {
   disconnect(): void {
     this.shouldReconnect = false
     this.clearReconnectTimer()
+    this.stopHeartbeat()
     if (this.ws) {
       this.ws.onclose = null
       this.ws.onerror = null
@@ -90,6 +102,45 @@ export class WebSocketManager {
     return true
   }
 
+  /**
+   * 应用层心跳（P2）：每 30s 发送 ping 并巡检连接活性。
+   * 半开连接（网络中断但 onclose 不触发）下，若超时未收到任何消息，
+   * 主动关闭连接交由 onclose 调度重连，避免状态永久停留在 connected。
+   */
+  private startHeartbeat(): void {
+    this.stopHeartbeat()
+    this.heartbeatTimer = window.setInterval(() => {
+      if (!this.ws || this.state !== 'connected') return
+      if (Date.now() - this.lastActivity > PING_TIMEOUT_MS) {
+        this.lastActivity = Date.now()
+        try {
+          this.ws.close()
+        } catch {
+          // 关闭失败由 onclose 兜底
+        }
+        return
+      }
+      try {
+        this.ws.send(JSON.stringify({ type: 'ping' }))
+      } catch {
+        // 发送异常视为连接异常：立即关闭走重连
+        this.lastActivity = Date.now()
+        try {
+          this.ws.close()
+        } catch {
+          // ignore
+        }
+      }
+    }, PING_INTERVAL_MS)
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer !== null) {
+      window.clearInterval(this.heartbeatTimer)
+      this.heartbeatTimer = null
+    }
+  }
+
   private openSocket(initialState: WsConnectionState): void {
     this.setState(initialState)
     let socket: WebSocket
@@ -103,10 +154,13 @@ export class WebSocketManager {
 
     socket.onopen = () => {
       this.reconnectAttempt = 0
+      this.lastActivity = Date.now()
       this.setState('connected')
+      this.startHeartbeat()
     }
 
     socket.onmessage = (event) => {
+      this.lastActivity = Date.now()
       const parsed = this.parse(event.data)
       if (parsed === undefined) return
       this.messageListeners.forEach((fn) => {
@@ -119,6 +173,7 @@ export class WebSocketManager {
     }
 
     socket.onclose = () => {
+      this.stopHeartbeat()
       this.ws = null
       if (this.shouldReconnect) {
         this.scheduleReconnect()

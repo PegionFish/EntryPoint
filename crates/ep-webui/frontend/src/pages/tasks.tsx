@@ -325,12 +325,10 @@ function TaskCard({
   task,
   expanded,
   onToggle,
-  now,
 }: {
   task: TaskSummary
   expanded: boolean
   onToggle: () => void
-  now: number
 }) {
   const { t, i18n } = useTranslation('tasks')
   const [detail, setDetail] = useState<TaskDetail | null>(null)
@@ -341,6 +339,16 @@ function TaskCard({
   const [artifactRetry, setArtifactRetry] = useState(0)
 
   const terminal = isTerminalStatus(task.status)
+
+  // 非终态任务驱动「已运行 Xs」走针：仅本卡片自身以 1s 频率重渲染，
+  // 避免页面级每秒 setNow 导致整页（全部卡片 + 表格）重渲染（P3 惰性化）
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (terminal) return
+    setNow(Date.now())
+    const timer = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [terminal])
 
   // 展开时拉取节点详情；未终态的任务每轮询周期刷新一次
   useEffect(() => {
@@ -674,18 +682,7 @@ export function TasksPage() {
     }
   }, [refreshTasks])
 
-  // running/pending 任务存在时驱动「已运行 Xs」走针
-  const hasActiveTask = (tasks ?? []).some(
-    (item) => item.status === 'running' || item.status === 'pending',
-  )
-  const [now, setNow] = useState(() => Date.now())
-  useEffect(() => {
-    if (!hasActiveTask) return
-    setNow(Date.now())
-    const timer = setInterval(() => setNow(Date.now()), 1000)
-    return () => clearInterval(timer)
-  }, [hasActiveTask])
-
+  // running/pending 任务存在时驱动「已运行 Xs」走针（走针已下沉到 TaskCard 本地）
   const activeModules = (modules ?? []).filter(isActive)
   const runningCount = (modules ?? []).filter(
     (m) => (m.service_status || m.status).toLowerCase() === 'running',
@@ -931,7 +928,6 @@ export function TasksPage() {
                 <TaskCard
                   key={task.id}
                   task={task}
-                  now={now}
                   expanded={expandedId === task.id}
                   onToggle={() =>
                     setExpandedId((cur) => (cur === task.id ? null : task.id))
