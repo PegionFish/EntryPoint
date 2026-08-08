@@ -19,6 +19,9 @@ use crate::types::{DeviceId, ServiceStatus};
 /// 日志缓冲区最大行数
 const MAX_LOG_LINES: usize = 500;
 
+/// 日志通道容量（有界，防止无界 channel 内存膨胀）
+const LOG_CHANNEL_CAPACITY: usize = 4096;
+
 /// 共享 CUDA 库目录默认值（相对 root）。与 config.rs `[compute].cuda_libs_dir` 默认值保持一致（§3.1）。
 pub const DEFAULT_CUDA_LIBS_DIR: &str = "runtime/cuda-libs";
 
@@ -283,7 +286,9 @@ pub struct ServiceInstance {
     /// 实际子进程句柄
     pub child: Option<Child>,
     /// 日志接收端：reader task 通过此 channel 回传 stdout/stderr 行
-    log_rx: Option<mpsc::UnboundedReceiver<String>>,
+    log_rx: Option<mpsc::Receiver<String>>,
+    /// stdout/stderr reader task 句柄（stop/超时回收时 join，防 task 泄漏）
+    reader_tasks: Vec<tokio::task::JoinHandle<()>>,
     /// 健康检查端点（如 "/health"）
     health_endpoint: Option<String>,
     /// 健康检查超时（秒）
@@ -301,6 +306,7 @@ impl ServiceInstance {
             log_buffer: VecDeque::with_capacity(MAX_LOG_LINES),
             child: None,
             log_rx: None,
+            reader_tasks: Vec::new(),
             health_endpoint: None,
             ready_timeout_secs: 30,
         }
@@ -309,6 +315,33 @@ impl ServiceInstance {
     /// 获取子进程 PID（如果进程仍在运行）
     pub fn pid(&self) -> Option<u32> {
         self.child.as_ref().and_then(|c| c.id())
+    }
+
+    /// 回收子进程树 + 关闭日志通道 + 回收 reader task（stop / 健康检查超时共用）。
+    ///
+    /// Linux 下模块子孙进程可能继承 stdout/stderr 管道句柄，reader 读不到 EOF
+    /// 会永久阻塞——先关 channel（阻塞在 send 的 reader 立即失败退出），再
+    /// 有界等待 reader，超时则 abort，避免 task 泄漏。
+    async fn teardown(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let tree_killed = match child.id() {
+                Some(pid) => kill_process_tree(pid).await,
+                None => false, // 进程已退出
+            };
+            if !tree_killed {
+                let _ = child.kill().await;
+            }
+            let _ = child.wait().await; // reap zombie
+        }
+        if let Some(rx) = self.log_rx.take() {
+            drop(rx); // 关闭 channel：阻塞在 send 的 reader 立即退出
+        }
+        for mut task in self.reader_tasks.drain(..) {
+            match tokio::time::timeout(Duration::from_secs(2), &mut task).await {
+                Ok(_) => {}
+                Err(_) => task.abort(),
+            }
+        }
     }
 }
 
@@ -479,33 +512,34 @@ impl ProcessManager {
         let pid = child.id();
         debug!(module_id, ?pid, "spawned child process");
 
-        // H1: 捕获 stdout/stderr 到日志缓冲区（通过 channel 回传）
-        let (log_tx, log_rx) = mpsc::unbounded_channel::<String>();
+        // H1: 捕获 stdout/stderr 到日志缓冲区（有界 channel，避免无界内存膨胀）
+        let (log_tx, log_rx) = mpsc::channel::<String>(LOG_CHANNEL_CAPACITY);
+        let mut reader_tasks = Vec::new();
 
         if let Some(stdout) = child.stdout.take() {
             let tx = log_tx.clone();
-            tokio::spawn(async move {
+            reader_tasks.push(tokio::spawn(async move {
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    if tx.send(line).is_err() {
+                    if tx.send(line).await.is_err() {
                         break;
                     }
                 }
-            });
+            }));
         }
 
         if let Some(stderr) = child.stderr.take() {
             let tx = log_tx.clone();
-            tokio::spawn(async move {
+            reader_tasks.push(tokio::spawn(async move {
                 let reader = BufReader::new(stderr);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    if tx.send(format!("[stderr] {line}")).is_err() {
+                    if tx.send(format!("[stderr] {line}")).await.is_err() {
                         break;
                     }
                 }
-            });
+            }));
         }
 
         // Store the instance
@@ -520,6 +554,7 @@ impl ProcessManager {
         instance.started_at = Some(Utc::now());
         instance.child = Some(child);
         instance.log_rx = Some(log_rx);
+        instance.reader_tasks = reader_tasks;
         instance.health_endpoint = manifest.interface.health_endpoint.clone();
         instance.ready_timeout_secs = manifest.interface.ready_timeout_secs.unwrap_or(30);
 
@@ -538,20 +573,10 @@ impl ProcessManager {
             .get_mut(module_id)
             .ok_or_else(|| anyhow::anyhow!("module '{}' not found", module_id))?;
 
-        if let Some(ref mut child) = instance.child {
-            debug!(module_id, "killing child process tree");
-            let tree_killed = match child.id() {
-                Some(pid) => kill_process_tree(pid).await,
-                None => false, // 进程已退出
-            };
-            if !tree_killed {
-                let _ = child.kill().await;
-            }
-            let _ = child.wait().await; // reap zombie
-        }
+        debug!(module_id, "killing child process tree");
+        instance.teardown().await;
 
         instance.status = ServiceStatus::Stopped;
-        instance.child = None;
         instance.started_at = None;
         info!(module_id, "module stopped");
         Ok(())
@@ -597,18 +622,25 @@ impl ProcessManager {
                                 }
                                 _ => {
                                     // 尚未就绪，检查是否超过总超时
-                                    let elapsed = instance
-                                        .started_at
-                                        .map(|t| Utc::now().signed_duration_since(t))
-                                        .unwrap_or_default();
                                     let timeout_secs = instance.ready_timeout_secs as i64;
-                                    if elapsed.num_seconds() > timeout_secs {
+                                    // started_at 缺失（异常路径）按已超时兜底：
+                                    // 否则 elapsed=0 永不超时，卡死 Starting
+                                    let elapsed_secs = match instance.started_at {
+                                        Some(t) => Utc::now().signed_duration_since(t).num_seconds(),
+                                        None => i64::MAX,
+                                    };
+                                    if elapsed_secs >= timeout_secs {
                                         warn!(
                                             module_id,
-                                            elapsed_secs = elapsed.num_seconds(),
+                                            elapsed_secs,
                                             timeout_secs,
                                             "health check timeout"
                                         );
+                                        // P0 修复：超时分支必须回收进程树并清空句柄，
+                                        // 否则旧进程成孤儿继续占端口，且 Error 状态下
+                                        // 再次 start 会与残留进程端口冲突
+                                        instance.teardown().await;
+                                        instance.started_at = None;
                                         instance.status = ServiceStatus::Error(format!(
                                             "health check timed out after {}s",
                                             timeout_secs
@@ -673,10 +705,46 @@ impl ProcessManager {
         }
     }
 
+    /// 判断替换值是否需要 shell 引用：含空白或平台 shell 元字符（P1 修复）。
+    /// Windows（cmd）与 Linux（sh）元字符集不同，按平台分别判定。
+    /// 空值保持原样（占位符替换为空，不引入多余引号）。
+    fn needs_shell_quote(value: &str, is_windows: bool) -> bool {
+        if value.is_empty() {
+            return false;
+        }
+        if value.chars().any(char::is_whitespace) {
+            return true;
+        }
+        if is_windows {
+            // cmd 元字符：& | < > ^ % "（引号内 % 展开与引号转义仍需处理）
+            value.contains(['&', '|', '<', '>', '^', '%', '"'])
+        } else {
+            // sh 元字符：引号/展开/重定向/通配符等
+            value.contains([
+                '&', ';', '|', '<', '>', '(', ')', '$', '`', '\\', '"', '\'', '*', '?', '[', ']',
+                '#', '~',
+            ])
+        }
+    }
+
+    /// 按平台对替换值做 shell 引号转义（P1 修复）：
+    /// - Windows（cmd /C）：双引号包裹，内部 `"` 转义为 `\"`
+    /// - Linux（sh -c）：单引号包裹，内部 `'` 转义为 `'"'"'`
+    fn shell_quote(value: &str, is_windows: bool) -> String {
+        if is_windows {
+            format!("\"{}\"", value.replace('"', "\\\""))
+        } else {
+            format!("'{}'", value.replace('\'', "'\"'\"'"))
+        }
+    }
+
     /// 构建启动命令：对 manifest.runtime.start_command 模板执行变量替换。
     ///
     /// 支持的变量：`{root}`, `{module_dir}`, `{model_dir}`, `{models_root}`, `{port}`, `{device}`,
     /// `{device_index}`, `{backend}`, `{entrypoint}`, `{binary}`, `{input}`, `{output}`
+    ///
+    /// 替换值按平台做 shell 转义（含空白/元字符时加引号，如 `{venv_python}`
+    /// 解析出的带空格路径），避免 `cmd /C` 与 `sh -c` 下命令被拆断。
     pub fn build_start_command(manifest: &ModuleManifest, vars: &HashMap<String, String>) -> String {
         let template = manifest
             .runtime
@@ -684,10 +752,16 @@ impl ProcessManager {
             .clone()
             .unwrap_or_default();
 
+        let is_windows = cfg!(target_os = "windows");
         let mut result = template;
         for (key, value) in vars {
             let placeholder = format!("{{{key}}}");
-            result = result.replace(&placeholder, value);
+            let quoted = if Self::needs_shell_quote(value, is_windows) {
+                Self::shell_quote(value, is_windows)
+            } else {
+                value.clone()
+            };
+            result = result.replace(&placeholder, &quoted);
         }
         result
     }
@@ -1514,5 +1588,99 @@ mod tests {
         let vars = prepare_template_vars("m", &manifest, &DeviceId::Cpu, 18000, HashMap::new());
         assert!(!vars.contains_key("venv_python"));
         assert_eq!(vars.get("backend").unwrap(), "cpu");
+    }
+
+    // ─── P1 回归：占位符替换值必须做平台 shell 转义 ────────────────────────
+
+    #[test]
+    fn test_build_start_command_shell_quotes_values() {
+        // 含空格/&/% 的值直接拼接会在 cmd /C 与 sh -c 下拆断命令；
+        // 含空格的 {venv_python} 路径是核心场景
+        let manifest = test_manifest(Some(
+            "{venv_python} {entrypoint} --model-dir {model_dir} --label {label}",
+        ));
+        let mut vars = HashMap::new();
+        vars.insert(
+            "venv_python".to_string(),
+            "C:/Program Files/EP/runtime/venvs/demo/Scripts/python.exe".to_string(),
+        );
+        vars.insert("entrypoint".to_string(), "adapter.py".to_string());
+        vars.insert("model_dir".to_string(), "/data/whisper model".to_string());
+        vars.insert("label".to_string(), "a&b%c".to_string());
+
+        let cmd = ProcessManager::build_start_command(&manifest, &vars);
+        if cfg!(target_os = "windows") {
+            assert_eq!(
+                cmd,
+                "\"C:/Program Files/EP/runtime/venvs/demo/Scripts/python.exe\" adapter.py --model-dir \"/data/whisper model\" --label \"a&b%c\""
+            );
+        } else {
+            assert_eq!(
+                cmd,
+                "'C:/Program Files/EP/runtime/venvs/demo/Scripts/python.exe' adapter.py --model-dir '/data/whisper model' --label 'a&b%c'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_start_command_escapes_internal_quotes() {
+        let manifest = test_manifest(Some("--title {title}"));
+        let mut vars = HashMap::new();
+        vars.insert("title".to_string(), "it's \"quoted\" now".to_string());
+
+        let cmd = ProcessManager::build_start_command(&manifest, &vars);
+        if cfg!(target_os = "windows") {
+            // cmd：双引号包裹，内部 " 转义为 \"
+            assert_eq!(cmd, "--title \"it's \\\"quoted\\\" now\"");
+        } else {
+            // sh：单引号包裹，内部 ' 转义为 '"'"'
+            assert_eq!(cmd, "--title 'it'\"'\"'s \"quoted\" now'");
+        }
+    }
+
+    // ─── P0 回归：健康检查超时必须回收进程树并清空句柄 ────────────────────
+
+    #[tokio::test]
+    async fn test_health_timeout_reclaims_process_tree() {
+        // 长驻进程 + ready_timeout=0：首次 monitor 即触发超时回收；
+        // 旧实现只置 Error 状态，子进程句柄残留 → 重启即孤儿进程 + 端口冲突
+        let long_cmd = if cfg!(target_os = "windows") {
+            "powershell -NoProfile -Command Start-Sleep -Seconds 60"
+        } else {
+            "sleep 60"
+        };
+        let mut manifest = test_manifest(Some(long_cmd));
+        manifest.interface.ready_timeout_secs = Some(0);
+
+        // 找一个当前空闲的端口（bind 后立即释放，无监听进程 → 健康检查必失败）
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let mut pm = ProcessManager::new();
+        pm.start_module("timeout-mod", &manifest, DeviceId::Cpu, port, HashMap::new())
+            .await
+            .unwrap();
+
+        pm.monitor_process("timeout-mod").await.unwrap();
+
+        let inst = pm.get_instance("timeout-mod").unwrap();
+        assert!(
+            matches!(&inst.status, ServiceStatus::Error(e) if e.contains("timed out")),
+            "status: {:?}",
+            inst.status
+        );
+        assert!(inst.child.is_none(), "超时后子进程句柄必须清空");
+        assert!(inst.started_at.is_none());
+
+        // Error 状态可再次启动（旧实现残留孤儿 + 句柄，重启即冲突）
+        pm.start_module("timeout-mod", &manifest, DeviceId::Cpu, port, HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            pm.get_status("timeout-mod"),
+            Some(&ServiceStatus::Starting)
+        );
+        pm.stop_module("timeout-mod").await.unwrap();
     }
 }

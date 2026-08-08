@@ -40,7 +40,9 @@ impl PortManager {
     /// 监听器释放端口后、模块进程真正绑定前，该端口仍可能被其他进程
     /// 抢占。此竞态可接受；若真的发生冲突，会在模块绑定失败时暴露。
     pub fn allocate(&mut self, module_id: &str) -> Result<u16> {
-        // 已分配则直接返回
+        // 已分配则直接返回：模块运行中其端口被监听属正常状态，OS 探测会把
+        // 正常运行的模块误判为"占用"而错误换端口（孤儿进程端口冲突由
+        // process.rs teardown 的进程树回收兜底，见 P0 修复）
         if let Some(&port) = self.allocations.get(module_id) {
             debug!(module_id, port, "port already allocated, returning existing");
             return Ok(port);
@@ -82,12 +84,12 @@ impl PortManager {
         self.allocations.get(module_id).copied()
     }
 
-    /// 检查端口是否在管理范围内且未被分配
+    /// 检查端口是否在管理范围内且未被分配、OS 层面空闲（与 allocate 语义对齐）
     pub fn is_available(&self, port: u16) -> bool {
         if port < self.range_start || port > self.range_end {
             return false;
         }
-        !self.allocations.values().any(|&p| p == port)
+        !self.allocations.values().any(|&p| p == port) && os_port_free(port)
     }
 
     /// 当前已分配的端口数量
@@ -272,7 +274,8 @@ mod tests {
     #[test]
     fn test_is_available() {
         let _guard = lock_port_tests();
-        let start = find_free_window(1);
+        // 窗口须覆盖 start+5：is_available 现在含 OS 探测，候选须确认 OS 空闲
+        let start = find_free_window(6);
         let mut pm = PortManager::new(start, start + 5);
         assert!(pm.is_available(start));
         assert!(pm.is_available(start + 5));
@@ -368,5 +371,43 @@ mod tests {
         assert_eq!(pm.allocate("mod-a").unwrap(), occupied + 1);
         assert_eq!(pm.get_port("mod-a"), Some(occupied + 1));
         assert_eq!(pm.allocated_count(), 1);
+    }
+
+    // ─── 复用语义回归：复用路径必须直接返回已持有端口 ──────────────────────
+    // 模块运行中其端口被监听属正常状态——复用路径若做 OS 探测会把正常运行的
+    // 模块误判为"占用"而错误换端口（孤儿进程端口冲突由 process.rs teardown
+    // 的进程树回收兜底，不在此处探测）。
+
+    #[test]
+    fn test_allocate_reuse_returns_held_port_even_if_os_occupied() {
+        let _guard = lock_port_tests();
+        let start = find_free_window(2);
+        let mut pm = PortManager::new(start, start + 1);
+
+        // 首次分配：start 空闲
+        assert_eq!(pm.allocate("mod-a").unwrap(), start);
+
+        // OS 层占住 mod-a 已持有的端口（模拟运行中的模块服务监听）
+        let _listener = TcpListener::bind(("127.0.0.1", start)).unwrap();
+
+        // 复用路径必须直接返回已持有端口，不得因 OS 监听而换端口
+        assert_eq!(pm.allocate("mod-a").unwrap(), start);
+        assert_eq!(pm.get_port("mod-a"), Some(start));
+        assert_eq!(pm.allocated_count(), 1);
+    }
+
+    // ─── P3 回归：is_available 须查 OS 层（与 allocate 语义对齐） ───────────
+
+    #[test]
+    fn test_is_available_checks_os_occupancy() {
+        let _guard = lock_port_tests();
+        // occupied 被回环监听器持续占住（进程内未分配）→ 应判不可用。
+        // 旧实现只看进程内分配表，会误判空闲（P3 修复核心回归）。
+        // 正向用例（空闲端口判可用）由 test_is_available 覆盖——空闲端口的
+        // 二次探测与并行测试存在 TOCTOU 窗口，不在本测试中重复。
+        let (listener, occupied) = occupied_then_free_pair();
+        let pm = PortManager::new(occupied, occupied + 1);
+        assert!(!pm.is_available(occupied));
+        drop(listener);
     }
 }
