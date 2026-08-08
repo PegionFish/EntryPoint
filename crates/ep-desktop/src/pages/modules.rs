@@ -32,10 +32,10 @@ use crate::pages::{
     ParamDraft,
 };
 use crate::ui::{
-    badge, card, card_grid, confirm_dialog_with_lang, danger_button, empty_state,
-    keyboard_scroll, page_header, primary_button, responsive_columns, section_title,
-    service_status, subtle_button, Palette,
-    CONTROL_ROUNDING,
+    badge, card, card_grid, card_running, color_with_alpha, confirm_dialog_with_lang,
+    danger_button, empty_state, glow_breath_alpha, grid_columns, keyboard_scroll, page_header,
+    primary_button, primary_button_with_glow, section_title, status_badge, subtle_button,
+    Palette, CONTROL_ROUNDING,
 };
 
 // ─── 页面持久状态 ────────────────────────────────────────────────────────────
@@ -68,6 +68,8 @@ struct PipeInfo {
 struct ModulesUi {
     /// tag chips 筛选（多选 AND 语义：模块须含至少一个命中变体才显示）
     tag_filter: Vec<String>,
+    /// 关键词搜索（§5 差异矩阵补齐项：过滤模块名/描述/标签，大小写不敏感）
+    search_query: String,
     /// 当前展开的抽屉 (种类, module_id)；同一时间仅一个
     drawer: Option<(DrawerKind, String)>,
     /// 直跑表单：module_id → 选中 capability
@@ -151,12 +153,13 @@ pub fn show(
         load_meta_cache(config, models, &mut st);
     }
 
-    // ── 页头：「模块管理」+ 顶部工具栏 ──
+    // ── 页头：「模块管理」+ 顶部工具行（搜索框 + 工具按钮） ──
     page_header(
         ui,
         &tr(lang, "desktopPages.modules.title", &[]),
         |ui| {
             toolbar(ui, lang, &pal, cmd_tx, &mut st);
+            search_box(ui, lang, &pal, &mut st);
         },
     );
     ui.add_space(8.0);
@@ -343,6 +346,52 @@ fn toolbar(
     }
 }
 
+// ─── 页头搜索框（§5 差异矩阵补齐项：关键词过滤模块名/描述/标签） ─────────────
+
+/// 关键词搜索框（页头工具行；层 2 底 + 1px 描边 + 控件圆角，对齐 §3.4 输入件观感）
+fn search_box(ui: &mut egui::Ui, lang: &str, pal: &Palette, st: &mut ModulesUi) {
+    let placeholder = trfb(
+        lang,
+        "desktopPages.modules.search.placeholder",
+        "搜索模块名称、描述或标签…",
+        &[],
+    );
+    egui::Frame::new()
+        .fill(pal.bg_raised)
+        .stroke(egui::Stroke::new(1.0_f32, pal.border))
+        .corner_radius(egui::CornerRadius::same(CONTROL_ROUNDING))
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(egui::RichText::new("🔍").color(pal.text_faint));
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut st.search_query)
+                        .hint_text(placeholder)
+                        .desired_width(190.0)
+                        .frame(false),
+                );
+                if !st.search_query.is_empty()
+                    && ui
+                        .add(subtle_button(
+                            pal,
+                            egui::RichText::new("✕").color(pal.text_dim),
+                        ))
+                        .on_hover_text(trfb(
+                            lang,
+                            "desktopPages.modules.search.clear",
+                            "清除搜索",
+                            &[],
+                        ))
+                        .clicked()
+                {
+                    st.search_query.clear();
+                    resp.request_focus();
+                }
+            });
+        });
+}
+
 // ─── 导入进度条（原整合包页迁移） ────────────────────────────────────────────
 
 fn import_progress_strip(
@@ -469,6 +518,29 @@ fn module_matches_filter(st: &ModulesUi, module_models: &[&ModelView]) -> bool {
     })
 }
 
+/// 模块是否命中关键词搜索（§5 差异矩阵补齐项）：大小写不敏感子串匹配
+/// 模块名/描述/任一变体标签；空查询恒显示。与 tag 筛选为 AND 叠加。
+fn module_matches_search(
+    query: &str,
+    m: &ModuleEntry,
+    module_models: &[&ModelView],
+    meta_cache: &HashMap<String, MetaLite>,
+) -> bool {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return true;
+    }
+    if m.name.to_lowercase().contains(&q) || m.description.to_lowercase().contains(&q) {
+        return true;
+    }
+    module_models.iter().any(|mv| {
+        meta_cache
+            .get(&mv.target_dir)
+            .map(|meta| meta.tags.iter().any(|t| t.to_lowercase().contains(&q)))
+            .unwrap_or(false)
+    })
+}
+
 fn tag_filter_row(ui: &mut egui::Ui, lang: &str, pal: &Palette, st: &mut ModulesUi) {
     let mut all_tags: Vec<String> = st
         .meta_cache
@@ -534,12 +606,13 @@ fn render_module_grid(
         by_module.entry(mv.module_id.clone()).or_default().push(mv);
     }
 
-    // tag 筛选可见性（按模块）
+    // 可见性：tag 筛选 AND 关键词搜索（§5 差异矩阵补齐项）
     let visible: Vec<bool> = modules
         .iter()
         .map(|m| {
             let module_models = by_module.get(&m.id).cloned().unwrap_or_default();
             module_matches_filter(st, &module_models)
+                && module_matches_search(&st.search_query, m, &module_models, &st.meta_cache)
         })
         .collect();
 
@@ -548,12 +621,12 @@ fn render_module_grid(
         empty_state(
             ui,
             pal,
-            "🏷",
+            if st.search_query.trim().is_empty() { "🏷" } else { "🔍" },
             &trfb(lang, "desktopPages.modules.filter.empty", "无匹配模块", &[]),
             &trfb(
                 lang,
                 "desktopPages.modules.filter.emptyHint",
-                "调整或清除标签筛选后重试",
+                "调整或清除搜索关键词/标签筛选后重试",
                 &[],
             ),
         );
@@ -564,17 +637,27 @@ fn render_module_grid(
     summary_bar(ui, lang, pal, modules, &visible_indices);
     ui.add_space(8.0);
 
-    // 等宽列网格：列数按可用宽度计算（单卡最小 360px），窄窗口逐级降列、
-    // 最窄时单列纵向堆叠。单元格经 card_grid 在独立垂直布局作用域内渲染
-    // 并固定列宽，消除 scope 继承父级 horizontal 布局导致的横向溢出（P1-2 加固）。
-    let cols = responsive_columns(ui.available_width(), 360.0, 12.0);
+    // 等宽列网格：列数按可用宽度计算并封顶于可见卡数（纯函数，过滤后重算
+    // 不裁切，无空槽；记忆规范）；单元格经 card_grid 在独立垂直布局作用域内
+    // 渲染并固定列宽，消除 scope 继承父级 horizontal 布局导致的横向溢出（P1-2 加固）。
+    let cols = grid_columns(ui.available_width(), 360.0, 12.0, visible_indices.len());
+    // 运行态呼吸辉光（§7.2）：存在运行中卡片时按 ~20fps 追加重绘
+    let now_ms = ui.ctx().input(|i| i.time * 1000.0);
+    let breath = glow_breath_alpha(now_ms);
+    let any_running = visible_indices
+        .iter()
+        .any(|&i| modules[i].status.is_running());
     card_grid(ui, cols, &visible_indices, |ui, &idx| {
         let module_models = by_module.get(&modules[idx].id).cloned().unwrap_or_default();
         module_card(
             ui, lang, pal, config, &mut modules[idx], &module_models, data,
-            downloads, updates, download_sources, packs, cmd_tx, st,
+            downloads, updates, download_sources, packs, cmd_tx, st, breath,
         );
     });
+    if any_running {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(48));
+    }
 }
 
 /// 可见模块的状态计数徽章（0 不显示）
@@ -655,6 +738,7 @@ fn module_card(
     packs: &[PackEntry],
     cmd_tx: &UnboundedSender<AppCmd>,
     st: &mut ModulesUi,
+    breath: f32,
 ) {
     let manifest = data.manifest(&m.id).cloned();
     // 默认选中变体：激活变体（延迟初始化，避免每帧覆盖用户选择）
@@ -665,11 +749,11 @@ fn module_card(
         }
     }
 
-    card(ui, pal, |ui| {
+    // glass 风格卡（§7.2）：运行态呼吸辉光，静止态 hover 描边提亮
+    card_running(ui, pal, m.status.is_running(), breath, |ui| {
         ui.set_width(ui.available_width());
 
-        // ── 卡头：名称 + 类别 + 运行状态徽章（窄列时自动换行，不溢出） ──
-        let meta = service_status(&m.status, pal);
+        // ── 卡头：名称 + 类别 + 运行状态徽章（四态色 StatusBadge；窄列时自动换行，不溢出） ──
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new(&m.name).strong());
             ui.label(
@@ -678,7 +762,7 @@ fn module_card(
                     .color(pal.text_faint),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                badge(ui, pal, meta.color, service_label(lang, &m.status));
+                status_badge(ui, pal, &m.status, service_label(lang, &m.status));
             });
         });
         // 类别 + 端口/设备
@@ -786,47 +870,62 @@ fn variant_section(
     for decl in &mf.models {
         let mv = module_models.iter().find(|v| v.model_id == decl.id);
         let chosen = selected == decl.id;
-        ui.horizontal_wrapped(|ui| {
-            if ui.radio(chosen, "").clicked() && !chosen {
-                st.sel_variant.insert(m.id.clone(), decl.id.clone());
-            }
-            let mut name = egui::RichText::new(&decl.name);
-            if decl.id == active {
-                name = name.strong();
-            }
-            ui.label(name);
-            ui.label(
-                egui::RichText::new(format!("[{}]", decl.id))
-                    .monospace()
-                    .small()
-                    .color(pal.text_faint),
-            );
-            // 激活徽章
-            if decl.id == active {
-                badge(
-                    ui,
-                    pal,
-                    pal.primary,
-                    trfb(lang, "desktopPages.models.active", "激活", &[]),
+        let is_active = decl.id == active;
+        // 变体行渲染（激活/就绪/缺失三态视觉区分沿用四态色徽章）
+        let mut row = |ui: &mut egui::Ui| {
+            ui.horizontal_wrapped(|ui| {
+                if ui.radio(chosen, "").clicked() && !chosen {
+                    st.sel_variant.insert(m.id.clone(), decl.id.clone());
+                }
+                let mut name = egui::RichText::new(&decl.name);
+                if is_active {
+                    name = name.strong();
+                }
+                ui.label(name);
+                ui.label(
+                    egui::RichText::new(format!("[{}]", decl.id))
+                        .monospace()
+                        .small()
+                        .color(pal.text_faint),
                 );
-            }
-            // 就绪/缺失徽章（来自 ModelView 状态）
-            if let Some(v) = mv {
-                let (color, label) = status_meta(lang, &v.status, pal);
-                badge(ui, pal, color, label);
-                // 下载进度（进行中）；P1 修复：复合键隔离跨模块同名变体
-                if let Some(dl) = downloads.get(&download_key(&v.module_id, &v.model_id)) {
-                    if matches!(dl.state, DownloadState::Downloading) {
-                        ui.label(
-                            egui::RichText::new(format!("{:.0}%", dl.percent))
-                                .monospace()
-                                .small()
-                                .color(pal.info),
-                        );
+                // 激活徽章
+                if is_active {
+                    badge(
+                        ui,
+                        pal,
+                        pal.primary,
+                        trfb(lang, "desktopPages.models.active", "激活", &[]),
+                    );
+                }
+                // 就绪/缺失徽章（来自 ModelView 状态）
+                if let Some(v) = mv {
+                    let (color, label) = status_meta(lang, &v.status, pal);
+                    badge(ui, pal, color, label);
+                    // 下载进度（进行中）；P1 修复：复合键隔离跨模块同名变体
+                    if let Some(dl) = downloads.get(&download_key(&v.module_id, &v.model_id)) {
+                        if matches!(dl.state, DownloadState::Downloading) {
+                            ui.label(
+                                egui::RichText::new(format!("{:.0}%", dl.percent))
+                                    .monospace()
+                                    .small()
+                                    .color(pal.info),
+                            );
+                        }
                     }
                 }
-            }
-        });
+            });
+        };
+        // 激活变体行：primary/5 底 + primary/25 描边高亮（§7.2 变体区层级优化）
+        if is_active {
+            egui::Frame::new()
+                .fill(color_with_alpha(pal.primary, 13))
+                .stroke(egui::Stroke::new(1.0_f32, color_with_alpha(pal.primary, 64)))
+                .corner_radius(egui::CornerRadius::same(CONTROL_ROUNDING))
+                .inner_margin(egui::Margin::symmetric(6, 2))
+                .show(ui, row);
+        } else {
+            row(ui);
+        }
     }
     ui.add_space(6.0);
 
@@ -1114,7 +1213,7 @@ fn action_row(
                 download_action(ui, lang, pal, mv, download_sources, cmd_tx);
             } else if has_update {
                 if ui
-                    .add(primary_button(
+                    .add(subtle_button(
                         pal,
                         format!("⬇ {}", tr(lang, "desktopPages.models.redownload", &[])),
                     ))
@@ -1153,11 +1252,11 @@ fn action_row(
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // 激活变体应用（选中 ≠ 激活 时可点）
+            // 激活变体应用（选中 ≠ 激活 时可点；按钮层级打磨：次级操作一律 subtle）
             let changed = !selected.is_empty() && selected != active;
             let apply_btn = ui.add_enabled(
                 changed,
-                primary_button(
+                subtle_button(
                     pal,
                     trfb(lang, "desktopPages.modules.applyVariant", "激活变体应用", &[]),
                 ),
@@ -1225,21 +1324,22 @@ fn service_action_row(
     let key_stop = egui::Id::new(("confirm_stop", m.id.clone()));
     let key_restart = egui::Id::new(("confirm_restart", m.id.clone()));
 
+    // 按钮层级打磨（§7.2）：启动 = primary 辉光主操作，其余一律 subtle
     ui.horizontal(|ui| match &m.status {
         ServiceStatus::Stopped => {
-            if ui
-                .add(primary_button(
-                    pal,
-                    format!("▶ {}", tr(lang, "common.action.start", &[])),
-                ))
-                .clicked()
+            if primary_button_with_glow(
+                ui,
+                pal,
+                format!("▶ {}", tr(lang, "common.action.start", &[])),
+            )
+            .clicked()
             {
                 let _ = cmd_tx.send(AppCmd::StartModule(m.id.clone()));
             }
         }
         ServiceStatus::Running | ServiceStatus::Starting => {
             if ui
-                .add(danger_button(
+                .add(subtle_button(
                     pal,
                     format!("⏹ {}", tr(lang, "common.action.stop", &[])),
                 ))
@@ -1249,15 +1349,13 @@ fn service_action_row(
             }
         }
         ServiceStatus::Error(_) => {
-            let btn = egui::Button::new(egui::RichText::new(format!(
-                "🔄 {}",
-                tr(lang, "common.action.restart", &[])
-            ))
-            .color(pal.bg_base))
-            .fill(pal.warning)
-            .corner_radius(egui::CornerRadius::same(CONTROL_ROUNDING))
-            .stroke(egui::Stroke::NONE);
-            if ui.add(btn).clicked() {
+            if ui
+                .add(subtle_button(
+                    pal,
+                    format!("🔄 {}", tr(lang, "common.action.restart", &[])),
+                ))
+                .clicked()
+            {
                 ui.ctx().data_mut(|d| d.insert_temp(key_restart, true));
             }
         }
@@ -1933,7 +2031,7 @@ fn download_action(
         } else {
             format!("⬇ {}", tr(lang, "common.action.download", &[]))
         };
-        let btn = primary_button(pal, label);
+        let btn = subtle_button(pal, label);
         let resp = if multi {
             ui.add(btn).on_hover_text(tr(lang, "desktopPages.models.multiSourceTip", &[]))
         } else {

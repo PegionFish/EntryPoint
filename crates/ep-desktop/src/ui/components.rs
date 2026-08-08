@@ -128,6 +128,43 @@ pub fn card<R>(
     inner
 }
 
+/// 卡片容器（运行态呼吸辉光 / 静止态 hover 描边提亮；§7.2 模块卡与
+/// §7.4 任务卡共用）：`active` 时按 `breath`（调用方经 [`glow_breath_alpha`]
+/// 时间插值）用 status_running 呼吸描边 + 辉光阴影，静止态退回 [`card`]
+/// 的 hover 行为。
+pub fn card_running<R>(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    active: bool,
+    breath: f32,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    let id = ui.next_auto_id();
+    let prev_hovered = ui.ctx().data(|d| d.get_temp::<bool>(id).unwrap_or(false));
+    let (stroke, shadow) = if active {
+        let stroke_alpha = (breath * 115.0) as u8;
+        let shadow_alpha = (breath * 64.0) as u8;
+        (
+            egui::Stroke::new(1.0_f32, color_with_alpha(pal.status_running, stroke_alpha)),
+            Some(color_with_alpha(pal.status_running, shadow_alpha)),
+        )
+    } else {
+        (
+            card_stroke(pal, prev_hovered),
+            prev_hovered.then_some(pal.primary_glow),
+        )
+    };
+    let inner = card_frame_active(pal, stroke, shadow).show(ui, add_contents);
+    if !active {
+        let hovered = inner.response.hovered();
+        if hovered != prev_hovered {
+            ui.ctx().data_mut(|d| d.insert_temp(id, hovered));
+            ui.ctx().request_repaint();
+        }
+    }
+    inner
+}
+
 // ─── 徽章 ────────────────────────────────────────────────────────────────────
 
 /// 通用徽章：胶囊底 + 色点 + 文字
@@ -322,6 +359,67 @@ pub fn accent_underline(ui: &mut egui::Ui, pal: &Palette, width: f32) {
         let t = if segs > 1 { i as f32 / (segs - 1) as f32 } else { 0.0 };
         painter.rect_filled(seg, 1.0, pal.accent_at(t));
     }
+}
+
+// ─── 分段筛选 Tabs（§9 组件清单 SegmentedTabs） ─────────────────────────────
+
+/// 分段 Tab 文案：标签 + 计数徽章（计数 ≥0 恒显示，与 WebUI 任务筛选口径一致）
+pub fn segmented_tab_label(label: &str, count: usize) -> String {
+    format!("{label} {count}")
+}
+
+/// 分段筛选 Tabs（SegmentedTabs，§9；任务页状态筛选载体 §7.4）：
+/// 层 1 底容器 + 1px 描边，选中段 primary/15 底 + primary/25 描边 + 主色文字，
+/// 未选中段弱化文字；点击非当前段返回 `Some(新下标)`，无交互返回 `None`。
+///
+/// 各段 rect 按序写入容器 id 的临时数据（egui 无公开 widget rect 枚举 API，
+/// 供测试定位段落注入点击）。
+pub fn segmented_tabs(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    tabs: &[(String, usize)],
+    selected: usize,
+) -> Option<usize> {
+    let container_id = ui.id().with("segmented_tabs");
+    let mut clicked: Option<usize> = None;
+    let mut tab_rects: Vec<egui::Rect> = Vec::with_capacity(tabs.len());
+    egui::Frame::new()
+        .fill(pal.bg_card)
+        .stroke(egui::Stroke::new(1.0_f32, pal.border))
+        .corner_radius(egui::CornerRadius::same(CONTROL_ROUNDING))
+        .inner_margin(egui::Margin::symmetric(3, 3))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                for (i, (label, count)) in tabs.iter().enumerate() {
+                    let active = i == selected;
+                    let text_color = if active { pal.primary } else { pal.text_dim };
+                    let btn = egui::Button::new(
+                        egui::RichText::new(segmented_tab_label(label, *count))
+                            .size(13.0)
+                            .color(text_color),
+                    )
+                    .fill(if active {
+                        color_with_alpha(pal.primary, 38) // primary/15
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    })
+                    .stroke(if active {
+                        egui::Stroke::new(1.0_f32, color_with_alpha(pal.primary, 64)) // primary/25
+                    } else {
+                        egui::Stroke::NONE
+                    })
+                    .corner_radius(egui::CornerRadius::same(6));
+                    let resp = ui.add(btn);
+                    tab_rects.push(resp.rect);
+                    if resp.clicked() && !active {
+                        clicked = Some(i);
+                    }
+                }
+            });
+        });
+    ui.ctx().data_mut(|d| d.insert_temp(container_id, tab_rects));
+    clicked
 }
 
 // ─── 响应式布局 ──────────────────────────────────────────────────────────────
@@ -626,6 +724,79 @@ mod tests {
         assert_eq!(gradient_segment_count(5.0), 2);
         assert_eq!(gradient_segment_count(80.0), 10);
         assert_eq!(gradient_segment_count(10_000.0), 24);
+    }
+
+    /// SegmentedTabs 文案：标签与计数空格拼接（计数恒显示，与 WebUI 口径一致）
+    #[test]
+    fn segmented_tab_label_formats_count() {
+        assert_eq!(segmented_tab_label("运行中", 2), "运行中 2");
+        assert_eq!(segmented_tab_label("All", 0), "All 0");
+    }
+
+    /// SegmentedTabs 交互语义：点击非当前段返回其下标，点击当前段不触发切换。
+    /// （首帧记录各段 rect，后续帧在目标段中心注入指针按压/释放事件模拟真实点击）
+    #[test]
+    fn segmented_tabs_selection_semantics() {
+        let ctx = egui::Context::default();
+        let tabs: Vec<(String, usize)> = vec![
+            ("全部".to_string(), 4),
+            ("运行中".to_string(), 1),
+            ("失败".to_string(), 0),
+        ];
+        let rects = std::rc::Rc::new(std::cell::RefCell::new(Vec::<egui::Rect>::new()));
+        let slot = std::rc::Rc::new(std::cell::Cell::new(None::<usize>));
+        let tab_count = tabs.len();
+        let render = {
+            let rects = rects.clone();
+            let slot = slot.clone();
+            move |selected: usize, input: egui::RawInput| {
+                rects.borrow_mut().clear();
+                let rects = rects.clone();
+                let slot = slot.clone();
+                let _ = ctx.run(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let pal = Palette::dark();
+                        slot.set(segmented_tabs(ui, &pal, &tabs, selected));
+                        // 组件把各段 rect 按序写入容器 id 临时数据，此处读回供点击定位
+                        let id = ui.id().with("segmented_tabs");
+                        if let Some(rs) = ui.ctx().data(|d| d.get_temp::<Vec<egui::Rect>>(id)) {
+                            rects.borrow_mut().extend(rs);
+                        }
+                    });
+                });
+            }
+        };
+
+        // 首帧建立布局，无点击 → 不产生切换
+        render(0, egui::RawInput::default());
+        assert_eq!(slot.get(), None);
+
+        // 在首段中心注入点击（当前选中段）→ 不触发切换
+        let rects_snapshot = rects.borrow().clone();
+        assert_eq!(rects_snapshot.len(), tab_count, "三段均须可见");
+        let click = |pos: egui::Pos2| {
+            let mut input = egui::RawInput::default();
+            input.events.push(egui::Event::PointerMoved(pos));
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            });
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            input
+        };
+        render(0, click(rects_snapshot[0].center()));
+        assert_eq!(slot.get(), None, "点击当前段不应切换");
+
+        // 在第 3 段中心注入点击（非当前段）→ 返回下标 2
+        render(0, click(rects_snapshot[2].center()));
+        assert_eq!(slot.get(), Some(2), "点击非当前段应返回其下标");
     }
 
     #[test]

@@ -25,8 +25,8 @@ use crate::i18n::tr;
 use crate::pages::modules::{category_label, service_label};
 use crate::pages::{format_size, open_path, publish_tasks_snapshot, trfb};
 use crate::ui::{
-    badge, card, empty_state, keyboard_scroll, page_header, section_title, service_status,
-    subtle_button, Palette,
+    badge, card, card_running, empty_state, glow_breath_alpha, keyboard_scroll, page_header,
+    progress_gradient, section_title, segmented_tabs, status_badge, subtle_button, Palette,
 };
 
 /// 产物目录递归扫描的最大深度（`files/{node_id}/…` 布局足够，防御深目录）
@@ -40,6 +40,43 @@ const ARTIFACT_SCAN_TTL: std::time::Duration = std::time::Duration::from_secs(2)
 struct ArtifactScanCache {
     scanned_at: std::time::Instant,
     files: Vec<ArtifactEntry>,
+}
+
+/// 任务状态筛选（§7.4 SegmentedTabs；口径与 WebUI 协调：运行中含排队 Pending）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum TaskFilter {
+    #[default]
+    All,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl TaskFilter {
+    /// 声明顺序 = SegmentedTabs 段顺序（`as usize` 下标依赖此序）
+    const ALL: [TaskFilter; 5] = [
+        TaskFilter::All,
+        TaskFilter::Running,
+        TaskFilter::Completed,
+        TaskFilter::Failed,
+        TaskFilter::Cancelled,
+    ];
+
+    fn matches(&self, status: &TaskStatus) -> bool {
+        match self {
+            TaskFilter::All => true,
+            TaskFilter::Running => matches!(status, TaskStatus::Running | TaskStatus::Pending),
+            TaskFilter::Completed => matches!(status, TaskStatus::Completed),
+            TaskFilter::Failed => matches!(status, TaskStatus::Failed(_)),
+            TaskFilter::Cancelled => matches!(status, TaskStatus::Cancelled),
+        }
+    }
+}
+
+/// 筛选状态持久化键（egui temp data，会话内保持）
+fn filter_state_id() -> egui::Id {
+    egui::Id::new("tasks_page_filter")
 }
 
 /// 任务中心页入口：`cmd_tx` 为后台命令通道（queued/running 任务卡内取消）。
@@ -77,9 +114,56 @@ pub fn show_full(
                 &tr(lang, "desktopApp.tasks.emptyHint", &[]),
             );
         } else {
-            for task in tasks {
-                task_card(ui, lang, &pal, config, task, &queue_positions, cmd_tx);
-                ui.add_space(8.0);
+            // ── 状态筛选 SegmentedTabs（§7.4；全部/运行中/已完成/失败/取消） ──
+            let mut filter = ui
+                .ctx()
+                .data(|d| d.get_temp::<TaskFilter>(filter_state_id()))
+                .unwrap_or_default();
+            let tab_labels = [
+                tr(lang, "tasks.filter.all", &[]),
+                tr(lang, "tasks.filter.running", &[]),
+                tr(lang, "tasks.filter.completed", &[]),
+                tr(lang, "tasks.filter.failed", &[]),
+                tr(lang, "tasks.filter.cancelled", &[]),
+            ];
+            let tabs: Vec<(String, usize)> = TaskFilter::ALL
+                .iter()
+                .zip(tab_labels)
+                .map(|(f, label)| {
+                    (label, tasks.iter().filter(|t| f.matches(&t.status)).count())
+                })
+                .collect();
+            if let Some(idx) = segmented_tabs(ui, &pal, &tabs, filter as usize) {
+                filter = TaskFilter::ALL[idx];
+                ui.ctx().data_mut(|d| d.insert_temp(filter_state_id(), filter));
+            }
+            ui.add_space(8.0);
+
+            let visible: Vec<&TaskSummary> =
+                tasks.iter().filter(|t| filter.matches(&t.status)).collect();
+            if visible.is_empty() {
+                empty_state(
+                    ui,
+                    &pal,
+                    "🔍",
+                    &tr(lang, "tasks.filteredEmpty", &[]),
+                    &tr(lang, "tasks.filteredEmptyHint", &[]),
+                );
+            } else {
+                // 运行态呼吸辉光（§7.4）：存在运行中任务卡时按 ~20fps 追加重绘
+                let now_ms = ui.ctx().input(|i| i.time * 1000.0);
+                let breath = glow_breath_alpha(now_ms);
+                let any_running = visible
+                    .iter()
+                    .any(|t| matches!(t.status, TaskStatus::Running));
+                for task in &visible {
+                    task_card(ui, lang, &pal, config, task, &queue_positions, cmd_tx, breath);
+                    ui.add_space(8.0);
+                }
+                if any_running {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(48));
+                }
             }
         }
 
@@ -149,6 +233,7 @@ fn compute_queue_positions(tasks: &[TaskSummary]) -> std::collections::HashMap<S
 
 // ─── 管线任务卡片 ────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn task_card(
     ui: &mut egui::Ui,
     lang: &str,
@@ -157,10 +242,17 @@ fn task_card(
     task: &TaskSummary,
     queue_positions: &std::collections::HashMap<String, usize>,
     cmd_tx: Option<&UnboundedSender<AppCmd>>,
+    breath: f32,
 ) {
     let (color, label) = task_status_meta(lang, &task.status, pal);
 
-    card(ui, pal, |ui| {
+    // glass 风格卡（§7.4）：运行态呼吸辉光，静止态 hover 描边提亮
+    card_running(
+        ui,
+        pal,
+        matches!(task.status, TaskStatus::Running),
+        breath,
+        |ui| {
         // 行1：管线名 + 状态徽章 + 队列位置（queued）+ 任务 ID（右对齐 mono）
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(&task.pipeline_name).strong());
@@ -190,17 +282,20 @@ fn task_card(
         });
         ui.add_space(8.0);
 
-        // 行2：整体进度条（占满可用宽度，填充色 = 状态色）
+        // 行2：整体进度（§7.4 渐变进度条：运行中=主色渐变，终态/排队=状态色单档）
         let progress = if task.node_count > 0 {
             task.completed_nodes as f32 / task.node_count as f32
         } else {
             0.0
         };
-        ui.add(
-            egui::ProgressBar::new(progress)
-                .desired_width(ui.available_width())
-                .fill(color),
-        );
+        let alert = match &task.status {
+            TaskStatus::Running => None,
+            TaskStatus::Pending => Some(pal.warning),
+            TaskStatus::Completed => Some(pal.status_ready),
+            TaskStatus::Failed(_) => Some(pal.status_error),
+            TaskStatus::Cancelled => Some(pal.status_stopped),
+        };
+        progress_gradient(ui, pal, progress, alert);
         ui.add_space(6.0);
 
         // 行3：时间（ISO 截短到秒）+ 节点进度
@@ -267,7 +362,8 @@ fn task_card(
         // ── 产物区（展开式；queued/运行中同样可查看已落盘的部分产物） ──
         ui.add_space(6.0);
         artifacts_section(ui, lang, pal, config, task);
-    });
+        },
+    );
 }
 
 // ─── 产物列表 ────────────────────────────────────────────────────────────────
@@ -472,9 +568,8 @@ fn module_grid(
             for m in rows {
                 ui.label(&m.name);
                 ui.label(egui::RichText::new(category_label(lang, &m.category)).color(pal.text_dim));
-                // 颜色取自主题色板，文案走 i18n（StatusMeta.label 为静态串，不能承载翻译结果）
-                let meta = service_status(&m.status, pal);
-                badge(ui, pal, meta.color, service_label(lang, &m.status));
+                // 四态色 StatusBadge（§9）；文案走 i18n
+                status_badge(ui, pal, &m.status, service_label(lang, &m.status));
                 ui.label(
                     egui::RichText::new(
                         m.port
@@ -588,6 +683,29 @@ mod tests {
     fn queue_positions_empty_when_no_pending() {
         let tasks = vec![task("a", TaskStatus::Running)];
         assert!(compute_queue_positions(&tasks).is_empty());
+    }
+
+    /// SegmentedTabs 筛选语义（§7.4，口径与 WebUI 协调：运行中含排队 Pending）
+    #[test]
+    fn task_filter_matches_status_buckets() {
+        assert!(TaskFilter::All.matches(&TaskStatus::Cancelled));
+        assert!(TaskFilter::Running.matches(&TaskStatus::Running));
+        assert!(TaskFilter::Running.matches(&TaskStatus::Pending));
+        assert!(!TaskFilter::Running.matches(&TaskStatus::Completed));
+        assert!(TaskFilter::Completed.matches(&TaskStatus::Completed));
+        assert!(TaskFilter::Failed.matches(&TaskStatus::Failed("e".into())));
+        assert!(!TaskFilter::Failed.matches(&TaskStatus::Cancelled));
+        assert!(TaskFilter::Cancelled.matches(&TaskStatus::Cancelled));
+        assert!(!TaskFilter::Cancelled.matches(&TaskStatus::Running));
+    }
+
+    /// 段顺序 = Tab 展示顺序；`as usize` 下标映射依赖此不变量
+    #[test]
+    fn task_filter_all_order_stable() {
+        assert_eq!(TaskFilter::ALL.len(), 5);
+        assert_eq!(TaskFilter::ALL[0], TaskFilter::All);
+        assert_eq!(TaskFilter::ALL[4], TaskFilter::Cancelled);
+        assert_eq!(TaskFilter::Completed as usize, 2);
     }
 
     #[test]
