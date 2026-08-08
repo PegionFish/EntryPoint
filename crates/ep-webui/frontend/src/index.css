@@ -26,12 +26,29 @@
   --input: hsl(240 5.9% 90%);
   --ring: hsl(217 91% 60%);
 
-  /* Status colors */
-  --status-running: hsl(142 71% 45%);
-  --status-stopped: hsl(240 5% 65%);
+  /* 科技感令牌（浅色主题弱化：§3.1 规则 4，权威色值见方案 §1.2） */
+  --accent-gradient-from: #38bdf8;
+  --accent-gradient-to: #6366f1;
+  --primary-glow: rgba(56, 189, 248, 0.2);
+  --ring-glow: rgba(56, 189, 248, 0.28);
+  --border-glow: rgba(56, 189, 248, 0.12);
+  --border-glow-strong: rgba(56, 189, 248, 0.3);
+  --surface-glass: hsl(0 0% 100% / 0.72);
+  --status-glow-running: rgba(34, 211, 238, 0.3);
+  --grid-dot: rgba(100, 116, 139, 0.16);
+
+  /* 动效纪律令牌（§1 主张 6） */
+  --duration-fast: 150ms;
+  --duration-base: 200ms;
+  --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* 四态状态色（§1.2 权威重定值，双端统一，breaking） */
+  --status-ready: #4ade80;
+  --status-running: #22d3ee;
+  --status-stopped: #94a3b8;
   --status-starting: hsl(217 91% 60%);
   --status-preparing: hsl(45 93% 47%);
-  --status-error: hsl(0 84% 60%);
+  --status-error: #fb7185;
   --status-notready: hsl(240 4% 35%);
 
   /* Data type (port) colors — light theme uses deep shades for contrast */
@@ -67,26 +84,37 @@
 }
 
 .dark {
-  /* Dark theme (default) */
-  --background: hsl(240 10% 3.9%);
-  --foreground: hsl(0 0% 98%);
-  --card: hsl(240 6% 10%);
-  --card-foreground: hsl(0 0% 98%);
-  --popover: hsl(240 10% 3.9%);
-  --popover-foreground: hsl(0 0% 98%);
-  --primary: hsl(217 91% 60%);
-  --primary-foreground: hsl(0 0% 100%);
-  --secondary: hsl(240 3.7% 15.9%);
-  --secondary-foreground: hsl(0 0% 98%);
-  --muted: hsl(240 3.7% 15.9%);
-  --muted-foreground: hsl(240 5% 64.9%);
-  --accent: hsl(240 3.7% 15.9%);
-  --accent-foreground: hsl(0 0% 98%);
+  /* 深空三级层深（§1.2 权威：层 0 应用背景 / 层 1 卡片 / 层 2 浮层） */
+  --background: #0b0f17;
+  --foreground: #e2e8f0;
+  --card: #0e1420;
+  --card-foreground: #e2e8f0;
+  --popover: #121a2b;
+  --popover-foreground: #e2e8f0;
+  --primary: #38bdf8;
+  --primary-foreground: #0b0f17;
+  --secondary: #121a2b;
+  --secondary-foreground: #e2e8f0;
+  --muted: #121a2b;
+  --muted-foreground: #94a3b8;
+  --accent: #121a2b;
+  --accent-foreground: #e2e8f0;
   --destructive: hsl(0 84% 60%);
   --destructive-foreground: hsl(0 0% 100%);
-  --border: hsl(240 4% 16%);
-  --input: hsl(240 4% 16%);
-  --ring: hsl(217 91% 60%);
+  --border: rgba(148, 163, 184, 0.12);
+  --input: rgba(148, 163, 184, 0.12);
+  --ring: #38bdf8;
+
+  /* 科技感令牌（深色为第一主题，全量生效） */
+  --accent-gradient-from: #38bdf8;
+  --accent-gradient-to: #6366f1;
+  --primary-glow: rgba(56, 189, 248, 0.35);
+  --ring-glow: rgba(56, 189, 248, 0.5);
+  --border-glow: rgba(56, 189, 248, 0.18);
+  --border-glow-strong: rgba(56, 189, 248, 0.45);
+  --surface-glass: hsl(240 6% 12% / 0.72);
+  --status-glow-running: rgba(34, 211, 238, 0.4);
+  --grid-dot: rgba(148, 163, 184, 0.12);
 
   /* Data type (port) colors — dark theme uses bright shades */
   --dtype-audio: hsl(43 96% 56%);
@@ -141,12 +169,19 @@
   --color-input: var(--input);
   --color-ring: var(--ring);
 
+  --color-status-ready: var(--status-ready);
   --color-status-running: var(--status-running);
   --color-status-stopped: var(--status-stopped);
   --color-status-starting: var(--status-starting);
   --color-status-preparing: var(--status-preparing);
   --color-status-error: var(--status-error);
   --color-status-notready: var(--status-notready);
+
+  --color-border-glow: var(--border-glow);
+  --color-border-glow-strong: var(--border-glow-strong);
+  --color-grid-dot: var(--grid-dot);
+  --color-accent-gradient-from: var(--accent-gradient-from);
+  --color-accent-gradient-to: var(--accent-gradient-to);
 
   --color-dtype-audio: var(--dtype-audio);
   --color-dtype-video: var(--dtype-video);
@@ -203,5 +238,76 @@
   pre,
   kbd {
     font-family: var(--font-mono);
+  }
+}
+
+/* ===== 统一设计语言工具类（方案 §6.2-A / §10） ===== */
+@layer utilities {
+  /* 玻璃拟态浮层：半透明底 + 背景模糊（限 Drawer/Dialog/CommandBar） */
+  .glass {
+    background: var(--surface-glass);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+  }
+
+  /* 玻璃拟态卡片基础类：半透明 + 1px 内发光描边，hover 仅提升描边亮度（零位移） */
+  .glass-card {
+    background: var(--surface-glass);
+    border: 1px solid var(--border-glow);
+    box-shadow:
+      inset 0 0 16px rgba(56, 189, 248, 0.04),
+      0 4px 16px rgba(2, 6, 12, 0.35);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    transition:
+      border-color var(--duration-fast) var(--ease-standard),
+      box-shadow var(--duration-fast) var(--ease-standard);
+  }
+  .glass-card:hover {
+    border-color: var(--border-glow-strong);
+  }
+
+  /* 中档发光（6-8px 模糊、35% 透明度）：主按钮 / 聚焦 */
+  .glow-primary {
+    box-shadow: 0 0 8px var(--primary-glow);
+  }
+
+  /* 强档发光（12px+）：仅运行中状态点与管线执行中节点 */
+  .glow-status-running {
+    box-shadow: 0 0 12px var(--status-glow-running);
+  }
+
+  /* 品牌渐变：电光青→靛蓝，仅限 §3.1 规则 1 列举的 6 处 */
+  .bg-gradient-accent {
+    background-image: linear-gradient(
+      90deg,
+      var(--accent-gradient-from),
+      var(--accent-gradient-to)
+    );
+  }
+
+  .text-gradient {
+    background-image: linear-gradient(
+      90deg,
+      var(--accent-gradient-from),
+      var(--accent-gradient-to)
+    );
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  /* 运行态呼吸辉光：2.4s 周期、不透明度 0.35-0.7（§1 主张 3） */
+  @keyframes breath-glow {
+    0%,
+    100% {
+      opacity: 0.35;
+    }
+    50% {
+      opacity: 0.7;
+    }
+  }
+  .animate-breath-glow {
+    animation: breath-glow 2.4s ease-in-out infinite;
   }
 }
