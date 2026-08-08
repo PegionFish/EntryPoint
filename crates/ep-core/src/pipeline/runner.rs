@@ -164,6 +164,17 @@ impl PipelineRunnerImpl {
         self.default_node_timeout = timeout;
     }
 
+    /// 任务终结统一路径（P3）：清位协作取消标志——标志为外部共享的
+    /// `AtomicBool`，若不清位，复用同一 runner/标志执行后续任务时会
+    /// 在首个节点边界被残留标志立即取消；随后保存任务快照。
+    fn finish_task(&mut self, task: PipelineTask) {
+        if let Some(flag) = &self.cancel_flag {
+            flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.tasks.insert(task.id.clone(), task.clone());
+        self.task = Some(task);
+    }
+
     // ─── 任务列表 API（GUI 展示用） ─────────────────────────────────────
 
     /// 列出所有已知任务的摘要信息
@@ -178,6 +189,18 @@ impl PipelineRunnerImpl {
                     .filter(|s| matches!(s, NodeState::Completed { .. }))
                     .count();
 
+                // 汇总已完成节点的文件产物（P1：原实现硬编码空 Vec）
+                let artifacts = task
+                    .node_states
+                    .iter()
+                    .filter_map(|(node_id, state)| match state {
+                        NodeState::Completed {
+                            artifact: Some(Artifact::File(path)),
+                        } => Some((node_id.clone(), path.clone())),
+                        _ => None,
+                    })
+                    .collect();
+
                 TaskSummary {
                     id: task.id.clone(),
                     pipeline_name: task.pipeline_id.clone(),
@@ -186,7 +209,7 @@ impl PipelineRunnerImpl {
                     finished_at: task.finished_at.map(|t| t.to_rfc3339()),
                     node_count,
                     completed_nodes,
-                    artifacts: Vec::new(),
+                    artifacts,
                 }
             })
             .collect()
@@ -268,9 +291,10 @@ impl PipelineRunnerImpl {
                         cb(node_id, &err_msg);
                     }
                     task.mark_failed_with_pipeline(node_id, err_msg, false, pipeline);
+                    // P0：同层剩余 Running 兄弟一并置 Skipped，避免任务永久 Running
+                    task.skip_layer_remaining(layer);
                     task.status = TaskStatus::Cancelled;
-                    self.tasks.insert(task.id.clone(), task.clone());
-                    self.task = Some(task);
+                    self.finish_task(task);
                     return Err(anyhow::anyhow!("pipeline execution cancelled"));
                 }
 
@@ -385,9 +409,10 @@ impl PipelineRunnerImpl {
                             cb(node_id, &err_msg);
                         }
                         task.mark_failed_with_pipeline(node_id, err_msg, false, pipeline);
+                        // P0：同层剩余 Running 兄弟一并置 Skipped，避免任务永久 Running
+                        task.skip_layer_remaining(layer);
                         task.status = TaskStatus::Cancelled;
-                        self.tasks.insert(task.id.clone(), task.clone());
-                        self.task = Some(task);
+                        self.finish_task(task);
                         return Err(anyhow::anyhow!("pipeline execution cancelled"));
                     }
                 };
@@ -412,6 +437,9 @@ impl PipelineRunnerImpl {
                             cb(node_id, &err_msg);
                         }
                         task.mark_failed_with_pipeline(node_id, err_msg, retryable, pipeline);
+                        // P0：同层剩余 Running 兄弟一并置 Skipped；check_completion
+                        // 随之在全部节点终结时置 Failed，任务终态正确传播
+                        task.skip_layer_remaining(layer);
                         break; // 停止当前层的执行
                     }
                 }
@@ -421,13 +449,11 @@ impl PipelineRunnerImpl {
         // 检查任务最终状态
         if let TaskStatus::Failed(ref e) = task.status {
             let err = anyhow::anyhow!("pipeline execution failed: {e}");
-            self.tasks.insert(task.id.clone(), task.clone());
-            self.task = Some(task);
+            self.finish_task(task);
             return Err(err);
         }
 
-        self.tasks.insert(task.id.clone(), task.clone());
-        self.task = Some(task);
+        self.finish_task(task);
         Ok(())
     }
 }
@@ -440,8 +466,9 @@ impl PipelineRunner for PipelineRunnerImpl {
     ) -> anyhow::Result<()> {
         // 桥接 sync trait → async 实现
         match tokio::runtime::Handle::try_current() {
-            Ok(_handle) => {
-                // 已在 tokio 运行时中 — 在新线程上 block_on 以避免嵌套 panic
+            Ok(handle) => {
+                // 已在 tokio 运行时中。P1 修复：不再 `thread::spawn + join`
+                // 阻塞异步 worker（饿死同池任务），也不再每任务新建 Runtime。
                 let work_dir_path = work_dir.to_path_buf();
                 let pipeline_clone = pipeline.clone();
 
@@ -465,13 +492,33 @@ impl PipelineRunner for PipelineRunnerImpl {
                     default_node_timeout,
                 };
 
-                let (result, returned_runner) = std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    let res = rt.block_on(temp_runner.execute_async(&pipeline_clone, &work_dir_path));
-                    (res, temp_runner)
-                })
-                .join()
-                .map_err(|_| anyhow::anyhow!("tokio spawn thread panicked"))?;
+                let (result, returned_runner) =
+                    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+                        // 单线程 runtime：`block_in_place` 会 panic。回退独立线程 +
+                        // 独立 runtime 的旧路径（单线程 runtime 上阻塞不可避免）。
+                        let pipeline_owned = pipeline_clone.clone();
+                        let work_dir_owned = work_dir_path.clone();
+                        std::thread::spawn(move || {
+                            let rt = tokio::runtime::Runtime::new().unwrap();
+                            let res =
+                                rt.block_on(temp_runner.execute_async(&pipeline_owned, &work_dir_owned));
+                            (res, temp_runner)
+                        })
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("tokio spawn thread panicked"))?
+                    } else {
+                        // 多线程 runtime：`block_in_place` 把当前线程临时移出调度池
+                        //（worker 不被占住），随后复用当前 runtime 的 `handle.block_on`
+                        // 直接驱动执行 —— 既不在 worker 上同步 join 长任务，也免去
+                        // 每任务新建 Runtime 的开销。
+                        let pipeline_owned = pipeline_clone.clone();
+                        let work_dir_owned = work_dir_path.clone();
+                        tokio::task::block_in_place(move || {
+                            let res =
+                                handle.block_on(temp_runner.execute_async(&pipeline_owned, &work_dir_owned));
+                            (res, temp_runner)
+                        })
+                    };
 
                 // 恢复状态
                 self.task = returned_runner.task;
@@ -512,6 +559,7 @@ mod tests {
     use super::*;
     use crate::pipeline::dag::Pipeline;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
 
     /// 检查 ffmpeg 是否可用（优先使用 portable 版本）
     fn ffmpeg_available() -> bool {
@@ -1464,6 +1512,207 @@ to = ["slow", "input"]
         let detail = runner.get_task_detail(&runner.list_tasks()[0].id).unwrap();
         let slow = detail.nodes.iter().find(|n| n.node_id == "slow").unwrap();
         assert!(slow.error.as_deref().unwrap_or("").contains("timed out"));
+
+        cleanup_dir(&work_dir);
+    }
+
+    // ─── P0：同层兄弟节点失败 → 不得泄漏为永久 Running ────────────────────
+
+    /// 同层兄弟失败回归（P0）：input 分叉到 bad（模块失败）与 good
+    /// （file_output，本可成功）两个同层节点。bad 失败后：
+    /// - 若 good 尚未执行（bad 先于 good 被遍历），必须被置 Skipped；
+    /// - 若 good 已先行完成，保持 Completed。
+    /// 两种顺序下任务都必须 Failed、execute 返回 Err、且不允许任何节点
+    /// 残留 Running（修复前：兄弟永久 Running + 误报 Ok 的泄漏）。
+    #[tokio::test]
+    async fn test_same_layer_sibling_failure_no_running_leak() {
+        let work_dir = temp_work_dir("sibling-fail");
+        let input_file = work_dir.join("source.txt");
+        std::fs::write(&input_file, "sibling data").unwrap();
+        let out_file = work_dir.join("out.txt");
+
+        let toml_str = format!(
+            r#"
+[pipeline]
+id = "test-sibling-fail"
+name = "Sibling Fail Test"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = {{ path = "{}" }}
+
+[[nodes]]
+id = "bad"
+kind = "module"
+module_id = "nonexistent"
+capability = "do_thing"
+
+[[nodes]]
+id = "good"
+kind = "builtin"
+builtin = "file_output"
+params = {{ path = "{}" }}
+
+[[edges]]
+from = ["input", "output"]
+to = ["bad", "input"]
+
+[[edges]]
+from = ["input", "output"]
+to = ["good", "input"]
+"#,
+            input_file.to_string_lossy().replace('\\', "/"),
+            out_file.to_string_lossy().replace('\\', "/"),
+        );
+        let pipeline = Pipeline::from_toml_str(&toml_str).unwrap();
+        let mut runner = PipelineRunnerImpl::new(work_dir.clone());
+
+        let result = runner.execute_async(&pipeline, &work_dir).await;
+        assert!(result.is_err(), "兄弟失败后执行必须返回 Err");
+
+        // 任务终态：Failed（而非永久 Running）
+        assert!(matches!(runner.task_status(), TaskStatus::Failed(_)));
+        let tasks = runner.list_tasks();
+        assert!(matches!(tasks[0].status, TaskStatus::Failed(_)));
+        let detail = runner.get_task_detail(&tasks[0].id).unwrap();
+        assert!(
+            detail.nodes.iter().all(|n| n.state != "running"),
+            "不允许残留 Running 节点: {:?}",
+            detail.nodes
+        );
+        assert!(matches!(
+            runner.node_status("input"),
+            Some(NodeState::Completed { .. })
+        ));
+        assert!(matches!(runner.node_status("bad"), Some(NodeState::Failed { .. })));
+        // good 要么在 bad 失败前已完成、要么被置 Skipped —— 绝不 Running/Pending
+        let good = runner.node_status("good").expect("good 节点存在");
+        assert!(
+            matches!(good, NodeState::Completed { .. } | NodeState::Skipped),
+            "good 应为 Skipped 或 Completed（实际: {good:?}）"
+        );
+
+        cleanup_dir(&work_dir);
+    }
+
+    // ─── P3：协作取消标志终结后清位 ────────────────────────────────────────
+
+    /// 取消标志复用回归（P3）：预置取消 → 首次任务 Cancelled 且标志被清位；
+    /// 复用同一 runner + 同一标志再次执行 → 不应被残留标志立即取消，正常完成。
+    #[tokio::test]
+    async fn test_cancel_flag_cleared_after_task_termination() {
+        let work_dir = temp_work_dir("cancel-clear");
+        let input_file = work_dir.join("source.txt");
+        let output_file = work_dir.join("out.txt");
+        std::fs::write(&input_file, "first run").unwrap();
+
+        let toml_str = format!(
+            r#"
+[pipeline]
+id = "test-cancel-clear"
+name = "Cancel Clear Test"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = {{ path = "{}" }}
+
+[[nodes]]
+id = "output"
+kind = "builtin"
+builtin = "file_output"
+params = {{ path = "{}" }}
+
+[[edges]]
+from = ["input", "output"]
+to = ["output", "input"]
+"#,
+            input_file.to_string_lossy().replace('\\', "/"),
+            output_file.to_string_lossy().replace('\\', "/"),
+        );
+        let pipeline = Pipeline::from_toml_str(&toml_str).unwrap();
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut runner = PipelineRunnerImpl::new(work_dir.clone());
+        runner.set_cancel_flag(flag.clone());
+
+        let result = runner.execute_async(&pipeline, &work_dir).await;
+        assert!(result.is_err(), "预置取消应使首次执行失败");
+        assert_eq!(*runner.task_status(), TaskStatus::Cancelled);
+        assert!(
+            !flag.load(std::sync::atomic::Ordering::SeqCst),
+            "任务终结后取消标志应被清位"
+        );
+
+        // 复用同一 runner 与标志再次执行 → 不应被残留标志立即取消
+        std::fs::write(&input_file, "second run").unwrap();
+        let result2 = runner.execute_async(&pipeline, &work_dir).await;
+        assert!(result2.is_ok(), "清位后后续任务不应被立即取消: {result2:?}");
+        assert_eq!(*runner.task_status(), TaskStatus::Completed);
+        assert!(output_file.exists(), "第二次执行应正常产出");
+
+        cleanup_dir(&work_dir);
+    }
+
+    // ─── P1：list_tasks 产物汇总 ───────────────────────────────────────────
+
+    /// 产物汇总回归（P1）：file_input → file_output 完成后，
+    /// TaskSummary.artifacts 应汇总已完成节点的文件产物（node_id, 路径），
+    /// 而非硬编码空 Vec。
+    #[tokio::test]
+    async fn test_list_tasks_artifacts_aggregated() {
+        let work_dir = temp_work_dir("artifacts");
+        let input_file = work_dir.join("source.txt");
+        let output_file = work_dir.join("output.txt");
+        std::fs::write(&input_file, "artifact test").unwrap();
+
+        let toml_str = format!(
+            r#"
+[pipeline]
+id = "test-artifacts"
+name = "Artifacts Test"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = {{ path = "{}" }}
+
+[[nodes]]
+id = "output"
+kind = "builtin"
+builtin = "file_output"
+params = {{ path = "{}" }}
+
+[[edges]]
+from = ["input", "output"]
+to = ["output", "input"]
+"#,
+            input_file.to_string_lossy().replace('\\', "/"),
+            output_file.to_string_lossy().replace('\\', "/"),
+        );
+        let pipeline = Pipeline::from_toml_str(&toml_str).unwrap();
+        let mut runner = PipelineRunnerImpl::new(work_dir.clone());
+
+        let result = runner.execute_async(&pipeline, &work_dir).await;
+        assert!(result.is_ok());
+
+        let summary = &runner.list_tasks()[0];
+        assert_eq!(summary.artifacts.len(), 2, "两个节点各产出一个文件产物");
+        let input_art = summary
+            .artifacts
+            .iter()
+            .find(|(id, _)| id == "input")
+            .expect("应含 input 产物");
+        let output_art = summary
+            .artifacts
+            .iter()
+            .find(|(id, _)| id == "output")
+            .expect("应含 output 产物");
+        assert!(input_art.1.is_file(), "input 产物文件应存在");
+        assert!(output_art.1.is_file(), "output 产物文件应存在");
 
         cleanup_dir(&work_dir);
     }

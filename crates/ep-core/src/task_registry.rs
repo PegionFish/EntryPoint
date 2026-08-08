@@ -213,6 +213,22 @@ impl TaskRegistry {
                 record.finished_at = Some(Utc::now());
             }
             record.queue_position = None;
+            // P2：文件名（`{task_id}.json`）与 record.id 必须一致——不一致时
+            // 以文件名 key 为准重写 record.id，否则该记录会丢失（如 x.json 内
+            // 声明 id=y 时，查询 get("x") 落空且可能被 y.json 覆盖）
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if !stem.is_empty() && record.id != stem {
+                tracing::warn!(
+                    file = %path.display(),
+                    record_id = %record.id,
+                    "task record id does not match its filename; rewriting id to match filename"
+                );
+                record.id = stem;
+            }
             // 内存优先：冲突时不覆盖
             self.records.entry(record.id.clone()).or_insert(record);
         }
@@ -500,6 +516,28 @@ mod tests {
         let reg = TaskRegistry::load(&dir);
         assert_eq!(reg.len(), 1);
         assert!(reg.get("task-good").is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2：文件名为 `{task_id}.json`，与 record.id 不一致时以文件名 key 为准
+    /// 重写 record.id（否则记录丢失：x.json 内声明 id=y 时 get("x") 落空）。
+    #[test]
+    fn load_rewrites_record_id_to_match_filename() {
+        let dir = temp_dir("mismatch");
+        let mut r = record("mismatched-id", "p", TaskState::Completed);
+        r.finished_at = Some(r.started_at);
+        std::fs::write(
+            dir.join("file-x.json"),
+            serde_json::to_vec_pretty(&r).unwrap(),
+        )
+        .unwrap();
+
+        let reg = TaskRegistry::load(&dir);
+        assert_eq!(reg.len(), 1, "不一致记录不应丢失");
+        assert!(reg.get("file-x").is_some(), "应以文件名 key 索引");
+        assert!(reg.get("mismatched-id").is_none(), "原 record.id 不应再被索引");
+        assert_eq!(reg.get("file-x").unwrap().id, "file-x", "record.id 应重写为文件名");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
