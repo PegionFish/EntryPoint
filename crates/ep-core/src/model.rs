@@ -3,15 +3,16 @@
 //! 负责模型缓存目录管理、元数据读写、下载命令构建。
 //! 不实际执行下载（只构建命令），实际执行由 ProcessManager / UI 层驱动。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::process::Child;
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{broadcast, oneshot, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::config::{AppConfig, ModelsConfig, NetworkConfig};
@@ -20,6 +21,15 @@ use crate::module::manifest::{ModelDecl, ModelSource, ModuleManifest};
 // ─── 常量 ────────────────────────────────────────────────────────────────────
 
 const META_FILE_NAME: &str = ".ep_meta.json";
+
+/// 下载监督任务总时长上限（秒）：超时 kill 下载子进程并清理临时文件（P1）
+const DOWNLOAD_MAX_DURATION_SECS: u64 = 30 * 60;
+/// 下载临时文件基名（生成的 python 与 Rust 侧取消/超时路径共知，P1 清理用）
+const DOWNLOAD_TEMP_FILE: &str = "_download.tar.gz";
+/// 解压总量上限（字节）：防御 tar 炸弹（P1，与项目模型规模匹配）
+const EXTRACT_MAX_BYTES: u64 = 50 * 1024 * 1024 * 1024;
+/// 解压条目数上限：防御条目海量 tar（P1）
+const EXTRACT_MAX_ENTRIES: u64 = 100_000;
 
 // ─── ModelMeta ───────────────────────────────────────────────────────────────
 
@@ -212,7 +222,12 @@ pub struct ModelManager {
     default_source: String,
     /// 本地模型缓存搜索路径（按优先级排序）
     cache_paths: Vec<PathBuf>,
-    /// 当前正在执行的下载子进程（用于取消）
+    /// 当前正在执行的下载子进程（用于取消）。
+    ///
+    /// 单槽位限制（P2，文档化）：同一实例并发多次 `execute_download*` 会
+    /// 覆盖此句柄，`cancel_download` 只能取消最后一次提交的进程。带进度下载
+    /// 不受影响（取消走各自独立的 `DownloadHandle`）。保留单槽位设计——
+    /// 结构字段冻结，阻塞式下载的并发建议由调用方串行化。
     download_child: Option<Child>,
     /// 网络代理配置（更新检查 HTTP 客户端使用）
     network: NetworkConfig,
@@ -338,6 +353,8 @@ impl ModelManager {
 
     /// 写入模型的 `.ep_meta.json` 元数据
     pub fn write_meta(&self, target_dir: &str, meta: &ModelMeta) -> Result<()> {
+        // target_dir 校验（P1）：拒绝路径穿越与非法字符，违规返回错误
+        validate_target_dir(target_dir)?;
         let dir = self.model_dir(target_dir);
         write_meta_to_dir(&dir, meta)
     }
@@ -369,12 +386,19 @@ impl ModelManager {
             }
             ModelSource::Url => model.url.clone().unwrap_or_default(),
         };
-        let python_code = self.gen_download_code(
-            model.source,
-            &location,
-            model.revision.as_deref(),
-            &local_dir_str,
-        );
+        // 校验失败（本 pub 签名无法返回 Result）时生成"报错退出"的占位脚本，
+        // 绝不把非法输入（target_dir 穿越 / 注入字符）拼进可执行 python 代码
+        let python_code = match validate_target_dir(&model.target_dir).and_then(|()| {
+            self.gen_download_code(
+                model.source,
+                &location,
+                model.revision.as_deref(),
+                &local_dir_str,
+            )
+        }) {
+            Ok(code) => code,
+            Err(e) => download_error_stub(&format!("invalid model download source: {e:#}")),
+        };
 
         let program = venv_python.to_string_lossy().to_string();
         let args = vec!["-c".to_string(), python_code];
@@ -401,15 +425,14 @@ impl ModelManager {
     ) -> Result<(String, Vec<String>)> {
         let (resolved_source, location, revision) = model.resolve(source)?;
 
+        // target_dir 校验（P1）：恶意/损坏 manifest 的 "../x" 不得写出缓存根
+        validate_target_dir(&model.target_dir)?;
+
         let local_dir = self.model_dir(&model.target_dir);
         let local_dir_str = local_dir.to_string_lossy().replace('\\', "/");
 
-        let python_code = self.gen_download_code(
-            resolved_source,
-            &location,
-            revision.as_deref(),
-            &local_dir_str,
-        );
+        let python_code =
+            self.gen_download_code(resolved_source, &location, revision.as_deref(), &local_dir_str)?;
 
         let program = venv_python.to_string_lossy().to_string();
         let args = vec!["-c".to_string(), python_code];
@@ -425,16 +448,20 @@ impl ModelManager {
     }
 
     /// 生成下载用的 python -c 代码
+    ///
+    /// 所有拼进单引号 Python 字符串字面量的值都经 [`escape_py_str`] 转义，
+    /// 并做字符集/协议校验（P0 注入防护）；返回 Err 时调用方应放弃执行。
     fn gen_download_code(
         &self,
         source: ModelSource,
         location: &str,
         revision: Option<&str>,
         local_dir_str: &str,
-    ) -> String {
+    ) -> Result<String> {
         match source {
             ModelSource::Huggingface => {
                 let repo_id = location;
+                validate_repo_id(repo_id)?;
                 let revision = revision.unwrap_or("main");
 
                 let mut parts: Vec<String> = Vec::new();
@@ -443,26 +470,31 @@ impl ModelManager {
                 if !self.hf_endpoint.is_empty() {
                     parts.push(format!(
                         "import os; os.environ['HF_ENDPOINT']='{}'",
-                        self.hf_endpoint
+                        escape_py_str(&self.hf_endpoint)
                     ));
                 }
 
                 parts.push("from huggingface_hub import snapshot_download".to_string());
                 parts.push(format!(
                     "snapshot_download(repo_id='{}', local_dir='{}', revision='{}')",
-                    repo_id, local_dir_str, revision
+                    escape_py_str(repo_id),
+                    escape_py_str(local_dir_str),
+                    escape_py_str(revision),
                 ));
 
-                parts.join("; ")
+                Ok(parts.join("; "))
             }
             ModelSource::Modelscope => {
                 let repo_id = location;
+                validate_repo_id(repo_id)?;
                 let revision = revision.unwrap_or("master");
 
-                format!(
+                Ok(format!(
                     "from modelscope import snapshot_download; snapshot_download('{}', local_dir='{}', revision='{}')",
-                    repo_id, local_dir_str, revision
-                )
+                    escape_py_str(repo_id),
+                    escape_py_str(local_dir_str),
+                    escape_py_str(revision),
+                ))
             }
             ModelSource::Url => {
                 let url = location;
@@ -470,54 +502,85 @@ impl ModelManager {
                 if url == "auto" {
                     // 模块自行管理模型下载（如 PaddleOCR 首次运行时自动下载）
                     // 生成一个空操作命令，标记为已就绪
-                    format!(
+                    Ok(format!(
                         "import os; os.makedirs('{}', exist_ok=True); print('auto-download model: skipped (managed by module)')",
-                        local_dir_str
-                    )
-                } else if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
-                    // 下载 .tar.gz 并解压到目标目录；随后展平包装目录：
-                    // 若解压结果只含单个顶层目录（如 df3 的 tmp/export/ 嵌套
-                    // 打包），逐层上提内容，使模型文件直接落在 target_dir 下。
-                    // 多行代码（python -c 参数支持换行）：展平循环需要 def/while。
-                    format!(
-                        "import urllib.request, tarfile, os, shutil\n\
-                         os.makedirs('{dir}', exist_ok=True)\n\
-                         tmp = os.path.join('{dir}', '_download.tar.gz')\n\
-                         print('Downloading {url} ...')\n\
-                         urllib.request.urlretrieve('{url}', tmp)\n\
-                         print('Extracting...')\n\
-                         t = tarfile.open(tmp); t.extractall('{dir}'); t.close()\n\
-                         os.remove(tmp)\n\
-                         def _ep_flatten(d):\n\
-                         \x20   while True:\n\
-                         \x20       entries = [e for e in os.listdir(d) if not e.startswith('.') and e != '_download.tar.gz']\n\
-                         \x20       if len(entries) != 1:\n\
-                         \x20           break\n\
-                         \x20       inner = os.path.join(d, entries[0])\n\
-                         \x20       if not os.path.isdir(inner):\n\
-                         \x20           break\n\
-                         \x20       for name in os.listdir(inner):\n\
-                         \x20           shutil.move(os.path.join(inner, name), os.path.join(d, name))\n\
-                         \x20       os.rmdir(inner)\n\
-                         _ep_flatten('{dir}')\n\
-                         print('Done.')",
-                        dir = local_dir_str,
-                        url = url
-                    )
+                        escape_py_str(local_dir_str)
+                    ))
                 } else {
-                    // 单文件下载（.onnx 等）
-                    let file_name = url.rsplit('/').next().unwrap_or("model.bin");
-                    format!(
-                        "import urllib.request, os; \
-                         os.makedirs('{dir}', exist_ok=True); \
-                         dst = os.path.join('{dir}', '{fname}'); \
-                         print('Downloading {url} ...'); \
-                         urllib.request.urlretrieve('{url}', dst); \
-                         print('Done.')",
-                        dir = local_dir_str,
-                        fname = file_name,
-                        url = url
-                    )
+                    validate_url(url)?;
+                    if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
+                        // 下载 .tar.gz 并安全解压到目标目录（P1 zip-slip 防护）：
+                        // 逐成员校验（拒绝绝对路径 / `..` 穿越 / 符号链接），并设
+                        // 总量与条目数上限；随后展平包装目录（df3 的 tmp/export/
+                        // 嵌套打包），使模型文件直接落在 target_dir 下。
+                        // try/finally 保证临时包 `_download.tar.gz` 失败时也被清理。
+                        // 多行代码（python -c 参数支持换行）：解压校验循环与
+                        // 展平循环需要 def/for/while。Python 3.10+ 兼容
+                        // （不用 3.12 新增的 tarfile extractall filter= 参数）。
+                        Ok(format!(
+                            "import urllib.request, tarfile, os, shutil\n\
+                             os.makedirs('{dir}', exist_ok=True)\n\
+                             tmp = os.path.join('{dir}', '_download.tar.gz')\n\
+                             def _ep_flatten(d):\n\
+                             \x20   while True:\n\
+                             \x20   \x20   entries = [e for e in os.listdir(d) if not e.startswith('.') and e != '_download.tar.gz']\n\
+                             \x20   \x20   if len(entries) != 1:\n\
+                             \x20   \x20   \x20   break\n\
+                             \x20   \x20   inner = os.path.join(d, entries[0])\n\
+                             \x20   \x20   if not os.path.isdir(inner):\n\
+                             \x20   \x20   \x20   break\n\
+                             \x20   \x20   for name in os.listdir(inner):\n\
+                             \x20   \x20   \x20   shutil.move(os.path.join(inner, name), os.path.join(d, name))\n\
+                             \x20   \x20   os.rmdir(inner)\n\
+                             try:\n\
+                             \x20   print('Downloading {url} ...')\n\
+                             \x20   urllib.request.urlretrieve('{url}', tmp)\n\
+                             \x20   print('Extracting...')\n\
+                             \x20   t = tarfile.open(tmp)\n\
+                             \x20   base = os.path.abspath('{dir}')\n\
+                             \x20   total = 0\n\
+                             \x20   count = 0\n\
+                             \x20   for m in t.getmembers():\n\
+                             \x20   \x20   name = m.name.replace('\\\\', '/')\n\
+                             \x20   \x20   if not name or name == '.' or name.startswith('/') or os.path.isabs(m.name):\n\
+                             \x20   \x20   \x20   raise RuntimeError('unsafe tar entry: ' + repr(m.name))\n\
+                             \x20   \x20   tgt = os.path.abspath(os.path.join(base, name))\n\
+                             \x20   \x20   if os.path.commonpath([base, tgt]) != base:\n\
+                             \x20   \x20   \x20   raise RuntimeError('unsafe tar entry: ' + repr(m.name))\n\
+                             \x20   \x20   if m.issym() or m.islnk():\n\
+                             \x20   \x20   \x20   continue\n\
+                             \x20   \x20   if count >= {max_entries} or total + max(m.size, 0) > {max_bytes}:\n\
+                             \x20   \x20   \x20   raise RuntimeError('extract limits exceeded')\n\
+                             \x20   \x20   count += 1\n\
+                             \x20   \x20   total += max(m.size, 0)\n\
+                             \x20   \x20   t.extract(m, base)\n\
+                             \x20   t.close()\n\
+                             \x20   os.remove(tmp)\n\
+                             \x20   _ep_flatten('{dir}')\n\
+                             \x20   print('Done.')\n\
+                             finally:\n\
+                             \x20   if os.path.exists(tmp):\n\
+                             \x20   \x20   os.remove(tmp)",
+                            dir = escape_py_str(local_dir_str),
+                            url = escape_py_str(url),
+                            max_bytes = EXTRACT_MAX_BYTES,
+                            max_entries = EXTRACT_MAX_ENTRIES,
+                        ))
+                    } else {
+                        // 单文件下载（.onnx 等）：文件名剥离 query/fragment 并清洗
+                        let file_name = sanitize_file_name(url);
+                        Ok(format!(
+                            "import urllib.request, os; \
+                             os.makedirs('{dir}', exist_ok=True); \
+                             dst = os.path.join('{dir}', '{fname}'); \
+                             print('Downloading {url} ...'); \
+                             urllib.request.urlretrieve('{url}', dst); \
+                             print('Done.')",
+                            dir = escape_py_str(local_dir_str),
+                            fname = escape_py_str(&file_name),
+                            url = escape_py_str(url),
+                        ))
+                    }
                 }
             }
         }
@@ -725,6 +788,15 @@ impl ModelManager {
             self.build_download_command_with_source(model, venv_python, source)?;
         let (resolved_source, location, revision) = model.resolve(source)?;
 
+        // 下载并发闸（P2）：按 config.models.max_concurrent_downloads 限流，
+        // 持 permit 直至本函数结束（子进程回收后归还）
+        let _gate_permit = model_download_gate(config.models.max_concurrent_downloads)
+            .acquire_owned()
+            .await
+            .context("failed to acquire download concurrency slot")?;
+
+        let target_dir_path = self.model_dir(&model.target_dir);
+
         info!(
             model_id = %model.id,
             program = %program,
@@ -749,9 +821,16 @@ impl ModelManager {
 
         // Wait for the download to complete
         if let Some(child) = self.download_child.take() {
-            let output = child.wait_with_output().await.with_context(|| {
-                format!("failed to wait for download of model '{}'", model.id)
-            })?;
+            let output = match child.wait_with_output().await {
+                Ok(output) => output,
+                Err(e) => {
+                    // P1：等待失败时清理已知临时文件（python 侧可能来不及清理）
+                    cleanup_download_temp_files(&target_dir_path);
+                    return Err(e).with_context(|| {
+                        format!("failed to wait for download of model '{}'", model.id)
+                    });
+                }
+            };
 
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -764,6 +843,8 @@ impl ModelManager {
             }
 
             if !output.status.success() {
+                // P1：失败时清理已知临时文件（python try/finally 的兜底）
+                cleanup_download_temp_files(&target_dir_path);
                 anyhow::bail!(
                     "download of model '{}' failed with exit code {:?}: {}",
                     model.id,
@@ -776,7 +857,6 @@ impl ModelManager {
         }
 
         // 成功后写入下载元数据
-        let target_dir_path = self.model_dir(&model.target_dir);
         let total_size = dir_total_size(&target_dir_path);
         let module_id = module_dir
             .file_name()
@@ -808,6 +888,12 @@ impl ModelManager {
     }
 
     /// 取消正在进行的下载（kill 进程）
+    ///
+    /// 单槽位限制（P2，文档化）：`download_child` 只能记录最近一次提交的
+    /// 下载进程，同一实例并发多次阻塞式 `execute_download*` 时只能取消
+    /// 最后一次；带进度下载（`execute_download_with_progress`）不受影响——
+    /// 其取消走各自独立的 `DownloadHandle`。阻塞式下载建议由调用方串行化
+    /// （与 daemon 层并发闸 P2-1 语义一致）。
     pub async fn cancel_download(&mut self) {
         if let Some(mut child) = self.download_child.take() {
             info!("cancelling model download");
@@ -961,9 +1047,11 @@ impl ModelManager {
                 return Some(candidate);
             }
 
-            // 模糊匹配: 遍历 cache_path 下的子目录，查找名称包含 target_dir 关键词的目录
-            // 例如 target_dir = "faster-whisper-large-v3"，
-            // 可以匹配 "models--Systran--faster-whisper-large-v3"
+            // 精确匹配（P2）：遍历 cache_path 下的子目录，目录名 == target_dir，
+            // 或命中 HF 缓存布局 `models--org--name`（末段 == target_dir）。
+            // 完整路径段比较，杜绝 "qwen" 子串误中 "qwen3-asr" 的误匹配。
+            // 例如 target_dir = "faster-whisper-large-v3" 可精确命中
+            // "models--Systran--faster-whisper-large-v3"。
             if let Ok(entries) = fs::read_dir(cache_path) {
                 for entry in entries.flatten() {
                     let entry_path = entry.path();
@@ -971,11 +1059,13 @@ impl ModelManager {
                         continue;
                     }
                     if let Some(dir_name) = entry_path.file_name().and_then(|n| n.to_str()) {
-                        if dir_name.contains(target_dir) && self.dir_has_files(&entry_path) {
+                        if model_dir_name_matches(dir_name, target_dir)
+                            && self.dir_has_files(&entry_path)
+                        {
                             debug!(
                                 target_dir = %target_dir,
                                 found_at = %entry_path.display(),
-                                "model found via fuzzy match in local cache path"
+                                "model found via exact name match in local cache path"
                             );
                             return Some(entry_path);
                         }
@@ -1058,6 +1148,9 @@ impl ModelManager {
             );
         }
 
+        // target_dir 校验（P1）：恶意/损坏 manifest 的 "../x" 不得写出缓存根
+        validate_target_dir(target_dir_name)?;
+
         let target_dir = self.model_dir(target_dir_name);
 
         info!(
@@ -1102,10 +1195,47 @@ impl ModelManager {
         Ok(())
     }
 
-    /// 递归复制目录，返回 (文件数, 总字节数)
+    /// 递归复制目录，返回 (文件数, 总字节数)。
+    ///
+    /// 安全规则（P2）：符号链接一律跳过（用 symlink_metadata 判定、不跟随，
+    /// 与 [`dir_total_size`] 语义一致）；以 canonical 路径跟踪已访问目录，
+    /// 检测源目录环（junction / 绑定挂载）并报错，杜绝无限递归。
+    /// 顶层 src 若为符号链接则解析到真实目录（用户显式指定的可信入口）。
     async fn copy_dir_recursive(&self, src: &Path, dst: &Path) -> Result<(usize, u64)> {
+        let mut visited = HashSet::new();
+        let resolved = fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
+        self.copy_dir_recursive_inner(&resolved, dst, &mut visited)
+            .await
+    }
+
+    /// `copy_dir_recursive` 的实际实现（共享 visited 集合防环）
+    async fn copy_dir_recursive_inner(
+        &self,
+        src: &Path,
+        dst: &Path,
+        visited: &mut HashSet<PathBuf>,
+    ) -> Result<(usize, u64)> {
         let mut file_count: usize = 0;
         let mut total_bytes: u64 = 0;
+
+        // 符号链接不跟随（与 dir_total_size 的 symlink_metadata 用法对齐）
+        match fs::symlink_metadata(src) {
+            Ok(m) if m.file_type().is_symlink() => {
+                debug!(src = %src.display(), "skipping symlink while importing");
+                return Ok((0, 0));
+            }
+            Ok(_) => {}
+            Err(e) => anyhow::bail!("failed to stat {}: {e}", src.display()),
+        }
+
+        // canonical 路径防环：同一真实目录重复访问（junction/绑定挂载）→ 报错
+        let canonical = fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
+        if !visited.insert(canonical) {
+            anyhow::bail!(
+                "directory cycle detected while importing at {}",
+                src.display()
+            );
+        }
 
         let mut entries = tokio::fs::read_dir(src)
             .await
@@ -1116,16 +1246,33 @@ impl ModelManager {
             let file_name = entry.file_name();
             let dst_path = dst.join(&file_name);
 
-            if src_path.is_dir() {
+            // symlink_metadata：不跟随符号链接
+            let meta = match tokio::fs::symlink_metadata(&src_path).await {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(
+                        path = %src_path.display(),
+                        error = %e,
+                        "skipping unreadable entry while importing"
+                    );
+                    continue;
+                }
+            };
+            if meta.file_type().is_symlink() {
+                debug!(src = %src_path.display(), "skipping symlink while importing");
+                continue;
+            }
+
+            if meta.file_type().is_dir() {
                 tokio::fs::create_dir_all(&dst_path).await.with_context(|| {
                     format!("failed to create dir {}", dst_path.display())
                 })?;
                 let (sub_count, sub_bytes) =
-                    Box::pin(self.copy_dir_recursive(&src_path, &dst_path)).await?;
+                    Box::pin(self.copy_dir_recursive_inner(&src_path, &dst_path, visited)).await?;
                 file_count += sub_count;
                 total_bytes += sub_bytes;
             } else {
-                let file_size = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
+                let file_size = meta.len();
 
                 debug!(
                     file = %src_path.display(),
@@ -1281,6 +1428,140 @@ impl ModelManager {
     }
 }
 
+// ─── 下载代码安全辅助（P0/P1/P2）────────────────────────────────────────────
+
+/// 转义 Python 单引号字符串字面量中的特殊字符（`\`、`'`、换行等）。
+///
+/// `gen_download_code` 中所有拼进单引号字符串的值必须经此转义，
+/// 防止 repo_id/url/路径含引号或换行时注入 Python 代码。
+fn escape_py_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// repo_id 字符集校验：仅允许 `[A-Za-z0-9/._-]`（HF/ModelScope 仓库 ID 规范）。
+fn validate_repo_id(repo_id: &str) -> Result<()> {
+    let ok = !repo_id.is_empty()
+        && repo_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'));
+    if !ok {
+        anyhow::bail!("invalid repo_id '{repo_id}': only [A-Za-z0-9/._-] allowed");
+    }
+    Ok(())
+}
+
+/// URL 校验：协议必须为 http/https，字符集限于 URL 合法字符（含 % 编码与 ?&=）。
+fn validate_url(url: &str) -> Result<()> {
+    let lower = url.to_ascii_lowercase();
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+        anyhow::bail!("invalid url '{url}': only http/https protocol allowed");
+    }
+    let charset_ok = url.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                '/' | '.' | '_' | '-' | '%' | '?' | '&' | '=' | ':' | '#' | '@' | '~' | '+'
+                    | '!' | '*' | '(' | ')' | ',' | ';'
+            )
+    });
+    if !charset_ok {
+        anyhow::bail!("invalid url '{url}': contains characters outside URL charset");
+    }
+    Ok(())
+}
+
+/// target_dir 校验：仅允许单段安全目录名（`[A-Za-z0-9._-]`），
+/// 拒绝路径分隔、`..` 穿越与空值（P1：恶意/损坏 manifest 写出缓存根）。
+fn validate_target_dir(target_dir: &str) -> Result<()> {
+    if target_dir.is_empty() {
+        anyhow::bail!("invalid target_dir: empty");
+    }
+    if target_dir == "." || target_dir == ".." {
+        anyhow::bail!("invalid target_dir '{target_dir}': path traversal");
+    }
+    if target_dir.contains('/') || target_dir.contains('\\') {
+        anyhow::bail!(
+            "invalid target_dir '{target_dir}': must be a single directory segment"
+        );
+    }
+    if !target_dir
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        anyhow::bail!("invalid target_dir '{target_dir}': only [A-Za-z0-9._-] allowed");
+    }
+    Ok(())
+}
+
+/// 从 URL 提取并清洗单文件下载的目标文件名（P2）。
+///
+/// 剥离 query/fragment，尾段做安全清洗（非法字符替换为 `_`）；
+/// 空/`.`/`..`/过长时回退 `model.bin`。
+fn sanitize_file_name(url: &str) -> String {
+    let path_part = url.split(['?', '#']).next().unwrap_or("");
+    let tail = path_part.rsplit('/').next().unwrap_or("");
+    let cleaned: String = tail
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_end_matches(['.', ' ']);
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." || cleaned.len() > 200 {
+        "model.bin".to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+/// 构建命令无法返回 Result 时（`build_download_command` pub 签名冻结），
+/// 对非法输入生成"报错退出"的占位 python 脚本，绝不执行注入内容。
+fn download_error_stub(message: &str) -> String {
+    format!(
+        "import sys; sys.stderr.write('{}'); sys.exit(1)",
+        escape_py_str(message)
+    )
+}
+
+/// 本地缓存目录名与 target_dir 的精确匹配（完整路径段比较，P2）：
+/// 目录名 == target_dir，或 HF 缓存布局 `models--org--name` 的末段 == target_dir。
+/// 杜绝 "qwen" 子串误中 "qwen3-asr" 这类误匹配。
+fn model_dir_name_matches(dir_name: &str, target_dir: &str) -> bool {
+    dir_name == target_dir || dir_name.ends_with(&format!("--{target_dir}"))
+}
+
+/// 清理下载产生的已知临时文件（`_download.tar.gz`）。
+///
+/// 取消/超时/失败路径调用；python 侧 try/finally 是主清理，
+/// 这里是 kill 无法触发 finally 时的兜底（P1）。
+fn cleanup_download_temp_files(dir: &Path) {
+    let tmp = dir.join(DOWNLOAD_TEMP_FILE);
+    if let Err(e) = fs::remove_file(&tmp) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            debug!(
+                path = %tmp.display(),
+                error = %e,
+                "failed to remove download temp file"
+            );
+        }
+    }
+}
+
 // ─── active_models 单槽位（§5.2）────────────────────────────────────────────
 
 /// 解析模块当前激活的模型变体 id — 版本单槽位语义（§5.2，冻结）。
@@ -1321,6 +1602,30 @@ pub fn active_model_for<'a>(config: &AppConfig, manifest: &'a ModuleManifest) ->
 }
 
 // ─── DownloadHandle 与下载监督任务 ──────────────────────────────────────────
+
+/// 下载并发闸（P2）：按 `max_concurrent_downloads` 懒构建的进程级信号量。
+///
+/// 阻塞式下载入口 [`ModelManager::execute_download_with_source`] 在 spawn
+/// 前 `acquire_owned` 并持至函数结束；带进度入口 `execute_download_with_progress`
+/// 不加闸——daemon 层已有同款闸门（P2-1，见 ep-daemon models.rs `download_gate`），
+/// 重复加闸存在"释放顺序竞态"导致排队下载被误杀的风险。
+/// `max_concurrent_downloads` 运行时变更 → 按新值懒重建；0 按 1 处理。
+static MODEL_DOWNLOAD_GATE: std::sync::Mutex<Option<(u32, Arc<Semaphore>)>> =
+    std::sync::Mutex::new(None);
+
+/// 获取（懒构建/重建）下载并发闸信号量
+fn model_download_gate(max_concurrent: u32) -> Arc<Semaphore> {
+    let max = max_concurrent.max(1);
+    let mut guard = MODEL_DOWNLOAD_GATE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((current, sem)) = guard.as_ref() {
+        if *current == max {
+            return sem.clone();
+        }
+    }
+    let sem = Arc::new(Semaphore::new(max as usize));
+    *guard = Some((max, sem.clone()));
+    sem
+}
 
 /// 带进度下载的句柄：进度订阅 + 完成等待 + 取消。
 ///
@@ -1464,9 +1769,31 @@ async fn supervise_download(
     };
 
     let mut interval = tokio::time::interval(Duration::from_secs(2));
+    // 总时长上限（P1）：超时 kill 下载子进程并清理已知临时文件
+    let deadline = tokio::time::sleep(Duration::from_secs(DOWNLOAD_MAX_DURATION_SECS));
+    tokio::pin!(deadline);
 
     loop {
         tokio::select! {
+            _ = &mut deadline => {
+                info!(
+                    model_id = %model_id,
+                    duration_secs = DOWNLOAD_MAX_DURATION_SECS,
+                    "download exceeded max duration, killing child"
+                );
+                let _ = child.start_kill();
+                let _ = child.wait().await; // 回收子进程
+                // P1：kill 无法触发 python try/finally，这里兜底清理临时文件
+                cleanup_download_temp_files(&poll_dir);
+                let msg = format!(
+                    "download exceeded the {} minute time limit and was aborted",
+                    DOWNLOAD_MAX_DURATION_SECS / 60
+                );
+                let bytes = dir_total_size(&poll_dir);
+                emit(compute_percent(bytes, size_estimate_mb), bytes, DownloadState::Failed(msg.clone()));
+                let _ = done_tx.send(Err(msg));
+                return;
+            }
             _ = interval.tick() => {
                 let bytes = dir_total_size(&poll_dir);
                 emit(compute_percent(bytes, size_estimate_mb), bytes, DownloadState::Downloading);
@@ -1475,6 +1802,8 @@ async fn supervise_download(
                 info!(model_id = %model_id, "cancelling tracked model download");
                 let _ = child.start_kill();
                 let _ = child.wait().await; // 回收子进程
+                // P1：kill 无法触发 python try/finally，这里兜底清理临时文件
+                cleanup_download_temp_files(&poll_dir);
                 let bytes = dir_total_size(&poll_dir);
                 emit(compute_percent(bytes, size_estimate_mb), bytes, DownloadState::Cancelled);
                 let _ = done_tx.send(Err("download cancelled".to_string()));
@@ -1501,6 +1830,8 @@ async fn supervise_download(
                         return;
                     }
                     Ok(status) => {
+                        // P1：失败兜底清理（python try/finally 通常已完成清理）
+                        cleanup_download_temp_files(&poll_dir);
                         let summary = {
                             let q = stderr_tail.lock().unwrap_or_else(|e| e.into_inner());
                             let skip = q.len().saturating_sub(10);
@@ -1522,6 +1853,7 @@ async fn supervise_download(
                         return;
                     }
                     Err(e) => {
+                        cleanup_download_temp_files(&poll_dir);
                         let msg = format!("failed to wait for download process: {e}");
                         emit(0.0, 0, DownloadState::Failed(msg.clone()));
                         let _ = done_tx.send(Err(msg));
@@ -2174,7 +2506,7 @@ mod tests {
         assert!(code.contains("url-model"), "target dir must appear: {code}");
     }
 
-    /// .tar.gz / .tgz URL → 下载 + 解压 + 清理临时包
+    /// .tar.gz / .tgz URL → 下载 + 安全解压 + 清理临时包
     #[test]
     fn test_gen_download_code_url_tar_gz_extract() {
         let mgr = ModelManager::new(&test_config("models"), Path::new("G:/EntryPoint"));
@@ -2184,9 +2516,20 @@ mod tests {
 
         assert!(code.contains("import urllib.request, tarfile"), "code: {code}");
         assert!(code.contains(&format!("urlretrieve('{url}'")), "code: {code}");
-        assert!(code.contains("extractall("), "must extract the archive: {code}");
+        // 逐成员安全解压（P1 zip-slip）：不再使用 extractall
+        assert!(!code.contains("extractall("), "must not use extractall: {code}");
+        assert!(code.contains("os.path.commonpath"), "must guard path traversal: {code}");
+        assert!(code.contains("m.issym() or m.islnk()"), "must skip symlinks: {code}");
+        assert!(code.contains("unsafe tar entry"), "must reject unsafe entries: {code}");
+        assert!(code.contains("extract limits exceeded"), "must cap size/entries: {code}");
+        assert!(
+            code.contains(&format!("> {}:", EXTRACT_MAX_BYTES)),
+            "must embed size cap: {code}"
+        );
+        // try/finally 清理临时包
         assert!(code.contains("os.remove(tmp)"), "must clean up the temp archive: {code}");
-        
+        assert!(code.contains("finally:"), "must clean up temp archive on failure: {code}");
+
         // 解压后必须展平包装目录（如 df3 的 tmp/export/ 嵌套），
         // 使模型文件直接落在 target_dir 下，adapter 无需再 rglob 兼容
         assert!(
@@ -2250,6 +2593,199 @@ mod tests {
             env_pos < import_pos,
             "HF_ENDPOINT must be set before the import: {code}"
         );
+    }
+
+    // ── P0/P1/P2 安全回归（注入转义 / 校验 / 文件名清洗 / 精确匹配）────────
+
+    #[test]
+    fn test_escape_py_str() {
+        assert_eq!(escape_py_str("plain"), "plain");
+        assert_eq!(escape_py_str("a'b"), r"a\'b");
+        assert_eq!(escape_py_str("a\\b"), r"a\\b");
+        assert_eq!(escape_py_str("a\nb"), "a\\nb");
+        assert_eq!(escape_py_str("a\r\tb"), "a\\r\\tb");
+    }
+
+    #[test]
+    fn test_gen_download_code_rejects_invalid_repo_id() {
+        let mgr = ModelManager::new(&test_config("models"), Path::new("G:/EntryPoint"));
+        // 含空格/引号/分号的 repo_id → 字符集校验拒绝（命令构建返回错误）
+        let model = ModelDecl {
+            repo_id: Some("Systran/evil'; print('pwned')".to_string()),
+            ..test_hf_model()
+        };
+        let err = mgr
+            .build_download_command_with_source(&model, Path::new("python"), None)
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid repo_id"), "err: {err}");
+    }
+
+    #[test]
+    fn test_gen_download_code_injection_becomes_error_stub() {
+        // build_download_command 无法返回 Result（pub 签名冻结）：
+        // 非法 repo_id 必须生成"报错退出"脚本，绝不把载荷拼进可执行代码
+        let mgr = ModelManager::new(&test_config("models"), Path::new("G:/EntryPoint"));
+        let model = ModelDecl {
+            repo_id: Some("Systran/evil'; import os; os.system('x')".to_string()),
+            ..test_hf_model()
+        };
+        let (_p, args) = mgr.build_download_command(&model, Path::new("python"));
+        let code = &args[1];
+        assert!(code.contains("sys.exit(1)"), "must fail closed: {code}");
+        // 载荷只允许以"已转义"形式出现在报错消息字符串内，绝不得以可执行形式出现
+        assert!(
+            !code.contains("os.system('x')"),
+            "payload must never appear as executable code: {code}"
+        );
+        assert!(
+            code.contains("os.system(\\'x\\')"),
+            "payload must be safely escaped inside a string literal: {code}"
+        );
+    }
+
+    #[test]
+    fn test_gen_download_code_escapes_path_quotes() {
+        // 合法路径可能含单引号：必须转义为 \' 而非注入
+        let mgr = ModelManager::new(&test_config("models/O'Neil"), Path::new("G:/EntryPoint"));
+        let (_p, args) = mgr.build_download_command(&test_hf_model(), Path::new("python"));
+        let code = &args[1];
+        assert!(
+            code.contains("O\\'Neil"),
+            "path quotes must be escaped: {code}"
+        );
+    }
+
+    #[test]
+    fn test_gen_download_code_url_rejects_non_http_scheme() {
+        let mgr = ModelManager::new(&test_config("models"), Path::new("G:/EntryPoint"));
+        let model = test_url_model("ftp://example.com/x.bin");
+        let err = mgr
+            .build_download_command_with_source(&model, Path::new("python"), None)
+            .unwrap_err();
+        assert!(err.to_string().contains("http"), "err: {err}");
+    }
+
+    #[test]
+    fn test_sanitize_file_name() {
+        assert_eq!(sanitize_file_name("https://x.com/a/b/net.onnx"), "net.onnx");
+        // query/fragment 剥离
+        assert_eq!(
+            sanitize_file_name("https://x.com/net.onnx?download=1#frag"),
+            "net.onnx"
+        );
+        // 非法字符替换
+        assert_eq!(sanitize_file_name("https://x.com/my file:2.bin"), "my_file_2.bin");
+        // 空尾段 / `..` 尾段回退；裸域名取尾段（旧行为保留）
+        assert_eq!(sanitize_file_name("https://x.com/"), "model.bin");
+        assert_eq!(sanitize_file_name("https://x.com/.."), "model.bin");
+        assert_eq!(sanitize_file_name("https://x.com"), "x.com");
+    }
+
+    #[test]
+    fn test_gen_download_code_url_single_file_strips_query() {
+        let mgr = ModelManager::new(&test_config("models"), Path::new("G:/EntryPoint"));
+        let url = "https://example.com/models/net.onnx?download=1#section";
+        let (_p, args) = mgr.build_download_command(&test_url_model(url), Path::new("python"));
+        let code = &args[1];
+        assert!(
+            code.contains("'net.onnx'"),
+            "query/fragment must be stripped from file name: {code}"
+        );
+    }
+
+    #[test]
+    fn test_validate_target_dir() {
+        for ok in ["model-a", "faster-whisper-large-v3", "qwen3_asr", "a.b-c"] {
+            assert!(validate_target_dir(ok).is_ok(), "should accept {ok:?}");
+        }
+        for bad in ["", ".", "..", "../x", "a/b", "a\\b", "a b", "a;b", "x/y/z"] {
+            assert!(validate_target_dir(bad).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_write_meta_rejects_traversal_target_dir() {
+        let dir = temp_dir("meta_trav");
+        let config = test_config(dir.to_str().unwrap());
+        let mgr = ModelManager::new(&config, Path::new("."));
+        let escape_name = format!("ep_escape_{}", std::process::id());
+        let err = mgr
+            .write_meta(&format!("../../{escape_name}"), &test_meta())
+            .unwrap_err();
+        assert!(err.to_string().contains("target_dir"), "err: {err}");
+        // 未写出缓存根之外
+        assert!(!dir.parent().unwrap().join(escape_name).exists());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_model_dir_name_matches() {
+        assert!(model_dir_name_matches(
+            "faster-whisper-large-v3",
+            "faster-whisper-large-v3"
+        ));
+        assert!(model_dir_name_matches(
+            "models--Systran--faster-whisper-large-v3",
+            "faster-whisper-large-v3"
+        ));
+        assert!(model_dir_name_matches("qwen3-asr", "qwen3-asr"));
+        assert!(!model_dir_name_matches("qwen3-asr-tokenizer", "qwen3-asr"));
+        assert!(!model_dir_name_matches("qwen3-asr", "qwen"));
+    }
+
+    #[test]
+    fn test_find_in_cache_paths_exact_segment_match() {
+        let dir = temp_dir("cache_exact");
+        // 子串陷阱目录：qwen3-asr-tokenizer 内含 qwen3-asr / qwen
+        let tokenizer = dir.join("qwen3-asr-tokenizer");
+        fs::create_dir_all(&tokenizer).unwrap();
+        fs::write(tokenizer.join("f.bin"), b"x").unwrap();
+        // HF 缓存布局目录（无同名普通目录）
+        let hf_layout = dir.join("models--Systran--faster-whisper-large-v3");
+        fs::create_dir_all(&hf_layout).unwrap();
+        fs::write(hf_layout.join("f.bin"), b"x").unwrap();
+
+        let mut config = test_config(dir.to_str().unwrap());
+        config.cache_paths = vec![dir.to_str().unwrap().to_string()];
+        let mgr = ModelManager::new(&config, Path::new("."));
+
+        // "qwen3-asr" 不存在 → 不得命中 "qwen3-asr-tokenizer"（旧 contains 会误中）
+        assert!(
+            mgr.find_in_cache_paths("qwen3-asr").is_none(),
+            "substring must not match qwen3-asr-tokenizer"
+        );
+        // "qwen" 也不得命中 "qwen3-asr-tokenizer"
+        assert!(mgr.find_in_cache_paths("qwen").is_none());
+        // HF 布局目录经精确末段匹配命中
+        let found = mgr
+            .find_in_cache_paths("faster-whisper-large-v3")
+            .expect("hf layout dir must match");
+        assert_eq!(
+            found.file_name().unwrap(),
+            "models--Systran--faster-whisper-large-v3"
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_cleanup_download_temp_files() {
+        let dir = temp_dir("dl_cleanup");
+        let tmp = dir.join("_download.tar.gz");
+        fs::write(&tmp, b"partial").unwrap();
+        cleanup_download_temp_files(&dir);
+        assert!(!tmp.exists(), "temp archive must be removed");
+        // 不存在时 no-op，不 panic
+        cleanup_download_temp_files(&dir);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_model_download_gate_rebuilds_on_config_change() {
+        // 同一 max 值返回同一闸门实例；max 变化后重建（与 daemon P2-1 同款语义）
+        let g2 = model_download_gate(2);
+        assert!(Arc::ptr_eq(&g2, &model_download_gate(2)));
+        let g1 = model_download_gate(1);
+        assert!(!Arc::ptr_eq(&g1, &g2));
     }
 
     // ── read_meta / write_meta 往返 ────────────────────────────────────
@@ -3098,6 +3634,68 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("not found in manifest"), "err: {err}");
 
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_copy_dir_recursive_skips_symlinks_and_cycles() {
+        // P2：源目录含指向祖先的 symlink（无限递归风险）与指向外部的 symlink：
+        // 一律跳过，不得跟随、不得死循环、不得泄出内容
+        let dir = temp_dir("copy_cycle");
+        let src = dir.join("src");
+        let sub = src.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(src.join("a.bin"), vec![0u8; 100]).unwrap();
+        // symlink 指向祖先（src 自身）
+        std::os::unix::fs::symlink(&src, sub.join("back")).unwrap();
+        // symlink 指向外部文件
+        let outside = dir.join("outside.bin");
+        fs::write(&outside, b"secret").unwrap();
+        std::os::unix::fs::symlink(&outside, sub.join("leak")).unwrap();
+
+        let mgr = ModelManager::new(&test_config(dir.to_str().unwrap()), Path::new("."));
+        let dst = dir.join("dst");
+        fs::create_dir_all(&dst).unwrap();
+        let (files, bytes) = mgr.copy_dir_recursive(&src, &dst).await.unwrap();
+
+        // 只复制 a.bin（两个 symlink 均跳过）
+        assert_eq!(files, 1, "only a.bin must be copied");
+        assert_eq!(bytes, 100);
+        assert!(dst.join("a.bin").exists());
+        assert!(
+            !dst.join("sub").join("back").exists(),
+            "ancestor symlink must not be copied"
+        );
+        assert!(
+            !dst.join("sub").join("leak").exists(),
+            "external symlink must not be copied"
+        );
+        assert!(!dst.join("outside.bin").exists(), "no content may leak out");
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_import_model_rejects_traversal_target_dir() {
+        // P1：恶意/损坏 manifest 的 target_dir="../../x" 必须被拒绝，写出缓存根
+        let dir = temp_dir("import_trav");
+        let config = test_config(dir.to_str().unwrap());
+        let mgr = ModelManager::new(&config, Path::new("."));
+        let mut model = test_hf_model();
+        model.target_dir = "../../escape_import".to_string();
+        let manifest = test_manifest_with_model(model);
+
+        let src = dir.join("src4");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("w.bin"), b"data").unwrap();
+
+        let err = mgr
+            .import_model_with_manifest("faster-whisper", "large-v3", &src, &manifest)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("target_dir"), "err: {err}");
+        let escape = std::env::temp_dir().join("escape_import");
+        assert!(!escape.exists(), "must not write outside cache root");
         cleanup(&dir);
     }
 
