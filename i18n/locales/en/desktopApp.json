@@ -110,6 +110,8 @@
   "pipeline.runTip": "After validation passes, pick an input file and submit",
   "pipeline.refreshTasks": "Tasks",
   "pipeline.refreshTasksTip": "Fetch the task list for this pipeline",
+  "pipeline.libraryTitle": "Pipeline library",
+  "pipeline.libraryLoadTip": "Click to load into the editor",
   "palette.addTip": "Click to add the node to the canvas",
   "palette.llmTip": "OpenAI-compatible LLM node (chat/completions)",
   "palette.noModules": "No module capabilities discovered",
