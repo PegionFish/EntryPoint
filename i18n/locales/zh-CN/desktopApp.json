@@ -110,6 +110,8 @@
   "pipeline.runTip": "校验通过后选择输入文件并提交执行",
   "pipeline.refreshTasks": "任务",
   "pipeline.refreshTasksTip": "拉取该管线的任务列表",
+  "pipeline.libraryTitle": "管线库",
+  "pipeline.libraryLoadTip": "点击加载进编辑器",
   "palette.addTip": "点击添加节点到画布",
   "palette.llmTip": "OpenAI 兼容 LLM 节点（chat/completions）",
   "palette.noModules": "未发现模块能力",

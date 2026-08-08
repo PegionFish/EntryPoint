@@ -36,7 +36,10 @@ use crate::i18n::tr;
 use crate::pages::{
     device_snapshot, draft_default, module_data, tasks_snapshot, trfb, ModuleData, ParamDraft,
 };
-use crate::ui::{badge, danger_button, empty_state, primary_button, subtle_button, Palette};
+use crate::ui::{
+    badge, card_frame, danger_button, empty_state, keyboard_scroll, primary_button,
+    subtle_button, Palette, CARD_ROUNDING,
+};
 
 const NODE_W: f32 = 160.0;
 const NODE_H: f32 = 60.0;
@@ -193,6 +196,12 @@ pub fn show_full(
                 &[],
             ),
         );
+        // 管线库一键加载（Task #26）：空态列出现成管线，点击即走既有加载流程。
+        // 目录不存在或无 toml 时保持上方空态文案不变。
+        let library = scan_pipeline_library(&pipeline_library_dir());
+        if !library.is_empty() {
+            draw_library(ui, lang, &pal, &mut st, &library);
+        }
     } else {
         let pipeline = st.pipeline.clone().unwrap();
         if st.positions.is_empty() && !pipeline.nodes.is_empty() {
@@ -2691,6 +2700,141 @@ fn port_types_for_draw(node: &PipelineNode) -> (Option<DataType>, Option<DataTyp
 
 // ── Actions ───────────────────────────────────────────────────────
 
+// ── 管线库（空态一键加载，Task #26）─────────────────────────────
+
+/// 管线库条目：`config/pipelines/*.toml` 扫描结果（路径 + 展示名/描述）
+#[derive(Debug, Clone, PartialEq)]
+struct LibraryEntry {
+    path: PathBuf,
+    name: String,
+    description: String,
+}
+
+/// 管线库目录：`<EP_ROOT>/config/pipelines`（与整合包管线圈选同根解析）
+fn pipeline_library_dir() -> PathBuf {
+    ep_core::config::resolve_root()
+        .join("config")
+        .join("pipelines")
+}
+
+/// 扫描目录下的 `*.toml` 管线定义 → 库条目列表（纯函数，可测）：
+/// - 仅取扩展名为 `toml` 的文件（非 toml / 子目录过滤），按文件名排序；
+/// - 解析成功优先用 `[pipeline] name/description`（name 为空回退文件名）；
+/// - 解析失败回退文件名（去扩展名），不阻塞列表展示；
+/// - 目录不存在或无 toml 时返回空列表。
+fn scan_pipeline_library(dir: &std::path::Path) -> Vec<LibraryEntry> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("toml"))
+        .collect();
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let stem = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let (name, description) = match Pipeline::from_toml(&path) {
+                Ok(p) if !p.name.trim().is_empty() => (p.name, p.description),
+                _ => (stem, String::new()),
+            };
+            LibraryEntry {
+                path,
+                name,
+                description,
+            }
+        })
+        .collect()
+}
+
+/// 空态下方绘制管线库：标题 + 可点击卡片列表（点击 = 既有加载流程）
+fn draw_library(
+    ui: &mut egui::Ui,
+    lang: &str,
+    pal: &Palette,
+    st: &mut VizState,
+    entries: &[LibraryEntry],
+) {
+    ui.add_space(4.0);
+    ui.vertical_centered(|ui| {
+        ui.label(
+            egui::RichText::new(tr(lang, "desktopApp.pipeline.libraryTitle", &[]))
+                .strong()
+                .color(pal.text_dim),
+        );
+    });
+    ui.add_space(4.0);
+    keyboard_scroll(
+        ui,
+        "pipeline_library",
+        egui::ScrollArea::vertical(),
+        |ui| {
+            for entry in entries {
+                let resp = library_card(ui, pal, entry);
+                if resp.clicked() {
+                    st.file_path = entry.path.to_string_lossy().to_string();
+                    load_pipeline(st, lang);
+                }
+                resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(trfb(
+                        lang,
+                        "desktopApp.pipeline.libraryLoadTip",
+                        "点击加载进编辑器",
+                        &[],
+                    ));
+            }
+        },
+    );
+}
+
+/// 单条管线卡片：名称（强字）+ 描述 + 文件路径（等宽弱化）；
+/// 悬停时以 primary 描边 + 半透明罩色提示可点击。
+fn library_card(ui: &mut egui::Ui, pal: &Palette, entry: &LibraryEntry) -> egui::Response {
+    let inner = card_frame(pal).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.vertical(|ui| {
+            ui.label(egui::RichText::new(entry.name.as_str()).strong());
+            if !entry.description.is_empty() {
+                ui.label(
+                    egui::RichText::new(entry.description.as_str())
+                        .small()
+                        .color(pal.text_dim),
+                );
+            }
+            ui.label(
+                egui::RichText::new(entry.path.to_string_lossy().into_owned())
+                    .monospace()
+                    .small()
+                    .color(pal.text_faint),
+            );
+        });
+    });
+    let rect = inner.response.rect;
+    let resp = ui.interact(rect, inner.response.id, egui::Sense::click());
+    if resp.hovered() {
+        let tint = egui::Color32::from_rgba_unmultiplied(
+            pal.primary.r(),
+            pal.primary.g(),
+            pal.primary.b(),
+            22,
+        );
+        ui.painter().rect(
+            rect,
+            egui::CornerRadius::same(CARD_ROUNDING),
+            tint,
+            egui::Stroke::new(1.5_f32, pal.primary),
+            egui::StrokeKind::Inside,
+        );
+        ui.ctx().request_repaint();
+    }
+    resp
+}
+
 fn load_pipeline(st: &mut VizState, lang: &str) {
     let path = std::path::Path::new(&st.file_path);
     match Pipeline::from_toml(path) {
@@ -3526,5 +3670,77 @@ builtin = "file_input"
             assert_eq!(again.nodes, pipeline.nodes, "{name}: nodes");
             assert_eq!(again.edges, pipeline.edges, "{name}: edges");
         }
+    }
+
+    // ── 管线库枚举（Task #26）────────────────────────────────
+
+    /// 临时目录夹具（唯一路径，用后清理）
+    fn library_tmp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ep-library-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 最小合法管线 TOML（[pipeline] id/name/description）
+    fn library_valid_toml(id: &str, name: &str, desc: &str) -> String {
+        format!(
+            "[pipeline]\nid = \"{id}\"\nname = \"{name}\"\ndescription = \"{desc}\"\n"
+        )
+    }
+
+    #[test]
+    fn library_scan_filters_non_toml_and_sorts() {
+        let dir = library_tmp_dir("filter");
+        // 乱序写入多个 toml + 非 toml + 子目录
+        std::fs::write(dir.join("beta.toml"), library_valid_toml("b", "B 管线", "描述 B")).unwrap();
+        std::fs::write(dir.join("alpha.toml"), library_valid_toml("a", "A 管线", "")).unwrap();
+        std::fs::write(dir.join("notes.txt"), "not a pipeline").unwrap();
+        std::fs::write(dir.join("README.md"), "# readme").unwrap();
+        std::fs::create_dir(dir.join("subdir.toml")).unwrap();
+
+        let entries = scan_pipeline_library(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["A 管线", "B 管线"], "仅保留 toml 且按文件名排序");
+        assert_eq!(entries[0].description, "");
+        assert_eq!(entries[1].description, "描述 B");
+        assert!(entries.iter().all(|e| e.path.extension() == Some("toml".as_ref())));
+    }
+
+    #[test]
+    fn library_scan_missing_or_empty_dir_returns_empty() {
+        let dir = library_tmp_dir("empty");
+        assert!(scan_pipeline_library(&dir).is_empty(), "空目录 → 空列表");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            scan_pipeline_library(&dir).is_empty(),
+            "目录不存在 → 空列表"
+        );
+    }
+
+    #[test]
+    fn library_scan_parse_failure_falls_back_to_filename() {
+        let dir = library_tmp_dir("fallback");
+        std::fs::write(dir.join("broken.toml"), "this is [not valid toml").unwrap();
+        std::fs::write(dir.join("noname.toml"), "[pipeline]\nid = \"x\"\nname = \"\"\n").unwrap();
+
+        let entries = scan_pipeline_library(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["broken", "noname"],
+            "解析失败与 name 为空均回退文件名（去扩展名）"
+        );
+        assert!(entries.iter().all(|e| e.description.is_empty()));
     }
 }
