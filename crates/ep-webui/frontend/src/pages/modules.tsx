@@ -3,6 +3,7 @@ import {
   ChevronDown,
   CircleCheck,
   CircleX,
+  Copy,
   Database,
   Download,
   FileArchive,
@@ -18,10 +19,12 @@ import {
   Pencil,
   Play,
   RefreshCw,
+  RotateCw,
   ScrollText,
   SlidersHorizontal,
   Square,
   Tag,
+  TerminalSquare,
   Trash2,
   TriangleAlert,
   Upload,
@@ -38,6 +41,7 @@ import type {
   ModelListResponse,
   ModelSource,
   ModuleResponse,
+  PackInfo,
   PipelineSummary,
 } from '@/api/types'
 import { wsManager } from '@/api/ws'
@@ -93,6 +97,7 @@ import {
   TabsTrigger,
 } from '@/components/ui/tabs'
 import { isTaskTerminal, useDirectExec } from '@/hooks/use-direct-exec'
+import { useModuleDetail } from '@/hooks/use-module-detail'
 import {
   useModelDownloads,
   type ModelDownloadProgress,
@@ -101,13 +106,14 @@ import { useModels } from '@/hooks/use-models'
 import { useModules } from '@/hooks/use-modules'
 import {
   PACK_UPLOAD_ABORTED,
+  triggerPackDownload,
   usePackIo,
   type PackProgressEntry,
   type PackUploadProgress,
   type UsePackIoResult,
 } from '@/hooks/use-pack-io'
 import { categoryLabel, statusMeta } from '@/lib/constants'
-import { cn, formatBytes, formatMB } from '@/lib/utils'
+import { cn, formatBytes, formatMB, formatUptime } from '@/lib/utils'
 
 // ─── 常量与工具 ──────────────────────────────────────────────────────────────
 
@@ -258,10 +264,12 @@ function ModelStatusBadge({ status }: { status: string }) {
   )
 }
 
-/** 模块服务状态徽章（running/stopped/starting/…，复用 constants 状态元） */
+/** 模块服务状态徽章（running/stopped/starting/…，复用 constants 状态元）；
+ *  运行态圆点附 status-glow-running 辉光（§3.4） */
 function ServiceStatusBadge({ status }: { status: string }) {
   const { t } = useTranslation('modules')
   const meta = statusMeta(status)
+  const running = status.trim().toLowerCase() === 'running'
   const label = meta.labelKey ? t(meta.labelKey) : status
   return (
     <Badge variant="outline" className={meta.badge}>
@@ -270,6 +278,7 @@ function ServiceStatusBadge({ status }: { status: string }) {
           'size-1.5 rounded-full',
           meta.dot,
           meta.transitional && 'animate-pulse',
+          running && 'glow-status-running',
         )}
       />
       {label}
@@ -940,15 +949,116 @@ function DirectRunDrawer({ module, onClose }: DirectRunDrawerProps) {
 
 // ─── 模块详情抽屉（能力 / 参数 schema）───────────────────────────────────────
 
+/** 详情抽屉 dl 网格信息项（ID / 版本 / 端口等） */
+function DetailInfoItem({
+  label,
+  value,
+  mono,
+}: {
+  label: string
+  value: string
+  mono?: boolean
+}) {
+  return (
+    <div className="min-w-0">
+      <dt className="text-xs text-muted-foreground">{label}</dt>
+      <dd
+        className={cn('mt-1 truncate text-sm font-medium', mono && 'font-mono')}
+        title={value}
+      >
+        {value}
+      </dd>
+    </div>
+  )
+}
+
+/**
+ * 模块详情抽屉（W2 §7.2：裁撤 /modules/:id 独立页后的统一详情入口）。
+ *
+ * 聚合原独立页全部信息：实时状态轮询（useModuleDetail）、启停操作、
+ * 运行信息（端口 / 运行时长）、模型状态明细、能力声明与参数 schema；
+ * 实时日志经 onOpenLogs 打开页面级日志抽屉。
+ */
 function ModuleDetailSheet({
   module,
   onClose,
+  onOpenLogs,
+  onStart,
+  onStop,
+  onRestart,
 }: {
   module: ModuleResponse | null
   onClose: () => void
+  /** 打开页面级实时日志抽屉（先关闭本抽屉） */
+  onOpenLogs: (moduleId: string) => void
+  /** 启动（页面级处理器：toast + 列表刷新） */
+  onStart: (module: ModuleResponse) => void
+  /** 停止（打开页面级确认框） */
+  onStop: (module: ModuleResponse) => void
+  /** 重启（先停后启） */
+  onRestart: (module: ModuleResponse) => void
 }) {
   const { t } = useTranslation('modules')
+  const detail = useModuleDetail(module?.id)
   const capabilities = module?.capabilities ?? []
+
+  const rawStatus =
+    detail.status?.status ?? module?.service_status ?? 'stopped'
+  const statusKey = normalizeStatus(rawStatus).replace(/\s+/g, '_')
+  const meta = statusMeta(rawStatus)
+  const running = statusKey === 'running'
+
+  async function handleCopy(value: string, label: string) {
+    try {
+      await navigator.clipboard.writeText(value)
+      toast.success(t('detail.copied', { label }))
+    } catch {
+      toast.error(t('detail.copyFailed'))
+    }
+  }
+
+  /** 依据当前状态渲染操作按钮（与卡片操作行语义一致） */
+  function renderAction() {
+    if (!module) return null
+    switch (statusKey) {
+      case 'stopped':
+      case 'not_ready':
+        return (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => onStart(module)}
+            className="border-status-running/50 text-status-running hover:bg-status-running/10 hover:text-status-running dark:bg-transparent dark:hover:bg-status-running/10"
+          >
+            <Play />
+            {t('common:action.start')}
+          </Button>
+        )
+      case 'running':
+      case 'starting':
+      case 'preparing':
+        return (
+          <Button
+            variant="destructive"
+            size="sm"
+            onClick={() => onStop(module)}
+          >
+            <Square />
+            {t('common:action.stop')}
+          </Button>
+        )
+      case 'error':
+        return (
+          <Button size="sm" onClick={() => onRestart(module)}>
+            <RotateCw />
+            {t('common:action.restart')}
+          </Button>
+        )
+      default:
+        return null
+    }
+  }
+
   return (
     <Sheet
       open={module !== null}
@@ -956,7 +1066,7 @@ function ModuleDetailSheet({
         if (!open) onClose()
       }}
     >
-      <SheetContent className="overflow-y-auto sm:max-w-lg">
+      <SheetContent className="overflow-y-auto sm:max-w-xl">
         <SheetHeader>
           <SheetTitle className="flex items-center gap-2">
             <SlidersHorizontal className="size-4 text-primary" />
@@ -968,17 +1078,219 @@ function ModuleDetailSheet({
             {module?.version ? ` · v${module.version}` : ''}
           </SheetDescription>
         </SheetHeader>
-        <div className="space-y-4 px-4 pb-6">
-          {module?.description ? (
-            <p className="text-sm text-foreground/80">{module.description}</p>
-          ) : null}
-          <div className="space-y-1 text-xs text-muted-foreground">
-            <p className="flex items-center gap-1.5">
-              <FolderOpen className="size-3.5" />
-              <span className="break-all font-mono">{module?.path}</span>
-            </p>
+        <div className="space-y-5 px-4 pb-6">
+          {/* 状态徽章 + 操作行（启 / 停 / 重启 / 实时日志） */}
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge
+              variant="outline"
+              className={cn('gap-1.5 px-2.5 py-1 text-sm', meta.badge)}
+            >
+              <span
+                className={cn(
+                  'size-2 rounded-full',
+                  meta.dot,
+                  (running || meta.transitional) && 'animate-pulse',
+                  running && 'glow-status-running',
+                )}
+                aria-hidden
+              />
+              {meta.label}
+            </Badge>
+            <div className="ml-auto flex flex-wrap items-center gap-1.5">
+              {renderAction()}
+              {module ? (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => onOpenLogs(module.id)}
+                >
+                  <TerminalSquare />
+                  {t('detail.logsTitle', { defaultValue: '实时日志' })}
+                </Button>
+              ) : null}
+            </div>
           </div>
 
+          {module?.description ? (
+            <p className="text-sm leading-relaxed text-foreground/80">
+              {module.description}
+            </p>
+          ) : null}
+          {module?.path ? (
+            <div className="flex items-center gap-1 font-mono text-xs text-muted-foreground/70">
+              <FolderOpen className="size-3.5 shrink-0" />
+              <span className="min-w-0 flex-1 break-all">{module.path}</span>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                className="shrink-0 text-muted-foreground/70 hover:text-foreground"
+                onClick={() =>
+                  void handleCopy(module.path, t('detail.modulePath'))
+                }
+                title={t('detail.copyTitle', {
+                  label: t('detail.modulePath'),
+                })}
+                aria-label={t('detail.copyTitle', {
+                  label: t('detail.modulePath'),
+                })}
+              >
+                <Copy />
+              </Button>
+            </div>
+          ) : null}
+
+          {/* 未就绪提示：指明具体原因（缺模型/依赖） */}
+          {statusKey === 'not_ready' ? (
+            <div
+              className="flex items-start gap-3 rounded-lg border border-status-preparing/40 bg-status-preparing/10 px-4 py-3"
+              role="alert"
+            >
+              <TriangleAlert className="mt-0.5 size-4 shrink-0 text-status-preparing" />
+              <div className="min-w-0 flex-1 text-sm">
+                <p className="font-medium text-status-preparing">
+                  {t('detail.notReadyTitle')}
+                </p>
+                <p className="mt-0.5 leading-relaxed text-status-preparing/75">
+                  {t('detail.notReadyDescription')}
+                </p>
+              </div>
+            </div>
+          ) : null}
+
+          {/* 运行信息（useModuleDetail 3s 轮询） */}
+          <div className="space-y-2">
+            <h3 className="text-sm font-semibold">{t('detail.runtimeTitle')}</h3>
+            <dl className="grid grid-cols-2 gap-x-6 gap-y-4">
+              <DetailInfoItem label="ID" value={module?.id ?? '—'} mono />
+              <DetailInfoItem
+                label={t('detail.version')}
+                value={module?.version ? `v${module.version}` : '—'}
+                mono={Boolean(module?.version)}
+              />
+              <DetailInfoItem
+                label={t('detail.category')}
+                value={module?.category ? categoryLabel(module.category) : '—'}
+              />
+              <div className="min-w-0">
+                <dt className="text-xs text-muted-foreground">
+                  {t('common:label.status')}
+                </dt>
+                <dd className="mt-1">
+                  <Badge variant="outline" className={cn('gap-1.5', meta.badge)}>
+                    <span
+                      className={cn(
+                        'size-1.5 rounded-full',
+                        meta.dot,
+                        (running || meta.transitional) && 'animate-pulse',
+                      )}
+                      aria-hidden
+                    />
+                    {meta.label}
+                  </Badge>
+                </dd>
+              </div>
+              {/* API 无模块 → 设备映射，明示「暂不支持」而非占位符（与仪表盘一致） */}
+              <DetailInfoItem
+                label={t('detail.device')}
+                value={t('detail.deviceUnsupported')}
+              />
+              <DetailInfoItem
+                label={t('detail.port')}
+                value={
+                  detail.status?.port != null
+                    ? String(detail.status.port)
+                    : '—'
+                }
+                mono={detail.status?.port != null}
+              />
+              <DetailInfoItem
+                label={t('detail.uptime')}
+                value={
+                  detail.status && detail.status.uptime_secs > 0
+                    ? formatUptime(detail.status.uptime_secs)
+                    : '—'
+                }
+                mono
+              />
+            </dl>
+          </div>
+
+          {/* 模型状态（关联模型明细） */}
+          <div className="space-y-2">
+            <h3 className="flex items-center gap-2 text-sm font-semibold">
+              <Database className="size-4 text-muted-foreground" />
+              {t('detail.modelsTitle')}
+            </h3>
+            {detail.modelsLoading ? (
+              <div className="space-y-2">
+                <Skeleton className="h-12 rounded-md" />
+                <Skeleton className="h-12 rounded-md" />
+              </div>
+            ) : !detail.models || detail.models.models.length === 0 ? (
+              <p className="rounded-lg border border-dashed border-border px-3 py-4 text-center text-xs text-muted-foreground">
+                {t('detail.modelsEmpty')}
+              </p>
+            ) : (
+              <div className="space-y-2">
+                {detail.models.models.map((m) => {
+                  const mMeta = statusMeta(m.status)
+                  return (
+                    <div
+                      key={m.model_id}
+                      className="flex items-center justify-between gap-4 rounded-md border border-border bg-background/60 px-3 py-2.5 transition-colors hover:border-primary/30"
+                    >
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-medium">{m.name}</p>
+                        <p className="flex items-center gap-1 font-mono text-xs text-muted-foreground/70">
+                          <span className="truncate" title={m.target_dir}>
+                            {m.target_dir}
+                          </span>
+                          <Button
+                            variant="ghost"
+                            size="icon-xs"
+                            className="shrink-0 text-muted-foreground/70 hover:text-foreground"
+                            onClick={() =>
+                              void handleCopy(m.target_dir, t('detail.modelPath'))
+                            }
+                            title={t('detail.copyTitle', {
+                              label: t('detail.modelPath'),
+                            })}
+                            aria-label={t('detail.copyTitle', {
+                              label: t('detail.modelPath'),
+                            })}
+                          >
+                            <Copy />
+                          </Button>
+                        </p>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-3">
+                        <span className="hidden font-mono text-xs text-muted-foreground sm:inline">
+                          {formatBytes(m.size_bytes)}
+                        </span>
+                        <span className="hidden font-mono text-xs text-muted-foreground sm:inline">
+                          {m.file_count != null
+                            ? t('detail.fileCount', { count: m.file_count })
+                            : '—'}
+                        </span>
+                        <Badge
+                          variant="outline"
+                          className={cn('gap-1.5', mMeta.badge)}
+                        >
+                          <span
+                            className={cn('size-1.5 rounded-full', mMeta.dot)}
+                            aria-hidden
+                          />
+                          {mMeta.label}
+                        </Badge>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* 能力声明（含参数 schema） */}
           <div className="space-y-2">
             <h3 className="text-sm font-semibold">
               {t('models:detail.capabilities', { defaultValue: '能力声明' })}
@@ -1090,6 +1402,202 @@ function ModuleDetailSheet({
 }
 
 // ─── 日志抽屉 ────────────────────────────────────────────────────────────────
+
+/**
+ * 整合包抽屉（W2 §5.4：settings.packs 段与工具栏导入/导出入口归拢于此）。
+ *
+ * - 列表：GET /api/packs 注册表（打开时拉取，卸载/导入落位后经 reloadKey 刷新）；
+ * - 导入 / 导出：复用页面级 ImportModuleDialog / ExportModuleDialog；
+ * - 下载：export 端点直接触发浏览器下载；卸载：复用页面级确认框（keep_models）。
+ */
+function PacksDrawer({
+  open,
+  onClose,
+  reloadKey,
+  onImport,
+  onExport,
+  onUninstall,
+}: {
+  open: boolean
+  onClose: () => void
+  /** 外部变化（导入/卸载落位）后自增，触发列表重拉 */
+  reloadKey: number
+  onImport: () => void
+  onExport: () => void
+  onUninstall: (packId: string) => void
+}) {
+  const { t } = useTranslation('modules')
+  const [packs, setPacks] = useState<PackInfo[] | null>(null)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [retryKey, setRetryKey] = useState(0)
+
+  useEffect(() => {
+    if (!open) return
+    let cancelled = false
+    setPacks(null)
+    setLoadError(null)
+    api
+      .listPacks()
+      .then((list) => {
+        if (!cancelled) setPacks(list)
+      })
+      .catch((e) => {
+        if (!cancelled) setLoadError(errMsg(e))
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [open, retryKey, reloadKey])
+
+  return (
+    <Sheet
+      open={open}
+      onOpenChange={(o) => {
+        if (!o) onClose()
+      }}
+    >
+      <SheetContent className="overflow-y-auto sm:max-w-xl">
+        <SheetHeader>
+          <SheetTitle className="flex items-center gap-2">
+            <Package className="size-4 text-primary" />
+            {t('packs:drawer.title', { defaultValue: '整合包' })}
+          </SheetTitle>
+          <SheetDescription>
+            {t('packs:drawer.description', {
+              defaultValue: '管理本机已安装整合包；可导入新包或将模型导出为包',
+            })}
+          </SheetDescription>
+        </SheetHeader>
+        <div className="space-y-4 px-4 pb-6">
+          {/* 操作行：导入 / 导出 / 刷新（低频入口归拢，§5.4） */}
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Button size="sm" onClick={onImport}>
+              <Upload className="size-3.5" />
+              {t('packs:action.import', { defaultValue: '导入整合包' })}
+            </Button>
+            <Button variant="outline" size="sm" onClick={onExport}>
+              <PackagePlus className="size-3.5" />
+              {t('toolbar.export', { defaultValue: '导出模块' })}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setRetryKey((n) => n + 1)}
+            >
+              <RefreshCw className="size-3.5" />
+              {t('common:action.refresh')}
+            </Button>
+          </div>
+
+          {packs === null && loadError === null ? (
+            <div className="space-y-2">
+              <Skeleton className="h-20 rounded-lg" />
+              <Skeleton className="h-20 rounded-lg" />
+            </div>
+          ) : loadError !== null ? (
+            <div className="flex items-center gap-2 rounded-lg border border-status-error/30 bg-status-error/10 px-4 py-3 text-sm text-status-error">
+              <TriangleAlert className="size-4 shrink-0" />
+              <span className="min-w-0 flex-1 truncate">
+                {t('packs:drawer.loadFailed', { defaultValue: '加载失败' })}：
+                {loadError}
+              </span>
+              <Button
+                variant="ghost"
+                size="xs"
+                onClick={() => setRetryKey((n) => n + 1)}
+              >
+                {t('common:action.retry')}
+              </Button>
+            </div>
+          ) : (packs ?? []).length === 0 ? (
+            <EmptyState
+              icon={Package}
+              title={t('packs:empty.title', { defaultValue: '暂无整合包' })}
+              description={t('packs:empty.description', {
+                defaultValue: '导入或构建整合包后将在此显示',
+              })}
+            />
+          ) : (
+            <div className="space-y-2">
+              {(packs ?? []).map((p) => (
+                <div
+                  key={p.id}
+                  className="space-y-1.5 rounded-lg border border-border bg-background/60 p-3 transition-colors hover:border-primary/30"
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="min-w-0 truncate text-sm font-medium">
+                      {p.name}
+                    </span>
+                    <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                      {p.id}
+                    </code>
+                    {p.version ? (
+                      <span className="font-mono text-[10px] text-muted-foreground">
+                        v{p.version}
+                      </span>
+                    ) : null}
+                    <div className="ml-auto flex shrink-0 items-center gap-1">
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        onClick={() => triggerPackDownload(p.id)}
+                        title={t('packs:drawer.download', {
+                          defaultValue: '下载 .epzip',
+                        })}
+                        aria-label={t('packs:drawer.download', {
+                          defaultValue: '下载 .epzip',
+                        })}
+                      >
+                        <Download className="size-3.5" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        className="text-destructive hover:text-destructive"
+                        onClick={() => onUninstall(p.id)}
+                        title={t('packs:action.uninstall', { defaultValue: '卸载' })}
+                        aria-label={t('packs:action.uninstall', {
+                          defaultValue: '卸载',
+                        })}
+                      >
+                        <Trash2 className="size-3.5" />
+                      </Button>
+                    </div>
+                  </div>
+                  {p.description ? (
+                    <p className="text-xs text-muted-foreground">
+                      {p.description}
+                    </p>
+                  ) : null}
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[11px] text-muted-foreground">
+                    <span>
+                      {t('packs:card.modelsCount', {
+                        count: p.models?.length ?? 0,
+                        defaultValue: '{{count}} 个模型',
+                      })}
+                    </span>
+                    <span>
+                      {t('packs:card.pipelinesCount', {
+                        count: p.pipelines?.length ?? 0,
+                        defaultValue: '{{count}} 条管线',
+                      })}
+                    </span>
+                    {p.installed_at ? (
+                      <span>
+                        {t('packs:detail.installedAt', { defaultValue: '安装时间' })}{' '}
+                        {p.installed_at}
+                      </span>
+                    ) : null}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </SheetContent>
+    </Sheet>
+  )
+}
 
 function ModuleLogsSheet({
   moduleId,
@@ -2237,6 +2745,10 @@ export function ModulesPage() {
   const [stopTarget, setStopTarget] = useState<ModuleResponse | null>(null)
   const [importOpen, setImportOpen] = useState(false)
   const [exportOpen, setExportOpen] = useState(false)
+  /** 整合包抽屉（W2：settings.packs 与导入/导出入口归拢） */
+  const [packsOpen, setPacksOpen] = useState(false)
+  /** 整合包列表重拉信号（导入/卸载落位后自增） */
+  const [packsReloadKey, setPacksReloadKey] = useState(0)
   const [uninstallTarget, setUninstallTarget] = useState<string | null>(null)
   const [keepModels, setKeepModels] = useState(true)
   const [uninstalling, setUninstalling] = useState(false)
@@ -2298,6 +2810,7 @@ export function ModulesPage() {
         { description: entry.message ?? packId },
       )
       // 导入完成后可能新增模块/模型/管线；卸载同理需要刷新
+      setPacksReloadKey((n) => n + 1)
       void refreshAll()
     } else if (entry.state === 'failed') {
       toast.error(t('pack.failed', { defaultValue: '整合包操作失败' }), {
@@ -2592,7 +3105,20 @@ export function ModulesPage() {
     const capabilities = m.capabilities ?? []
 
     return (
-      <Card key={m.id}>
+      <Card
+        key={m.id}
+        className={cn(
+          'glass-card relative overflow-hidden',
+          svcKey === 'running' && 'border-status-running/40',
+        )}
+      >
+        {/* 运行态呼吸辉光覆盖层（§3.4：仅 running，零位移） */}
+        {svcKey === 'running' ? (
+          <div
+            aria-hidden
+            className="glow-status-running animate-breath-glow pointer-events-none absolute inset-0 z-10 rounded-[inherit] border border-status-running/40"
+          />
+        ) : null}
         <CardHeader className="pb-3">
           <div className="flex items-center justify-between gap-2">
             <CardTitle className="flex min-w-0 flex-wrap items-center gap-2 text-base font-semibold">
@@ -2896,17 +3422,13 @@ export function ModulesPage() {
       title={t('page.title')}
       description={t('page.descriptionV2', {
         defaultValue:
-          '模型即模块：卡片内完成变体选择、下载、启停与直跑；顶部工具栏导入 / 导出模块',
+          '模型即模块：卡片内完成变体选择、下载、启停与直跑；整合包导入 / 导出 / 管理见顶部「整合包」抽屉',
       })}
       actions={
         <>
-          <Button variant="outline" size="sm" onClick={() => setImportOpen(true)}>
-            <Upload className="size-3.5" />
-            {t('toolbar.import', { defaultValue: '导入模块' })}
-          </Button>
-          <Button size="sm" onClick={() => setExportOpen(true)}>
-            <PackagePlus className="size-3.5" />
-            {t('toolbar.export', { defaultValue: '导出模块' })}
+          <Button variant="outline" size="sm" onClick={() => setPacksOpen(true)}>
+            <Package className="size-3.5" />
+            {t('toolbar.packs', { defaultValue: '整合包' })}
           </Button>
           <Button
             variant="outline"
@@ -3058,7 +3580,28 @@ export function ModulesPage() {
         }
         onClose={() => setLogsModuleId(null)}
       />
-      <ModuleDetailSheet module={detailModule} onClose={() => setDetailModule(null)} />
+      <ModuleDetailSheet
+        module={detailModule}
+        onClose={() => setDetailModule(null)}
+        onOpenLogs={(id) => {
+          setDetailModule(null)
+          setLogsModuleId(id)
+        }}
+        onStart={(m) => void startModule(m)}
+        onStop={(m) => setStopTarget(m)}
+        onRestart={(m) => void restartModule(m)}
+      />
+      <PacksDrawer
+        open={packsOpen}
+        onClose={() => setPacksOpen(false)}
+        reloadKey={packsReloadKey}
+        onImport={() => setImportOpen(true)}
+        onExport={() => setExportOpen(true)}
+        onUninstall={(packId) => {
+          setKeepModels(true)
+          setUninstallTarget(packId)
+        }}
+      />
       <DirectRunDrawer module={runModule} onClose={() => setRunModule(null)} />
       <TagEditorDialog
         target={tagsTarget}
