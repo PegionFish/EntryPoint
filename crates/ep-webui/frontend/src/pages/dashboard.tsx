@@ -18,6 +18,7 @@ import { PageContainer } from '@/components/layout/page-container'
 import { DeviceCard } from '@/components/shared/device-card'
 import { NoModulesState } from '@/components/shared/empty-state'
 import { CardSkeleton } from '@/components/shared/loading-skeleton'
+import { StatStrip } from '@/components/shared/stat-strip'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -35,9 +36,11 @@ import { cn } from '@/lib/utils'
 
 /* ---------- 页面内局部组件 ---------- */
 
-/** 局部状态徽章：状态圆点 + 状态标签，过渡态附加脉冲动画 */
+/** 局部状态徽章：状态圆点 + 状态标签，过渡态附加脉冲动画。
+ *  四态色对齐 §1 主张 5（令牌 W0 已重定值），运行态圆点附 status-glow-running 辉光（§3.4） */
 function StatusBadge({ status }: { status: string }) {
   const meta = statusMeta(status)
+  const running = status.trim().toLowerCase() === 'running'
   return (
     <Badge variant="outline" className={cn('gap-1.5', meta.badge)}>
       <span
@@ -45,6 +48,7 @@ function StatusBadge({ status }: { status: string }) {
           'size-1.5 rounded-full',
           meta.dot,
           meta.transitional && 'animate-pulse',
+          running && 'glow-status-running',
         )}
       />
       {meta.label}
@@ -155,7 +159,7 @@ function DevicesSection({
           <CardSkeleton />
         </div>
       ) : !devices || devices.length === 0 ? (
-        <Card className="border-dashed py-0">
+        <Card className="glass-card border-dashed py-0">
           <CardContent className="flex flex-col items-center justify-center gap-3 px-6 py-14 text-center">
             <div className="flex size-12 items-center justify-center rounded-full bg-muted">
               {hasError ? (
@@ -252,7 +256,7 @@ function ModulesSection({
           ) : undefined
         }
       />
-      <Card className="gap-0 overflow-hidden py-0">
+      <Card className="glass-card gap-0 overflow-hidden py-0">
         <Table>
           <TableHeader>
             <TableRow className="hover:bg-transparent">
@@ -355,7 +359,7 @@ function DepCard({
   return (
     <Card
       className={cn(
-        'gap-0 py-0 transition-colors',
+        'glass-card gap-0 py-0 transition-colors',
         !available && 'border-status-preparing/40 bg-status-preparing/5',
       )}
     >
@@ -469,6 +473,9 @@ function DepsSection({
 export function DashboardPage() {
   const { t } = useTranslation('dashboard')
   const { devices, modules, deps, moduleStatus, loading, error } = useDevices()
+  // 统计条带（§6.2-D，与桌面端 IA 对齐：设备 / 模块 / 运行中 / 异常）
+  const runningCount = modules?.filter(isRunning).length
+  const errorCount = modules?.filter(isError).length
 
   return (
     <PageContainer
@@ -492,6 +499,33 @@ export function DashboardPage() {
       }
     >
       <div className="space-y-8">
+        {/* 统计条带：大号等宽数字 + 全大写灰阶标签（主张 4 数据仪表盘化） */}
+        <StatStrip
+          items={[
+            {
+              label: t('stat.devices'),
+              value: devices?.length ?? '–',
+            },
+            {
+              label: t('stat.modules'),
+              value: modules?.length ?? '–',
+            },
+            {
+              label: t('stat.running'),
+              value: runningCount ?? '–',
+              tone: 'text-status-running',
+            },
+            {
+              label: t('stat.errors'),
+              value: errorCount ?? '–',
+              tone:
+                errorCount != null && errorCount > 0
+                  ? 'text-status-error'
+                  : undefined,
+            },
+          ]}
+        />
+
         {error && (
           <div className="flex items-start gap-2.5 rounded-lg border border-status-error/40 bg-status-error/10 px-4 py-3">
             <CircleAlert className="mt-0.5 size-4 shrink-0 text-status-error" />

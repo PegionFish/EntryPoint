@@ -71,7 +71,7 @@ function Section({
   children: ReactNode
 }) {
   return (
-    <Card>
+    <Card className="glass-card">
       <CardHeader>
         <CardTitle className="flex items-center gap-2 text-base font-semibold">
           <Icon className="size-4 text-primary" />
@@ -132,7 +132,7 @@ function SwitchRow({
   return (
     <div
       className={cn(
-        'flex items-center justify-between gap-4 rounded-md border border-border px-4 py-3',
+        'flex items-center justify-between gap-4 rounded-md border border-border bg-muted/30 px-4 py-3 transition-[border-color,background-color] duration-150 hover:border-(--border-glow-strong)',
         className,
       )}
     >
@@ -155,6 +155,7 @@ function NumberField({
   min,
   max,
   invalid,
+  className,
 }: {
   value: number
   onValueChange: (v: number) => void
@@ -162,6 +163,8 @@ function NumberField({
   max?: number
   /** 校验未通过（红色边框提示） */
   invalid?: boolean
+  /** 输入件附加样式（观感层，不影响行为） */
+  className?: string
 }) {
   // 本地文本镜像：容忍清空等过渡性无效输入，只在输入为合法数字时回写配置
   const [text, setText] = useState(() =>
@@ -196,7 +199,7 @@ function NumberField({
         // 失焦时回退显示为实际配置值，避免无效内容造成误导
         setText(Number.isFinite(value) ? String(value) : '')
       }}
-      className="font-mono"
+      className={cn('font-mono tabular-nums', className)}
     />
   )
 }
@@ -439,7 +442,7 @@ export function SettingsPage() {
       actions={
         <>
           {dirty && (
-            <span className="flex items-center gap-1.5 text-xs text-status-preparing">
+            <span className="flex items-center gap-1.5 rounded-full border border-status-preparing/30 bg-status-preparing/10 px-2.5 py-1 text-xs text-status-preparing">
               <span className="size-1.5 animate-pulse rounded-full bg-status-preparing" />
               {t('common:tip.unsavedChanges')}
             </span>
@@ -457,6 +460,7 @@ export function SettingsPage() {
             size="sm"
             onClick={() => void handleSave()}
             disabled={loading || saving || !dirty}
+            className={cn(dirty && 'glow-primary')}
           >
             {saving ? (
               <Loader2 className="size-3.5 animate-spin" />
@@ -675,7 +679,7 @@ export function SettingsPage() {
             </Field>
           </Section>
 
-          {/* ── 端口 ── */}
+          {/* ── 端口（区间输入观感：两字段拼接为连贯区间，校验锚点保留，§7.5）── */}
           <Section
             icon={Network}
             title={t('ports.title')}
@@ -685,6 +689,7 @@ export function SettingsPage() {
               label={t('ports.rangeStart')}
               field="range-start"
               error={errors.range_start}
+              className="sm:pr-0"
             >
               <NumberField
                 value={config.ports.range_start}
@@ -694,12 +699,14 @@ export function SettingsPage() {
                 min={1024}
                 max={65535}
                 invalid={Boolean(errors.range_start)}
+                className="bg-muted/30 sm:rounded-r-none sm:border-r-0"
               />
             </Field>
             <Field
               label={t('ports.rangeEnd')}
               field="range-end"
               error={errors.range_end ?? errors.ports_range}
+              className="sm:-ml-6 sm:pl-0"
             >
               <NumberField
                 value={config.ports.range_end}
@@ -707,6 +714,7 @@ export function SettingsPage() {
                 min={1024}
                 max={65535}
                 invalid={Boolean(errors.range_end ?? errors.ports_range)}
+                className="bg-muted/30 sm:rounded-l-none"
               />
             </Field>
           </Section>
