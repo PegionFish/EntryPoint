@@ -41,6 +41,8 @@ pub struct ComputeScheduler {
     /// 全局禁用后端（`[compute].disabled_backends`）— 共享选择时从 manifest
     /// 兼容集中剔除（设备探测与选择双重保险，配置热改后不依赖下一轮重探测）
     disabled_backends: Vec<ComputeBackend>,
+    /// Single 策略指定的设备名（如 "cuda:1"；None = 回退第一个兼容设备）
+    single_device: Option<String>,
 }
 
 /// 设备分配摘要（由 `status_report` 返回）
@@ -64,11 +66,18 @@ impl ComputeScheduler {
             allocated_per_device: RwLock::new(HashMap::new()),
             vram_per_module: RwLock::new(HashMap::new()),
             disabled_backends: Vec::new(),
+            single_device: None,
         }
     }
 
     pub fn set_allow_overcommit(&mut self, allow: bool) {
         self.allow_overcommit = allow;
+    }
+
+    /// 设置 Single 策略的指定设备名（`[compute].single_device`，如 "cuda:1"）。
+    /// 配置了名称时 Single 按 DeviceId 字符串匹配兼容设备，找不到回退 [0]。
+    pub fn set_single_device(&mut self, name: Option<String>) {
+        self.single_device = name;
     }
 
     /// 设置全局禁用后端（`[compute].disabled_backends`，共享选择尊重该清单）
@@ -238,8 +247,15 @@ impl DeviceScheduler for ComputeScheduler {
         backends: &[ComputeBackend],
         vram_mb: u32,
     ) -> Option<DeviceId> {
+        // P1：check-then-act 原子化——选择 + 显存闸门 + 记账包进同一把
+        // `assignments` 写锁临界区。此前"先读锁查重、后分散记账"在并发下会
+        // 双记账/超分：两个线程对同一模块都能通过查重，或不同模块同时读到
+        // 同一剩余显存后都落账。加锁顺序恒为 assignments → allocated →
+        // vram_per_module，与 status_report / release 的加锁顺序一致，无死锁。
+        let mut assignments = self.assignments.write().unwrap();
+
         // 若该模块已有分配，直接返回
-        if let Some(existing) = self.assignments.read().unwrap().get(module_id) {
+        if let Some(existing) = assignments.get(module_id) {
             return Some(existing.clone());
         }
 
@@ -263,7 +279,17 @@ impl DeviceScheduler for ComputeScheduler {
                 compatible[idx_pos]
             }
 
-            SchedulingStrategy::Single => compatible[0],
+            // P1-6：Single 策略尊重 single_device 名称（如 "cuda:1"）——
+            // 在兼容设备中按 DeviceId 字符串（id.to_string()）匹配，
+            // 找不到（名称不存在或不在兼容集内）再回退 [0]
+            SchedulingStrategy::Single => match self.single_device.as_deref() {
+                Some(name) => compatible
+                    .iter()
+                    .copied()
+                    .find(|&idx| self.devices[idx].id.to_string() == name)
+                    .unwrap_or(compatible[0]),
+                None => compatible[0],
+            },
         };
 
         // 显存检查
@@ -283,12 +309,9 @@ impl DeviceScheduler for ComputeScheduler {
             }
         }
 
-        // 记录分配
+        // 记录分配（仍在临界区内：查重/闸门/记账同锁，杜绝双记账/超分）
         let device_id = self.devices[selected_index].id.clone();
-        self.assignments
-            .write()
-            .unwrap()
-            .insert(module_id.to_string(), device_id.clone());
+        assignments.insert(module_id.to_string(), device_id.clone());
         self.record_allocation(selected_index, vram_mb);
         self.vram_per_module
             .write()
@@ -339,9 +362,36 @@ pub fn select_device_for_module(
     allow_overcommit: bool,
     disabled_backends: &[ComputeBackend],
 ) -> Option<DeviceId> {
+    // 兼容入口：不带 single_device（名称未接线时保持旧行为，Single 回退 [0]）。
+    // 需让 `[compute].single_device` 参与落位请用
+    // [`select_device_for_module_with_single_device`]。
+    select_device_for_module_with_single_device(
+        devices,
+        manifest,
+        vram_mb,
+        strategy,
+        None,
+        allow_overcommit,
+        disabled_backends,
+    )
+}
+
+/// 同 [`select_device_for_module`]，额外接受 `single_device` 名称
+/// （`[compute].single_device`，如 "cuda:1"）：Single 策略按 DeviceId 字符串
+/// 匹配兼容设备，找不到再回退 [0]（P1-6）。
+pub fn select_device_for_module_with_single_device(
+    devices: &[ComputeDevice],
+    manifest: &ModuleManifest,
+    vram_mb: u32,
+    strategy: SchedulingStrategy,
+    single_device: Option<&str>,
+    allow_overcommit: bool,
+    disabled_backends: &[ComputeBackend],
+) -> Option<DeviceId> {
     let mut scheduler = ComputeScheduler::new(devices.to_vec(), strategy);
     scheduler.set_allow_overcommit(allow_overcommit);
     scheduler.set_disabled_backends(disabled_backends.to_vec());
+    scheduler.set_single_device(single_device.map(str::to_string));
     if strategy == SchedulingStrategy::RoundRobin {
         let start = STATELESS_ROUND_ROBIN_CURSOR.fetch_add(1, Ordering::SeqCst);
         scheduler.round_robin_index.store(start, Ordering::SeqCst);
@@ -360,7 +410,9 @@ pub fn module_vram_request(config: &AppConfig, manifest: &ModuleManifest) -> u32
 }
 
 /// `[compute].strategy` → 调度器策略（daemon/桌面共享，语义同桌面原
-/// `scheduling_strategy_for`；`Single` 的具体设备名当前不参与落位）
+/// `scheduling_strategy_for`）。Single 的具体设备名经 [`single_device_name`]
+/// 单独提取，由 [`select_device_for_module_with_single_device`] /
+/// [`ComputeScheduler::set_single_device`] 接线（P1-6）。
 pub fn scheduling_strategy_for(config: &AppConfig) -> SchedulingStrategy {
     match config.compute.resolved_strategy() {
         AssignStrategy::Manual => SchedulingStrategy::Manual,
@@ -368,6 +420,14 @@ pub fn scheduling_strategy_for(config: &AppConfig) -> SchedulingStrategy {
         AssignStrategy::RoundRobin => SchedulingStrategy::RoundRobin,
         AssignStrategy::Single(_) => SchedulingStrategy::Single,
     }
+}
+
+/// 提取 `[compute].single_device` 名称（如 "cuda:1"）供 Single 策略接线
+/// （未配置返回 None）。P1-6：调用方在
+/// [`select_device_for_module_with_single_device`] / `set_single_device`
+/// 时传入，使配置的设备名真正参与落位。
+pub fn single_device_name(config: &AppConfig) -> Option<String> {
+    config.compute.single_device.clone()
 }
 
 // ─── 测试 ────────────────────────────────────────────────────────────────────
@@ -454,6 +514,125 @@ mod tests {
 
         let r2 = scheduler.assign("mod_b", &[ComputeBackend::Cuda], 100);
         assert_eq!(r2, Some(DeviceId::Cuda(0))); // 始终选第一个
+    }
+
+    // ── P1-6：Single 策略按 single_device 名称落位（回归） ─────────────────
+
+    #[test]
+    fn test_single_strategy_honors_named_device() {
+        // single_device="cuda:1" 必须参与落位：即便 compatible[0] 是 cuda:0
+        let devices = vec![
+            cuda_device(0, "GPU-0", 4096),
+            cuda_device(1, "GPU-1", 8192),
+        ];
+        let mut scheduler = ComputeScheduler::new(devices, SchedulingStrategy::Single);
+        scheduler.set_single_device(Some("cuda:1".to_string()));
+
+        let r1 = scheduler.assign("mod_a", &[ComputeBackend::Cuda], 100);
+        assert_eq!(r1, Some(DeviceId::Cuda(1)), "Single 应按名称命中 cuda:1");
+        let r2 = scheduler.assign("mod_b", &[ComputeBackend::Cuda], 100);
+        assert_eq!(r2, Some(DeviceId::Cuda(1)));
+    }
+
+    #[test]
+    fn test_single_strategy_named_device_not_found_falls_back() {
+        // 名称在设备表中不存在 → 回退 [0]（保持旧行为）
+        let devices = vec![
+            cuda_device(0, "GPU-0", 4096),
+            cuda_device(1, "GPU-1", 8192),
+        ];
+        let mut scheduler = ComputeScheduler::new(devices, SchedulingStrategy::Single);
+        scheduler.set_single_device(Some("cuda:9".to_string()));
+        let r = scheduler.assign("mod_a", &[ComputeBackend::Cuda], 100);
+        assert_eq!(r, Some(DeviceId::Cuda(0)), "找不到命名设备应回退 compatible[0]");
+
+        // 名称存在但不在请求后端的兼容集内（如单设 cpu 却只请求 CUDA）→ 同样回退
+        let mut s2 = ComputeScheduler::new(
+            vec![cuda_device(0, "GPU-0", 4096), cuda_device(1, "GPU-1", 8192)],
+            SchedulingStrategy::Single,
+        );
+        s2.set_single_device(Some("cpu".to_string()));
+        let r2 = s2.assign("mod_b", &[ComputeBackend::Cuda], 0);
+        assert_eq!(r2, Some(DeviceId::Cuda(0)));
+    }
+
+    #[test]
+    fn test_single_device_name_helper_reads_config() {
+        let mut config = AppConfig::default();
+        assert_eq!(single_device_name(&config), None, "默认未配置");
+
+        config.compute.strategy = AssignStrategy::Single(None);
+        config.compute.single_device = Some("cuda:1".to_string());
+        assert_eq!(single_device_name(&config).as_deref(), Some("cuda:1"));
+    }
+
+    // ── P1：assign 临界区原子化回归（并发双记账/超分） ─────────────────────
+
+    #[test]
+    fn test_concurrent_assign_same_module_no_double_booking() {
+        // 8 线程并发为同一模块分配：原子临界区后只记账一次
+        let devices = vec![cuda_device(0, "GPU-0", 8192)];
+        let scheduler = std::sync::Arc::new(ComputeScheduler::new(
+            devices,
+            SchedulingStrategy::LeastMemory,
+        ));
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let s = scheduler.clone();
+                std::thread::spawn(move || s.assign("mod-same", &[ComputeBackend::Cuda], 1000))
+            })
+            .collect();
+        for h in handles {
+            assert!(h.join().unwrap().is_some());
+        }
+
+        let report = scheduler.status_report();
+        assert_eq!(
+            report[0].assigned_modules.len(),
+            1,
+            "并发分配同模块只能记账一次"
+        );
+        assert_eq!(
+            report[0].allocated_memory_mb, 1000,
+            "同模块并发分配不得双记账"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_assign_no_oversubscription() {
+        // 显存收紧：10 个模块各要 1000MB 争抢 4000MB 单卡，关闭超分 →
+        // 原子临界区保证成功数 ≤ 4、账面分配不超容量（旧实现会同时通过闸门）
+        let devices = vec![cuda_device(0, "GPU-0", 4000)];
+        let scheduler = std::sync::Arc::new(ComputeScheduler::new(
+            devices,
+            SchedulingStrategy::LeastMemory,
+        ));
+
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                let s = scheduler.clone();
+                std::thread::spawn(move || {
+                    s.assign(&format!("mod-{i}"), &[ComputeBackend::Cuda], 1000).is_some()
+                })
+            })
+            .collect();
+        let success = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|&ok| ok)
+            .count();
+        assert!(
+            success <= 4,
+            "4000MB 容量下 1000MB×10 并发分配不得超分，成功数 {success}"
+        );
+
+        let report = scheduler.status_report();
+        assert!(
+            report[0].allocated_memory_mb <= 4000,
+            "账面分配不得超过容量: {}",
+            report[0].allocated_memory_mb
+        );
     }
 
     #[test]

@@ -5,8 +5,10 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use tracing::{debug, info, warn};
@@ -431,7 +433,10 @@ impl EnvManager {
                 format!("failed to create venv directory: {}", venv_dir.display())
             })?;
 
-            let output = run_command_with_env(
+            // P1：`uv venv` 失败分支同样拆除半壳目录。此前 `?` 提前返回会
+            // 留下 create_dir_all 已建好的空壳 venv——下次 `exists()` 恒真跳过
+            // 创建，安装永远无法重试（永久卡死）。成功才保留目录。
+            let output = match run_command_with_env(
                 uv.to_str().unwrap_or("uv"),
                 &[
                     "venv",
@@ -440,8 +445,27 @@ impl EnvManager {
                     venv_dir.to_str().unwrap_or_default(),
                 ],
                 &uv_env,
-            )
-            .with_context(|| format!("failed to create venv for module '{module_id}'"))?;
+            ) {
+                Ok(output) => output,
+                Err(e) => {
+                    if let Err(rm_err) = std::fs::remove_dir_all(&venv_dir) {
+                        warn!(
+                            module = module_id,
+                            path = %venv_dir.display(),
+                            error = %rm_err,
+                            "failed to remove half-shell venv after 'uv venv' failure"
+                        );
+                    } else {
+                        info!(
+                            module = module_id,
+                            "removed half-shell venv after 'uv venv' failure"
+                        );
+                    }
+                    return Err(e).with_context(|| {
+                        format!("failed to create venv for module '{module_id}'")
+                    });
+                }
+            };
             created_now = true;
             debug!(module = module_id, output = %output, "venv created");
         } else {
@@ -759,10 +783,74 @@ pub fn run_command(cmd: &str, args: &[&str]) -> Result<String> {
     run_command_with_env(cmd, args, &[])
 }
 
+/// 单条命令超时上限：uv venv / uv pip install 联网任务可合法耗时数分钟
+/// （torch 等大包下载），故取 3600s 保守值——只兜底真正挂死的子进程
+/// （网络黑洞/进程锁死），不误伤长耗时安装。无上限时"永不返回"会无限
+/// 阻塞调用方（含 daemon 的 async worker）。
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// 捕获式执行子进程，带超时 kill（P2）。
+///
+/// 替代 `Command::output()` 的无限阻塞：轮询 `try_wait`，超时后
+/// `kill + wait` 并以错误返回。stdout/stderr 由后台线程并发读取，
+/// 避免管道写满时子进程与读取方互锁。
+fn run_command_captured(
+    command: &mut Command,
+    cmd_name: &str,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to execute command: {cmd_name}"))?;
+
+    let out_reader = child.stdout.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let err_reader = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    // 子进程已终止、管道关闭，读取线程自然收尾，join 兜底回收
+                    let _ = out_reader.map(|h| h.join());
+                    let _ = err_reader.map(|h| h.join());
+                    bail!("command '{cmd_name}' timed out after {}s", timeout.as_secs());
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e).with_context(|| format!("failed to wait for command: {cmd_name}"));
+            }
+        }
+    };
+
+    let stdout = out_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stderr = err_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+    Ok((status, stdout, stderr))
+}
+
 /// 执行外部命令并注入额外环境变量（仅注入非空值），捕获 stdout 输出
 ///
 /// 用于给 uv/pip 等联网子进程注入代理环境变量。
 /// 成功时返回 stdout 内容，失败时返回错误（含 stderr 信息）。
+/// P2：带超时兜底（见 [`COMMAND_TIMEOUT`]），挂死命令不再无限阻塞调用方。
 pub fn run_command_with_env(
     cmd: &str,
     args: &[&str],
@@ -779,19 +867,22 @@ pub fn run_command_with_env(
             command.env(key, value);
         }
     }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
-    let output = command
-        .output()
-        .with_context(|| format!("failed to execute command: {cmd}"))?;
+    let (status, stdout_bytes, stderr_bytes) =
+        run_command_captured(&mut command, cmd, COMMAND_TIMEOUT)?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+    let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
 
-    if !output.status.success() {
+    if !status.success() {
         bail!(
             "command '{}' failed with exit code {:?}\nstderr: {}",
             cmd,
-            output.status.code(),
+            status.code(),
             stderr.trim()
         );
     }
@@ -922,6 +1013,69 @@ mod tests {
     }
 
     // ── 半壳 venv 回归（E2E 任务 #10）：只有解释器、未装依赖的 venv 不得误判就绪 ──
+
+    /// P1 回归：`uv venv` 失败必须拆除 create_dir_all 已建好的半壳目录，
+    /// 否则下次 `exists()` 恒真跳过创建 → 安装永久卡死。
+    #[test]
+    fn uv_venv_failure_removes_half_shell_dir() {
+        let root = std::env::temp_dir().join(format!("ep_uv_fail_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // uv_path 指向必然 spawn 失败的路径 → ensure_venv 走 uv venv 错误路径
+        let mgr = EnvManager {
+            root: root.clone(),
+            python_path: None,
+            uv_path: Some(PathBuf::from("/nonexistent/uv-binary-for-test")),
+            network_env: Vec::new(),
+            uv_cache_dir: String::new(),
+            constraints: String::new(),
+        };
+
+        let module_id = "mod-uv-fail";
+        let req = root.join("requirements.txt");
+        std::fs::write(&req, "fastapi\n").unwrap();
+
+        // 注意：不预建 venv_dir——半壳目录由 ensure_venv 内部 create_dir_all
+        // 创建（uv venv 执行前的现场）；uv venv 失败后该目录必须被拆除。
+        let venv_dir = root.join("runtime").join("venvs").join(module_id);
+        assert!(mgr.ensure_venv(module_id, "3.12", &req).is_err());
+        assert!(
+            !venv_dir.exists(),
+            "uv venv 失败后由 ensure_venv 创建的半壳目录必须被拆除: {}",
+            venv_dir.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P2 回归：挂死命令在超时后被 kill，调用方拿到错误而非无限阻塞
+    #[test]
+    fn run_command_timeout_returns_error_not_hang() {
+        // 故意跑得比超时长 → 应快速返回 Err（而非永久阻塞）
+        let (program, args): (&str, Vec<&str>) = if cfg!(windows) {
+            ("cmd", vec!["/C", "ping", "-n", "3", "127.0.0.1"])
+        } else {
+            ("sleep", vec!["5"])
+        };
+        let start = Instant::now();
+        let result = run_command_captured(
+            Command::new(program).args(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()),
+            program,
+            Duration::from_millis(150),
+        );
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "超时应返回 Err");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "超时后必须快速返回，实际耗时 {:?}",
+            elapsed
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("timed out"),
+            "错误信息应说明超时"
+        );
+    }
 
     #[test]
     fn is_venv_ready_half_shell_returns_false() {

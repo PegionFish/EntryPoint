@@ -5,6 +5,7 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
@@ -148,6 +149,36 @@ impl SystemDep {
 
 // ─── 自动安装 ────────────────────────────────────────────────────────────────
 
+/// `apt-get update` 超时（秒）：包列表同步可能较慢，120s 兜底挂死（P2）
+const UPDATE_TIMEOUT: Duration = Duration::from_secs(120);
+/// 包安装超时（秒）：大包下载可能较久，1800s 兜底挂死（P2）
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(1800);
+
+/// 带超时的 `status()`（P2）：轮询 `try_wait`，超时 kill 子进程并以
+/// `Ok(None)` 返回（调用方按失败处理）。无需捕获输出（无管道），
+/// 不存在管道写满互锁问题。
+fn run_status_with_timeout(
+    cmd: &mut Command,
+    timeout: Duration,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let mut child = cmd.spawn()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(Some(status)),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(None); // 超时
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// 安装结果
 #[derive(Debug)]
 pub enum InstallResult {
@@ -219,7 +250,22 @@ pub fn auto_install(dep: SystemDep) -> InstallResult {
         };
         update_cmd.arg("update").arg("-qq");
         info!(cmd = ?update_cmd, "running package list update");
-        let _ = update_cmd.status();
+        // P2：不再 `let _ = status()` 静默吞掉失败——记录告警并继续（update
+        // 失败不一定致命，install 自会失败重试）；同时加超时兜底挂死。
+        match run_status_with_timeout(&mut update_cmd, UPDATE_TIMEOUT) {
+            Ok(Some(status)) if status.success() => {
+                info!("package list update succeeded");
+            }
+            Ok(Some(status)) => {
+                warn!(code = ?status.code(), "package list update failed; proceeding with install");
+            }
+            Ok(None) => {
+                warn!("package list update timed out; proceeding with install");
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to execute package list update; proceeding with install");
+            }
+        }
     }
 
     // 安装
@@ -238,16 +284,23 @@ pub fn auto_install(dep: SystemDep) -> InstallResult {
 
     info!(dep = ?dep, pkg = %pkg, family = ?family, "attempting auto-install");
 
-    match cmd.status() {
-        Ok(status) if status.success() => {
+    match run_status_with_timeout(&mut cmd, INSTALL_TIMEOUT) {
+        Ok(Some(status)) if status.success() => {
             info!(dep = ?dep, pkg = %pkg, "auto-install succeeded");
             InstallResult::Installed
         }
-        Ok(status) => {
+        Ok(Some(status)) => {
             warn!(dep = ?dep, pkg = %pkg, code = ?status.code(), "auto-install failed");
             InstallResult::Failed(format!(
                 "package manager exited with code {:?}. Manual install: {}",
                 status.code(),
+                dep.manual_guidance()
+            ))
+        }
+        Ok(None) => {
+            warn!(dep = ?dep, pkg = %pkg, "auto-install timed out");
+            InstallResult::Failed(format!(
+                "package manager timed out. Manual install: {}",
                 dep.manual_guidance()
             ))
         }
@@ -366,5 +419,41 @@ mod tests {
         assert!(DistroFamily::Debian.install_args().contains(&"-y"));
         assert!(DistroFamily::Arch.install_args().contains(&"--noconfirm"));
         assert!(DistroFamily::Unknown.install_args().is_empty());
+    }
+
+    #[test]
+    fn run_status_with_timeout_kills_hung_process() {
+        // 子进程故意跑得比超时长 → 应被 kill 并以 Ok(None) 快速返回（P2）
+        let (program, args): (&str, Vec<&str>) = if cfg!(windows) {
+            ("cmd", vec!["/C", "ping", "-n", "3", "127.0.0.1"])
+        } else {
+            ("sleep", vec!["5"])
+        };
+        let start = Instant::now();
+        let mut cmd = Command::new(program);
+        cmd.args(&args);
+        let result = run_status_with_timeout(&mut cmd, Duration::from_millis(150));
+        let elapsed = start.elapsed();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), None, "超时后应返回 Ok(None)");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "超时后必须快速返回，实际耗时 {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn run_status_with_timeout_normal_exit() {
+        // 正常快速退出的命令 → Ok(Some(成功状态))
+        let (program, args): (&str, Vec<&str>) = if cfg!(windows) {
+            ("cmd", vec!["/C", "exit", "0"])
+        } else {
+            ("true", vec![])
+        };
+        let mut cmd = Command::new(program);
+        cmd.args(&args);
+        let result = run_status_with_timeout(&mut cmd, Duration::from_secs(10)).unwrap();
+        assert_eq!(result.map(|s| s.success()), Some(true));
     }
 }

@@ -79,12 +79,30 @@ pub(crate) fn build_directml_devices(
             continue;
         }
         let lower = name.to_ascii_lowercase();
-        // Microsoft Basic Display Adapter / Basic Render Device：兜底驱动，无加速能力
-        if lower.contains("basic display") || lower.contains("basic render") {
+        // Microsoft Basic Display Adapter / Basic Render Driver / Standard VGA：
+        // 兜底驱动，无加速能力（P3 扩充：microsoft basic / standard vga）
+        if lower.contains("basic display")
+            || lower.contains("basic render")
+            || lower.contains("microsoft basic")
+            || lower.contains("standard vga")
+        {
             continue;
         }
         // 虚拟显示适配器（Parsec/RDP 等）：无物理 GPU，DirectML 不可用（真机实测存在）
-        if lower.contains("virtual display") || lower.contains("remote display") {
+        if lower.contains("virtual display")
+            || lower.contains("remote display")
+            || lower.contains("virtual graphics")
+        {
+            continue;
+        }
+        // Hyper-V / VM 虚拟显卡（P3 扩充）：Hyper-V Video、VMware SVGA、
+        // VirtualBox WDDM、QEMU 模拟显卡、Citrix 间接显示——均无物理 GPU
+        if lower.contains("hyper-v")
+            || lower.contains("vmware")
+            || lower.contains("virtualbox")
+            || lower.contains("qemu")
+            || lower.contains("citrix")
+        {
             continue;
         }
         // Indirect Display Driver 虚拟显卡（向日葵 OrayIddDriver / ToDesk 等
@@ -223,6 +241,25 @@ mod tests {
         let devices = build_directml_devices(adapters, &[]);
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].name, "Intel(R) Graphics");
+    }
+
+    #[test]
+    fn test_hyperv_and_vm_software_adapters_skipped() {
+        // P3：Hyper-V / VM 虚拟显卡与常见软件适配器不得误报为 DirectML 设备；
+        // 真实设备不受影响
+        let adapters = vec![
+            "Microsoft Hyper-V Video".to_string(),
+            "Microsoft Basic Display Driver".to_string(),
+            "Standard VGA Graphics Adapter".to_string(),
+            "VMware SVGA 3D".to_string(),
+            "VirtualBox Graphics Adapter for Windows (WDDM)".to_string(),
+            "QEMU Standard VGA".to_string(),
+            "Citrix Indirect Display Adapter".to_string(),
+            "NVIDIA GeForce RTX 5090 D".to_string(), // 真实设备必须保留
+        ];
+        let devices = build_directml_devices(adapters, &[]);
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "NVIDIA GeForce RTX 5090 D");
     }
 
     #[test]
