@@ -112,17 +112,26 @@ impl PipelineTask {
         self.check_completion();
     }
 
-    /// 标记节点执行失败，并将所有下游节点标记为 Skipped
+    /// 标记节点执行失败，并将其余未执行的节点标记为 Skipped
+    ///
+    /// 限制（P1 修复）：本方法签名不含 pipeline 引用，无法计算精确的
+    /// 传递下游闭包（精确版本见 [`Self::mark_failed_with_pipeline`]）。
+    /// 保守起见将**所有仍为 Pending 的节点**一并置 Skipped —— 在
+    /// 「首个失败即终止管线」的执行模型下，任一 Pending 节点都不会再
+    /// 执行，该超集跳过不会改变任务终态，同时保证 `is_complete()` 终能
+    /// 成立、`check_completion` 正确置 Failed（修复旧实现空跳过导致的
+    /// 状态机永不终结）。
     pub fn mark_failed(&mut self, node_id: &str, error: String, retryable: bool) {
         if let Some(state) = self.node_states.get_mut(node_id) {
             *state = NodeState::Failed { error, retryable };
         }
 
-        // 标记所有下游为 Skipped（需要管线信息来获取下游）
-        // 这里通过 node_states 中仍为 Pending 的节点来处理：
-        // 调用者应传入 pipeline 引用，或使用 all_downstream_of
-        // 为保持接口简洁，此处标记所有依赖该节点的 Pending 下游
-        self.skip_downstream_of(node_id);
+        // 无管线引用：所有剩余 Pending 节点保守置 Skipped
+        for state in self.node_states.values_mut() {
+            if *state == NodeState::Pending {
+                *state = NodeState::Skipped;
+            }
+        }
 
         self.check_completion();
     }
@@ -158,13 +167,25 @@ impl PipelineTask {
 
     // ─── 内部方法 ────────────────────────────────────────────────────────────
 
-    /// 简单的下游跳过：遍历所有 Pending 节点，如果其上游有 Failed/Skipped 则跳过
+    /// 将当前层中仍为 Running 的节点一并置 Skipped（P0 状态机泄漏修复）。
     ///
-    /// 注意：这是简化实现，仅处理直接下游。完整的传递闭包跳过
-    /// 应使用 `mark_failed_with_pipeline`。
-    fn skip_downstream_of(&mut self, _node_id: &str) {
-        // 简化实现：不做传递闭包（需要 pipeline 引用）
-        // 完整逻辑见 mark_failed_with_pipeline
+    /// 层内某个节点失败/被取消后，同层其余兄弟节点已被 `execute_layer`
+    /// 置为 Running，但 runner 的失败分支会 `break` 提前终止本层执行，
+    /// 若不处理它们将永远保持 Running，导致 `is_complete()` 恒 false、
+    /// 任务卡在 Running 且外层误报成功。置 Skipped 后再次触发
+    /// `check_completion`：全部节点终结时任务终态（Failed/Cancelled）落地。
+    ///
+    /// 仅处理 Running → Skipped：Completed/Failed/Skipped 保持不动，
+    /// Pending 不在当前层（本层已被 execute_layer 置位）。
+    pub(crate) fn skip_layer_remaining(&mut self, layer: &[String]) {
+        for node_id in layer {
+            if let Some(state) = self.node_states.get_mut(node_id) {
+                if *state == NodeState::Running {
+                    *state = NodeState::Skipped;
+                }
+            }
+        }
+        self.check_completion();
     }
 
     /// 检查是否所有节点都已终结，更新任务整体状态
@@ -325,6 +346,110 @@ to = ["save", "input"]
         assert_eq!(task.node_states["save"], NodeState::Skipped);
         assert!(task.is_complete());
         assert!(matches!(task.status, TaskStatus::Failed(_)));
+    }
+
+    #[test]
+    fn test_mark_failed_skips_remaining_pending() {
+        let pipeline = test_pipeline();
+        let mut task = PipelineTask::new(&pipeline, PathBuf::from("/tmp/test"));
+
+        task.execute_layer(&["input".to_string()]);
+        task.mark_completed("input", Artifact::File(PathBuf::from("in.wav")));
+        task.execute_layer(&["process".to_string()]);
+        task.mark_failed("process", "boom".to_string(), false);
+
+        assert_eq!(
+            task.node_states["process"],
+            NodeState::Failed {
+                error: "boom".to_string(),
+                retryable: false,
+            }
+        );
+        // 无 pipeline 引用：剩余 Pending 节点保守置 Skipped（不再空跳过）
+        assert_eq!(task.node_states["save"], NodeState::Skipped);
+        assert!(task.is_complete());
+        assert!(matches!(task.status, TaskStatus::Failed(_)));
+    }
+
+    /// P0 状态机泄漏修复：同层兄弟失败后，剩余 Running 兄弟必须被置
+    /// Skipped、全部节点终结、任务终态 Failed（修复前兄弟永久 Running，
+    /// is_complete 恒 false、check_completion 不置 Failed）。
+    #[test]
+    fn test_skip_layer_remaining_after_failure() {
+        let toml_str = r#"
+[pipeline]
+id = "test-skip-layer"
+name = "Skip layer"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+
+[[nodes]]
+id = "process"
+kind = "module"
+module_id = "m"
+capability = "c"
+
+[[nodes]]
+id = "save"
+kind = "builtin"
+builtin = "file_output"
+
+[[edges]]
+from = ["input", "output"]
+to = ["process", "input"]
+
+[[edges]]
+from = ["input", "output"]
+to = ["save", "input"]
+"#;
+        let pipeline = Pipeline::from_toml_str(toml_str).unwrap();
+        let mut task = PipelineTask::new(&pipeline, PathBuf::from("/tmp/test"));
+
+        task.execute_layer(&["input".to_string()]);
+        task.mark_completed("input", Artifact::File(PathBuf::from("in.wav")));
+
+        // process 与 save 同层，均为 Running
+        task.execute_layer(&["process".to_string(), "save".to_string()]);
+        assert_eq!(task.node_states["save"], NodeState::Running);
+
+        // process 失败 → 下游跳过 + 同层剩余 Running 兄弟置 Skipped
+        task.mark_failed_with_pipeline("process", "boom".into(), false, &pipeline);
+        task.skip_layer_remaining(&["process".to_string(), "save".to_string()]);
+
+        assert_eq!(task.node_states["save"], NodeState::Skipped, "同层兄弟须置 Skipped");
+        assert_eq!(
+            task.node_states["process"],
+            NodeState::Failed {
+                error: "boom".to_string(),
+                retryable: false,
+            }
+        );
+        assert!(task.is_complete(), "全部节点应终结");
+        assert!(matches!(task.status, TaskStatus::Failed(_)), "终态应为 Failed");
+    }
+
+    /// timeout_secs=0 语义（P3）：显式 0 = 无硬超时（返回 0，客户端不设超时），
+    /// 与 runner 侧「0 即无 wall-clock 包裹」一致；None 才回退缺省 300s。
+    #[test]
+    fn test_node_timeout_secs_zero_means_no_timeout() {
+        let node = |secs: Option<u32>| PipelineNode {
+            id: "n".to_string(),
+            kind: NodeKind::Builtin {
+                builtin: "ffmpeg".to_string(),
+            },
+            label: String::new(),
+            params: serde_json::json!({}),
+            position: None,
+            timeout_secs: secs,
+            retry_count: None,
+        };
+
+        assert_eq!(node_timeout_secs(&node(Some(0))), 0, "Some(0) = 无硬超时");
+        assert_eq!(node_timeout_secs(&node(None)), HTTP_TIMEOUT_SECS, "缺省回退 300s");
+        assert_eq!(node_timeout_secs(&node(Some(7))), 7);
     }
 
     // ─── ffmpeg args 占位符替换（P0：shipped 管线依赖 {input}/{output}） ────
@@ -575,6 +700,97 @@ to = ["save", "input"]
         assert!(std::fs::metadata(&output).unwrap().len() > 0);
 
         cleanup_ffmpeg_dir(&work_dir);
+    }
+
+    /// P3：ffmpeg 命令以 0 退出但未产出目标文件 → 必须报错（防止下游拿到
+    /// 悬空路径）。输出指向空设备（NUL //dev/null）时命令成功但无常规文件。
+    #[tokio::test]
+    async fn test_ffmpeg_success_without_output_file_errors() {
+        if !ffmpeg_available() {
+            eprintln!("SKIP: ffmpeg not available");
+            return;
+        }
+
+        let work_dir = ffmpeg_temp_dir("noout");
+        let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        let node = ffmpeg_node(
+            "enc",
+            serde_json::json!({
+                "args": ["-f", "lavfi", "-i", "testsrc=duration=1:size=32x32:rate=1", "-frames:v", "1", "-f", "rawvideo", "-y"],
+                "output": null_device,
+            }),
+        );
+
+        let err = execute_builtin_ffmpeg(&node, &[], &work_dir)
+            .await
+            .expect_err("ffmpeg 成功但无产物时应报错");
+        assert!(
+            err.to_string().contains("did not produce"),
+            "错误应说明产物缺失: {err}"
+        );
+
+        cleanup_ffmpeg_dir(&work_dir);
+    }
+
+    /// file_input 目标命名回归（P2）：目标路径含节点 id —— 同管线两个
+    /// 同名源文件（不同目录）不互相覆盖；源与目标为同一文件时跳过复制。
+    #[tokio::test]
+    async fn test_file_input_node_id_in_dest_name() {
+        let work_dir = std::env::temp_dir().join(format!("ep_fi_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let dir_a = work_dir.join("a");
+        let dir_b = work_dir.join("b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let src_a = dir_a.join("audio.wav");
+        let src_b = dir_b.join("audio.wav");
+        std::fs::write(&src_a, b"AAAA").unwrap();
+        std::fs::write(&src_b, b"BBBB").unwrap();
+
+        let node = |id: &str, path: &std::path::Path| PipelineNode {
+            id: id.to_string(),
+            kind: NodeKind::Builtin {
+                builtin: "file_input".to_string(),
+            },
+            label: String::new(),
+            params: serde_json::json!({ "path": path.to_string_lossy() }),
+            position: None,
+            timeout_secs: None,
+            retry_count: None,
+        };
+
+        let Artifact::File(dest_a) =
+            execute_builtin_file_input(&node("left", &src_a), &work_dir).await.unwrap()
+        else {
+            panic!("expected file artifact");
+        };
+        let Artifact::File(dest_b) =
+            execute_builtin_file_input(&node("right", &src_b), &work_dir).await.unwrap()
+        else {
+            panic!("expected file artifact");
+        };
+
+        assert_ne!(dest_a, dest_b, "同管线同名源文件目标不得互相覆盖");
+        assert_eq!(std::fs::read(&dest_a).unwrap(), b"AAAA");
+        assert_eq!(std::fs::read(&dest_b).unwrap(), b"BBBB");
+        assert!(dest_a.to_string_lossy().contains("left"), "目标名应含节点 id: {dest_a:?}");
+        assert!(dest_b.to_string_lossy().contains("right"), "目标名应含节点 id: {dest_b:?}");
+
+        // 源位于工作目录内：复制到带节点 id 前缀的目标（不会原地覆盖源），
+        // 内容完整 —— 目标命名含节点 id 后，dest 与源路径不再可能词法相等，
+        // 同文件判定退化为防御性分支（源=目标时经 canonicalize 跳过复制）
+        let in_work = work_dir.join("input.txt");
+        std::fs::write(&in_work, b"in work dir").unwrap();
+        let Artifact::File(dest) =
+            execute_builtin_file_input(&node("self", &in_work), &work_dir).await.unwrap()
+        else {
+            panic!("expected file artifact");
+        };
+        assert_eq!(dest, work_dir.join("self").join("input.txt"), "目标应放入按节点 id 隔离的子目录");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"in work dir");
+        assert_eq!(std::fs::read(&in_work).unwrap(), b"in work dir", "源文件不受影响");
+
+        let _ = std::fs::remove_dir_all(&work_dir);
     }
 
     /// {input} 占位符但无上游产物 → 中文报错（不需要 ffmpeg 二进制，不 spawn）
@@ -1575,6 +1791,57 @@ to = ["output", "input"]
         let _ = std::fs::remove_dir_all(&work_dir);
     }
 
+    /// 大文件 multipart 上传回归（P1）：Part::stream_with_length 流式上传，
+    /// 约 4 MiB 文件内容应完整送达（替代旧实现的 tokio::fs::read 全量读入）。
+    #[tokio::test]
+    async fn test_module_node_file_input_multipart_streams_large_file() {
+        let work_dir = std::env::temp_dir().join(format!("ep_mod_mp_big_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&work_dir).unwrap();
+        // 可打印 ASCII 内容（32..=126），保证 mock 的 lossy 捕获无损比较
+        let payload: Vec<u8> = (0..4 * 1024 * 1024)
+            .map(|i| 32 + ((i * 7) % 95) as u8)
+            .collect();
+        let input_file = work_dir.join("big.bin");
+        std::fs::write(&input_file, &payload).unwrap();
+
+        let expected_out = work_dir.join("cap_output.bin");
+        let server = MockLlmServer::start(MockLlmBehavior::Respond {
+            status: 200,
+            body: module_ok_response(
+                Some("file"),
+                serde_json::json!(expected_out.to_string_lossy().to_string()),
+            ),
+        })
+        .await;
+
+        let node = module_node_with("m1", "cap", serde_json::json!({ "output_format": "bin" }));
+        let artifact = execute_module_node(
+            &node,
+            &[Artifact::File(input_file)],
+            &work_dir,
+            &single_port_map("m1", &server),
+        )
+        .await
+        .expect("large multipart upload should succeed");
+        assert_eq!(artifact, Artifact::File(expected_out));
+
+        // 原始请求完整捕获 → 校验 file part 内容未截断/未损坏
+        let req = server.captured().pop().unwrap();
+        let fields = multipart_fields(&req);
+        let file_field = fields
+            .iter()
+            .find(|(n, _, _)| n == "file")
+            .expect("multipart must carry a 'file' part");
+        assert_eq!(file_field.1.as_deref(), Some("big.bin"));
+        assert_eq!(
+            file_field.2.as_bytes(),
+            payload.as_slice(),
+            "大文件 multipart 内容应完整无损"
+        );
+
+        let _ = std::fs::remove_dir_all(&work_dir);
+    }
+
     /// output_format 声明 → output_path 注入 params（JSON body 路径）；
     /// output_format="json" 不注入
     #[tokio::test]
@@ -1967,10 +2234,25 @@ async fn execute_builtin_file_input(
         ));
     }
 
-    let dest = work_dir.join(source_path.file_name().unwrap_or_else(|| std::ffi::OsStr::new("input")));
+    let file_name = source_path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("input"));
+    // P2：目标放入按节点 id 隔离的子目录 —— 同管线多个同名源文件（不同目录）
+    // 不再互相覆盖，且产物文件名保持源文件名（`{node_id}_` 前缀命名会改变
+    // 产物名，破坏 daemon 任务产物契约）
+    let dest_dir = work_dir.join(&node.id);
+    std::fs::create_dir_all(&dest_dir)?;
+    let dest = dest_dir.join(file_name);
 
-    // 如果源文件和目标是同一个文件，跳过复制（避免 Windows 文件锁冲突）
-    if dest != source_path {
+    // P2：源与目标是同一文件时跳过复制（避免 Windows 文件锁冲突）。
+    // 用 canonicalize 绝对化后比较而非词法比较——相对/绝对路径混用时
+    // 词法比较不可靠；dest 尚不存在时 canonicalize 失败即视为不同文件。
+    let same_file = source_path
+        .canonicalize()
+        .ok()
+        .zip(dest.canonicalize().ok())
+        .is_some_and(|(src, dst)| src == dst);
+    if !same_file {
         std::fs::copy(source_path, &dest)?;
     }
 
@@ -2290,6 +2572,15 @@ async fn execute_builtin_ffmpeg(
         return Err(anyhow::anyhow!("ffmpeg failed: {stderr}"));
     }
 
+    // P3：命令成功但产物未落盘 → 下游将拿到悬空路径，显式报错
+    //（如输出到空设备 / 写错位置时 ffmpeg 仍以 0 退出）
+    if !output_path.is_file() {
+        return Err(anyhow::anyhow!(
+            "ffmpeg succeeded but did not produce the expected output file '{}'",
+            output_path.display()
+        ));
+    }
+
     Ok(Artifact::File(output_path))
 }
 
@@ -2321,13 +2612,17 @@ const RETRY_DELAY_SECS: u64 = 2;
 /// HTTP 请求超时（秒）— 节点未配置 `timeout_secs` 时的缺省值
 const HTTP_TIMEOUT_SECS: u64 = 300;
 
-/// 节点级 HTTP 调用超时解析（P1-11）：`timeout_secs` 配置且 >0 时生效，
-/// 否则回退缺省 [`HTTP_TIMEOUT_SECS`]。
+/// 节点级 HTTP 调用超时解析（P1-11）：`timeout_secs` 显式声明且 >0 时生效。
+///
+/// `Some(0)` = 显式「无硬超时」，返回 0（调用方据此**不设置**客户端超时，
+/// 与 runner 侧 `timeout_secs=0 → 无 wall-clock 包裹` 的语义一致）；
+/// 缺省（None）才回退 [`HTTP_TIMEOUT_SECS`]。
 fn node_timeout_secs(node: &PipelineNode) -> u64 {
-    node.timeout_secs
-        .map(u64::from)
-        .filter(|t| *t > 0)
-        .unwrap_or(HTTP_TIMEOUT_SECS)
+    match node.timeout_secs {
+        Some(0) => 0,
+        Some(secs) => u64::from(secs),
+        None => HTTP_TIMEOUT_SECS,
+    }
 }
 
 /// 模块节点执行 — 通过 HTTP 调用本地模块服务
@@ -2383,11 +2678,14 @@ async fn execute_module_node(
     // 模块调用永远只打本机地址（127.0.0.1）：显式禁用代理，避免配置的
     // 出口代理（HTTP_PROXY 等）拦截 localhost 流量。
     // 节点级 timeout_secs（P1-11）：配置后作为本次调用的客户端超时，
-    // 缺省沿用 HTTP_TIMEOUT_SECS
+    // 缺省沿用 HTTP_TIMEOUT_SECS；`timeout_secs=0` = 无硬超时（不设置
+    // 客户端超时，与 runner 侧语义一致）。
     let timeout_secs = node_timeout_secs(node);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout_secs))
-        .no_proxy()
+    let mut client_builder = reqwest::Client::builder().no_proxy();
+    if timeout_secs > 0 {
+        client_builder = client_builder.timeout(std::time::Duration::from_secs(timeout_secs));
+    }
+    let client = client_builder
         .build()
         .map_err(|e| {
             anyhow::anyhow!(ModuleCallError {
@@ -2508,15 +2806,20 @@ async fn send_module_request(
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "input".to_string());
 
-                let bytes = tokio::fs::read(path).await.map_err(|e| {
+                // P1：流式上传（Part::stream_with_length）替代 tokio::fs::read
+                // 全量读入内存 —— GB 级输入不再出现「内存峰值 ≈ 文件大小」；
+                // 显式携带 Content-Length，兼容要求声明长度的服务端。
+                let file = tokio::fs::File::open(path).await.map_err(|e| {
                     anyhow::anyhow!(ModuleCallError {
                         module_id: module_id.to_string(),
-                        message: format!("failed to read input file '{}': {e}", path.display()),
+                        message: format!("failed to open input file '{}': {e}", path.display()),
                         retryable: false,
                     })
                 })?;
+                let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
 
-                let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name);
+                let part =
+                    reqwest::multipart::Part::stream_with_length(file, len).file_name(file_name);
                 form = form.part("file", part);
             }
         }
@@ -2927,10 +3230,13 @@ fn llm_endpoint_is_local(url: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 构建 LLM HTTP 客户端：节点 `timeout_secs` 生效，本机端点豁免代理
+/// 构建 LLM HTTP 客户端：节点 `timeout_secs` 生效（0 = 无客户端超时），
+/// 本机端点豁免代理
 fn build_llm_http_client(url: &str, timeout_secs: u64) -> anyhow::Result<reqwest::Client> {
-    let mut builder =
-        reqwest::Client::builder().timeout(std::time::Duration::from_secs(timeout_secs));
+    let mut builder = reqwest::Client::builder();
+    if timeout_secs > 0 {
+        builder = builder.timeout(std::time::Duration::from_secs(timeout_secs));
+    }
     if llm_endpoint_is_local(url) {
         builder = builder.no_proxy();
     }
