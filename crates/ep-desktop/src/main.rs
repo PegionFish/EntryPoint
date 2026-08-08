@@ -112,7 +112,8 @@ fn main() -> anyhow::Result<()> {
         .with_title("EntryPoint")
         .with_inner_size([1280.0, 800.0])
         .with_min_inner_size([720.0, 480.0]);
-    if let Some((pos, size)) = load_window_state(&root) {
+    let restored = load_window_state(&root);
+    if let Some((pos, size)) = restored {
         viewport = viewport.with_position(pos);
         if size.x >= 320.0 && size.y >= 240.0 {
             viewport = viewport.with_inner_size([size.x, size.y]);
@@ -133,7 +134,13 @@ fn main() -> anyhow::Result<()> {
             cc.egui_ctx.set_zoom_factor(ep_desktop::theme::clamp_scale_factor(
                 ui_config.ui.scale_factor,
             ));
-            Ok(Box::new(ep_desktop::App::new(rx, cmd_tx, ui_config)))
+            // §13 风险 1：注入恢复期望几何，App 首帧校验是否落在现存
+            // 显示器内（孤儿窗口自动回退主屏居中）
+            let mut app = ep_desktop::App::new(rx, cmd_tx, ui_config);
+            if let Some((pos, size)) = restored {
+                app = app.with_restored_expectation(pos, size);
+            }
+            Ok(Box::new(app))
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))

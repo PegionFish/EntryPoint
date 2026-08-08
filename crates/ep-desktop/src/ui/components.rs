@@ -82,6 +82,34 @@ pub fn card_frame_hover(pal: &Palette, hovered: bool) -> egui::Frame {
     f
 }
 
+/// 活跃态卡片 Frame（§7.1 设备卡运行态呼吸辉光）：自定义描边色 +
+/// 可选彩色辉光阴影；描边色由调用方按 [`glow_breath_alpha`] 时间插值。
+pub fn card_frame_active(
+    pal: &Palette,
+    stroke: egui::Stroke,
+    glow_shadow: Option<egui::Color32>,
+) -> egui::Frame {
+    let mut f = egui::Frame::new()
+        .fill(pal.bg_card)
+        .stroke(stroke)
+        .corner_radius(egui::CornerRadius::same(CARD_ROUNDING))
+        .inner_margin(egui::Margin::same(CARD_PADDING as i8));
+    if let (Some(color), true) = (glow_shadow, pal.dark) {
+        f = f.shadow(egui::epaint::Shadow {
+            offset: [0, 0],
+            blur: 16,
+            spread: 0,
+            color,
+        });
+    }
+    f
+}
+
+/// 半透明派生色：保留 RGB、替换 alpha（辉光描边/条纹底等层色用）
+pub fn color_with_alpha(color: egui::Color32, alpha: u8) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+}
+
 /// 卡片容器（含悬停描边提亮示范：hover 上一帧状态经临时存储驱动本帧描边，
 /// 状态变化时请求重绘；§1.1 主张 3「hover 只提升描边亮度，零位移」）
 pub fn card<R>(
@@ -121,6 +149,42 @@ pub fn badge(ui: &mut egui::Ui, pal: &Palette, color: egui::Color32, label: impl
         });
 }
 
+/// 状态徽章（StatusBadge，§9）：胶囊 + 状态圆点 + 四态色文字。
+///
+/// 颜色经 [`crate::ui::service_status`] 统一映射（四态权威色 §1.2）；
+/// 运行/过渡态（starting/preparing）圆点附加 status_glow_running 辉光晕
+///（§3.4 徽章规范；静态晕，不驱动连续重绘）。
+pub fn status_badge(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    status: &ep_core::types::ServiceStatus,
+    label: impl Into<String>,
+) {
+    use ep_core::types::ServiceStatus;
+    let meta = crate::ui::service_status(status, pal);
+    let label = label.into();
+    let glowing = meta.transitional || matches!(status, ServiceStatus::Running);
+    egui::Frame::new()
+        .fill(pal.badge_bg(meta.color))
+        .stroke(egui::Stroke::new(1.0_f32, pal.badge_stroke(meta.color)))
+        .corner_radius(egui::CornerRadius::same(20))
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
+                let center = rect.center();
+                if glowing {
+                    // 辉光晕：运行中附 status-glow-running（§1.1 主张 5）
+                    ui.painter().circle_filled(center, 6.5, pal.status_glow_running);
+                }
+                ui.painter().circle_filled(center, 3.5, meta.color);
+                ui.label(egui::RichText::new(label).size(12.0).color(meta.color));
+            });
+        });
+}
+
 // ─── 页面骨架 ────────────────────────────────────────────────────────────────
 
 /// 页头：左侧标题 + 右侧操作区
@@ -149,6 +213,115 @@ pub fn empty_state(ui: &mut egui::Ui, pal: &Palette, icon: &str, title: &str, hi
         }
         ui.add_space(20.0);
     });
+}
+
+// ─── 表单组件（§9 SwitchRow/FormRow） ─────────────────────────────────────
+
+/// 开关行（SwitchRow，§9）：带可见文案的 checkbox + 弱化描述。
+///
+/// 修复设置页空标签 checkbox 缺陷：旧实现把文案放在 Grid 标签列、
+/// checkbox 本体传空串，控件自身无可读文本；本组件让控件直接携带标签。
+pub fn switch_row(ui: &mut egui::Ui, pal: &Palette, value: &mut bool, label: &str, description: &str) {
+    ui.checkbox(value, label);
+    if !description.is_empty() {
+        ui.label(egui::RichText::new(description).small().color(pal.text_faint));
+    }
+}
+
+/// 数值控件容器（§3.4 数值件「可编辑外观」）：层 2 底色 + 1px 描边 +
+/// 控件圆角，把 DragValue 包成带底带框的输入盒观感。
+pub fn numeric_field<R>(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    egui::Frame::new()
+        .fill(pal.bg_raised)
+        .stroke(egui::Stroke::new(1.0_f32, pal.border))
+        .corner_radius(egui::CornerRadius::same(CONTROL_ROUNDING))
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .show(ui, add_contents)
+        .inner
+}
+
+// ─── 数据可视化（§1.1 主张 4 仪表盘化） ──────────────────────────────────
+
+/// 渐变分段数：每段约 8px，限在 2..=24（过短填充至少 2 段保两端圆角）
+pub fn gradient_segment_count(width: f32) -> usize {
+    ((width / 8.0).ceil() as usize).clamp(2, 24)
+}
+
+/// 渐变进度条（egui 0.31 无渐变画刷 → accent_at 分段插值近似，§3.6）。
+///
+/// 6px 高、圆角轨道（层 2 底）；填充默认电光青→靛蓝渐变近似；
+/// `alert` 提供时改单色填充（高占用告警：warning/danger 语义不变）。
+pub fn progress_gradient(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    fraction: f32,
+    alert: Option<egui::Color32>,
+) -> egui::Response {
+    let height = 6.0_f32;
+    let radius = 3.0_f32;
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, radius, pal.bg_raised);
+    let frac = fraction.clamp(0.0, 1.0);
+    if frac > 0.0 {
+        let fill_w = rect.width() * frac;
+        let fill = egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, height));
+        match alert {
+            Some(color) => {
+                painter.rect_filled(fill, radius, color);
+            }
+            None => {
+                // 分段渐变：首/尾段带圆角，中段矩形拼接
+                let segs = gradient_segment_count(fill_w);
+                let seg_w = fill_w / segs as f32;
+                for i in 0..segs {
+                    let x0 = fill.min.x + i as f32 * seg_w;
+                    let x1 = if i + 1 == segs {
+                        fill.max.x
+                    } else {
+                        fill.min.x + (i + 1) as f32 * seg_w
+                    };
+                    let seg =
+                        egui::Rect::from_min_max(egui::pos2(x0, fill.min.y), egui::pos2(x1, fill.max.y));
+                    let t = if segs > 1 { i as f32 / (segs - 1) as f32 } else { 0.0 };
+                    let r = radius as u8;
+                    let rounding = match (i == 0, i + 1 == segs) {
+                        (true, true) => egui::CornerRadius::same(r),
+                        (true, false) => egui::CornerRadius { nw: r, ne: 0, sw: r, se: 0 },
+                        (false, true) => egui::CornerRadius { nw: 0, ne: r, sw: 0, se: r },
+                        (false, false) => egui::CornerRadius::same(0),
+                    };
+                    painter.rect_filled(seg, rounding, pal.accent_at(t));
+                }
+            }
+        }
+    }
+    response
+}
+
+/// 统计大数字下划线（§3.1 渐变允许位：仪表盘统计大数字）：
+/// 2px 高双色分段插值近似青→靛蓝渐变，居中分配宽度。
+pub fn accent_underline(ui: &mut egui::Ui, pal: &Palette, width: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width.max(8.0), 2.0), egui::Sense::hover());
+    let painter = ui.painter();
+    let segs = gradient_segment_count(rect.width());
+    let seg_w = rect.width() / segs as f32;
+    for i in 0..segs {
+        let x0 = rect.min.x + i as f32 * seg_w;
+        let x1 = if i + 1 == segs {
+            rect.max.x
+        } else {
+            rect.min.x + (i + 1) as f32 * seg_w
+        };
+        let seg = egui::Rect::from_min_max(egui::pos2(x0, rect.min.y), egui::pos2(x1, rect.max.y));
+        let t = if segs > 1 { i as f32 / (segs - 1) as f32 } else { 0.0 };
+        painter.rect_filled(seg, 1.0, pal.accent_at(t));
+    }
 }
 
 // ─── 响应式布局 ──────────────────────────────────────────────────────────────
@@ -283,6 +456,27 @@ pub fn primary_button(pal: &Palette, text: impl Into<egui::WidgetText>) -> egui:
         .stroke(egui::Stroke::NONE)
 }
 
+/// 带辉光的主操作按钮（§3.4 primary：填充 + 中档发光）。
+///
+/// egui 0.31 的 Button 无 shadow 能力，以透明 Frame 包裹外发辉光；
+/// 浅色主题 primary_glow 为透明，自动退化为普通主按钮（§10.5）。
+pub fn primary_button_with_glow(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    text: impl Into<egui::WidgetText>,
+) -> egui::Response {
+    let mut frame = egui::Frame::new().corner_radius(egui::CornerRadius::same(CONTROL_ROUNDING));
+    if pal.primary_glow != egui::Color32::TRANSPARENT {
+        frame = frame.shadow(egui::epaint::Shadow {
+            offset: [0, 0],
+            blur: 12,
+            spread: 0,
+            color: pal.primary_glow,
+        });
+    }
+    frame.show(ui, |ui| ui.add(primary_button(pal, text))).inner
+}
+
 /// 危险操作按钮（danger 填充）
 pub fn danger_button(pal: &Palette, text: impl Into<egui::WidgetText>) -> egui::Button<'_> {
     egui::Button::new(text)
@@ -398,6 +592,40 @@ mod tests {
         let l = Palette::light();
         assert_eq!(card_stroke(&l, false).color, l.border_glow);
         assert_ne!(card_stroke(&l, true).color, l.border_glow);
+    }
+
+    /// 活跃态卡片（§7.1）：自定义描边原样透传；浅色主题不附辉光阴影。
+    #[test]
+    fn card_frame_active_stroke_and_shadow() {
+        let pal = Palette::dark();
+        let stroke = egui::Stroke::new(1.0_f32, pal.status_running);
+        let f = card_frame_active(&pal, stroke, Some(pal.status_glow_running));
+        assert_eq!(f.stroke, stroke);
+        assert!(f.shadow.color != egui::Color32::TRANSPARENT, "深色应附辉光阴影");
+        let light = card_frame_active(&Palette::light(), stroke, Some(pal.status_glow_running));
+        assert_eq!(light.shadow.color, egui::Color32::TRANSPARENT, "浅色关闭辉光");
+    }
+
+    /// 半透明派生色：RGB 基本不变、alpha 精确替换（from_rgba_unmultiplied
+    /// 内部经线性空间预乘转换，round-trip 允许 ±2 舍入）
+    #[test]
+    fn color_with_alpha_preserves_rgb() {
+        let c = egui::Color32::from_rgb(34, 211, 238);
+        let d = color_with_alpha(c, 102);
+        let [r, g, b, a] = d.to_srgba_unmultiplied();
+        assert_eq!(a, 102);
+        assert!(r.abs_diff(34) <= 2, "r={r}");
+        assert!(g.abs_diff(211) <= 2, "g={g}");
+        assert!(b.abs_diff(238) <= 2, "b={b}");
+    }
+
+    /// 渐变分段数：下限 2 段（保两端圆角）、上限 24 段、约 8px/段
+    #[test]
+    fn gradient_segments_bounded() {
+        assert_eq!(gradient_segment_count(0.0), 2);
+        assert_eq!(gradient_segment_count(5.0), 2);
+        assert_eq!(gradient_segment_count(80.0), 10);
+        assert_eq!(gradient_segment_count(10_000.0), 24);
     }
 
     #[test]

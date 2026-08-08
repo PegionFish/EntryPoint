@@ -312,6 +312,36 @@ const REPAINT_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(2);
 
 // ─── App ────────────────────────────────────────────────────────────────────
 
+/// 窗口恢复位置对比容差（points）：OS 钳回/窗口边框测量与落盘期望
+/// 的微小偏差在此范围内视为「位置相符」
+const RESTORE_POS_TOLERANCE: f32 = 8.0;
+
+/// 窗口恢复显示器覆盖校验判定结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreVerdict {
+    /// 视口几何未就绪——下帧重试
+    Pending,
+    /// 实际位置与落盘期望相符——恢复落到了现存显示器内
+    Covered,
+    /// 位置不符——OS 已钳回孤儿窗口（目标显示器不可达）
+    Orphaned,
+}
+
+/// 纯函数判定：实际外框左上角与恢复期望位置的容差对比。
+/// outer_rect 缺失 → Pending（不判定）。
+fn restore_verdict(actual_outer_min: Option<egui::Pos2>, expected: egui::Pos2) -> RestoreVerdict {
+    match actual_outer_min {
+        None => RestoreVerdict::Pending,
+        Some(actual) => {
+            if (actual - expected).length() <= RESTORE_POS_TOLERANCE {
+                RestoreVerdict::Covered
+            } else {
+                RestoreVerdict::Orphaned
+            }
+        }
+    }
+}
+
 pub struct App {
     current_page: Page,
     /// 上一帧所在页面（页面切换时触发一次性数据刷新：Modules/Tasks）
@@ -344,6 +374,11 @@ pub struct App {
     last_maximized: bool,
     /// 是否已执行过首帧窗口尺寸保护
     window_fitted: bool,
+    /// 启动恢复的期望几何（window-state.json 读出的 outer 左上角 + inner 尺寸）；
+    /// 用于首帧显示器覆盖校验（§13 风险 5）
+    restored_expectation: Option<(egui::Pos2, egui::Vec2)>,
+    /// 窗口恢复校验是否已完成（一次性；视口信息未就绪时逐帧重试）
+    restore_checked: bool,
     /// 上一帧的紧凑模式状态（切换时重置侧栏宽度缓存，使 default_width 重新生效）
     last_compact: Option<bool>,
 }
@@ -423,7 +458,65 @@ impl App {
             last_window_inner: None,
             last_maximized: false,
             window_fitted: false,
+            restored_expectation: None,
+            restore_checked: false,
             last_compact: None,
+        }
+    }
+
+    /// 携带启动恢复的期望几何（main.rs 从 window-state.json 读出后注入）：
+    /// 首帧据此校验恢复窗口是否落在现存显示器内（§13 风险 5）。
+    pub fn with_restored_expectation(
+        mut self,
+        outer_min: egui::Pos2,
+        inner_size: egui::Vec2,
+    ) -> Self {
+        self.restored_expectation = Some((outer_min, inner_size));
+        self
+    }
+
+    /// 窗口恢复显示器覆盖校验（§13 风险 1；与 Task #28 窗口状态恢复衔接）：
+    /// 启动恢复的位置若落在已断开的显示器上，egui 0.31 无显示器列表 API
+    /// 可直接枚举校验，改用间接判定——对比首帧实际外框左上角与落盘期望
+    /// 位置：相符 → 恢复落到了现存显示器内（Covered）；不符 → OS 已把
+    /// 孤儿窗口钳回可见区（Orphaned），此时下发 center_on_screen 回退到
+    /// 现存显示器居中。视口几何未就绪（outer_rect/monitor_size 缺失）逐帧
+    /// 重试（Pending），一次性完成后不再判定。
+    fn validate_window_restore(&mut self, ctx: &egui::Context) {
+        if self.restore_checked {
+            return;
+        }
+        let Some((expected, _inner_size)) = self.restored_expectation else {
+            // 无恢复期望（window-state.json 缺失/损坏）：无需校验
+            self.restore_checked = true;
+            return;
+        };
+        let (outer, maximized) = ctx.input(|i| {
+            let vp = i.viewport();
+            (vp.outer_rect, vp.maximized.unwrap_or(false))
+        });
+        // 最大化窗口位置由 OS 管理，不参与判定（恢复恒为 normal 态，
+        // 此分支仅为防御极端时序）
+        let verdict = if maximized {
+            RestoreVerdict::Pending
+        } else {
+            restore_verdict(outer.map(|r| r.min), expected)
+        };
+        match verdict {
+            RestoreVerdict::Pending => {}
+            RestoreVerdict::Covered => {
+                self.restore_checked = true;
+            }
+            RestoreVerdict::Orphaned => {
+                self.restore_checked = true;
+                // egui 内建：按当前显示器 monitor_size 计算居中 OuterPosition；
+                // monitor_size 未就绪返回 None → 保持未校验，下帧重试
+                if let Some(cmd) = egui::ViewportCommand::center_on_screen(ctx) {
+                    ctx.send_viewport_cmd(cmd);
+                } else {
+                    self.restore_checked = false;
+                }
+            }
         }
     }
 
@@ -792,6 +885,9 @@ impl eframe::App for App {
             self.window_fitted = true;
             self.fit_window_to_screen(ctx);
         }
+
+        // ── 窗口恢复显示器覆盖校验（一次性；孤儿窗口回退居中） ──
+        self.validate_window_restore(ctx);
 
         // Poll messages from background thread
         self.process_messages();
@@ -1426,6 +1522,78 @@ mod tests {
                 .all(|c| !matches!(c, egui::ViewportCommand::InnerSize(_))),
             "最大化状态下不得下发 InnerSize（避免启动/切换期 resize 风暴）"
         );
+    }
+
+    /// 窗口恢复显示器覆盖校验：孤儿窗口（落盘位置在无覆盖显示器）被 OS
+    /// 钳回后位置不符 → 下发居中命令回退现存显示器；位置相符 → 不下发
+    /// 任何位置命令；outer_rect 缺失 → Pending 不判定（下帧重试）。
+    #[test]
+    fn window_restore_orphaned_falls_back_to_center() {
+        let ctx = egui::Context::default();
+        let monitor = Some(egui::vec2(2560.0, 1440.0));
+        // 期望：落盘的副屏坐标（该显示器已断开）
+        let expected_pos = egui::pos2(2560.0, -300.0);
+
+        // ── 孤儿场景：实际被 OS 钳到主屏（位置不符）→ 居中回退 ──
+        let mut app = test_app().with_restored_expectation(expected_pos, egui::vec2(1184.0, 769.0));
+        let clamped_outer =
+            egui::Rect::from_min_size(egui::pos2(120.0, 80.0), egui::vec2(1200.0, 800.0));
+        let out = rect_pass_mon(&ctx, Some(clamped_outer), None, false, monitor, |ctx| {
+            app.validate_window_restore(ctx)
+        });
+        let cmds = &out.viewport_output[&egui::ViewportId::ROOT].commands;
+        let centered = cmds.iter().find_map(|c| match c {
+            egui::ViewportCommand::OuterPosition(p) => Some(*p),
+            _ => None,
+        });
+        assert_eq!(
+            centered,
+            Some(egui::pos2(680.0, 320.0)),
+            "孤儿窗口必须回退到现存显示器居中"
+        );
+        assert!(app.restore_checked, "判定完成后不得重复校验");
+
+        // ── 覆盖场景：实际位置与期望相符 → 无任何位置命令 ──
+        let mut app = test_app().with_restored_expectation(expected_pos, egui::vec2(1184.0, 769.0));
+        let ok_outer = egui::Rect::from_min_size(expected_pos, egui::vec2(1200.0, 800.0));
+        let out = rect_pass_mon(&ctx, Some(ok_outer), None, false, monitor, |ctx| {
+            app.validate_window_restore(ctx)
+        });
+        let cmds = &out.viewport_output[&egui::ViewportId::ROOT].commands;
+        assert!(
+            cmds.iter()
+                .all(|c| !matches!(c, egui::ViewportCommand::OuterPosition(_))),
+            "恢复落在现存显示器内时不得移动窗口"
+        );
+        assert!(app.restore_checked);
+
+        // ── Pending 场景：outer_rect 缺失 → 不判定不标记完成 ──
+        let mut app = test_app().with_restored_expectation(expected_pos, egui::vec2(1184.0, 769.0));
+        rect_pass_mon(&ctx, None, None, false, monitor, |ctx| {
+            app.validate_window_restore(ctx)
+        });
+        assert!(!app.restore_checked, "几何未就绪时必须逐帧重试");
+    }
+
+    /// 窗口恢复纯函数判定：容差内相符 / 超出容差 / 几何缺失。
+    #[test]
+    fn restore_verdict_tolerates_small_offsets() {
+        let expected = egui::pos2(2560.0, -300.0);
+        assert_eq!(
+            restore_verdict(Some(expected), expected),
+            RestoreVerdict::Covered
+        );
+        // 容差边界内（~5.66 < 8）
+        assert_eq!(
+            restore_verdict(Some(egui::pos2(2564.0, -296.0)), expected),
+            RestoreVerdict::Covered
+        );
+        // 超出容差（OS 钳回量级）
+        assert_eq!(
+            restore_verdict(Some(egui::pos2(120.0, 80.0)), expected),
+            RestoreVerdict::Orphaned
+        );
+        assert_eq!(restore_verdict(None, expected), RestoreVerdict::Pending);
     }
 
     /// P1 回归：窗口关闭（on_exit）必须向后台发出全量停止命令，
