@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
   Activity,
@@ -26,6 +26,7 @@ import type {
 } from '@/api/types'
 import { wsManager } from '@/api/ws'
 import { PageContainer } from '@/components/layout/page-container'
+import { SegmentedTabs } from '@/components/shared/segmented-tabs'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -123,6 +124,29 @@ function isTerminalStatus(status: string): boolean {
   return ['completed', 'failed', 'cancelled'].includes(
     status.trim().toLowerCase(),
   )
+}
+
+/** 任务状态筛选值（§7.4 SegmentedTabs；会话内 sessionStorage 保持） */
+type TaskFilter = 'all' | 'running' | 'completed' | 'failed' | 'cancelled'
+
+/** 筛选会话保持键 */
+const TASK_FILTER_STORAGE_KEY = 'ep.tasks.statusFilter'
+
+/** 筛选值 → 命中状态集合（running 含 pending/queued 等非终态活跃态） */
+const TASK_FILTER_STATES: Record<Exclude<TaskFilter, 'all'>, Set<string>> = {
+  running: new Set(['pending', 'running', 'queued']),
+  completed: new Set(['completed']),
+  failed: new Set(['failed']),
+  cancelled: new Set(['cancelled']),
+}
+
+function parseTaskFilter(raw: string | null): TaskFilter {
+  return raw === 'running' ||
+    raw === 'completed' ||
+    raw === 'failed' ||
+    raw === 'cancelled'
+    ? raw
+    : 'all'
 }
 
 /** 任务开始时间戳格式（与前端支持的两种语言一一对应） */
@@ -319,16 +343,20 @@ function CopyIconButton({ text, label }: { text: string; label: string }) {
  * 单个任务卡片。
  *
  * - 头部：管线名、状态徽章、开始时间、耗时、节点进度条；
+ * - 非终态任务提供取消按钮（POST /api/tasks/{id}/cancel；§7.4）；
  * - 展开后：节点级详情（running 任务随轮询刷新）+ completed 任务的产物下载。
  */
 function TaskCard({
   task,
   expanded,
   onToggle,
+  onCancelled,
 }: {
   task: TaskSummary
   expanded: boolean
   onToggle: () => void
+  /** 取消受理成功后回调（页面层立即刷新列表） */
+  onCancelled: () => void
 }) {
   const { t, i18n } = useTranslation('tasks')
   const [detail, setDetail] = useState<TaskDetail | null>(null)
@@ -337,8 +365,30 @@ function TaskCard({
   const [artifacts, setArtifacts] = useState<TaskArtifact[] | null>(null)
   const [artifactsError, setArtifactsError] = useState<string | null>(null)
   const [artifactRetry, setArtifactRetry] = useState(0)
+  const [cancelling, setCancelling] = useState(false)
 
   const terminal = isTerminalStatus(task.status)
+
+  /** 取消任务（排队中 → 立即终结；运行中 → 逻辑终态 cancelled） */
+  async function handleCancel() {
+    if (cancelling || terminal) return
+    setCancelling(true)
+    try {
+      await api.cancelTask(task.id)
+      toast.success(
+        t('toast.cancelSucceeded', { defaultValue: '任务已取消' }),
+        { description: task.pipeline_name || task.id },
+      )
+      onCancelled()
+    } catch (e) {
+      toast.error(
+        t('toast.cancelFailed', { defaultValue: '任务取消失败' }),
+        { description: failMsg(e) },
+      )
+    } finally {
+      setCancelling(false)
+    }
+  }
 
   // 非终态任务驱动「已运行 Xs」走针：仅本卡片自身以 1s 频率重渲染，
   // 避免页面级每秒 setNow 导致整页（全部卡片 + 表格）重渲染（P3 惰性化）
@@ -425,14 +475,15 @@ function TaskCard({
       : 0
 
   return (
-    <div className="overflow-hidden rounded-lg border border-border bg-card transition-colors hover:border-primary/40">
-      {/* 头部（点击展开 / 收起） */}
-      <button
-        type="button"
-        onClick={onToggle}
-        aria-expanded={expanded}
-        className="w-full cursor-pointer px-4 py-3 text-left"
-      >
+    <div className="glass-card overflow-hidden rounded-lg">
+      {/* 头部（点击展开 / 收起）+ 非终态取消按钮 */}
+      <div className="flex items-stretch">
+        <button
+          type="button"
+          onClick={onToggle}
+          aria-expanded={expanded}
+          className="min-w-0 flex-1 cursor-pointer px-4 py-3 text-left"
+        >
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
           <ChevronDown
             className={cn(
@@ -460,20 +511,45 @@ function TaskCard({
           </span>
         </div>
         <div className="mt-2 flex items-center gap-3">
-          <div className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-muted">
-            <div
-              className={cn('h-full rounded-full transition-all', meta.bar)}
-              style={{ width: `${percent}%` }}
-            />
+            <div className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-muted">
+              <div
+                className={cn(
+                  'h-full rounded-full transition-all',
+                  meta.pulse ? 'bg-gradient-accent' : meta.bar,
+                )}
+                style={{ width: `${percent}%` }}
+              />
+            </div>
+            <span className="shrink-0 font-mono text-xs text-muted-foreground">
+              {t('task.nodeProgress', {
+                completed: task.completed_nodes,
+                total: task.node_count,
+              })}
+            </span>
           </div>
-          <span className="shrink-0 font-mono text-xs text-muted-foreground">
-            {t('task.nodeProgress', {
-              completed: task.completed_nodes,
-              total: task.node_count,
-            })}
-          </span>
-        </div>
-      </button>
+        </button>
+
+        {/* 取消任务（§7.4）：仅非终态展示；排队中立即终结，运行中转为 cancelled */}
+        {!terminal ? (
+          <div className="flex shrink-0 items-center pr-3">
+            <Button
+              variant="ghost"
+              size="xs"
+              disabled={cancelling}
+              className="text-muted-foreground hover:bg-status-error/10 hover:text-status-error"
+              onClick={() => void handleCancel()}
+              title={t('task.cancel', { defaultValue: '取消任务' })}
+            >
+              {cancelling ? (
+                <Loader2 className="animate-spin" />
+              ) : (
+                <CircleStop />
+              )}
+              {t('task.cancel', { defaultValue: '取消' })}
+            </Button>
+          </div>
+        ) : null}
+      </div>
 
       {/* 展开区：节点详情 + 产物下载 */}
       {expanded && (
@@ -607,8 +683,16 @@ export function TasksPage() {
   const [tasksError, setTasksError] = useState<string | null>(null)
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  /** 任务状态筛选（§7.4；会话内保持） */
+  const [statusFilter, setStatusFilter] = useState<TaskFilter>(() =>
+    parseTaskFilter(sessionStorage.getItem(TASK_FILTER_STORAGE_KEY)),
+  )
   // 轮询失败只在恢复前提示一次，避免每 5s 弹 toast
   const taskToastShown = useRef(false)
+
+  useEffect(() => {
+    sessionStorage.setItem(TASK_FILTER_STORAGE_KEY, statusFilter)
+  }, [statusFilter])
 
   const refresh = useCallback(async () => {
     try {
@@ -688,6 +772,58 @@ export function TasksPage() {
     (m) => (m.service_status || m.status).toLowerCase() === 'running',
   ).length
 
+  // ── 状态筛选（§7.4 SegmentedTabs）──
+  const filterCounts = useMemo(() => {
+    const counts = { running: 0, completed: 0, failed: 0, cancelled: 0 }
+    for (const task of tasks ?? []) {
+      const s = task.status.trim().toLowerCase()
+      if (TASK_FILTER_STATES.running.has(s)) counts.running += 1
+      else if (s === 'completed') counts.completed += 1
+      else if (s === 'failed') counts.failed += 1
+      else if (s === 'cancelled') counts.cancelled += 1
+    }
+    return counts
+  }, [tasks])
+
+  const filteredTasks = useMemo(() => {
+    if (!tasks) return null
+    if (statusFilter === 'all') return tasks
+    const hit = TASK_FILTER_STATES[statusFilter]
+    return tasks.filter((task) => hit.has(task.status.trim().toLowerCase()))
+  }, [tasks, statusFilter])
+
+  const filterItems = [
+    {
+      value: 'all' as TaskFilter,
+      label: t('filter.all', { defaultValue: '全部' }),
+      count: tasks?.length,
+    },
+    {
+      value: 'running' as TaskFilter,
+      label: t('filter.running', { defaultValue: '运行中' }),
+      count: filterCounts.running,
+      tone: 'text-status-starting',
+    },
+    {
+      value: 'completed' as TaskFilter,
+      label: t('filter.completed', { defaultValue: '已完成' }),
+      count: filterCounts.completed,
+      tone: 'text-status-running',
+    },
+    {
+      value: 'failed' as TaskFilter,
+      label: t('filter.failed', { defaultValue: '失败' }),
+      count: filterCounts.failed,
+      tone: 'text-status-error',
+    },
+    {
+      value: 'cancelled' as TaskFilter,
+      label: t('filter.cancelled', { defaultValue: '取消' }),
+      count: filterCounts.cancelled,
+      tone: 'text-status-preparing',
+    },
+  ]
+
   return (
     <PageContainer
       title={t('page.title')}
@@ -720,7 +856,7 @@ export function TasksPage() {
         )}
 
         {/* ── 概览 ── */}
-        <div className="flex flex-wrap items-center gap-4 rounded-lg border border-border bg-card px-6 py-4 sm:gap-8">
+        <div className="glass-card flex flex-wrap items-center gap-4 rounded-lg px-6 py-4 sm:gap-8">
           <div>
             <div className="font-mono text-3xl font-bold text-status-running">
               {modules === null ? '–' : runningCount}
@@ -777,7 +913,7 @@ export function TasksPage() {
                 return (
                   <div
                     key={m.id}
-                    className="group rounded-lg border border-border bg-card p-4 transition-colors hover:border-primary/40"
+                    className="glass-card group rounded-lg p-4"
                   >
                     <div className="flex items-center justify-between gap-2">
                       <div className="flex min-w-0 items-center gap-2">
@@ -887,6 +1023,18 @@ export function TasksPage() {
             title={t('stats.pipelineTasks')}
             count={tasks?.length}
           />
+          {/* 状态筛选（§7.4）：全部 / 运行中 / 已完成 / 失败 / 取消 */}
+          {tasks !== null && tasks.length > 0 && (
+            <SegmentedTabs
+              items={filterItems}
+              value={statusFilter}
+              onChange={setStatusFilter}
+              ariaLabel={t('filter.ariaLabel', {
+                defaultValue: '按状态筛选任务',
+              })}
+              className="mb-3"
+            />
+          )}
           {tasksError && (
             <div className="mb-3 flex items-center gap-2 rounded-lg border border-status-error/30 bg-status-error/10 px-4 py-3 text-sm text-status-error">
               <TriangleAlert className="size-4 shrink-0" />
@@ -922,9 +1070,19 @@ export function TasksPage() {
                 </Button>
               }
             />
+          ) : (filteredTasks ?? []).length === 0 ? (
+            <EmptyState
+              icon={Inbox}
+              title={t('tasks.filteredEmpty', {
+                defaultValue: '当前筛选下没有任务',
+              })}
+              hint={t('tasks.filteredEmptyHint', {
+                defaultValue: '切换其他状态筛选查看全部任务',
+              })}
+            />
           ) : (
             <div className="space-y-3">
-              {tasks.map((task) => (
+              {(filteredTasks ?? []).map((task) => (
                 <TaskCard
                   key={task.id}
                   task={task}
@@ -932,6 +1090,7 @@ export function TasksPage() {
                   onToggle={() =>
                     setExpandedId((cur) => (cur === task.id ? null : task.id))
                   }
+                  onCancelled={() => void refreshTasks()}
                 />
               ))}
             </div>

@@ -228,6 +228,16 @@ export const api = {
     apiFetch<TaskArtifact[]>(
       `/tasks/${encodeURIComponent(taskId)}/artifacts`,
     ),
+  /**
+   * 取消任务（P1-11；daemon 路由 POST /tasks/{id}/cancel）。
+   * 排队中 → 立即终结不执行；运行中 → 逻辑终态 cancelled。
+   * 404 任务不存在 / 409 已是终态。
+   */
+  cancelTask: (taskId: string) =>
+    apiFetch<{ ok: boolean; status: string }>(
+      `/tasks/${encodeURIComponent(taskId)}/cancel`,
+      { method: 'POST' },
+    ),
   /** 任务产物下载 URL（直接用于 <a href> / window.open，不走 fetch） */
   taskArtifactUrl: (taskId: string, nodeId: string) =>
     `/api/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeURIComponent(nodeId)}`,

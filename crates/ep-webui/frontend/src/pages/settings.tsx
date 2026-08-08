@@ -12,7 +12,6 @@ import {
   Globe,
   Loader2,
   Network,
-  Package,
   Plus,
   RotateCcw,
   Save,
@@ -903,28 +902,6 @@ export function SettingsPage() {
                   patchSection('python', { constraints: e.target.value })
                 }
                 placeholder="config/constraints.txt"
-                className="font-mono text-xs"
-              />
-            </Field>
-          </Section>
-
-          {/* ── 整合包（§8.3）── */}
-          <Section
-            icon={Package}
-            title={t('packs.title')}
-            description={t('packs.description')}
-          >
-            <Field
-              label={t('packs.stagingDir')}
-              description={t('packs.stagingDirDescription')}
-              className="sm:col-span-2"
-            >
-              <Input
-                value={config.packs?.staging_dir ?? ''}
-                onChange={(e) =>
-                  patchSection('packs', { staging_dir: e.target.value })
-                }
-                placeholder=".pack-staging"
                 className="font-mono text-xs"
               />
             </Field>

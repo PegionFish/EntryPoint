@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Route, Routes } from 'react-router-dom'
+import { Navigate, Route, Routes } from 'react-router-dom'
 import '@/i18n'
 import { normalizeLanguage, setAppLanguage } from '@/i18n'
 import { Header } from '@/components/layout/header'
@@ -12,7 +12,6 @@ import { wsManager } from '@/api/ws'
 import { useModelUpdateToast } from '@/hooks/use-model-update-toast'
 import { DashboardPage } from '@/pages/dashboard'
 import { ModulesPage } from '@/pages/modules'
-import ModuleDetailPage from '@/pages/module-detail'
 import { PipelinePage } from '@/pages/pipeline'
 import { TasksPage } from '@/pages/tasks'
 import { SettingsPage } from '@/pages/settings'
@@ -52,7 +51,8 @@ export default function App() {
             <Routes>
               <Route path="/" element={<DashboardPage />} />
               <Route path="/modules" element={<ModulesPage />} />
-              <Route path="/modules/:id" element={<ModuleDetailPage />} />
+              {/* W2：模块详情独立页裁撤，旧路由重定向回模块页（详情统一为抽屉） */}
+              <Route path="/modules/:id" element={<Navigate to="/modules" replace />} />
               <Route path="/pipeline" element={<PipelinePage />} />
               <Route path="/tasks" element={<TasksPage />} />
               <Route path="/settings" element={<SettingsPage />} />
