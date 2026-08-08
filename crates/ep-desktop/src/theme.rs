@@ -1,6 +1,6 @@
 //! 主题管理 — 深色/浅色主题，基于 [`crate::ui::Palette`] 构建设计系统。
 //!
-//! 色板对齐 docs/DESIGN_SYSTEM.md，与 WebUI 保持视觉一致。
+//! 色板对齐 docs/UNIFIED_UI_REDESIGN_PROPOSAL.md §1.2 精确色值表，与 WebUI 保持视觉一致。
 
 use eframe::egui;
 
@@ -64,30 +64,36 @@ fn visuals_for(pal: &Palette) -> egui::Visuals {
 
     let control = egui::CornerRadius::same(CONTROL_ROUNDING);
 
-    // 基础表面
+    // 基础表面（三级层深：页面底=层 0，卡片=层 1，浮层=层 2，§1.1 主张 1）
     v.override_text_color = Some(pal.text);
-    v.panel_fill = pal.bg;
-    v.window_fill = pal.card;
-    v.extreme_bg_color = pal.bg;
+    v.panel_fill = pal.bg_base;
+    v.window_fill = pal.bg_raised;
+    v.extreme_bg_color = pal.bg_base;
     v.window_shadow = egui::epaint::Shadow::NONE;
-    v.popup_shadow = egui::epaint::Shadow::NONE;
+    // 浮层阴影（§3.3：popover/dialog 8-16px 模糊黑色 40%）
+    v.popup_shadow = egui::epaint::Shadow {
+        offset: [0, 4],
+        blur: if pal.dark { 16 } else { 12 },
+        spread: 0,
+        color: egui::Color32::from_rgba_unmultiplied(0, 0, 0, if pal.dark { 102 } else { 31 }),
+    };
 
     // 选区
     v.selection.bg_fill = pal.primary.gamma_multiply(if pal.dark { 0.35 } else { 0.18 });
     v.selection.stroke.color = pal.primary;
 
     // 控件四态（noninteractive / inactive / hovered / active / open）
-    v.widgets.noninteractive.weak_bg_fill = pal.bg;
-    v.widgets.noninteractive.bg_fill = pal.bg;
+    v.widgets.noninteractive.weak_bg_fill = pal.bg_base;
+    v.widgets.noninteractive.bg_fill = pal.bg_base;
     v.widgets.noninteractive.fg_stroke.color = pal.text_dim;
 
-    v.widgets.inactive.weak_bg_fill = pal.card_raised;
-    v.widgets.inactive.bg_fill = pal.card_raised;
+    v.widgets.inactive.weak_bg_fill = pal.bg_raised;
+    v.widgets.inactive.bg_fill = pal.bg_raised;
     v.widgets.inactive.fg_stroke.color = pal.text;
     v.widgets.inactive.corner_radius = control;
 
-    v.widgets.hovered.weak_bg_fill = pal.card_raised;
-    v.widgets.hovered.bg_fill = pal.card_raised;
+    v.widgets.hovered.weak_bg_fill = pal.bg_raised;
+    v.widgets.hovered.bg_fill = pal.bg_raised;
     v.widgets.hovered.fg_stroke.color = pal.text;
     v.widgets.hovered.corner_radius = control;
 
@@ -95,7 +101,7 @@ fn visuals_for(pal: &Palette) -> egui::Visuals {
     v.widgets.active.fg_stroke.color = egui::Color32::WHITE;
     v.widgets.active.corner_radius = control;
 
-    v.widgets.open.weak_bg_fill = pal.card_raised;
+    v.widgets.open.weak_bg_fill = pal.bg_raised;
     v.widgets.open.fg_stroke.color = pal.text;
     v.widgets.open.corner_radius = control;
 

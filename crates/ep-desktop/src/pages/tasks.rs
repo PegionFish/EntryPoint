@@ -503,17 +503,18 @@ fn module_grid(
 
 /// 任务状态 → (颜色, 本地化文案)。颜色一律取自当前主题色板，禁止硬编码 RGB。
 ///
-/// Pending 即 §6.8 的 queued（等待全局/管线闸门），用 warning 色区分于运行中。
+/// Pending 即 §6.8 的 queued（等待全局/管线闸门），用 warning 色区分于运行中；
+/// 其余四态按 UNIFIED_UI_REDESIGN_PROPOSAL §1.2 统一（就绪绿/运行青/错误珊瑚红/停止灰）。
 fn task_status_meta(lang: &str, status: &TaskStatus, pal: &Palette) -> (egui::Color32, String) {
     match status {
-        TaskStatus::Completed => (pal.success, tr(lang, "common.status.completed", &[])),
-        TaskStatus::Running => (pal.info, tr(lang, "common.status.running", &[])),
+        TaskStatus::Completed => (pal.status_ready, tr(lang, "common.status.completed", &[])),
+        TaskStatus::Running => (pal.status_running, tr(lang, "common.status.running", &[])),
         TaskStatus::Pending => (
             pal.warning,
             trfb(lang, "common.status.queued", "排队中", &[]),
         ),
-        TaskStatus::Failed(_) => (pal.danger, tr(lang, "common.status.failed", &[])),
-        TaskStatus::Cancelled => (pal.warning, tr(lang, "common.status.cancelled", &[])),
+        TaskStatus::Failed(_) => (pal.status_error, tr(lang, "common.status.failed", &[])),
+        TaskStatus::Cancelled => (pal.status_stopped, tr(lang, "common.status.cancelled", &[])),
     }
 }
 

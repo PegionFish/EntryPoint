@@ -978,7 +978,7 @@ fn nav_item(
         let painter = ui.painter();
         let rounding = egui::CornerRadius::same(8);
         if active {
-            painter.rect_filled(rect, rounding, pal.card_raised);
+            painter.rect_filled(rect, rounding, pal.bg_raised);
             // 左侧 3px 圆角指示条
             let bar = egui::Rect::from_min_max(
                 egui::pos2(rect.min.x + 1.0, rect.min.y + 9.0),
@@ -986,8 +986,8 @@ fn nav_item(
             );
             painter.rect_filled(bar, egui::CornerRadius::same(2), pal.primary);
         } else if response.hovered() {
-            // hover 背景：bg 向 card_raised 插值，两套主题下均弱于激活态
-            painter.rect_filled(rect, rounding, pal.bg.lerp_to_gamma(pal.card_raised, 0.6));
+            // hover 背景：bg_base 向 bg_raised 插值，两套主题下均弱于激活态
+            painter.rect_filled(rect, rounding, pal.bg_base.lerp_to_gamma(pal.bg_raised, 0.6));
         }
 
         // 文本 / 图标（激活时加粗、primary 色）
@@ -1165,7 +1165,7 @@ mod tests {
                 "visuals.dark_mode 应随主题切换"
             );
             let pal = Palette::new(expect_dark);
-            assert_eq!(style.visuals.panel_fill, pal.bg, "panel_fill 应取自当前色板");
+            assert_eq!(style.visuals.panel_fill, pal.bg_base, "panel_fill 应取自当前色板");
             assert_eq!(style.visuals.override_text_color, Some(pal.text));
         }
     }
