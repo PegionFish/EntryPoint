@@ -1,10 +1,11 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     Router,
     extract::{
         State,
-        ws::{WebSocket, WebSocketUpgrade},
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::IntoResponse,
     routing::get,
@@ -13,6 +14,10 @@ use tokio::sync::broadcast;
 use tracing::debug;
 
 use crate::state::{AppState, ProgressMessage};
+
+/// 心跳间隔（秒）：定期发 Ping 探测半开连接。对端无 Pong 响应 → 关闭连接，
+/// 防止断网/掉电的僵尸订阅永久占用订阅槽位。
+const WS_PING_INTERVAL_SECS: u64 = 30;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new().route("/ws/progress", get(ws_progress_handler))
@@ -27,10 +32,24 @@ async fn ws_progress_handler(
 
 async fn handle_progress_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let mut rx: broadcast::Receiver<ProgressMessage> = state.progress_tx.subscribe();
+    // 心跳：上次 Ping 尚未收到 Pong → 判定半开，下一轮断开
+    let mut pong_pending = false;
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(WS_PING_INTERVAL_SECS));
+    heartbeat.tick().await; // 跳过首个立即 tick，从整 30s 起算
     debug!("WebSocket /ws/progress connected");
 
     loop {
         tokio::select! {
+            _ = heartbeat.tick() => {
+                // 上一轮 Ping 无 Pong → 半开连接（对端断网/掉电），关闭释放订阅
+                if pong_pending {
+                    break;
+                }
+                if socket.send(Message::Ping(vec![].into())).await.is_err() {
+                    break;
+                }
+                pong_pending = true;
+            }
             msg = rx.recv() => {
                 match msg {
                     Ok(progress_msg) => {
@@ -56,7 +75,8 @@ async fn handle_progress_socket(mut socket: WebSocket, state: Arc<AppState>) {
             }
             msg = socket.recv() => {
                 match msg {
-                    Some(Ok(axum::extract::ws::Message::Close(_))) | None => break,
+                    Some(Ok(Message::Pong(_))) => pong_pending = false,
+                    Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
                 }
             }

@@ -273,13 +273,34 @@ async fn wait_healthy(
 
         // 单次探测（含锁获取 + monitor_process + 状态快照），预算内完不成即超时
         let probe = tokio::time::timeout(remaining, async {
-            let mut pm = state.process_manager.write().await;
-            // 实例缺失（从未启动成功）→ 直接失败
-            if pm.get_instance(module_id).is_none() {
-                return Err(AutoStartError::StartFailed(
-                    "module instance disappeared before health check".to_string(),
-                ));
+            // P2 修复：先取读锁快照判定，仅状态需要迁移（Starting/Preparing/
+            // Stopped）才取写锁执行 monitor_process（内部 /health 网络探测）。
+            // 已 Running → 读锁直接成功；Error → 读锁直接失败——不再为无变化的
+            // 探测持有写锁，避免持写锁跨网络探测阻塞全部需要写锁的 handler。
+            // 注意：读锁守卫必须在本 async 块内先行 drop（无 await 持有读锁），
+            // 再取写锁，杜绝 Tokio RwLock 读→写升级死锁。
+            let quick = {
+                let pm = state.process_manager.read().await;
+                match pm.get_instance(module_id) {
+                    // 实例缺失（从未启动成功）→ 直接失败
+                    None => Some(Err(AutoStartError::StartFailed(
+                        "module instance disappeared before health check".to_string(),
+                    ))),
+                    Some(inst) => match &inst.status {
+                        ServiceStatus::Running => Some(Ok(Some(ServiceStatus::Running))),
+                        ServiceStatus::Error(detail) => {
+                            Some(Err(AutoStartError::StartFailed(detail.clone())))
+                        }
+                        // Starting/Preparing/Stopped → 需要写锁探测迁移
+                        _ => None,
+                    },
+                }
+            };
+            if let Some(result) = quick {
+                return result;
             }
+            // 仅状态迁移路径持写锁（网络探测只在 Starting 时发生）
+            let mut pm = state.process_manager.write().await;
             // 复用 ProcessManager 的健康探测（Starting → Running/Error 迁移）
             if let Err(e) = pm.monitor_process(module_id).await {
                 return Err(AutoStartError::StartFailed(e.to_string()));

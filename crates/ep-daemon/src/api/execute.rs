@@ -208,6 +208,17 @@ async fn execute_pipeline(
             )
             .await
         }
+        // P1 修复：在途任务达容量上限 → 429（复用 internalError 键位透传技术细节；
+        // i18n 键由 ep-core 侧所有，此处不新增）
+        Err(execution::SubmitError::QueueFull(limit)) => {
+            err_response(
+                &state,
+                StatusCode::TOO_MANY_REQUESTS,
+                "apiPipelines.execute.internalError",
+                &[("detail", format!("task queue is full (max {limit} in-flight tasks)"))],
+            )
+            .await
+        }
         Err(execution::SubmitError::ModuleStartFailed(detail)) => {
             err_response(
                 &state,
