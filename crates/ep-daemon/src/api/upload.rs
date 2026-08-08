@@ -123,6 +123,29 @@ struct StagedFile {
     file_name: Option<String>,
 }
 
+/// 暂存目录 RAII 守卫（P2 修复）：handler 正常路径已显式清理暂存目录，
+/// 本守卫只兜底 abort/panic/提前 return 等泄漏路径——Drop 时若目录仍在
+/// 则同步删除（NotFound 视为已清理）。保证任何退出路径都不残留 staging。
+struct StagingGuard(PathBuf);
+
+impl StagingGuard {
+    fn new(dir: PathBuf) -> Self {
+        Self(dir)
+    }
+}
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        // 正常路径已 remove_dir_all → 目录不存在 → NotFound 忽略；
+        // 只有泄漏路径（abort/panic）才会走到真实删除。
+        if let Err(e) = std::fs::remove_dir_all(&self.0) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(staging = %self.0.display(), error = %e, "staging cleanup (RAII fallback) failed");
+            }
+        }
+    }
+}
+
 /// POST /api/models/:module_id/upload — 浏览器上传模型文件
 async fn upload_model(
     State(state): State<Arc<AppState>>,
@@ -169,6 +192,9 @@ async fn upload_model(
         )
         .await;
     }
+    // RAII 兜底（P2）：abort/panic 等非正常退出路径也清理暂存目录；
+    // 正常路径下方显式清理后守卫 Drop 时目录已不存在 → no-op
+    let _staging_guard = StagingGuard::new(staging.clone());
 
     let result = handle_upload(&mgr, &manifest, &module_id, multipart, &staging).await;
 
@@ -605,8 +631,9 @@ fn copy_dir_contents(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 目标路径是否已被占用（非空目录或同名文件存在）
-async fn target_blocked(target: &Path) -> bool {
+/// 目标路径是否已被占用（非空目录或同名文件存在）。
+/// `pub(crate)`：models.rs import_model 复用同一语义（P2 冲突检查）。
+pub(crate) async fn target_blocked(target: &Path) -> bool {
     if target.is_file() {
         return true;
     }
@@ -946,6 +973,9 @@ async fn upload_input(
         )
         .await;
     }
+    // RAII 兜底（P2）：abort/panic 等非正常退出路径也清理 tempdir；
+    // 正常路径下方 cleanup_temp_dir 后守卫 Drop 时目录已不存在 → no-op
+    let _temp_guard = StagingGuard::new(temp_dir.clone());
 
     let result = receive_input_file(&mut multipart, &temp_dir).await;
 

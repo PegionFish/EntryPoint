@@ -247,6 +247,15 @@ fn is_active_download(state: &str) -> bool {
     matches!(state, "queued" | "downloading")
 }
 
+/// 终态下载条目 TTL（秒）：completed/failed/cancelled 条目超过该时长后在
+/// 读取路径淘汰（P2 修复），防 downloads 表内存长期增长。活跃条目不淘汰。
+const DOWNLOADS_TTL_SECS: i64 = 3600;
+
+/// 下载状态是否终态（completed / failed / cancelled）
+fn is_terminal_download_state(state: &str) -> bool {
+    matches!(state, "completed" | "failed" | "cancelled")
+}
+
 // ─── Handlers ───────────────────────────────────────────────────────────────
 
 /// GET /api/models — 列出所有模块的模型状态
@@ -459,6 +468,18 @@ async fn import_model(
     // import_model 内部使用 model_id 构建路径，这里需要确保 target_dir 正确
     // 先直接复制到正确的 target_dir
     let target_dir = mgr.model_dir(&model_decl.target_dir);
+
+    // P2 修复：与 upload 的 target_blocked 语义一致——目标目录已存在且非空
+    // （或为文件）→ 409，拒绝合并写入（旧实现直接 create_dir_all + 合并复制）
+    if super::upload::target_blocked(&target_dir).await {
+        return err_response(
+            &state,
+            StatusCode::CONFLICT,
+            "apiModels.uploadConflict",
+            &[("model_id", req.model_id.clone())],
+        )
+        .await;
+    }
 
     match tokio::fs::create_dir_all(&target_dir).await {
         Ok(()) => {}
@@ -1097,8 +1118,27 @@ async fn monitor_download(
 /// `state` 取值：`queued`（并发闸排队，B6 新增）/ `downloading` / `completed` /
 /// `failed` / `cancelled`。
 async fn list_downloads(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
+    let now = chrono::Utc::now();
     let mut entries: Vec<DownloadEntry> = {
-        let map = state.downloads.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = state.downloads.lock().unwrap_or_else(|e| e.into_inner());
+        // P2 修复：终态条目 TTL 淘汰（默认 1h）——completed/failed/cancelled
+        // 超过 TTL 后移除，防 downloads 表无限增长；活跃（queued/downloading）
+        // 条目不淘汰。started_at 无法解析视为终态已过期（防御性淘汰）。
+        let expired: Vec<String> = map
+            .iter()
+            .filter(|(_, e)| is_terminal_download_state(&e.state))
+            .filter(|(_, e)| {
+                chrono::DateTime::parse_from_rfc3339(&e.started_at)
+                    .map(|t| {
+                        (now - t.with_timezone(&chrono::Utc)).num_seconds() > DOWNLOADS_TTL_SECS
+                    })
+                    .unwrap_or(true)
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in expired {
+            map.remove(&k);
+        }
         map.values().cloned().collect()
     };
     entries.sort_by(|a, b| a.started_at.cmp(&b.started_at));
@@ -1697,6 +1737,10 @@ mod tests {
     #[tokio::test]
     async fn test_list_downloads_shape_and_sort() {
         let state = test_state();
+        // started_at 用近期时刻（TTL 淘汰边界内），保持排序断言稳定
+        let now = chrono::Utc::now();
+        let t_a = (now - chrono::Duration::seconds(120)).to_rfc3339();
+        let t_b = (now - chrono::Duration::seconds(60)).to_rfc3339();
         {
             let mut map = state.downloads.lock().unwrap();
             map.insert(
@@ -1708,7 +1752,7 @@ mod tests {
                     percent: 55.0,
                     bytes: 999,
                     state: "downloading".into(),
-                    started_at: "2026-08-04T10:01:00+00:00".into(),
+                    started_at: t_b,
                 },
             );
             map.insert(
@@ -1720,7 +1764,7 @@ mod tests {
                     percent: 100.0,
                     bytes: 42,
                     state: "completed".into(),
-                    started_at: "2026-08-04T10:00:00+00:00".into(),
+                    started_at: t_a,
                 },
             );
         }
@@ -1746,6 +1790,77 @@ mod tests {
         }
         assert_eq!(arr[0]["state"], "completed");
         assert_eq!(arr[1]["state"], "downloading");
+    }
+
+    // ── downloads TTL 淘汰（P2：终态条目不无限堆积） ──────────────────────
+
+    #[tokio::test]
+    async fn test_list_downloads_evicts_expired_terminal_entries() {
+        let state = test_state();
+        let now = chrono::Utc::now();
+        let insert = |state: &AppState, key: &str, mod_id: &str, model_id: &str,
+                      dl_state: &str, started_at: &str| {
+            state.downloads.lock().unwrap().insert(
+                key.into(),
+                DownloadEntry {
+                    module_id: mod_id.into(),
+                    model_id: model_id.into(),
+                    source: "huggingface".into(),
+                    percent: 10.0,
+                    bytes: 7,
+                    state: dl_state.into(),
+                    started_at: started_at.into(),
+                },
+            );
+        };
+        // 过期终态（>1h）：completed 3h 前 / failed 2h 前 → 应被淘汰
+        insert(
+            &state,
+            "m1:old-completed",
+            "m1",
+            "old-completed",
+            "completed",
+            &(now - chrono::Duration::hours(3)).to_rfc3339(),
+        );
+        insert(
+            &state,
+            "m1:old-failed",
+            "m1",
+            "old-failed",
+            "failed",
+            &(now - chrono::Duration::hours(2)).to_rfc3339(),
+        );
+        // 新鲜终态（1min 前）→ 保留；活跃条目 → 永不淘汰
+        insert(
+            &state,
+            "m1:recent-cancelled",
+            "m1",
+            "recent-cancelled",
+            "cancelled",
+            &(now - chrono::Duration::seconds(60)).to_rfc3339(),
+        );
+        insert(
+            &state,
+            "m1:active-downloading",
+            "m1",
+            "active-downloading",
+            "downloading",
+            &now.to_rfc3339(),
+        );
+
+        let (status, json) = list_downloads(State(state.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        let arr = json.0.as_array().unwrap();
+        let states: Vec<&str> = arr
+            .iter()
+            .map(|v| v["state"].as_str().unwrap())
+            .collect();
+        assert!(!states.contains(&"completed"), "过期 completed 应被淘汰");
+        assert!(!states.contains(&"failed"), "过期 failed 应被淘汰");
+        assert!(states.contains(&"cancelled"), "新鲜终态应保留");
+        assert!(states.contains(&"downloading"), "活跃条目不淘汰");
+        // 淘汰落盘：表内只剩 2 条
+        assert_eq!(state.downloads.lock().unwrap().len(), 2);
     }
 
     // ── delete ───────────────────────────────────────────────────────────

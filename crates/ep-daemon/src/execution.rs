@@ -168,6 +168,10 @@ fn scheduler() -> &'static Mutex<Scheduler> {
     SCHEDULER.get_or_init(|| Mutex::new(Scheduler::default()))
 }
 
+/// 在途任务总容量上限（排队 + 运行中，P1 修复）：提交超限时以 429 拒绝，
+/// 不再无条件入队 + 建目录 + 落盘（防队列无界膨胀拖垮磁盘与调度）。
+const MAX_INFLIGHT_TASKS: usize = 256;
+
 /// 已提交未执行任务的载荷（队列持有；执行启动时取出）
 struct PendingTask {
     pipeline: Pipeline,
@@ -187,9 +191,6 @@ struct TaskExtras {
     /// 取消请求标志：与 runner 共享；置位后经节点边界/在飞中断两类检查点
     /// 传播到引擎（缺陷 #5：在飞模块 HTTP 请求被 abort、引擎线程快速退出）
     cancel: Arc<AtomicBool>,
-    /// 终结 CAS：超时看门狗 / 用户取消 / 引擎收尾三方竞争，唯一赢家
-    /// 写终态 + 释放闸门 + 触发回调
-    finalize_done: Arc<AtomicBool>,
     callback_url: Option<String>,
     /// 最近一次节点进度时刻（epoch 毫秒，缺陷 #3）：节点开始/完成/失败回调
     /// 实时更新。任务级空闲看门狗据此判定“无心跳/无进度”而非任务总时长。
@@ -200,6 +201,22 @@ static EXTRAS: OnceLock<Mutex<HashMap<String, TaskExtras>>> = OnceLock::new();
 
 fn extras() -> &'static Mutex<HashMap<String, TaskExtras>> {
     EXTRAS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 终态 CAS 独立表（P1 修复）：终结标志与 extras 表生命周期解耦。
+///
+/// 旧实现把 `finalize_done` 挂在 [`TaskExtras`] 上，赢家在闸门释放**之前**
+/// 执行 `extras().remove(task_id)`——此后并发到达的 finalize 读 None 即
+/// 假赢（`None => true`），导致闸门 running_count 多减（超并发准入）、
+/// 重复触发完成回调、重复清理工作目录。
+///
+/// 本表条目与注册表记录同生命周期（任务在案期间不清理）：无论 extras
+/// 是否已被移除，已终态任务的 CAS 标志始终在案，第二次 finalize 必然
+/// 读到 `swap → false`，不可能再次获胜。
+static FINALIZED: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
+
+fn finalized() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
+    FINALIZED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 // ─── 任务级空闲看门狗（缺陷 #3 拆分：心跳/进度看门狗 ≠ 节点硬超时） ───────
@@ -360,6 +377,9 @@ pub enum SubmitError {
     CapabilityNotFound(String, String),
     /// 直跑：输入文件不存在 → 400（路径）
     InputMissing(PathBuf),
+    /// 在途任务达到容量上限（[`MAX_INFLIGHT_TASKS`]）→ 429（含上限值）。
+    /// P1 修复：提交路径在此拒绝，不建目录、不落盘、不入队。
+    QueueFull(usize),
     /// 模块自动拉起失败（§6.5；含模型未就绪/端口分配失败/健康超时）→ 502。
     /// `#[allow(dead_code)]`：运行期拉起失败当前计入任务错误
     /// （start_task → TerminalCause::Engine）；本变体预留给提交期预检
@@ -392,6 +412,9 @@ impl std::fmt::Display for SubmitError {
             Self::InputMissing(path) => {
                 write!(f, "input file does not exist: {}", path.display())
             }
+            Self::QueueFull(limit) => {
+                write!(f, "task queue is full (max {limit} in-flight tasks)")
+            }
             Self::ModuleStartFailed(detail) => {
                 write!(f, "failed to auto-start module: {detail}")
             }
@@ -404,10 +427,24 @@ impl std::fmt::Display for SubmitError {
 
 static TASK_SEQ: AtomicUsize = AtomicUsize::new(0);
 
-/// 生成任务 ID：`task-{UTC 时间戳}-{进程内序号}`（可读、可排序、进程内唯一）
+/// 生成任务 ID：`task-{UTC 时间戳}-{进程内序号}`（可读、可排序、进程内唯一）。
+///
+/// P3：重启后 `TASK_SEQ` 归零，若新任务恰在旧任务创建的同一秒内以同序号
+/// 提交，会与重启前加载的历史记录碰撞（[`TaskRegistry::insert`] 同 id 覆盖 =
+/// 旧任务数据丢失）。生成后对注册表做存在性检查，碰撞则自增重试。
 fn new_task_id() -> String {
-    let seq = TASK_SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("task-{}-{seq:04}", Utc::now().format("%Y%m%d-%H%M%S"))
+    loop {
+        let seq = TASK_SEQ.fetch_add(1, Ordering::Relaxed);
+        let id = format!("task-{}-{seq:04}", Utc::now().format("%Y%m%d-%H%M%S"));
+        if registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .is_none()
+        {
+            return id;
+        }
+    }
 }
 
 // ─── 输入参数覆盖 ────────────────────────────────────────────────────────────
@@ -512,6 +549,16 @@ pub async fn submit_pipeline_full(
 
     // 持久化兜底绑定（生产路径已在 AppState::new 绑定；此处覆盖测试/直连）
     bind_persistence(&state.root);
+
+    // P1 修复：在途任务容量上限（排队 + 运行中）——超限在**建目录/落盘/入队
+    // 之前**直接 429 拒绝，避免提交风暴无限创建任务目录与持久化记录。
+    let inflight_full = {
+        let sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
+        sched.queue.len() + sched.running_count >= MAX_INFLIGHT_TASKS
+    };
+    if inflight_full {
+        return Err(SubmitError::QueueFull(MAX_INFLIGHT_TASKS));
+    }
 
     let workspace = state
         .config
@@ -725,7 +772,6 @@ fn start_task(
     // 运行时标志 + 回调配置：先于任何 await 注册（消除排队→运行窗口的取消竞态）
     let task_extras = TaskExtras {
         cancel: Arc::new(AtomicBool::new(false)),
-        finalize_done: Arc::new(AtomicBool::new(false)),
         callback_url: task.callback_url.clone(),
         // 初始化进度基准时刻；后续由节点回调 bump（缺陷 #3 心跳看门狗）
         last_activity_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
@@ -750,8 +796,14 @@ fn start_task(
         .await;
         return;
     }
-    // 自动拉起期间被取消 → CAS 输家不执行引擎（闸门已由取消方释放）
-    if task_extras.finalize_done.load(Ordering::SeqCst) {
+    // 自动拉起期间被取消/终结 → CAS 输家不执行引擎（闸门已由取消方释放）。
+    // 检查独立终态表（extras 可能已被赢家移除，但其终结标志仍在案）
+    if finalized()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&task_id)
+        .is_some_and(|f| f.load(Ordering::SeqCst))
+    {
         return;
     }
 
@@ -934,9 +986,9 @@ enum TerminalCause {
 
 /// 写入终态 + 释放闸门 + 触发完成回调。
 ///
-/// 三方（引擎收尾 / 超时看门狗 / 用户取消）可能并发调用，`finalize_done`
-/// CAS 保证唯一赢家；输家直接返回（不重复释放闸门、不重复回调）。
-/// 返回实际写入的终态（输家返回 None）。
+/// 三方（引擎收尾 / 超时看门狗 / 用户取消）可能并发调用，独立终态表
+/// （[`finalized`]）的 CAS 保证唯一赢家；输家直接返回（不重复释放闸门、
+/// 不重复回调）。返回实际写入的终态（输家返回 None）。
 async fn finalize_task(
     state: &Arc<AppState>,
     task_id: &str,
@@ -945,14 +997,16 @@ async fn finalize_task(
     detail: Option<&TaskDetail>,
     callback_url: Option<String>,
 ) -> Option<TaskState> {
-    // CAS：唯一终结者
+    // CAS：唯一终结者——独立终态表（见 [`finalized`] 文档）：
+    // extras 在闸门释放前被移除，CAS 标志若仍放在 extras 里，移除后并发
+    // finalize 会读 None → 假赢（重复释放闸门/重复回调）。终态表条目与
+    // 注册表记录同生命周期，已终态任务不可能再次获胜。
     let won = {
-        let map = extras().lock().unwrap_or_else(|e| e.into_inner());
-        match map.get(task_id) {
-            Some(e) => !e.finalize_done.swap(true, Ordering::SeqCst),
-            // 无 extras（如排队中取消走 request_cancel 专用路径）也允许一次性终结
-            None => true,
-        }
+        let mut map = finalized().lock().unwrap_or_else(|e| e.into_inner());
+        let flag = map
+            .entry(task_id.to_string())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)));
+        !flag.swap(true, Ordering::SeqCst)
     };
     if !won {
         return None;
@@ -1605,6 +1659,7 @@ pub fn clear_registry_for_tests() {
     *scheduler().lock().unwrap_or_else(|e| e.into_inner()) = Scheduler::default();
     pending().lock().unwrap_or_else(|e| e.into_inner()).clear();
     extras().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    finalized().lock().unwrap_or_else(|e| e.into_inner()).clear();
     set_test_run_hook(None);
 }
 
@@ -1953,6 +2008,99 @@ to = ["output", "input"]
         assert!(matches!(err, SubmitError::InputsNotObject(_)));
         // 技术层消息为英文
         assert!(err.to_string().contains("must be a parameter object"));
+    }
+
+    // ── 4b. 在途任务达容量上限 → QueueFull（P1：队列深度上限） ──────────────
+
+    #[tokio::test]
+    async fn test_submit_queue_full_rejected() {
+        let _guard = lock_for_tests();
+        clear_registry_for_tests();
+
+        let root = unique_root("qfull");
+        let state = test_state(root.clone());
+
+        // 直接填满调度器计数（模拟 MAX_INFLIGHT_TASKS 个在途任务）
+        {
+            let mut sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
+            sched.running_count = MAX_INFLIGHT_TASKS;
+        }
+        // 提交必须在建目录/落盘/入队之前被拒绝（422/429 语义层由 handler 映射）
+        let err = submit_pipeline(&state, minimal_pipeline("qfull"), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SubmitError::QueueFull(limit) if limit == MAX_INFLIGHT_TASKS),
+            "期望 QueueFull({MAX_INFLIGHT_TASKS})，实际 {err}"
+        );
+        // 未入队、未产生任务记录
+        assert_eq!(snapshot_all().len(), 0);
+        assert_eq!(
+            scheduler()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .queue
+                .len(),
+            0
+        );
+        // 容量减 1 后提交恢复正常（边界：len+running == MAX-1 放行）
+        {
+            let mut sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
+            sched.running_count = MAX_INFLIGHT_TASKS - 1;
+        }
+        assert!(
+            submit_pipeline(&state, minimal_pipeline("qfull-ok"), None)
+                .await
+                .is_ok(),
+            "容量边界内提交应放行"
+        );
+    }
+
+    // ── 4c. 任务 ID 碰撞（P3：重启后 TASK_SEQ 归零可能与历史记录同秒同序号） ──
+
+    #[test]
+    fn test_new_task_id_skips_registry_collision() {
+        let _guard = lock_for_tests();
+        clear_registry_for_tests();
+
+        // 预置一条 id 与"当前秒 + 下一序号"完全一致的旧记录（模拟重启后碰撞）
+        let now = Utc::now();
+        let seq = TASK_SEQ.load(Ordering::Relaxed);
+        let colliding = format!("task-{}-{seq:04}", now.format("%Y%m%d-%H%M%S"));
+        let record = TaskRecord {
+            id: colliding.clone(),
+            pipeline_id: "old".to_string(),
+            status: TaskState::Completed,
+            error: None,
+            queue_position: None,
+            started_at: now,
+            started_running_at: None,
+            finished_at: Some(now),
+            node_order: Vec::new(),
+            nodes: HashMap::new(),
+            artifacts: HashMap::new(),
+            served_artifacts: HashMap::new(),
+            work_dir: PathBuf::new(),
+        };
+        registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(record)
+            .expect("seed 旧记录");
+
+        let id = new_task_id();
+        assert_ne!(
+            id, colliding,
+            "与注册表现有 id 碰撞时必须自增跳过（否则 insert 覆盖旧任务数据）"
+        );
+        assert!(
+            registry()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&id)
+                .is_none(),
+            "返回的 id 必须不在注册表中"
+        );
     }
 
     // ── 5. 失败管线：failed + 节点 failed/skipped ──────────────────────────
@@ -2874,5 +3022,149 @@ output_type = "json"
 
         // 时钟回拨（now < last_activity）→ saturating_sub 钉为 0，不误判
         assert!(!watchdog_idle_exceeded(&idle, 5_000, 1_000, 300));
+    }
+
+    // ── 22. finalize CAS 假赢回归（P1：终态标志与 extras 生命周期解耦） ────────
+
+    /// 构造一个占闸门的运行中任务（registry + extras + scheduler 计数齐备）
+    fn seed_running_task(task_id: &str, pipeline_id: &str) {
+        let record = TaskRecord {
+            id: task_id.to_string(),
+            pipeline_id: pipeline_id.to_string(),
+            status: TaskState::Running,
+            error: None,
+            queue_position: None,
+            started_at: Utc::now(),
+            started_running_at: Some(Utc::now()),
+            finished_at: None,
+            node_order: Vec::new(),
+            nodes: HashMap::new(),
+            artifacts: HashMap::new(),
+            served_artifacts: HashMap::new(),
+            work_dir: PathBuf::new(),
+        };
+        registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(record)
+            .expect("seed record insert");
+        extras()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                task_id.to_string(),
+                TaskExtras {
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    callback_url: None,
+                    last_activity_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
+                },
+            );
+        {
+            let mut sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
+            sched.running_count = 1;
+            sched.running_by_pipeline.insert(pipeline_id.to_string(), 1);
+        }
+    }
+
+    /// 回归：赢家完成收尾（extras 已移除、闸门已释放）后，迟到的第二次
+    /// finalize（引擎收尾线程 / 看门狗并发到达）必须输——不得重复释放闸门。
+    ///
+    /// 旧实现把 CAS 标志放在 extras 上，赢家先 remove 再释放闸门，此后
+    /// 并发 finalize 读 None → 假赢（返回 Some 而非 None）。
+    #[tokio::test]
+    async fn test_finalize_second_call_loses() {
+        let _guard = lock_for_tests();
+        clear_registry_for_tests();
+
+        let root = unique_root("finalize-twice");
+        let state = test_state(root.clone());
+        seed_running_task("race-1", "p1");
+
+        // 第一次 finalize（模拟引擎收尾）→ 唯一赢家
+        let first = finalize_task(
+            &state,
+            "race-1",
+            "p1",
+            TerminalCause::Engine(None),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(first, Some(TaskState::Completed));
+        // 闸门已释放
+        assert_eq!(
+            scheduler()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .running_count,
+            0
+        );
+
+        // 第二次 finalize（模拟看门狗/引擎迟到路径）→ 必须输（None）
+        let second = finalize_task(
+            &state,
+            "race-1",
+            "p1",
+            TerminalCause::Engine(Some("late finalizer".to_string())),
+            None,
+            None,
+        )
+        .await;
+        assert!(second.is_none(), "已终态任务二次 finalize 必须返回 None");
+        // 闸门不得再次被减（0 保持 0，且终态记录不被覆盖）
+        assert_eq!(
+            scheduler()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .running_count,
+            0
+        );
+        let record = snapshot("race-1").expect("记录仍在案");
+        assert_eq!(record.status, TaskState::Completed, "迟到的 finalize 不得覆盖终态");
+        assert!(record.error.is_none(), "迟到的失败原因不得写入");
+    }
+
+    /// 并发 finalize（引擎收尾 / 超时看门狗 / 用户取消三方同时到达）：
+    /// CAS 唯一赢家——成功次数必须恰为 1。
+    #[tokio::test]
+    async fn test_finalize_concurrent_single_winner() {
+        let _guard = lock_for_tests();
+        clear_registry_for_tests();
+
+        let root = unique_root("finalize-race");
+        let state = test_state(root.clone());
+        seed_running_task("race-2", "p2");
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let state = state.clone();
+            handles.push(tokio::spawn(async move {
+                let cause = if i % 3 == 0 {
+                    TerminalCause::Engine(None)
+                } else if i % 3 == 1 {
+                    TerminalCause::Timeout(300)
+                } else {
+                    TerminalCause::Cancelled
+                };
+                finalize_task(&state, "race-2", "p2", cause, None, None)
+                    .await
+                    .map(|t| t.as_str().to_string())
+            }));
+        }
+        let mut winners: Vec<String> = Vec::new();
+        for handle in handles {
+            if let Ok(Some(status)) = handle.await {
+                winners.push(status);
+            }
+        }
+        assert_eq!(winners.len(), 1, "并发 finalize 必须只有唯一赢家");
+        // 闸门只被释放一次
+        assert_eq!(
+            scheduler()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .running_count,
+            0
+        );
     }
 }

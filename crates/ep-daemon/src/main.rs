@@ -21,6 +21,7 @@ use ep_core::deps::DepReport;
 use ep_core::module::discovery::discover_modules;
 use ep_core::port::PortManager;
 use ep_core::process::ProcessManager;
+use ep_core::types::ServiceStatus;
 
 use crate::state::AppState;
 
@@ -237,8 +238,30 @@ async fn run_server(root: PathBuf, cfg: AppConfig) -> anyhow::Result<()> {
                 last_snapshots.retain(|mid, _| module_ids.iter().any(|m| m == mid));
 
                 for mid in &module_ids {
+                    // P2 修复：先取读锁快照判断状态，避免写锁跨网络探测。
+                    // monitor_process 对 Starting 实例会做 /health 网络探测
+                    // （单次最长 ~1s），持写锁期间全部需要写锁的 handler
+                    // （start/stop/autostart）都会被阻塞；仅状态迁移需要探测。
+                    let needs_probe = {
+                        let pm = state.process_manager.read().await;
+                        matches!(
+                            pm.get_instance(mid).map(|i| &i.status),
+                            Some(ServiceStatus::Starting)
+                        )
+                    };
                     // 取当前日志快照（monitor_process 会先 poll_logs 填充缓冲）
-                    let snapshot: Vec<String> = {
+                    let snapshot: Vec<String> = if needs_probe {
+                        // 状态迁移路径：持写锁执行健康探测（唯一跨网络 await 的
+                        // 写锁临界区，探测预算由 ep-core monitor 内部约束）
+                        let mut pm = state.process_manager.write().await;
+                        let _ = pm.monitor_process(mid).await;
+                        pm.get_instance(mid)
+                            .map(|inst| inst.log_buffer.iter().cloned().collect())
+                            .unwrap_or_default()
+                    } else {
+                        // 非 Starting（Running/Error/Stopped）：monitor_process
+                        // 无网络路径（try_wait + poll_logs 均同步快速），写锁
+                        // 临界区极短，不跨网络 await
                         let mut pm = state.process_manager.write().await;
                         let _ = pm.monitor_process(mid).await;
                         pm.get_instance(mid)
@@ -364,7 +387,57 @@ fn build_app_router(state: Arc<AppState>, static_dir: &Path) -> Router {
                 .allow_methods(Any)
                 .allow_headers(Any),
         )
+        // P2：请求总时长超时层（最外层，覆盖全部路由含 body 读取与响应）。
+        // 大文件上传/产物流式下载长连接路径在中间件内豁免（见 request_timeout）。
+        .layer(axum::middleware::from_fn(request_timeout))
         .with_state(state)
+}
+
+/// 请求总时长超时（秒）：非豁免路由的完整请求（含 body 读取 + handler + 响应）
+/// 超时上限。头部读取由连接层负责，本中间件兜住慢 body / 慢 handler。
+/// 上传/下载长连接豁免（见 [`is_timeout_exempt_path`]）。
+const REQUEST_TOTAL_TIMEOUT_SECS: u64 = 300;
+
+/// 长连接豁免路径（P2）：大文件 multipart 上传与产物流式下载可能持续数小时，
+/// 不套总时长超时。
+fn is_timeout_exempt_path(path: &str) -> bool {
+    // 模型上传 /api/models/{module_id}/upload 与直跑输入上传 /api/upload/input
+    if path.starts_with("/api/models/") && path.ends_with("/upload") {
+        return true;
+    }
+    if path == "/api/upload/input" {
+        return true;
+    }
+    // 产物流式下载（ServeDir）：/api/task-files/*、/api/pack-files/*
+    path.starts_with("/api/task-files/") || path.starts_with("/api/pack-files/")
+}
+
+/// 请求总时长超时中间件：豁免路径直接放行；其余路径在
+/// [`REQUEST_TOTAL_TIMEOUT_SECS`] 内未完成 → 408。
+async fn request_timeout(
+    request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let uri = request.uri().path().to_string();
+    if is_timeout_exempt_path(&uri) {
+        return next.run(request).await;
+    }
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(REQUEST_TOTAL_TIMEOUT_SECS),
+        next.run(request),
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(_) => {
+            tracing::warn!(uri = %uri, timeout_secs = REQUEST_TOTAL_TIMEOUT_SECS, "request exceeded total timeout");
+            (
+                axum::http::StatusCode::REQUEST_TIMEOUT,
+                "request timed out",
+            )
+                .into_response()
+        }
+    }
 }
 
 /// 计算两次日志快照之间的新增行（后缀比对去重）。

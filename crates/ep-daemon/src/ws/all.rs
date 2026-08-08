@@ -7,6 +7,7 @@
 //! 旧的 /ws/logs 与 /ws/progress 端点保留不变（见 logs.rs / progress.rs）。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     Router,
@@ -21,6 +22,10 @@ use tokio::sync::broadcast;
 use tracing::debug;
 
 use crate::state::{AppState, WsMessage};
+
+/// 心跳间隔（秒）：定期发 Ping 探测半开连接。对端无 Pong 响应 → 关闭连接，
+/// 防止断网/掉电的僵尸订阅永久占用订阅槽位。
+const WS_PING_INTERVAL_SECS: u64 = 30;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new().route("/ws", get(ws_all_handler))
@@ -46,10 +51,24 @@ async fn handle_all_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let mut log_rx = state.log_tx.subscribe();
     let mut progress_rx = state.progress_tx.subscribe();
     let mut download_rx = state.model_download_tx.subscribe();
+    // 心跳：上次 Ping 尚未收到 Pong → 判定半开，下一轮断开
+    let mut pong_pending = false;
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(WS_PING_INTERVAL_SECS));
+    heartbeat.tick().await; // 跳过首个立即 tick，从整 30s 起算
     debug!("WebSocket /ws connected");
 
     loop {
         tokio::select! {
+            _ = heartbeat.tick() => {
+                // 上一轮 Ping 无 Pong → 半开连接（对端断网/掉电），关闭释放订阅
+                if pong_pending {
+                    break;
+                }
+                if socket.send(Message::Ping(vec![].into())).await.is_err() {
+                    break;
+                }
+                pong_pending = true;
+            }
             r = log_rx.recv() => match r {
                 Ok(m) => {
                     // 旧 LogMessage → WsMessage::Log
@@ -97,8 +116,9 @@ async fn handle_all_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 Err(broadcast::error::RecvError::Closed) => break,
             },
             msg = socket.recv() => {
-                // 客户端消息（或断开）
+                // 客户端消息（或断开）；Pong 应答心跳
                 match msg {
+                    Some(Ok(Message::Pong(_))) => pong_pending = false,
                     Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
                 }

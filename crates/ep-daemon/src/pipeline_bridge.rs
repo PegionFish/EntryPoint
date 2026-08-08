@@ -21,12 +21,16 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::AtomicUsize;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use ep_core::pipeline::dag::{Edge, NodeKind, NodePosition, Pipeline, PipelineNode};
+
+/// 原子写临时文件命名序号（进程内自增，配合 PID 保证并发 save_spec 不撞名）
+static SAVE_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 // ─── spec 数据结构（前端契约，冻结） ─────────────────────────────────────────
 
@@ -123,6 +127,9 @@ pub fn load_spec(path: &Path) -> Result<PipelineSpec> {
 }
 
 /// spec → TOML：结构校验后落盘（自动创建父目录）。
+///
+/// P2 修复：tmp + rename 原子写——先写同目录临时文件再 rename 覆盖目标，
+/// 崩溃/写中断不会留下半个管线文件（旧实现直接 fs::write 原地截断重写）。
 pub fn save_spec(spec: &PipelineSpec, path: &Path) -> Result<()> {
     validate_spec(spec)?;
     let text = spec_to_toml(spec)?;
@@ -130,8 +137,18 @@ pub fn save_spec(spec: &PipelineSpec, path: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create directory `{}`", parent.display()))?;
     }
-    std::fs::write(path, text)
-        .with_context(|| format!("failed to write pipeline file `{}`", path.display()))?;
+    // 同目录临时文件（与目标同文件系统 → rename 原子），进程内唯一防并发碰撞
+    let tmp = path.with_extension(format!(
+        "toml.tmp{}{}",
+        std::process::id(),
+        SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::write(&tmp, &text)
+        .with_context(|| format!("failed to write pipeline file `{}`", tmp.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp); // 尽力清理残留临时文件
+        return Err(e).with_context(|| format!("failed to finalize pipeline file `{}`", path.display()));
+    }
     Ok(())
 }
 
@@ -455,6 +472,11 @@ fn toml_value(v: &JsonValue) -> Result<String> {
         JsonValue::Number(n) => {
             if let Some(i) = n.as_i64() {
                 return Ok(i.to_string());
+            }
+            // P3：u64 超出 i64::MAX 时 as_i64 为 None，若走 as_f64 会丢精度
+            // （>2^53 的整数值无法精确表示）——先按 u64 原样输出
+            if let Some(u) = n.as_u64() {
+                return Ok(u.to_string());
             }
             let f = n
                 .as_f64()
@@ -923,5 +945,45 @@ system_prompt = "翻译：{input}"
             .unwrap_err()
             .to_string();
         assert!(err.contains("failed to load pipeline file"), "got: {err}");
+    }
+
+    // ── P2/P3：原子写不留半成品、大 u64 精度无损 ───────────────────────────
+
+    #[test]
+    fn test_save_spec_atomic_write_leaves_no_tmp_and_loads_back() {
+        let dir = temp_dir("atomic");
+        let target = dir.join("atomic.toml");
+        let spec = sample_spec_body("atomic-pipe");
+        save_spec(&spec, &target).expect("保存应成功");
+        // 无残留临时文件（tmp 命名含 PID + 序号）
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("atomic.toml.tmp")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "原子写不得残留临时文件: {leftovers:?}"
+        );
+        // 目标文件可正常读回
+        let back = load_spec(&target).expect("保存后的文件应可加载");
+        assert_eq!(back, spec);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_toml_value_large_u64_exact() {
+        // u64::MAX 超出 i64::MAX 且超出 f64 精确范围（2^53）：必须原样输出
+        // （旧实现 as_i64 失败后走 as_f64 → 精度丢失）
+        let big = u64::MAX;
+        assert_eq!(toml_value(&json!(big)).unwrap(), big.to_string());
+        // 边界：i64::MAX 仍走 i64 分支
+        assert_eq!(toml_value(&json!(i64::MAX)).unwrap(), i64::MAX.to_string());
+        // 超过 u64 的数值（如 1e100 浮点字面量）回退浮点路径
+        assert!(toml_value(&serde_json::Number::from_f64(1e100).map(serde_json::Value::Number).unwrap()).is_ok());
     }
 }
