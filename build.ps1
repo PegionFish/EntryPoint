@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env pwsh
+#!/usr/bin/env pwsh
 # EntryPoint 编译打包脚本（Windows）
 # 用法: .\build.ps1 <gui|server> [-Target debug|release] [-SkipTest] [-SkipClippy] [-Clean] [-OutputDir <dir>]
 #   gui    — 桌面 GUI 客户端包（zip：entrypoint.exe + 配置 + 模块，解压即用）
@@ -35,7 +35,9 @@ if (-not (Test-Path $Rustc)) {
 }
 $Git = Get-Command git -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
 
-$Version = "0.1.0"
+# 版本单一来源：Cargo.toml [workspace.package] version（勿在此另写死版本号）
+$VersionLine = Select-String -Path "$ProjectRoot\Cargo.toml" -Pattern '^version\s*=\s*"([^"]+)"' -ErrorAction SilentlyContinue | Select-Object -First 1
+$Version = if ($VersionLine) { $VersionLine.Matches[0].Groups[1].Value } else { "0.0.0" }
 $Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $ProfileDir = if ($Target -eq "release") { "release" } else { "debug" }
 $CrateName = if ($Mode -eq "gui") { "ep-desktop" } else { "ep-daemon" }
@@ -49,12 +51,18 @@ function Write-Info { param($m) Write-Host "  $m" -ForegroundColor Yellow }
 # ── 1. 环境检查 ──
 Write-Step "环境检查"
 Write-Ok "cargo: $Cargo"
-Write-Ok "rustc: $(& $Rustc --version)"
+# rustc 未找到时 $Rustc 为 "unknown"，先判再调用（否则 & "unknown" 在 Stop 模式下直接崩溃）
+if ($Rustc -ne "unknown") {
+    $rustcVer = & $Rustc --version
+    Write-Ok "rustc: $rustcVer"
+} else {
+    Write-Info "rustc 未找到，跳过版本信息"
+    $rustcVer = "unknown"
+}
 if ($Git) { Write-Ok "git: $Git" } else { Write-Info "git 未找到，跳过版本信息" }
 
 $gitHash = if ($Git) { (& $Git rev-parse --short HEAD).Trim() } else { "unknown" }
 $gitBranch = if ($Git) { (& $Git rev-parse --abbrev-ref HEAD).Trim() } else { "unknown" }
-$rustcVer = & $Rustc --version
 
 # ── 2. Clean ──
 if ($Clean) {

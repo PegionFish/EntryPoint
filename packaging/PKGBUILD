@@ -7,12 +7,12 @@ arch=('x86_64')
 url="https://github.com/PegionFish/EntryPoint"
 license=('MIT')
 
-depends=('gcc-libs' 'fontconfig')
+# 运行期强依赖（daemon 运行时需要，与 deb 侧硬 Depends 对齐）：
+# ffmpeg=音视频处理、uv=Python 环境管理、python=模块运行时
+depends=('gcc-libs' 'fontconfig' 'ffmpeg' 'uv' 'python')
 makedepends=('rust' 'npm')
 optdepends=(
     'nvidia-utils: CUDA GPU 支持'
-    'ffmpeg: 视频/音频处理'
-    'uv: Python 环境管理'
 )
 
 source=("$pkgname-$pkgver.tar.gz")

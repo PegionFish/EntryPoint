@@ -23,12 +23,17 @@ Environment=RUST_LOG=info
 # - systemd 无继承环境可前置，需叠加系统 CUDA 库路径时请改写为完整列表（冒号分隔）：
 #   Environment=LD_LIBRARY_PATH=/opt/entrypoint/runtime/cuda-libs:/usr/local/cuda/lib64
 Environment=LD_LIBRARY_PATH=/opt/entrypoint/runtime/cuda-libs
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=entrypoint
 
 # 安全加固（EP_ROOT 需可写：config/ 会被 PUT /api/config 更新，
 # workspace/ runtime/ models/ 为运行期产物）
 NoNewPrivileges=true
 ProtectHome=read-only
 ProtectSystem=strict
+PrivateTmp=yes
+UMask=0027
 ReadWritePaths=/opt/entrypoint
 
 [Install]
