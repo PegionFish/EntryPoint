@@ -30,11 +30,11 @@ impl ToastKind {
         }
     }
 
-    /// 类型对应的语义色（描边与图标着色）
+    /// 类型对应的语义色（描边与图标着色；四态语义色统一，§1.1 主张 5）
     fn color(&self, pal: &Palette) -> egui::Color32 {
         match self {
-            Self::Success => pal.success,
-            Self::Error => pal.danger,
+            Self::Success => pal.status_ready,
+            Self::Error => pal.status_error,
             Self::Info => pal.info,
         }
     }
@@ -115,7 +115,7 @@ impl ToastManager {
 
                     // 预乘色直接 gamma_multiply 即向透明淡出
                     let accent = toast.kind.color(&pal).gamma_multiply(alpha);
-                    let fill = pal.card.gamma_multiply(alpha);
+                    let fill = pal.bg_card.gamma_multiply(alpha);
 
                     egui::Frame::new()
                         .fill(fill)

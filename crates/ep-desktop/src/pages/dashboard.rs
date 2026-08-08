@@ -98,12 +98,12 @@ fn stats_section(
         StatCard {
             label: tr(lang, "desktopPages.dashboard.stat.running", &[]),
             value: running.to_string(),
-            color: if running > 0 { pal.success } else { pal.text },
+            color: if running > 0 { pal.status_running } else { pal.text },
         },
         StatCard {
             label: tr(lang, "desktopPages.dashboard.stat.errors", &[]),
             value: errors.to_string(),
-            color: if errors > 0 { pal.danger } else { pal.text },
+            color: if errors > 0 { pal.status_error } else { pal.text },
         },
     ];
 
@@ -191,7 +191,7 @@ fn dep_row(
         if ok {
             badge(ui, pal, pal.success, tr(lang, "desktopPages.dashboard.deps.available", &[]));
         } else {
-            badge(ui, pal, pal.danger, tr(lang, "common.status.missing", &[]));
+            badge(ui, pal, pal.status_error, tr(lang, "common.status.missing", &[]));
         }
         ui.label(
             egui::RichText::new(detail)

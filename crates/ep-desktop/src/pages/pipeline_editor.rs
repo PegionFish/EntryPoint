@@ -232,7 +232,7 @@ pub fn show_full(
             ui.colored_label(pal.success, msg.as_str());
         }
         Some(msg) => {
-            ui.colored_label(pal.danger, msg.as_str());
+            ui.colored_label(pal.status_error, msg.as_str());
         }
         None => {
             ui.colored_label(pal.text_dim, tr(lang, "desktopApp.pipeline.statusReady", &[]));
@@ -421,14 +421,14 @@ fn task_status_badge(
     status: &TaskStatus,
 ) -> (egui::Color32, String) {
     match status {
-        TaskStatus::Completed => (pal.success, tr(lang, "common.status.completed", &[])),
-        TaskStatus::Running => (pal.info, tr(lang, "common.status.running", &[])),
+        TaskStatus::Completed => (pal.status_ready, tr(lang, "common.status.completed", &[])),
+        TaskStatus::Running => (pal.status_running, tr(lang, "common.status.running", &[])),
         TaskStatus::Pending => (
             pal.warning,
             trfb(lang, "common.status.queued", "排队中", &[]),
         ),
-        TaskStatus::Failed(_) => (pal.danger, tr(lang, "common.status.failed", &[])),
-        TaskStatus::Cancelled => (pal.warning, tr(lang, "common.status.cancelled", &[])),
+        TaskStatus::Failed(_) => (pal.status_error, tr(lang, "common.status.failed", &[])),
+        TaskStatus::Cancelled => (pal.status_stopped, tr(lang, "common.status.cancelled", &[])),
     }
 }
 
@@ -2050,7 +2050,7 @@ fn draw_canvas(
 
     // ── Paint ──
     let mut painter = ui.painter_at(canvas_rect);
-    painter.rect_filled(canvas_rect, 0.0, pal.bg);
+    painter.rect_filled(canvas_rect, 0.0, pal.bg_base);
     painter.set_clip_rect(canvas_rect);
 
     draw_grid(&painter, pal, canvas_rect, st.offset, st.zoom);
@@ -2493,16 +2493,16 @@ fn node_echo_colors(
     match &task.status {
         TaskStatus::Completed => {
             for id in &order {
-                colors.insert(id.clone(), pal.success);
+                colors.insert(id.clone(), pal.status_ready);
             }
         }
         TaskStatus::Running | TaskStatus::Failed(_) | TaskStatus::Cancelled => {
             for (i, id) in order.iter().enumerate() {
                 if i < task.completed_nodes {
-                    colors.insert(id.clone(), pal.success);
+                    colors.insert(id.clone(), pal.status_ready);
                 } else if i == task.completed_nodes && matches!(task.status, TaskStatus::Failed(_))
                 {
-                    colors.insert(id.clone(), pal.danger);
+                    colors.insert(id.clone(), pal.status_error);
                 }
             }
         }
@@ -2517,7 +2517,7 @@ fn draw_grid(painter: &egui::Painter, pal: &Palette, rect: egui::Rect, offset: e
     let origin = rect.min;
     let tl = to_canvas(rect.min, origin, offset, zoom);
     let br = to_canvas(rect.max, origin, offset, zoom);
-    let dot = pal.border;
+    let dot = pal.grid_dot;
 
     // P2 修复：步长按视口点数自适应（低 zoom / 大画布时放大网格间距），
     // 避免 4K 画布 + zoom=0.3 下每帧数万 circle_filled
@@ -2626,7 +2626,7 @@ fn draw_node(
     let cr = 8.0 * zoom;
 
     // Body
-    painter.rect_filled(rect, cr, pal.card);
+    painter.rect_filled(rect, cr, pal.bg_card);
 
     // Title bar (节点类型色)
     let kind_color = node_kind_color(pal, &node.kind);

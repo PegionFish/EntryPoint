@@ -5,29 +5,99 @@ use eframe::egui;
 use crate::i18n::tr;
 use crate::ui::palette::Palette;
 
-/// 卡片圆角（对齐 WebUI Card `rounded-xl` = 12px）
-pub const CARD_ROUNDING: u8 = 12;
-/// 控件圆角（按钮、输入框）
+/// 卡片圆角（对齐 WebUI `--radius-lg` = 10px，UNIFIED_UI_REDESIGN_PROPOSAL §3.3/§10.1）
+pub const CARD_ROUNDING: u8 = 10;
+/// 控件圆角（按钮、输入框，对齐 WebUI `rounded-md` = 8px）
 pub const CONTROL_ROUNDING: u8 = 8;
+/// 卡片内边距（§3.3：卡片内边距 24px，对齐 WebUI `p-6`）
+pub const CARD_PADDING: u16 = 24;
+/// 紧凑模式卡片内边距（§10.4：<1000px 时 24→16 保证信息密度）
+pub const COMPACT_CARD_PADDING: u16 = 16;
+/// 紧凑断点宽度（与 app.rs `COMPACT_WIDTH_THRESHOLD` 同值，按窗口内容区逻辑宽度）
+pub const COMPACT_WIDTH: f32 = 1000.0;
+
+/// 卡片内边距按断点取值（§10.4 紧凑密度规则）
+pub fn card_padding(available_width: f32) -> u16 {
+    if available_width < COMPACT_WIDTH {
+        COMPACT_CARD_PADDING
+    } else {
+        CARD_PADDING
+    }
+}
+
+// ─── 动效与辉光基础设施（§1.1 主张 3/6；供 W1-W3 波次复用） ──────────────────
+
+/// 统一动画时长基准 167ms（§1.1 主张 6：--duration-fast 150ms 与 --duration-base
+/// 200ms 的中值；egui 无 CSS 动画，一律时间驱动插值）
+pub const ANIM_MS: f64 = 167.0;
+/// 呼吸辉光周期 2.4s（§1.1 主张 3）
+pub const GLOW_BREATH_PERIOD_MS: f64 = 2400.0;
+/// 呼吸辉光不透明度区间 0.35–0.7（§1.1 主张 3）
+pub const GLOW_ALPHA_MIN: f32 = 0.35;
+pub const GLOW_ALPHA_MAX: f32 = 0.70;
+
+/// 呼吸辉光插值助手：按系统时钟返回当前不透明度（0.35–0.7），
+/// 2.4s ease-in-out 往返周期（余弦缓动近似）。运行态卡片/状态点附加此辉光。
+pub fn glow_breath_alpha(now_ms: f64) -> f32 {
+    let period = GLOW_BREATH_PERIOD_MS;
+    let t = if period > 0.0 { (now_ms % period) / period } else { 0.0 };
+    let phase = ((t * std::f64::consts::TAU).cos() * -0.5 + 0.5) as f32; // ease-in-out 0..1
+    GLOW_ALPHA_MIN + phase * (GLOW_ALPHA_MAX - GLOW_ALPHA_MIN)
+}
+
+/// 卡片描边（hover 只提升描边亮度，零位移；§1.1 主张 3）。
+/// 深色：border-glow(0.18) → border-glow-strong(0.45)；浅色辉光弱化，退回描边明暗对比。
+pub fn card_stroke(pal: &Palette, hovered: bool) -> egui::Stroke {
+    let color = if hovered {
+        pal.border_glow_strong
+    } else {
+        pal.border_glow
+    };
+    egui::Stroke::new(1.0_f32, color)
+}
 
 // ─── 卡片 ────────────────────────────────────────────────────────────────────
 
-/// 卡片容器 Frame：圆角 + 1px 边框 + 卡片底色 + 16px 内边距（向 WebUI `px-6` 靠拢）
+/// 卡片容器 Frame：10px 圆角 + 1px 内发光描边 + 层 1 底色 + 24px 内边距（§3.3）
 pub fn card_frame(pal: &Palette) -> egui::Frame {
-    egui::Frame::new()
-        .fill(pal.card)
-        .stroke(egui::Stroke::new(1.0_f32, pal.border))
-        .corner_radius(egui::CornerRadius::same(CARD_ROUNDING))
-        .inner_margin(egui::Margin::same(16))
+    card_frame_hover(pal, false)
 }
 
-/// 卡片容器
+/// 卡片容器 Frame（hover 感知）：悬停时描边由 border-glow 提亮为
+/// border-glow-strong，深色下附加主色弱发光阴影（§3.4 hover = 弱发光）。
+pub fn card_frame_hover(pal: &Palette, hovered: bool) -> egui::Frame {
+    let mut f = egui::Frame::new()
+        .fill(pal.bg_card)
+        .stroke(card_stroke(pal, hovered))
+        .corner_radius(egui::CornerRadius::same(CARD_ROUNDING))
+        .inner_margin(egui::Margin::same(CARD_PADDING as i8));
+    if hovered && pal.dark {
+        f = f.shadow(egui::epaint::Shadow {
+            offset: [0, 0],
+            blur: 12,
+            spread: 0,
+            color: pal.primary_glow,
+        });
+    }
+    f
+}
+
+/// 卡片容器（含悬停描边提亮示范：hover 上一帧状态经临时存储驱动本帧描边，
+/// 状态变化时请求重绘；§1.1 主张 3「hover 只提升描边亮度，零位移」）
 pub fn card<R>(
     ui: &mut egui::Ui,
     pal: &Palette,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<R> {
-    card_frame(pal).show(ui, add_contents)
+    let id = ui.next_auto_id();
+    let prev_hovered = ui.ctx().data(|d| d.get_temp::<bool>(id).unwrap_or(false));
+    let inner = card_frame_hover(pal, prev_hovered).show(ui, add_contents);
+    let hovered = inner.response.hovered();
+    if hovered != prev_hovered {
+        ui.ctx().data_mut(|d| d.insert_temp(id, hovered));
+        ui.ctx().request_repaint();
+    }
+    inner
 }
 
 // ─── 徽章 ────────────────────────────────────────────────────────────────────
@@ -290,6 +360,45 @@ pub fn confirm_dialog_with_lang(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 令牌修正守卫（§10.1/§10.4）：卡片圆角 10px、内边距 24px、紧凑 16px。
+    #[test]
+    fn card_tokens_match_proposal() {
+        assert_eq!(CARD_ROUNDING, 10);
+        assert_eq!(CONTROL_ROUNDING, 8);
+        assert_eq!(card_padding(1528.0), CARD_PADDING);
+        assert_eq!(card_padding(999.0), COMPACT_CARD_PADDING);
+        assert_eq!(card_padding(744.0), COMPACT_CARD_PADDING);
+    }
+
+    /// 呼吸辉光插值：恒在 0.35–0.7 区间；2.4s 周期端点为最小值、半周期为峰值。
+    #[test]
+    fn glow_breath_alpha_oscillates_within_range() {
+        for i in 0..240 {
+            let a = glow_breath_alpha(i as f64 * 10.0);
+            assert!(
+                (GLOW_ALPHA_MIN..=GLOW_ALPHA_MAX).contains(&a),
+                "越界: {a}"
+            );
+        }
+        assert!((glow_breath_alpha(0.0) - GLOW_ALPHA_MIN).abs() < 1e-4);
+        assert!((glow_breath_alpha(GLOW_BREATH_PERIOD_MS / 2.0) - GLOW_ALPHA_MAX).abs() < 1e-3);
+        assert!((glow_breath_alpha(GLOW_BREATH_PERIOD_MS) - GLOW_ALPHA_MIN).abs() < 1e-4);
+    }
+
+    /// 卡片 hover 只提升描边亮度（alpha 档位），零位移：线宽不变（§1.1 主张 3）。
+    #[test]
+    fn card_hover_only_lifts_stroke_brightness() {
+        let pal = Palette::dark();
+        let idle = card_stroke(&pal, false);
+        let hover = card_stroke(&pal, true);
+        assert_eq!(idle.width, hover.width, "零位移：描边宽度不变");
+        assert!(hover.color.a() > idle.color.a(), "hover 辉光描边档位应更高");
+        // 浅色主题辉光弱化：静态/悬停退回描边明暗对比
+        let l = Palette::light();
+        assert_eq!(card_stroke(&l, false).color, l.border_glow);
+        assert_ne!(card_stroke(&l, true).color, l.border_glow);
+    }
 
     #[test]
     fn responsive_columns_math() {

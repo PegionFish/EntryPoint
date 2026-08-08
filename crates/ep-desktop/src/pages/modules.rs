@@ -1253,7 +1253,7 @@ fn service_action_row(
                 "🔄 {}",
                 tr(lang, "common.action.restart", &[])
             ))
-            .color(pal.bg))
+            .color(pal.bg_base))
             .fill(pal.warning)
             .corner_radius(egui::CornerRadius::same(CONTROL_ROUNDING))
             .stroke(egui::Stroke::NONE);
@@ -1355,10 +1355,11 @@ fn download_progress_compact(
         ))
         .color(pal.success),
         DownloadState::Failed(_) => {
-            egui::RichText::new(tr(lang, "desktopPages.models.downloadFailed", &[])).color(pal.danger)
+            egui::RichText::new(tr(lang, "desktopPages.models.downloadFailed", &[]))
+                .color(pal.status_error)
         }
         DownloadState::Cancelled => {
-            egui::RichText::new(tr(lang, "common.status.cancelled", &[])).color(pal.warning)
+            egui::RichText::new(tr(lang, "common.status.cancelled", &[])).color(pal.status_stopped)
         }
     };
     ui.label(status.small());
@@ -1712,7 +1713,7 @@ fn logs_drawer(ui: &mut egui::Ui, lang: &str, pal: &Palette, m: &mut ModuleEntry
     });
     ui.add_space(4.0);
     egui::Frame::new()
-        .fill(pal.bg)
+        .fill(pal.bg_base)
         .stroke(egui::Stroke::new(1.0_f32, pal.border))
         .corner_radius(egui::CornerRadius::same(8))
         .inner_margin(egui::Margin::symmetric(8, 6))
@@ -2018,7 +2019,7 @@ fn source_label(src: &ModelSource) -> &'static str {
 fn status_meta(lang: &str, status: &ModelStatus, pal: &Palette) -> (egui::Color32, String) {
     match status {
         ModelStatus::Ready => (pal.success, tr(lang, "common.status.ready", &[])),
-        ModelStatus::Missing => (pal.danger, tr(lang, "common.status.missing", &[])),
+        ModelStatus::Missing => (pal.status_error, tr(lang, "common.status.missing", &[])),
         ModelStatus::Incomplete => (pal.warning, tr(lang, "common.status.incomplete", &[])),
         ModelStatus::Importable => (pal.info, tr(lang, "desktopPages.models.importable", &[])),
     }
