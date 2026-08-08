@@ -65,7 +65,7 @@ function PaletteItem({
       onClick={() => onAdd(payload)}
       onKeyDown={handleKeyDown}
       title={t('pipelineSidebar.addHint')}
-      className="group flex cursor-grab items-center gap-2.5 rounded-md border border-transparent px-2 py-1.5 transition-all duration-150 hover:border-border hover:bg-accent active:cursor-grabbing active:scale-[0.98]"
+      className="group flex cursor-grab items-center gap-2.5 rounded-md border border-transparent px-2 py-1.5 transition-all duration-150 hover:border-border-glow hover:bg-accent active:cursor-grabbing active:scale-[0.98]"
     >
       <span
         className={cn(
@@ -167,7 +167,7 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
   // §6.7：external_api 不进 palette —— LLM 接入统一走 llm builtin 项
   return (
     <aside
-      className={cn('flex h-full w-60 shrink-0 flex-col border-r border-border bg-card', className)}
+      className={cn('glass flex h-full w-60 shrink-0 flex-col border-r border-border-glow', className)}
     >
       <div className="shrink-0 space-y-2.5 border-b border-border p-3">
         <div className="flex items-center justify-between">
@@ -204,7 +204,7 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
             onChange={(e) => setFilter(e.target.value)}
             placeholder={t('pipelineSidebar.searchPlaceholder')}
             aria-label={t('pipelineSidebar.searchLabel')}
-            className="h-8 w-full rounded-md border border-input bg-transparent pl-8 pr-2 text-xs outline-none transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+            className="h-8 w-full rounded-md border border-input bg-transparent pl-8 pr-2 text-xs outline-none transition-colors placeholder:text-muted-foreground dark:bg-input/30 focus-visible:border-ring focus-visible:shadow-[0_0_0_3px_var(--ring-glow)]"
           />
         </div>
       </div>

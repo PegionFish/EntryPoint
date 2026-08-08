@@ -62,7 +62,7 @@ export function PipelineToolbar({
   }
 
   return (
-    <div className="flex h-14 shrink-0 items-center gap-2 border-b border-border bg-card px-3 md:gap-3 md:px-4">
+    <div className="glass flex h-14 shrink-0 items-center gap-2 border-b border-border-glow px-3 md:gap-3 md:px-4">
       <Button
         variant="ghost"
         size="icon-sm"
@@ -90,7 +90,7 @@ export function PipelineToolbar({
           onChange={(e) => onNameChange(e.target.value)}
           placeholder={t('pipelineToolbar.unnamedPipeline')}
           aria-label={t('pipelineToolbar.nameLabel')}
-          className="h-8 w-full min-w-0 max-w-xs flex-1 truncate rounded-md border border-transparent bg-transparent px-2 text-sm outline-none transition-colors placeholder:text-muted-foreground hover:border-input focus-visible:border-ring focus-visible:bg-background focus-visible:ring-[3px] focus-visible:ring-ring/50"
+          className="h-8 w-full min-w-0 max-w-xs flex-1 truncate rounded-md border border-transparent bg-transparent px-2 text-sm outline-none transition-colors placeholder:text-muted-foreground hover:border-input focus-visible:border-ring focus-visible:bg-background focus-visible:shadow-[0_0_0_3px_var(--ring-glow)]"
         />
       </div>
       <span className="hidden shrink-0 font-mono text-xs text-muted-foreground lg:inline">

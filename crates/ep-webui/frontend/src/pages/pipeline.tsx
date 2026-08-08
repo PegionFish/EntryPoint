@@ -146,38 +146,47 @@ function tp(key: string, options?: Record<string, unknown>): string {
 // React Flow 主题适配（映射到设计系统令牌）
 // ============================================================
 
+// 深空仪表盘皮肤（W3 样式层；§6.2-E 保护条款：仅 --xy-* 换肤与连线外观）。
+// 连线渐变引用画布容器内隐藏 SVG 的 #ep-edge-gradient（纯视觉标记）。
 const RF_THEME_CSS = `
 .react-flow {
-  --xy-background-pattern-color: color-mix(in srgb, var(--muted-foreground) 30%, transparent);
-  --xy-edge-stroke: color-mix(in srgb, var(--muted-foreground) 60%, transparent);
-  --xy-edge-stroke-selected: var(--primary);
-  --xy-edge-stroke-width: 1.5;
-  --xy-connectionline-stroke: var(--primary);
-  --xy-connectionline-stroke-width: 1.5;
+  --xy-background-color: var(--card);
+  --xy-background-pattern-color: var(--grid-dot);
+  --xy-edge-stroke: color-mix(in srgb, var(--muted-foreground) 55%, transparent);
+  --xy-edge-stroke-selected: var(--accent-gradient-from);
+  --xy-edge-stroke-width: 2;
+  --xy-connectionline-stroke: var(--accent-gradient-from);
+  --xy-connectionline-stroke-width: 2;
   --xy-handle-background-color: var(--muted-foreground);
   --xy-handle-border-color: var(--card);
-  --xy-controls-button-background-color: var(--card);
-  --xy-controls-button-background-color-hover: var(--accent);
+  --xy-controls-button-background-color: var(--surface-glass);
+  --xy-controls-button-background-color-hover: var(--popover);
   --xy-controls-button-color: var(--muted-foreground);
   --xy-controls-button-color-hover: var(--foreground);
-  --xy-controls-button-border-color: var(--border);
+  --xy-controls-button-border-color: var(--border-glow);
   --xy-controls-box-shadow: none;
-  --xy-minimap-background-color: var(--card);
+  --xy-minimap-background-color: var(--surface-glass);
   --xy-minimap-node-background-color: color-mix(in srgb, var(--muted-foreground) 75%, transparent);
-  --xy-minimap-mask-background-color: color-mix(in srgb, var(--muted-foreground) 45%, transparent);
-  --xy-edge-label-background-color: var(--card);
+  --xy-minimap-mask-background-color: color-mix(in srgb, var(--background) 55%, transparent);
+  --xy-edge-label-background-color: var(--popover);
   --xy-edge-label-color: var(--muted-foreground);
   --xy-selection-background-color: color-mix(in srgb, var(--primary) 10%, transparent);
   --xy-selection-border: 1px dotted color-mix(in srgb, var(--primary) 70%, transparent);
   --xy-attribution-background-color: transparent;
 }
 .react-flow__controls {
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-glow);
   border-radius: calc(var(--radius) - 2px);
   overflow: hidden;
+  backdrop-filter: blur(8px);
 }
 .react-flow__controls-button {
   transition: background-color 150ms ease, color 150ms ease;
+}
+.react-flow__minimap {
+  border: 1px solid var(--border-glow);
+  border-radius: calc(var(--radius) - 2px);
+  overflow: hidden;
 }
 .react-flow__attribution a {
   color: var(--muted-foreground);
@@ -185,12 +194,32 @@ const RF_THEME_CSS = `
 .react-flow__edge-path {
   transition: stroke 150ms ease;
 }
+/* 选中边：品牌渐变描边（§3.1 规则 1 许可位「管线画布选中边」） */
+.react-flow__edge.selected .react-flow__edge-path {
+  stroke: url(#ep-edge-gradient) var(--accent-gradient-from);
+}
+/* 拖拽连线预览：渐变 + 流光 */
+.react-flow__connection-path {
+  stroke: url(#ep-edge-gradient) var(--accent-gradient-from);
+  stroke-dasharray: 6 6;
+  animation: ep-edge-flow 1.6s linear infinite;
+}
+/* 数据流态：执行中全部连线走针流光（1.6s linear 循环，§1 主张 6） */
+.ep-executing .react-flow__edge-path {
+  stroke-dasharray: 6 6;
+  animation: ep-edge-flow 1.6s linear infinite;
+}
+@keyframes ep-edge-flow {
+  to {
+    stroke-dashoffset: -24;
+  }
+}
 `
 
 const DEFAULT_EDGE_OPTIONS = {
   type: 'default',
   markerEnd: { type: MarkerType.ArrowClosed, width: 16, height: 16 },
-  style: { strokeWidth: 1.5 },
+  style: { strokeWidth: 2 },
 }
 
 // ============================================================
@@ -1572,7 +1601,7 @@ function NodeParamsPanel({
   return (
     <aside
       className={cn(
-        'flex h-full w-72 shrink-0 flex-col border-l border-border bg-card',
+        'glass flex h-full w-72 shrink-0 flex-col border-l border-border-glow',
         className,
       )}
     >
@@ -1742,7 +1771,7 @@ function PipelineLibraryBar({
 }: PipelineLibraryBarProps) {
   const { t } = useTranslation('pipeline')
   return (
-    <div className="flex h-11 shrink-0 items-center gap-2 overflow-x-auto border-b border-border bg-muted/30 px-3">
+    <div className="glass flex h-11 shrink-0 items-center gap-2 overflow-x-auto border-b border-border-glow px-3">
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button variant="outline" size="sm" className="shrink-0" title={t('library.title')}>
@@ -1760,7 +1789,10 @@ function PipelineLibraryBar({
             <ChevronDown className="h-3 w-3 text-muted-foreground" />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="start" className="max-h-96 w-80 overflow-y-auto">
+        <DropdownMenuContent
+          align="start"
+          className="max-h-96 w-80 overflow-y-auto border-border-glow shadow-[0_8px_24px_rgba(2,6,12,0.5)] backdrop-blur-xl"
+        >
           <DropdownMenuLabel>{t('library.serverPipelines')}</DropdownMenuLabel>
           {error && (
             <DropdownMenuItem onSelect={onRefresh}>
@@ -2232,7 +2264,7 @@ function VramLedgerPanel({
   return (
     <aside
       className={cn(
-        'flex h-full w-72 shrink-0 flex-col border-l border-border bg-card',
+        'glass flex h-full w-72 shrink-0 flex-col border-l border-border-glow',
         className,
       )}
     >
@@ -2295,7 +2327,7 @@ function VramLedgerPanel({
                   key={d.device_id}
                   className={cn(
                     'space-y-2 rounded-lg border p-3',
-                    d.over ? 'border-status-error/50 bg-status-error/5' : 'border-border',
+                    d.over ? 'border-status-error/50 bg-status-error/5' : 'border-border-glow',
                   )}
                 >
                   <div className="flex items-center gap-2">
@@ -2380,7 +2412,7 @@ function VramLedgerPanel({
 
           {/* auto 节点未分配池（由调度器按 least_memory 落位） */}
           {report && (report.unassigned_mb > 0 || report.unassigned.length > 0) && (
-            <div className="space-y-2 rounded-lg border border-dashed border-border p-3">
+            <div className="space-y-2 rounded-lg border border-dashed border-border-glow p-3">
               <div className="flex items-center gap-2">
                 <span className="text-xs font-semibold">
                   {t('vram.unassignedTitle', { defaultValue: '未分配（device=auto）' })}
@@ -2512,7 +2544,7 @@ function VariantPinDialog({
                   key={`${issue.nodeId}-${issue.pin}`}
                   className={cn(
                     'space-y-1.5 rounded-md border p-3',
-                    resolved ? 'border-status-running/40 bg-status-running/5' : 'border-border',
+                    resolved ? 'border-status-running/40 bg-status-running/5' : 'border-border-glow',
                   )}
                 >
                   <div className="flex items-baseline gap-2">
@@ -2768,7 +2800,7 @@ function PipelineTasksDialog({ open, onOpenChange, pipelineId }: PipelineTasksDi
               const expanded = expandedId === task.id
               const arts = artifacts[task.id]
               return (
-                <div key={task.id} className="rounded-md border border-border">
+                <div key={task.id} className="rounded-md border border-border-glow transition-colors duration-150 hover:border-border-glow-strong">
                   <button
                     type="button"
                     className="flex w-full items-center gap-2 px-3 py-2 text-left"
@@ -4245,7 +4277,19 @@ function PipelineEditor() {
           )
         )}
 
-        <div ref={canvasRef} className="relative min-w-0 flex-1">
+        <div
+          ref={canvasRef}
+          className={cn('relative min-w-0 flex-1', executing && 'ep-executing')}
+        >
+          {/* 连线渐变定义：隐藏 SVG，供 RF_THEME_CSS 的 url(#ep-edge-gradient) 引用（纯视觉） */}
+          <svg className="absolute h-0 w-0" aria-hidden="true" focusable="false">
+            <defs>
+              <linearGradient id="ep-edge-gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                <stop offset="0%" stopColor="var(--accent-gradient-from)" />
+                <stop offset="100%" stopColor="var(--accent-gradient-to)" />
+              </linearGradient>
+            </defs>
+          </svg>
           <ReactFlow
             nodes={nodes}
             edges={edges}
@@ -4286,7 +4330,7 @@ function PipelineEditor() {
             <Controls position="bottom-left" showInteractive={false} />
             <MiniMap pannable zoomable nodeStrokeWidth={2} />
             <Panel position="bottom-center" className="pointer-events-none">
-              <div className="hidden max-w-[28rem] flex-wrap items-center justify-center gap-x-3 gap-y-1 rounded-lg border border-border bg-card/85 px-3.5 py-1.5 shadow-md backdrop-blur md:flex">
+              <div className="glass hidden max-w-[28rem] flex-wrap items-center justify-center gap-x-3 gap-y-1 rounded-lg border border-border-glow px-3.5 py-1.5 shadow-md md:flex">
                 {Object.entries(NODE_STATUS_META).map(([key, meta]) => (
                   <span
                     key={key}
@@ -4327,7 +4371,7 @@ function PipelineEditor() {
 
           {nodes.length === 0 && (
             <div className="pointer-events-none absolute inset-0 z-10 flex flex-col items-center justify-center gap-3">
-              <span className="flex h-14 w-14 items-center justify-center rounded-2xl border border-dashed border-border bg-card/60">
+              <span className="glass flex h-14 w-14 items-center justify-center rounded-2xl border border-dashed border-border-glow">
                 <Waypoints className="h-6 w-6 text-muted-foreground" />
               </span>
               <p className="text-sm font-medium">{t('canvas.emptyTitle')}</p>

@@ -114,27 +114,28 @@ interface NodeStatusMeta {
 export const NODE_STATUS_META: Record<NodeStatus, NodeStatusMeta> = {
   waiting: {
     get label() { return t('components:pipeline.nodeStatus.waiting') },
-    border: 'border-border',
+    border: 'border-border-glow!',
     dot: 'bg-status-stopped',
     glow: '',
   },
   running: {
     get label() { return t('components:pipeline.nodeStatus.running') },
-    border: 'border-status-starting',
-    dot: 'bg-status-starting animate-pulse',
-    glow: 'shadow-md shadow-status-starting/30',
+    border: 'border-status-running!',
+    dot: 'bg-status-running animate-pulse shadow-[0_0_8px_var(--status-glow-running)]',
+    // 强档辉光（12px+）仅限运行中节点（§3.1 规则 2）
+    glow: 'glow-status-running',
   },
   done: {
     get label() { return t('components:pipeline.nodeStatus.done') },
-    border: 'border-status-running',
+    border: 'border-status-running/60!',
     dot: 'bg-status-running',
-    glow: 'shadow-md shadow-status-running/25',
+    glow: 'glow-status-done',
   },
   failed: {
     get label() { return t('components:pipeline.nodeStatus.failed') },
-    border: 'border-status-error',
+    border: 'border-status-error!',
     dot: 'bg-status-error',
-    glow: 'shadow-md shadow-status-error/30',
+    glow: 'glow-status-failed',
   },
 }
 
@@ -883,7 +884,7 @@ export function ParamSpecField({ spec, value, onChange }: ParamSpecFieldProps) {
       )}
       {spec.type === 'textarea' && (
         <textarea
-          className="min-h-20 w-full resize-y rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs outline-none transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+          className="min-h-20 w-full resize-y rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs outline-none transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:shadow-[0_0_0_3px_var(--ring-glow)]"
           rows={4}
           value={stringValue}
           placeholder={spec.placeholder}
@@ -1097,12 +1098,13 @@ function NodeCard({
   return (
     <div
       className={cn(
-        'w-56 rounded-lg border-2 bg-card text-card-foreground transition-all duration-200',
+        // 玻璃拟态节点卡：半透明底 + 内发光描边；四态描边以 important 覆盖玻璃描边
+        'glass-card w-56 rounded-lg border-2! text-card-foreground',
         meta.border,
         meta.glow,
         selected
-          ? 'shadow-xl ring-2 ring-ring/70'
-          : 'shadow-sm hover:-translate-y-px hover:shadow-lg',
+          ? 'node-card-selected'
+          : 'transition-shadow duration-200 hover:shadow-lg',
       )}
     >
       {children}
@@ -1123,7 +1125,7 @@ function StatusDot({ status }: { status: NodeStatus }) {
 /** 端口行：handle 锚定在本行（relative），左侧输入 / 右侧输出，标签按数据类型着色 */
 function PortRow({ inputs, outputs }: { inputs: Port[]; outputs: Port[] }) {
   return (
-    <div className="relative flex h-7 items-center justify-between rounded-b-md border-t border-border/70 bg-muted/30 px-2.5">
+    <div className="relative flex h-7 items-center justify-between rounded-b-md border-t border-border-glow bg-background/40 px-2.5">
       <span className="flex items-center">
         {inputs.map((port) => (
           <PortLabel key={port.id} port={port} side="in" />

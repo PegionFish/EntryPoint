@@ -277,6 +277,21 @@
     box-shadow: 0 0 12px var(--status-glow-running);
   }
 
+  /* 节点卡完成/失败态辉光（定义于 glass-card 之后，叠层序上覆盖玻璃卡阴影） */
+  .glow-status-done {
+    box-shadow: 0 0 10px color-mix(in srgb, var(--status-running) 22%, transparent);
+  }
+  .glow-status-failed {
+    box-shadow: 0 0 10px color-mix(in srgb, var(--status-error) 28%, transparent);
+  }
+
+  /* 节点卡选中态：主色描边环 + 中档辉光（叠层序上覆盖 glass-card 阴影） */
+  .node-card-selected {
+    box-shadow:
+      0 0 0 2px color-mix(in srgb, var(--primary) 60%, transparent),
+      0 0 16px var(--primary-glow);
+  }
+
   /* 品牌渐变：电光青→靛蓝，仅限 §3.1 规则 1 列举的 6 处 */
   .bg-gradient-accent {
     background-image: linear-gradient(
