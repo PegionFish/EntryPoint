@@ -81,6 +81,21 @@ pub(crate) fn parse_smi_output(output: &str) -> Vec<ComputeDevice> {
         .collect()
 }
 
+/// 用最新采样刷新匹配设备的动态字段（P2：与 rocm/openvino 一致，采样字段
+/// 缺失（None）时保留旧值，避免"采样瞬间字段缺失抹掉既有值"）
+pub(crate) fn refresh_cuda_devices(devices: &mut [ComputeDevice], fresh: &[ComputeDevice]) {
+    for dev in devices.iter_mut() {
+        if dev.backend != ComputeBackend::Cuda {
+            continue;
+        }
+        if let Some(updated) = fresh.iter().find(|f| f.id == dev.id) {
+            dev.used_memory_mb = updated.used_memory_mb.or(dev.used_memory_mb);
+            dev.utilization = updated.utilization.or(dev.utilization);
+            dev.temperature = updated.temperature.or(dev.temperature);
+        }
+    }
+}
+
 impl DeviceDetector for CudaDetector {
     fn backend(&self) -> ComputeBackend {
         ComputeBackend::Cuda
@@ -98,16 +113,7 @@ impl DeviceDetector for CudaDetector {
             return;
         };
         let fresh = parse_smi_output(&output);
-        for dev in devices.iter_mut() {
-            if dev.backend != ComputeBackend::Cuda {
-                continue;
-            }
-            if let Some(updated) = fresh.iter().find(|f| f.id == dev.id) {
-                dev.used_memory_mb = updated.used_memory_mb;
-                dev.utilization = updated.utilization;
-                dev.temperature = updated.temperature;
-            }
-        }
+        refresh_cuda_devices(devices, &fresh);
     }
 }
 
@@ -165,6 +171,47 @@ mod tests {
     fn test_candidates_always_include_path_lookup() {
         // 无论平台，PATH 探测候选必须存在（nvidia-smi 在 PATH 的用户真机依赖此项）
         assert!(nvidia_smi_candidates().iter().any(|c| c == "nvidia-smi"));
+    }
+
+    /// P2 回归：采样瞬间字段缺失（N/A）不得抹掉既有值（.or() 保留旧值）
+    #[test]
+    fn test_refresh_preserves_old_values_when_sample_field_missing() {
+        let mut devices = vec![ComputeDevice {
+            id: DeviceId::Cuda(0),
+            backend: ComputeBackend::Cuda,
+            name: "RTX 4090".to_string(),
+            total_memory_mb: Some(24564),
+            used_memory_mb: Some(1234),
+            utilization: Some(45),
+            temperature: Some(62),
+        }];
+        // 最新采样：utilization/temperature 为 N/A（缺失），used 有更新值
+        let fresh = vec![ComputeDevice {
+            id: DeviceId::Cuda(0),
+            backend: ComputeBackend::Cuda,
+            name: "RTX 4090".to_string(),
+            total_memory_mb: Some(24564),
+            used_memory_mb: Some(999),
+            utilization: None,
+            temperature: None,
+        }];
+        refresh_cuda_devices(&mut devices, &fresh);
+        assert_eq!(devices[0].used_memory_mb, Some(999), "有效新值应更新");
+        assert_eq!(devices[0].utilization, Some(45), "缺失字段保留旧值");
+        assert_eq!(devices[0].temperature, Some(62), "缺失字段保留旧值");
+
+        // 非 CUDA 设备不被触碰
+        let mut other = vec![ComputeDevice {
+            id: DeviceId::Rocm(0),
+            backend: ComputeBackend::Rocm,
+            name: "AMD".to_string(),
+            total_memory_mb: None,
+            used_memory_mb: None,
+            utilization: None,
+            temperature: None,
+        }];
+        refresh_cuda_devices(&mut other, &fresh);
+        assert_eq!(other[0].utilization, None);
     }
 
     #[cfg(windows)]

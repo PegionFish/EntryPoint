@@ -84,11 +84,22 @@ fn check_segment(seg: &str, name: &str, whole: &str) -> Result<(), ModelIdError>
     Ok(())
 }
 
-/// 变体维度校验：非空，字符集 `[A-Za-z0-9.-]`（大小写、数字、连字符、点）。
+/// 变体维度校验：非空，字符集 `[A-Za-z0-9.-]`，且不得以 `.` 开头、不得
+/// 包含 `..`（P3：拒绝路径穿越隐患；单点仅作版本分隔，如 "1.5.0"）。
 fn check_variant(variant: &str, whole: &str) -> Result<(), ModelIdError> {
     if variant.is_empty() {
         return Err(ModelIdError::Invalid(format!(
             "'{whole}': variant after '@' must not be empty"
+        )));
+    }
+    if variant.starts_with('.') {
+        return Err(ModelIdError::Invalid(format!(
+            "'{whole}': variant '{variant}' must not start with a dot"
+        )));
+    }
+    if variant.contains("..") {
+        return Err(ModelIdError::Invalid(format!(
+            "'{whole}': variant '{variant}' must not contain '..'"
         )));
     }
     if !variant
@@ -367,6 +378,19 @@ mod tests {
                 "input {s:?} → {err}"
             );
         }
+    }
+
+    #[test]
+    fn pinned_rejects_dot_path_traversal_variants() {
+        // P3：拒绝以 `.` 开头或包含 `..` 的变体（路径穿越隐患）
+        for s in ["ep.a.b@.hidden", "ep.a.b@..", "ep.a.b@a..b", "ep.a.b@..v1", "ep.a.b@v1.."] {
+            assert!(PinnedModelId::parse(s).is_err(), "input {s:?}");
+        }
+        // 合法版本点（单点分隔）不受影响
+        assert_eq!(
+            PinnedModelId::parse("ep.a.b@1.5.0").unwrap().variant.as_deref(),
+            Some("1.5.0")
+        );
     }
 
     #[test]

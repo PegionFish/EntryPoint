@@ -34,8 +34,12 @@ pub trait DeviceDetector: Send + Sync {
     fn refresh(&self, devices: &mut [ComputeDevice]);
 }
 
-/// SMI 类检测命令的默认子进程超时
-pub(crate) const TOOL_TIMEOUT: Duration = Duration::from_secs(6);
+/// SMI 类检测命令的默认子进程超时。
+///
+/// 15s（P3 放宽）：Windows 上 nvidia-smi 冷启动 + WDDM 查询在低端机/驱动
+/// 异常时可能超过旧值 6s 而误判检测失败；探测是周期性的 best-effort，
+/// 放宽只延后挂死进程的 kill 点，不放大故障面。
+pub(crate) const TOOL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 执行外部检测命令并返回 stdout 文本（检测专用，绝不 panic）。
 ///

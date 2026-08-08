@@ -479,17 +479,47 @@ impl AppConfig {
         Ok(config)
     }
 
-    /// 持久化配置到 `config_dir/app.toml`。
+    /// 持久化配置到 `config_dir/app.toml`（P1：原子写盘）。
     ///
     /// #48：序列化字段保留用户原始形态（相对路径保持相对），
     /// 运行期解析缓存（[`Self::resolved_paths`]）`#[serde(skip)]` 不落盘。
+    ///
+    /// 原子性：先写同目录临时文件 `app.toml.tmp` + fsync，再 rename 覆盖目标
+    /// ——写一半崩溃不再损坏正式配置（`load_or_create` 只处理缺失、不处理损坏，
+    /// 半写文件会让 daemon 启动失败）。Windows 的 `std::fs::rename` 经
+    /// MoveFileExW+REPLACE_EXISTING 可直接覆盖已存在目标；个别场景（杀软/
+    /// 占用）失败时回退 删旧 + rename。
     pub fn save(&self, config_dir: &Path) -> Result<()> {
         std::fs::create_dir_all(config_dir)
             .with_context(|| format!("failed to create config dir {}", config_dir.display()))?;
         let path = Self::config_path(config_dir);
         let content = toml::to_string_pretty(self).context("failed to serialize config")?;
-        std::fs::write(&path, content)
-            .with_context(|| format!("failed to write {}", path.display()))?;
+
+        let tmp_path = config_dir.join(format!("{CONFIG_FILE_NAME}.tmp"));
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&tmp_path)
+                .with_context(|| format!("failed to create temp config {}", tmp_path.display()))?;
+            file.write_all(content.as_bytes()).with_context(|| {
+                format!("failed to write temp config {}", tmp_path.display())
+            })?;
+            file.sync_all().with_context(|| {
+                format!("failed to fsync temp config {}", tmp_path.display())
+            })?;
+        }
+
+        if std::fs::rename(&tmp_path, &path).is_err() {
+            // Windows 语义兜底：rename 覆盖目标失败（杀软/占用）→ 删旧再 rename
+            if path.exists() {
+                std::fs::remove_file(&path).with_context(|| {
+                    format!("failed to remove stale config {}", path.display())
+                })?;
+            }
+            std::fs::rename(&tmp_path, &path).with_context(|| {
+                format!("failed to replace {} with {}", path.display(), tmp_path.display())
+            })?;
+        }
+
         debug!(path = %path.display(), "config saved");
         Ok(())
     }
@@ -1095,6 +1125,69 @@ workspace_dir = "workspace"
         let config = AppConfig::load(&dir).expect("load missing");
         assert_eq!(config.general.language, "zh-CN");
         assert_eq!(config.ports.range_start, 18000);
+    }
+
+    // ── P1：save 原子写盘 / 半写文件容错（回归）──────────────────────────
+
+    /// P1 回归：save 后目标文件完整可解析、不残留 .tmp 临时文件（原子写盘）
+    #[test]
+    fn save_writes_complete_atomic_file() {
+        let dir = std::env::temp_dir().join(format!("ep_config_atomic_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut config = AppConfig::default();
+        config.general.language = "en-US".into();
+        config.ports.range_start = 20000;
+        config.save(&dir).expect("save");
+
+        // 落盘文件完整可解析
+        let loaded = AppConfig::load(&dir).expect("reload");
+        assert_eq!(loaded.general.language, "en-US");
+        assert_eq!(loaded.ports.range_start, 20000);
+
+        // 临时文件已被 rename 走，不残留
+        let tmp = dir.join(format!("{CONFIG_FILE_NAME}.tmp"));
+        assert!(!tmp.exists(), "save 后不得残留 .tmp 临时文件");
+
+        // 覆盖保存同样完整（rename 替换已存在目标）
+        config.general.theme = "light".into();
+        config.save(&dir).expect("resave");
+        let reloaded = AppConfig::load(&dir).expect("reload");
+        assert_eq!(reloaded.general.theme, "light");
+        assert!(!tmp.exists(), "覆盖保存后也不得残留 .tmp");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1 回归：模拟写一半崩溃（截断的 TOML）→ load 应报错而非 panic、
+    /// 而非静默回退默认；save 原子覆盖后可自愈
+    #[test]
+    fn load_half_written_file_returns_error() {
+        let dir = std::env::temp_dir().join(format!("ep_config_half_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 半写现场：合法序列化内容的前半截（截断在表名中间）
+        let full = toml::to_string_pretty(&AppConfig::default()).unwrap();
+        let half = &full[..full.len() / 2];
+        std::fs::write(dir.join(CONFIG_FILE_NAME), half).unwrap();
+
+        // 必须返回 Err（错误上下文含文件名），绝不 panic
+        let err = AppConfig::load(&dir).unwrap_err();
+        assert!(
+            err.to_string().contains("failed to parse"),
+            "半写文件应报解析错误，实际: {err}"
+        );
+
+        // 修复现场：save 原子覆盖损坏文件后可正常加载
+        AppConfig::default()
+            .save(&dir)
+            .expect("save over half-written file");
+        let loaded = AppConfig::load(&dir).expect("recover");
+        assert_eq!(loaded.general.language, "zh-CN");
+        assert!(!dir.join(format!("{CONFIG_FILE_NAME}.tmp")).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
