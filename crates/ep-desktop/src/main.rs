@@ -127,7 +127,9 @@ fn main() -> anyhow::Result<()> {
             configure_fonts(&cc.egui_ctx);
             // 应用配置中的字体大小与整体缩放（egui 0.31 的 API 为 set_zoom_factor）
             ep_desktop::theme::apply_font_size(&cc.egui_ctx, ui_config.ui.font_size);
-            cc.egui_ctx.set_zoom_factor(ui_config.ui.scale_factor);
+            cc.egui_ctx.set_zoom_factor(ep_desktop::theme::clamp_scale_factor(
+                ui_config.ui.scale_factor,
+            ));
             Ok(Box::new(ep_desktop::App::new(rx, cmd_tx, ui_config)))
         }),
     )
@@ -1479,29 +1481,40 @@ async fn start_model_download(
     ) {
         Ok(handle) => {
             let mut progress_rx = handle.subscribe_progress();
-            // 保存句柄供取消（UI 发 CancelDownload）
+            // P1 修复：句柄以 (module_id, model_id) 复合键登记，
+            // 跨模块同名变体不再互相覆盖（取消/进度各自独立）
+            let key = ep_desktop::app::download_key(module_id, &model_id);
             download_handles
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(model_id.clone(), handle);
+                .insert(key, handle);
 
             let tx2 = tx.clone();
-            let mid = model_id.clone();
+            let mid = module_id.to_string();
+            let mid2 = model_id.clone();
             let handles2 = Arc::clone(download_handles);
             tokio::spawn(async move {
                 use tokio::sync::broadcast::error::RecvError;
                 let mut success = false;
+                // P2 修复：进度节流 —— 非终态更新至少间隔 100ms 才转发，
+                // 避免 broadcast 高频更新洪泛 mpsc 通道；终态立即转发
+                let throttle = std::time::Duration::from_millis(100);
+                let mut last_send = std::time::Instant::now() - throttle;
                 loop {
                     match progress_rx.recv().await {
                         Ok(p) => {
                             let terminal =
                                 !matches!(p.state, DownloadState::Downloading);
-                            let _ = tx2.send(AppMsg::ModelDownloadProgress {
-                                model_id: mid.clone(),
-                                percent: p.percent,
-                                bytes: p.bytes,
-                                state: p.state.clone(),
-                            });
+                            if terminal || last_send.elapsed() >= throttle {
+                                let _ = tx2.send(AppMsg::ModelDownloadProgress {
+                                    module_id: mid.clone(),
+                                    model_id: mid2.clone(),
+                                    percent: p.percent,
+                                    bytes: p.bytes,
+                                    state: p.state.clone(),
+                                });
+                                last_send = std::time::Instant::now();
+                            }
                             if terminal {
                                 match &p.state {
                                     DownloadState::Completed => {
@@ -1511,14 +1524,14 @@ async fn start_model_download(
                                         let _ = tx2.send(AppMsg::Error(tr(
                                             lang,
                                             "desktopApp.error.downloadFailed",
-                                            &[("id", &mid), ("detail", msg)],
+                                            &[("id", &mid2), ("detail", msg)],
                                         )));
                                     }
                                     DownloadState::Cancelled => {
                                         let _ = tx2.send(AppMsg::Info(tr(
                                             lang,
                                             "desktopApp.error.downloadCancelled",
-                                            &[("id", &mid)],
+                                            &[("id", &mid2)],
                                         )));
                                     }
                                     DownloadState::Downloading => {}
@@ -1533,11 +1546,16 @@ async fn start_model_download(
                     }
                 }
                 // 清理句柄并发出最终消息（UI 据此刷新列表）
+                let key = ep_desktop::app::download_key(&mid, &mid2);
                 handles2
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .remove(&mid);
-                let _ = tx2.send(AppMsg::ModelDownloadFinished(mid, success));
+                    .remove(&key);
+                let _ = tx2.send(AppMsg::ModelDownloadFinished {
+                    module_id: mid,
+                    model_id: mid2,
+                    success,
+                });
             });
         }
         Err(e) => {
@@ -1546,7 +1564,131 @@ async fn start_model_download(
                 "desktopApp.error.startDownloadFailed",
                 &[("detail", &e.to_string())],
             )));
-            let _ = tx.send(AppMsg::ModelDownloadFinished(model_id, false));
+            let _ = tx.send(AppMsg::ModelDownloadFinished {
+                module_id: module_id.to_string(),
+                model_id,
+                success: false,
+            });
+        }
+    }
+}
+
+/// P2 修复：后台卸载整合包（原命令循环内 await GB 级删除会阻塞其他命令）。
+///
+/// 协调记录 #47：pack 来源徽章菜单「卸载来源整合包」，语义对齐
+/// daemon DELETE /api/packs/{id}：keep_models=false → 删除 meta.pack_id
+/// 指向本包的模型目录；本包安装的管线与注册表条目一并移除。
+///
+/// 数据全部 owned 传入（原借用 model_manager/discovered 的调用点改为在
+/// 任务内新建 ModelManager，与 CheckUpdate 同款模式）；终态经 mpsc 回传。
+#[allow(clippy::too_many_arguments)]
+async fn uninstall_pack_bg(
+    tx: std::sync::mpsc::Sender<ep_desktop::app::AppMsg>,
+    lang: &'static str,
+    root: std::path::PathBuf,
+    models_cfg: ep_core::config::ModelsConfig,
+    discovered: Vec<DiscoveredModule>,
+    pack_id: String,
+    keep_models: bool,
+) {
+    use ep_desktop::app::AppMsg;
+    use ep_desktop::i18n::tr;
+    let model_manager = ep_core::model::ModelManager::new(&models_cfg, &root);
+    let registry_dir = root.join("runtime").join("packs");
+    let reg_path = ep_pack::import::registry_entry_path(&registry_dir, &pack_id);
+    match ep_pack::import::read_installed_pack(&reg_path) {
+        Ok(Some(installed)) => {
+            if !keep_models {
+                for model in model_manager.list_downloaded_models() {
+                    if model.meta.pack_id.as_deref() == Some(installed.id.as_str()) {
+                        let dir = model_manager.model_dir(&model.target_dir);
+                        if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+                            tracing::warn!(
+                                dir = %dir.display(),
+                                error = %e,
+                                "failed to remove pack model dir"
+                            );
+                        }
+                    }
+                }
+            }
+            // 管线删除：按已装 id 反查 config/pipelines/*.toml
+            let pipelines_dir = root.join("config").join("pipelines");
+            if let Ok(rd) = tokio::fs::read_dir(&pipelines_dir).await {
+                let mut entries = Vec::new();
+                let mut rd = rd;
+                while let Ok(Some(entry)) = rd.next_entry().await {
+                    entries.push(entry.path());
+                }
+                for path in entries {
+                    if path.extension().and_then(|x| x.to_str()) != Some("toml") {
+                        continue;
+                    }
+                    let path_bg = path.clone();
+                    let parse = tokio::task::spawn_blocking(move || {
+                        ep_core::pipeline::Pipeline::from_toml(&path_bg)
+                    })
+                    .await;
+                    if let Ok(Ok(pipeline)) = parse {
+                        if installed.pipelines.contains(&pipeline.id) {
+                            if let Err(e) = tokio::fs::remove_file(&path).await {
+                                tracing::warn!(
+                                    file = %path.display(),
+                                    error = %e,
+                                    "failed to remove pack pipeline"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            if let Err(e) = tokio::fs::remove_file(&reg_path).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        path = %reg_path.display(),
+                        error = %e,
+                        "failed to remove pack registry file"
+                    );
+                }
+            }
+            let _ = tx.send(AppMsg::Info(trfb_bg(
+                lang,
+                "desktopApp.info.packUninstalled",
+                "已卸载整合包「{{id}}」",
+                &[("id", &installed.id)],
+            )));
+            // 刷新模型列表与已装包列表
+            let _ = tx.send(AppMsg::ModelsRefreshed(
+                model_manager.list_all_models(&manifests_from(&discovered)),
+            ));
+            match ep_pack::import::list_installed_packs(&registry_dir) {
+                Ok(packs) => {
+                    let entries = packs.into_iter().map(pack_entry_from).collect();
+                    let _ = tx.send(AppMsg::PacksRefreshed(entries));
+                }
+                Err(e) => {
+                    let _ = tx.send(AppMsg::Error(tr(
+                        lang,
+                        "desktopApp.error.packListFailed",
+                        &[("detail", &e.to_string())],
+                    )));
+                }
+            }
+        }
+        Ok(None) => {
+            let _ = tx.send(AppMsg::Error(trfb_bg(
+                lang,
+                "desktopApp.error.packNotFound",
+                "整合包「{{id}}」未安装或注册条目缺失",
+                &[("id", &pack_id)],
+            )));
+        }
+        Err(e) => {
+            let _ = tx.send(AppMsg::Error(tr(
+                lang,
+                "desktopApp.error.packListFailed",
+                &[("detail", &e.to_string())],
+            )));
         }
     }
 }
@@ -1815,9 +1957,11 @@ async fn background_loop(
                                                 &[("detail", &detail)],
                                             )));
                                         }
-                                        let _ = tx.send(AppMsg::ModelDownloadFinished(
-                                            model_id, false,
-                                        ));
+                                        let _ = tx.send(AppMsg::ModelDownloadFinished {
+                                            module_id: module_id.clone(),
+                                            model_id: model_id.clone(),
+                                            success: false,
+                                        });
                                     }
                                 }
                             }
@@ -1827,15 +1971,19 @@ async fn background_loop(
                                     "desktopApp.error.moduleOrModelNotFound",
                                     &[("module", &module_id), ("model", &model_id)],
                                 )));
-                                let _ = tx
-                                    .send(AppMsg::ModelDownloadFinished(model_id, false));
+                                let _ = tx.send(AppMsg::ModelDownloadFinished {
+                                    module_id,
+                                    model_id,
+                                    success: false,
+                                });
                             }
                         }
                     }
-                    Some(AppCmd::CancelDownload(model_id)) => {
-                        // 从句柄映射中取出引用并取消（cancel 幂等；supervise 任务会发 Cancelled）
+                    Some(AppCmd::CancelDownload { module_id, model_id }) => {
+                        // P1 修复：复合键定位句柄并取消（cancel 幂等；supervise 任务会发 Cancelled）
+                        let key = ep_desktop::app::download_key(&module_id, &model_id);
                         let mut guard = download_handles.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(handle) = guard.get_mut(&model_id) {
+                        if let Some(handle) = guard.get_mut(&key) {
                             handle.cancel();
                         }
                     }
@@ -1853,11 +2001,14 @@ async fn background_loop(
                             let network = config.network.clone();
                             let root2 = root.clone();
                             let tx2 = tx.clone();
+                            // P1 修复：module_id 随消息携带（跨模块同名变体隔离）
+                            let mid = module_id.clone();
                             tokio::spawn(async move {
                                 let mgr = ep_core::model::ModelManager::new(&models_cfg, &root2)
                                     .with_network(network);
                                 let result = mgr.check_update_available(&decl).await;
                                 let _ = tx2.send(AppMsg::ModelUpdateChecked {
+                                    module_id: mid,
                                     model_id,
                                     result,
                                     notify: true,
@@ -1879,21 +2030,29 @@ async fn background_loop(
                             .filter(|mv| mv.status == ep_core::model::ModelStatus::Ready)
                             .collect::<Vec<_>>();
 
-                        let decls: Vec<(String, ep_core::module::ModelDecl)> = ready_models
-                            .iter()
-                            .filter_map(|mv| {
-                                discovered
-                                    .iter()
-                                    .filter_map(|m| m.manifest.as_ref())
-                                    .find(|mf| mf.module.id == mv.module_id)
-                                    .and_then(|mf| {
-                                        mf.models
-                                            .iter()
-                                            .find(|d| d.id == mv.model_id)
-                                            .map(|d| (mv.model_id.clone(), d.clone()))
-                                    })
-                            })
-                            .collect();
+                        // P1 修复：decls 携带 module_id（跨模块同名变体隔离）
+                        let decls: Vec<(String, String, ep_core::module::ModelDecl)> =
+                            ready_models
+                                .iter()
+                                .filter_map(|mv| {
+                                    discovered
+                                        .iter()
+                                        .filter_map(|m| m.manifest.as_ref())
+                                        .find(|mf| mf.module.id == mv.module_id)
+                                        .and_then(|mf| {
+                                            mf.models
+                                                .iter()
+                                                .find(|d| d.id == mv.model_id)
+                                                .map(|d| {
+                                                    (
+                                                        mv.module_id.clone(),
+                                                        mv.model_id.clone(),
+                                                        d.clone(),
+                                                    )
+                                                })
+                                        })
+                                })
+                                .collect();
 
                         // 各模型各自 spawn 并发检查（JoinSet），完成后汇总
                         let models_cfg = config.models.clone();
@@ -1902,7 +2061,7 @@ async fn background_loop(
                         let tx2 = tx.clone();
                         tokio::spawn(async move {
                             let mut set = tokio::task::JoinSet::new();
-                            for (model_id, decl) in decls {
+                            for (module_id, model_id, decl) in decls {
                                 let models_cfg = models_cfg.clone();
                                 let network = network.clone();
                                 let root2 = root2.clone();
@@ -1911,17 +2070,18 @@ async fn background_loop(
                                         ep_core::model::ModelManager::new(&models_cfg, &root2)
                                             .with_network(network);
                                     let result = mgr.check_update_available(&decl).await;
-                                    (model_id, result)
+                                    (module_id, model_id, result)
                                 });
                             }
                             let total = set.len();
                             let mut available = 0usize;
                             while let Some(joined) = set.join_next().await {
-                                if let Ok((model_id, result)) = joined {
+                                if let Ok((module_id, model_id, result)) = joined {
                                     if result.available {
                                         available += 1;
                                     }
                                     let _ = tx2.send(AppMsg::ModelUpdateChecked {
+                                        module_id,
                                         model_id,
                                         result,
                                         notify: false,
@@ -1932,21 +2092,33 @@ async fn background_loop(
                         });
                     }
                     Some(AppCmd::DeleteModel(target_dir)) => {
+                        // P2 修复：spawn 独立任务执行删除（GB 级 remove_dir_all
+                        // 不再阻塞命令循环），终态经 mpsc 回传；模型列表刷新用
+                        // 任务内新建 ModelManager（与 CheckUpdate 同款模式）。
                         let dir = model_manager.model_dir(&target_dir);
-                        match tokio::fs::remove_dir_all(&dir).await {
-                            Ok(()) => {
-                                let _ = tx.send(AppMsg::ModelsRefreshed(
-                                    model_manager.list_all_models(&manifests_from(&discovered)),
-                                ));
+                        let tx2 = tx.clone();
+                        let models_cfg = config.models.clone();
+                        let root2 = root.clone();
+                        let discovered2 = discovered.clone();
+                        tokio::spawn(async move {
+                            match tokio::fs::remove_dir_all(&dir).await {
+                                Ok(()) => {
+                                    let mgr =
+                                        ep_core::model::ModelManager::new(&models_cfg, &root2)
+                                            .with_manifests(manifests_from(&discovered2));
+                                    let _ = tx2.send(AppMsg::ModelsRefreshed(
+                                        mgr.list_all_models(&manifests_from(&discovered2)),
+                                    ));
+                                }
+                                Err(e) => {
+                                    let _ = tx2.send(AppMsg::Error(tr(
+                                        lang,
+                                        "desktopApp.error.deleteModelFailed",
+                                        &[("detail", &e.to_string())],
+                                    )));
+                                }
                             }
-                            Err(e) => {
-                                let _ = tx.send(AppMsg::Error(tr(
-                                    lang,
-                                    "desktopApp.error.deleteModelFailed",
-                                    &[("detail", &e.to_string())],
-                                )));
-                            }
-                        }
+                        });
                     }
                     Some(AppCmd::ImportModel {
                         module_id,
@@ -2243,114 +2415,25 @@ async fn background_loop(
                         }
                     }
                     Some(AppCmd::UninstallPack { pack_id, keep_models }) => {
-                        // 协调记录 #47：pack 来源徽章菜单「卸载来源整合包」。
-                        // 语义对齐 daemon DELETE /api/packs/{id}：
-                        // keep_models=false → 删除 meta.pack_id 指向本包的模型目录；
-                        // 本包安装的管线与注册表条目一并移除。
-                        let registry_dir = root.join("runtime").join("packs");
-                        let reg_path =
-                            ep_pack::import::registry_entry_path(&registry_dir, &pack_id);
-                        match ep_pack::import::read_installed_pack(&reg_path) {
-                            Ok(Some(installed)) => {
-                                if !keep_models {
-                                    for model in model_manager.list_downloaded_models() {
-                                        if model.meta.pack_id.as_deref()
-                                            == Some(installed.id.as_str())
-                                        {
-                                            let dir = model_manager.model_dir(&model.target_dir);
-                                            if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
-                                                tracing::warn!(
-                                                    dir = %dir.display(),
-                                                    error = %e,
-                                                    "failed to remove pack model dir"
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                // 管线删除：按已装 id 反查 config/pipelines/*.toml
-                                let pipelines_dir = root.join("config").join("pipelines");
-                                if let Ok(rd) = tokio::fs::read_dir(&pipelines_dir).await {
-                                    let mut entries = Vec::new();
-                                    let mut rd = rd;
-                                    while let Ok(Some(entry)) = rd.next_entry().await {
-                                        entries.push(entry.path());
-                                    }
-                                    for path in entries {
-                                        if path.extension().and_then(|x| x.to_str())
-                                            != Some("toml")
-                                        {
-                                            continue;
-                                        }
-                                        let path_bg = path.clone();
-                                        let parse = tokio::task::spawn_blocking(move || {
-                                            ep_core::pipeline::Pipeline::from_toml(&path_bg)
-                                        })
-                                        .await;
-                                        if let Ok(Ok(pipeline)) = parse {
-                                            if installed.pipelines.contains(&pipeline.id) {
-                                                if let Err(e) = tokio::fs::remove_file(&path).await
-                                                {
-                                                    tracing::warn!(
-                                                        file = %path.display(),
-                                                        error = %e,
-                                                        "failed to remove pack pipeline"
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                if let Err(e) = tokio::fs::remove_file(&reg_path).await {
-                                    if e.kind() != std::io::ErrorKind::NotFound {
-                                        tracing::warn!(
-                                            path = %reg_path.display(),
-                                            error = %e,
-                                            "failed to remove pack registry file"
-                                        );
-                                    }
-                                }
-                                let _ = tx.send(AppMsg::Info(trfb_bg(
-                                    lang,
-                                    "desktopApp.info.packUninstalled",
-                                    "已卸载整合包「{{id}}」",
-                                    &[("id", &installed.id)],
-                                )));
-                                // 刷新模型列表与已装包列表
-                                let _ = tx.send(AppMsg::ModelsRefreshed(
-                                    model_manager.list_all_models(&manifests_from(&discovered)),
-                                ));
-                                match ep_pack::import::list_installed_packs(&registry_dir) {
-                                    Ok(packs) => {
-                                        let entries =
-                                            packs.into_iter().map(pack_entry_from).collect();
-                                        let _ = tx.send(AppMsg::PacksRefreshed(entries));
-                                    }
-                                    Err(e) => {
-                                        let _ = tx.send(AppMsg::Error(tr(
-                                            lang,
-                                            "desktopApp.error.packListFailed",
-                                            &[("detail", &e.to_string())],
-                                        )));
-                                    }
-                                }
-                            }
-                            Ok(None) => {
-                                let _ = tx.send(AppMsg::Error(trfb_bg(
-                                    lang,
-                                    "desktopApp.error.packNotFound",
-                                    "整合包「{{id}}」未安装或注册条目缺失",
-                                    &[("id", &pack_id)],
-                                )));
-                            }
-                            Err(e) => {
-                                let _ = tx.send(AppMsg::Error(tr(
-                                    lang,
-                                    "desktopApp.error.packListFailed",
-                                    &[("detail", &e.to_string())],
-                                )));
-                            }
-                        }
+                        // P2 修复：spawn 独立任务执行卸载（GB 级模型删除 +
+                        // 管线扫描在后台跑，命令循环不再被阻塞），终态经 mpsc 回传。
+                        // 原逻辑整体移入 uninstall_pack_bg（数据全 owned 传入）。
+                        let tx2 = tx.clone();
+                        let root2 = root.clone();
+                        let models_cfg = config.models.clone();
+                        let discovered2 = discovered.clone();
+                        tokio::spawn(async move {
+                            uninstall_pack_bg(
+                                tx2,
+                                lang,
+                                root2,
+                                models_cfg,
+                                discovered2,
+                                pack_id,
+                                keep_models,
+                            )
+                            .await;
+                        });
                     }
                     Some(AppCmd::ExecuteSingle {
                         module_id,
@@ -2512,7 +2595,31 @@ async fn background_loop(
                             send_task_snapshot(&task_registry, &tx);
                         }
                     }
-                    Some(AppCmd::Shutdown) => break,
+                    Some(AppCmd::Shutdown) => {
+                        // P1 修复：退出前回收子进程 —— 停止全部运行中模块 +
+                        // 取消在飞下载（UI on_exit 经 AppCmd::Shutdown 触发）。
+                        // 此处 await 无碍：命令循环本就要退出，runtime 保持存活
+                        // 直至全部子进程清理完毕。
+                        let running: Vec<String> = process_manager
+                            .list_running()
+                            .iter()
+                            .map(|inst| inst.module_id.clone())
+                            .collect();
+                        for mid in running {
+                            let _ = process_manager.stop_module(&mid).await;
+                            port_manager.release(&mid);
+                            scheduler.release(&mid);
+                        }
+                        {
+                            let mut guard = download_handles
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            for handle in guard.values_mut() {
+                                handle.cancel();
+                            }
+                        }
+                        break;
+                    }
                     None => break,
                 }
             }
