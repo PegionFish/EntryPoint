@@ -427,7 +427,7 @@ Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平�
 
 | 指标 | 值 |
 |---|---|
-| Rust 测试数 | 997（`cargo test --workspace -- --list` 实测口径；video_to_srt 修复批 +4 = 端口双探测 2 + 进程树回收 1 + e2e teardown 1；历史 984/990 为分 crate 报告累加口径，两者相差 3 系口径修正） |
+| Rust 测试数 | 1170（`cargo test --workspace -- --list` 实测口径，2026-08-08 全量修复批后；历史 997/1103 为修复前/中间口径，随回归测试持续增长） |
 | Clippy warnings | 0（--workspace --all-targets） |
 | Rust 源文件数 | ~90 .rs files |
 | 前端源文件数 | 58 (.ts/.tsx) |
