@@ -61,7 +61,9 @@ interface DeviceCardProps {
   device: DeviceResponse
 }
 
-/** 计算设备卡片：名称、后端徽章、内存进度条、利用率、温度 */
+/** 计算设备卡片：名称、后端徽章、内存进度条、利用率、温度。
+ *  玻璃拟态卡片（hover 仅提描边亮度、零位移，主张 3）；
+ *  设备活跃（有利用率或显存占用）时附加极淡呼吸辉光（§7.1）。 */
 export function DeviceCard({ device }: DeviceCardProps) {
   const { t } = useTranslation('components')
   const tone = backendTone(device.backend)
@@ -72,9 +74,19 @@ export function DeviceCard({ device }: DeviceCardProps) {
       ? Math.min(100, (device.used_memory_mb / device.total_memory_mb) * 100)
       : null
   const level = percent != null ? memoryLevel(percent) : null
+  /** 运行态判定：利用率 >0 或显存被占用，卡片附呼吸辉光 */
+  const active =
+    (device.utilization != null && device.utilization > 0) ||
+    (device.used_memory_mb != null && device.used_memory_mb > 0)
 
   return (
-    <Card className="gap-0 overflow-hidden py-0 transition-all duration-200 hover:-translate-y-0.5 hover:border-primary/40 hover:shadow-lg hover:shadow-primary/5">
+    <Card className="glass-card relative gap-0 overflow-hidden py-0">
+      {active && (
+        <div
+          aria-hidden
+          className="animate-breath-glow pointer-events-none absolute inset-0 z-10 rounded-lg shadow-[inset_0_0_24px_var(--status-glow-running)]"
+        />
+      )}
       <CardHeader className="flex flex-row items-center gap-3 border-b border-border px-5 py-4">
         <div
           className={cn(
