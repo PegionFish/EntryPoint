@@ -301,8 +301,11 @@ fn record_to_summary(r: &TaskRecord) -> ep_core::pipeline::runner::TaskSummary {
 ///（§5.3；形状与 daemon `execution::build_direct_pipeline` 一致，
 /// 直跑任务 pipeline_id 采用 `direct/<module_id>` 供任务列表过滤）。
 ///
-/// 输出节点不带 `path` 参数 → 引擎派生 `{work_dir}/output_output.out`，
-/// 随产物归集进入任务目录。
+/// 输出节点不带 `path` 参数 → 引擎按 `extension` 参数派生
+/// `{work_dir}/output_output.<ext>`，随产物归集进入任务目录。
+/// **D-7 修复**：`extension` 取输入文件扩展名（直跑为单文件处理，产物
+/// 与输入同族格式；如 remove_bg 输入 .png → 产物 .png）。不传时引擎
+/// 默认 `.out`，导致产物被 Notepad 打开。
 fn build_direct_pipeline(
     module_id: &str,
     capability: &str,
@@ -320,6 +323,14 @@ fn build_direct_pipeline(
             retry_count: None,
         }
     };
+    // 输出扩展名：输入文件扩展名（与 executor file_output 同口径的字符过滤）
+    let output_params = input_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>())
+        .filter(|e| !e.is_empty())
+        .map(|ext| serde_json::json!({ "extension": ext }))
+        .unwrap_or_else(|| serde_json::json!({}));
     Pipeline {
         id: format!("direct/{module_id}"),
         name: format!("直跑 {module_id}/{capability}"),
@@ -350,7 +361,7 @@ fn build_direct_pipeline(
                     builtin: "file_output".to_string(),
                 },
                 "结果输出",
-                serde_json::json!({}),
+                output_params,
             ),
         ],
         edges: vec![
@@ -2763,11 +2774,24 @@ mod tests {
             other => panic!("run node must be module, got {other:?}"),
         }
         assert_eq!(pipeline.nodes[1].params["beam_size"], 5);
-        // output：file_output 无 path（引擎派生输出名）
+        // output：file_output 无 path（引擎派生输出名）；D-7：extension 取
+        // 输入扩展名（in.mp3 → mp3），不再落盘 .out
         match &pipeline.nodes[2].kind {
             NodeKind::Builtin { builtin } => assert_eq!(builtin, "file_output"),
             other => panic!("output node must be builtin file_output, got {other:?}"),
         }
+        assert_eq!(
+            pipeline.nodes[2].params["extension"],
+            serde_json::Value::String("mp3".to_string())
+        );
+        // 无扩展名输入 → 不带 extension 参数（引擎回落 .out，同旧行为）
+        let no_ext = build_direct_pipeline(
+            "m",
+            "c",
+            serde_json::json!({}),
+            Path::new("/data/noext"),
+        );
+        assert!(no_ext.nodes[2].params.get("extension").is_none());
         // 退化 DAG 恒通过校验（含 file_input 要求）
         assert!(pipeline.validate().is_ok());
     }

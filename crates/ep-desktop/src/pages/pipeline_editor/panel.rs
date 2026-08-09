@@ -13,8 +13,48 @@ use super::{edit, VizState, PalettePayload, NODE_COLOR_API, NODE_COLOR_BUILTIN};
 
 // ── Three-panel layout ────────────────────────────────────────────
 
+/// palette 栏宽
+const PALETTE_W: f32 = 150.0;
+/// 属性面板栏宽
+const PANEL_W: f32 = 260.0;
+/// 画布最小宽（低于此值触发断点降级）
+const MIN_CANVAS_W: f32 = 200.0;
+
+/// 三栏总宽计算（纯函数可测；D-1 修复）：
+/// **保证 `left_w + right_w + chrome + canvas_w ≤ avail_x`**，画布吃剩余空间。
+/// 窗口过窄时按断点降级（统一 UI 方案 §8）：先丢属性面板，再丢 palette，
+/// 最窄时仅保留画布。
+fn compute_column_layout(avail_x: f32) -> (f32, f32, f32) {
+    // 栏间 chrome：两个分隔条（各 6px）+ 5 个条目间 4 道 item_spacing（默认各 8px）
+    const CHROME: f32 = 2.0 * 6.0 + 4.0 * 8.0;
+    if avail_x < 760.0 {
+        // 最窄断点：仅画布
+        return (0.0, 0.0, avail_x.max(MIN_CANVAS_W));
+    }
+    let mut left_w = PALETTE_W;
+    let mut right_w = PANEL_W;
+    let mut canvas_w = avail_x - left_w - right_w - CHROME;
+    // 断点 1：空间不足时隐藏属性面板（窄窗口降级）
+    if canvas_w < MIN_CANVAS_W {
+        right_w = 0.0;
+        canvas_w = avail_x - left_w - CHROME;
+    }
+    // 断点 2：仍不足则隐藏 palette
+    if canvas_w < MIN_CANVAS_W {
+        left_w = 0.0;
+        canvas_w = avail_x - CHROME;
+    }
+    (left_w, right_w, canvas_w.max(MIN_CANVAS_W))
+}
+
 /// 绘制编辑器主区域（palette | 画布 | 参数面板），返回画布实际尺寸
 ///（供"适配视图"使用）。
+///
+/// D-1/D-2/D-5 修复要点：
+/// 1. 三栏宽度经 [`compute_column_layout`] 纯函数钳制，总宽不超可用宽；
+/// 2. palette/属性面板的 ScrollArea 内容继承父级 `ui.horizontal` 的
+///    left_to_right 布局会把条目横向平铺并撑爆总宽（D-2 根因），必须
+///    显式 `ui.vertical` 隔离并在作用域内 `set_width` 固定为栏宽。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_main(
     ui: &mut egui::Ui,
@@ -28,44 +68,46 @@ pub(super) fn draw_main(
     tasks: Option<&crate::pages::TasksSnapshot>,
 ) -> egui::Vec2 {
     let avail = ui.available_size();
-    let narrow = ui.available_width() < 760.0;
-
-    // 响应式：narrow 时隐藏左右面板，只保留画布
-    let (left_w, right_w) = if narrow { (0.0, 0.0) } else { (150.0, 260.0) };
-    let chrome = if narrow { 0.0 } else { 24.0 };
-    let canvas_w = (avail.x - left_w - right_w - chrome).max(200.0);
+    let (left_w, right_w, canvas_w) = compute_column_layout(avail.x);
     let canvas_h = (avail.y - 4.0).max(200.0);
     let canvas_size = egui::vec2(canvas_w, canvas_h);
 
     // 任务回显：节点 → 状态色
     let echo = super::node_echo_colors(lang, pal, pipeline, tasks);
 
-    if narrow {
+    if left_w == 0.0 && right_w == 0.0 {
         super::canvas::draw_canvas(ui, lang, pal, st, pipeline, canvas_size, &echo, data);
         return canvas_size;
     }
 
     ui.horizontal(|ui| {
         // Left panel – node palette（可点击添加 / 拖放建节点）
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.set_width(left_w);
-            ui.set_min_height(canvas_h);
-            draw_palette(ui, lang, pal, st, data);
-        });
-
-        ui.separator();
+        if left_w > 0.0 {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                // 显式垂直隔离：ScrollArea 内容继承父级水平布局会横向平铺条目（D-2）
+                ui.vertical(|ui| {
+                    ui.set_width(left_w);
+                    ui.set_min_height(canvas_h);
+                    draw_palette(ui, lang, pal, st, data);
+                });
+            });
+            ui.separator();
+        }
 
         // Center – node canvas
         super::canvas::draw_canvas(ui, lang, pal, st, pipeline, canvas_size, &echo, data);
 
-        ui.separator();
-
         // Right panel – pipeline properties + node editor + VRAM ledger
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.set_width(right_w);
-            ui.set_min_height(canvas_h);
-            draw_right_panel(ui, lang, pal, st, config, data, devices);
-        });
+        if right_w > 0.0 {
+            ui.separator();
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(right_w);
+                    ui.set_min_height(canvas_h);
+                    draw_right_panel(ui, lang, pal, st, config, data, devices);
+                });
+            });
+        }
     });
 
     canvas_size
@@ -73,17 +115,49 @@ pub(super) fn draw_main(
 
 // ── Left panel: node palette（决策 2：可添加节点） ─────────────────
 
-/// palette 条目：点击 = 画布内级联落位；拖拽 = 发布载荷，画布侧释放落点
+/// palette 条目（自绘整行；D-2 修复）：宽度恒为栏宽（`ui.available_width()`，
+/// 由外层 `set_width` 钳制），垂直单列收纳，不受标签内容宽度影响。
+/// 点击 = 画布内级联落位；拖拽 = 发布载荷，画布侧释放落点。
+#[allow(clippy::too_many_arguments)]
 fn palette_entry(
     ui: &mut egui::Ui,
     pal: &Palette,
-    label: impl Into<egui::WidgetText>,
+    label: &str,
+    color: egui::Color32,
     tip: String,
     payload: PalettePayload,
     add_here: impl FnOnce(&mut VizState),
     st: &mut VizState,
 ) {
-    let resp = ui.add(subtle_button(pal, label)).on_hover_text(tip);
+    const ROW_H: f32 = 26.0;
+    let width = ui.available_width().max(40.0);
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(width, ROW_H),
+        egui::Sense::click_and_drag(),
+    );
+    if ui.is_rect_visible(rect) {
+        let hovered = resp.hovered();
+        let painter = ui.painter();
+        painter.rect(
+            rect.shrink(1.0),
+            4.0,
+            if hovered { pal.bg_raised } else { egui::Color32::TRANSPARENT },
+            egui::Stroke::new(
+                1.0_f32,
+                if hovered { pal.border_glow } else { pal.border },
+            ),
+            egui::StrokeKind::Inside,
+        );
+        // 文本左对齐；超出栏宽由 ScrollArea 裁剪（不回撞布局）
+        painter.text(
+            egui::pos2(rect.min.x + 8.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(12.0),
+            color,
+        );
+    }
+    let resp = resp.on_hover_text(tip);
     // 点击添加（既有行为）
     if resp.clicked() {
         add_here(st);
@@ -121,6 +195,7 @@ fn draw_palette(
             ui,
             pal,
             label,
+            pal.text,
             tip,
             payload,
             |st| edit::add_builtin_node(st, &b, None),
@@ -128,25 +203,21 @@ fn draw_palette(
         );
     }
     // LLM（§6.7 builtin，OpenAI 兼容端点）
-    {
-        let resp = ui
-            .add(subtle_button(
-                pal,
-                egui::RichText::new("🤖 llm").color(NODE_COLOR_API),
-            ))
-            .on_hover_text(trfb(
-                lang,
-                "desktopApp.palette.llmTip",
-                "OpenAI 兼容 LLM 节点（chat/completions）",
-                &[],
-            ));
-        if resp.clicked() {
-            edit::add_llm_node(st, None);
-        }
-        if resp.drag_started() {
-            egui::DragAndDrop::set_payload(ui.ctx(), PalettePayload::Llm);
-        }
-    }
+    palette_entry(
+        ui,
+        pal,
+        "🤖 llm",
+        NODE_COLOR_API,
+        trfb(
+            lang,
+            "desktopApp.palette.llmTip",
+            "OpenAI 兼容 LLM 节点（chat/completions）",
+            &[],
+        ),
+        PalettePayload::Llm,
+        |st| edit::add_llm_node(st, None),
+        st,
+    );
 
     ui.add_space(10.0);
     ui.separator();
@@ -179,7 +250,8 @@ fn draw_palette(
         palette_entry(
             ui,
             pal,
-            label,
+            &label,
+            pal.text,
             tip,
             payload,
             |st| edit::add_module_node(st, data, &m, &c, None),
@@ -1252,6 +1324,51 @@ pub(super) fn resolve_budget_variant(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D-1 回归：三栏总宽在任何窗口宽度下不超可用宽（含分隔条与间距
+    /// chrome=44），画布宽不低于最小宽；窄窗口按断点降级。
+    #[test]
+    fn column_layout_total_width_never_exceeds_available() {
+        const CHROME: f32 = 2.0 * 6.0 + 4.0 * 8.0;
+        // 600px ~ 2560px 逐 50px 扫描（覆盖 1280/1600/1920 三档验收宽度）
+        let mut w = 600.0_f32;
+        while w <= 2560.0 {
+            let (l, r, c) = compute_column_layout(w);
+            let chrome = if l == 0.0 && r == 0.0 { 0.0 } else { CHROME };
+            assert!(
+                l + r + chrome + c <= w + 1e-3,
+                "avail={w}: 总宽 {} 超可用宽",
+                l + r + chrome + c
+            );
+            assert!(c >= MIN_CANVAS_W - 1e-3, "avail={w}: 画布宽 {c} 低于最小宽");
+            assert!(
+                l == 0.0 || l == PALETTE_W,
+                "avail={w}: palette 宽只取 0 或栏宽"
+            );
+            assert!(
+                r == 0.0 || r == PANEL_W,
+                "avail={w}: 属性面板宽只取 0 或栏宽"
+            );
+            w += 50.0;
+        }
+    }
+
+    /// 断点降级：760px 及以上三栏完整（当前阈值下逐级降级 guard 为
+    /// 防御性保留，不可达）；低于 760px 直接降级为仅画布。
+    #[test]
+    fn column_layout_breakpoint_degradation() {
+        // 主流分辨率（窗口 1280 → 中央可用约 1084）三栏完整
+        assert_eq!(compute_column_layout(1084.0), (PALETTE_W, PANEL_W, 1084.0 - PALETTE_W - PANEL_W - 44.0));
+        assert!(compute_column_layout(1600.0).1 > 0.0);
+        // 760 = 三栏最小可用宽（150+260+200+44-... 恰为边界），仍三栏
+        assert!(compute_column_layout(760.0).1 > 0.0, "760 仍三栏");
+        // 低于 760：narrow 断点直接降级为仅画布
+        assert_eq!(compute_column_layout(759.0), (0.0, 0.0, 759.0));
+        assert_eq!(compute_column_layout(700.0), (0.0, 0.0, 700.0));
+        assert_eq!(compute_column_layout(500.0), (0.0, 0.0, 500.0));
+        // 极窄输入不低于画布最小宽
+        assert_eq!(compute_column_layout(100.0), (0.0, 0.0, MIN_CANVAS_W));
+    }
 
     #[test]
     fn resolve_budget_variant_pin_rules() {

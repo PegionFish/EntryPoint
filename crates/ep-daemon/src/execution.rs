@@ -1448,8 +1448,11 @@ pub async fn submit_direct(
 
 /// 编译直跑退化 DAG：`input(file_input) → run(module) → output(file_output)`。
 ///
-/// 输出节点不带 `path` 参数 → 引擎派生 `{work_dir}/output_output.out`，
-/// 随产物归集进入任务目录可下载（§5.3 结果预览/下载）。
+/// 输出节点不带 `path` 参数 → 引擎按 `extension` 参数派生
+/// `{work_dir}/output_output.<ext>`，随产物归集进入任务目录可下载
+///（§5.3 结果预览/下载）。`extension` 取输入文件扩展名（直跑为单文件
+/// 处理，产物与输入同族格式；D-7 修复，与桌面端 build_direct_pipeline
+/// 同口径）。
 #[allow(dead_code)] // 经 submit_direct 消费（B4 接线前测试直接调用）
 pub fn build_direct_pipeline(
     module_id: &str,
@@ -1466,6 +1469,14 @@ pub fn build_direct_pipeline(
         timeout_secs: None,
         retry_count: None,
     };
+    // 输出扩展名：输入文件扩展名（与 executor file_output 同口径的字符过滤）
+    let output_params = input_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>())
+        .filter(|e| !e.is_empty())
+        .map(|ext| json!({ "extension": ext }))
+        .unwrap_or_else(|| json!({}));
     Pipeline {
         // B4 契约：direct/<module_id> 形状（同模块直跑任务聚合，前端可过滤）
         id: format!("direct/{module_id}"),
@@ -1497,7 +1508,7 @@ pub fn build_direct_pipeline(
                     builtin: "file_output".to_string(),
                 },
                 "结果输出",
-                json!({}),
+                output_params,
             ),
         ],
         edges: vec![
@@ -2821,6 +2832,8 @@ builtin = "file_output"
             pipeline.nodes[0].params["path"],
             "/tmp/in.wav"
         );
+        // D-7：file_output 携带 extension（取输入扩展名），不再落盘 .out
+        assert_eq!(pipeline.nodes[2].params["extension"], "wav");
         assert_eq!(
             pipeline.nodes[1].kind,
             NodeKind::Module {
