@@ -35,9 +35,12 @@ if (-not (Test-Path $Rustc)) {
 }
 $Git = Get-Command git -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
 
-# 版本单一来源：Cargo.toml [workspace.package] version（勿在此另写死版本号）
+# 版本单一来源：Cargo.toml [workspace.package] version（勿在此另写死版本号）；
+# 与桌面端界面版本（env!("CARGO_PKG_VERSION")）同源，保证包名/VERSION.txt/界面一致。
+# 解析失败必须显式报错而非回退 0.0.0（否则静默产出错误命名的包）。
 $VersionLine = Select-String -Path "$ProjectRoot\Cargo.toml" -Pattern '^version\s*=\s*"([^"]+)"' -ErrorAction SilentlyContinue | Select-Object -First 1
-$Version = if ($VersionLine) { $VersionLine.Matches[0].Groups[1].Value } else { "0.0.0" }
+$Version = if ($VersionLine) { $VersionLine.Matches[0].Groups[1].Value } else { "" }
+if ($Version -notmatch '^\d+\.\d+\.\d+') { Write-Error "无法从 Cargo.toml 解析版本号，拒绝打包（请检查 [workspace.package] version）"; exit 1 }
 $Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $ProfileDir = if ($Target -eq "release") { "release" } else { "debug" }
 $CrateName = if ($Mode -eq "gui") { "ep-desktop" } else { "ep-daemon" }

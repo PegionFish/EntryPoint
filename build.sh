@@ -11,9 +11,14 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_ROOT"
 
-# 版本单一来源：Cargo.toml [workspace.package] version（勿在此处另写死版本号）
+# 版本单一来源：Cargo.toml [workspace.package] version（勿在此处另写死版本号）；
+# 与桌面端界面版本（env!("CARGO_PKG_VERSION")）同源，保证包名/VERSION.txt/界面一致。
+# 解析失败必须显式报错而非回退 0.0.0（否则静默产出错误命名的包）。
 VERSION="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' "$PROJECT_ROOT/Cargo.toml" | head -1)"
-[[ -n "$VERSION" ]] || VERSION="0.0.0"
+if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+    echo "  [FAIL] 无法从 Cargo.toml 解析版本号，拒绝打包（请检查 [workspace.package] version）" >&2
+    exit 1
+fi
 MODE=""
 TARGET="release"
 SKIP_TEST=0
