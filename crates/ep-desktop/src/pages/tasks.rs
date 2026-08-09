@@ -1,5 +1,8 @@
 //! 任务中心页 — 管线任务进度（含 queued 队列位置）+ 产物列表/打开 +
-//! 运行中的服务 + 全部模块状态。
+//! 运行中的服务。
+//!
+//! 用户裁决：裁撤「全部模块状态」表区块，任务页只保留管线任务 +
+//! 运行中服务（与 WebUI 任务页同步裁撤，保持两端一致）。
 //!
 //! 产物目录约定（C4）：任务产物落盘 `{workspace}/tasks/{task_id}/`
 //! （与 ep-core TaskRecord.work_dir 同口径），本页直接扫描该目录展示产物，
@@ -186,27 +189,7 @@ pub fn show_full(
         } else {
             card(ui, &pal, |ui| {
                 egui::ScrollArea::horizontal().show(ui, |ui| {
-                    module_grid(ui, lang, &pal, "tasks_running_grid", &running, true);
-                });
-            });
-        }
-
-        ui.add_space(16.0);
-
-        // ── 全部模块状态 ──
-        section_title(ui, &tr(lang, "tasks.stats.totalModules", &[]));
-        ui.add_space(6.0);
-
-        if modules.is_empty() {
-            ui.label(
-                egui::RichText::new(tr(lang, "desktopApp.tasks.noModules", &[]))
-                    .color(pal.text_dim),
-            );
-        } else {
-            let all: Vec<&ModuleEntry> = modules.iter().collect();
-            card(ui, &pal, |ui| {
-                egui::ScrollArea::horizontal().show(ui, |ui| {
-                    module_grid(ui, lang, &pal, "tasks_all_grid", &all, false);
+                    module_grid(ui, lang, &pal, "tasks_running_grid", &running);
                 });
             });
         }
@@ -536,7 +519,7 @@ fn collect_artifacts(base: &Path, dir: &Path, depth: usize, out: &mut Vec<Artifa
     }
 }
 
-// ─── 模块状态网格（卡片内横向滚动） ──────────────────────────────────────────
+// ─── 运行中服务网格（卡片内横向滚动） ──────────────────────────────────────────
 
 fn module_grid(
     ui: &mut egui::Ui,
@@ -544,22 +527,19 @@ fn module_grid(
     pal: &Palette,
     id: &str,
     rows: &[&ModuleEntry],
-    with_uptime: bool,
 ) {
     egui::Grid::new(id)
         .striped(true)
         .spacing([28.0, 10.0])
         .show(ui, |ui| {
             // 表头
-            let mut headers = vec![
+            let headers = [
                 tr(lang, "common.label.module", &[]),
                 tr(lang, "tasks.moduleTable.category", &[]),
                 tr(lang, "common.label.status", &[]),
                 tr(lang, "desktopPages.dashboard.col.port", &[]),
+                tr(lang, "desktopPages.modules.info.uptime", &[]),
             ];
-            if with_uptime {
-                headers.push(tr(lang, "desktopPages.modules.info.uptime", &[]));
-            }
             for col in headers {
                 ui.label(egui::RichText::new(col).small().color(pal.text_faint));
             }
@@ -579,16 +559,14 @@ fn module_grid(
                     .monospace()
                     .color(pal.text_dim),
                 );
-                if with_uptime {
-                    ui.label(
-                        egui::RichText::new(
-                            m.started_at
-                                .map(|t| format_uptime(lang, t.elapsed()))
-                                .unwrap_or_else(|| "-".into()),
-                        )
-                        .color(pal.text_dim),
-                    );
-                }
+                ui.label(
+                    egui::RichText::new(
+                        m.started_at
+                            .map(|t| format_uptime(lang, t.elapsed()))
+                            .unwrap_or_else(|| "-".into()),
+                    )
+                    .color(pal.text_dim),
+                );
                 ui.end_row();
             }
         });
