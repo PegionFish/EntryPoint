@@ -472,13 +472,14 @@ export function SettingsPage() {
       }
     >
       {loading || !config ? (
-        <div className="mx-auto max-w-4xl space-y-6">
+        // W4 密度修正：max-w-4xl → max-w-5xl，缓解 ≥1440px 宽屏右侧留白
+        <div className="mx-auto max-w-5xl space-y-6">
           {Array.from({ length: 3 }).map((_, i) => (
             <Skeleton key={i} className="h-48 rounded-lg" />
           ))}
         </div>
       ) : (
-        <div className="mx-auto max-w-4xl space-y-6">
+        <div className="mx-auto max-w-5xl space-y-6">
           {error && (
             <div className="flex items-center gap-2 rounded-lg border border-status-error/30 bg-status-error/10 px-4 py-3 text-sm text-status-error">
               <TriangleAlert className="size-4 shrink-0" />

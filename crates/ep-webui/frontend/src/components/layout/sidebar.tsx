@@ -45,15 +45,26 @@ export function SidebarNav({ onNavigate, className }: SidebarNavProps) {
           onClick={onNavigate}
           className={({ isActive }) =>
             cn(
-              'flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors',
+              'relative flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors',
               isActive
                 ? 'bg-primary/10 text-primary'
                 : 'text-muted-foreground hover:bg-accent hover:text-foreground',
             )
           }
         >
-          <item.icon className="h-4 w-4 shrink-0" />
-          <span>{t(item.labelKey)}</span>
+          {({ isActive }) => (
+            <>
+              {/* 激活指示条：2px 青→靛纵向渐变竖条，与桌面端导航语义同步（W4 渐变补齐） */}
+              {isActive && (
+                <span
+                  aria-hidden
+                  className="bg-gradient-accent-vertical absolute top-1/2 left-0 h-5 w-0.5 -translate-y-1/2 rounded-full"
+                />
+              )}
+              <item.icon className="h-4 w-4 shrink-0" />
+              <span>{t(item.labelKey)}</span>
+            </>
+          )}
         </NavLink>
       ))}
     </nav>

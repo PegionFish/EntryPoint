@@ -292,10 +292,19 @@
       0 0 16px var(--primary-glow);
   }
 
-  /* 品牌渐变：电光青→靛蓝，仅限 §3.1 规则 1 列举的 6 处 */
+  /* 品牌渐变：电光青→靛蓝（§3.1 规则 1 许可位；W4 起新增侧栏激活竖条与 Logo 字标） */
   .bg-gradient-accent {
     background-image: linear-gradient(
       90deg,
+      var(--accent-gradient-from),
+      var(--accent-gradient-to)
+    );
+  }
+
+  /* 纵向品牌渐变（180°）：供窄竖条等需自上而下走向的场景，如侧栏激活指示条 */
+  .bg-gradient-accent-vertical {
+    background-image: linear-gradient(
+      180deg,
       var(--accent-gradient-from),
       var(--accent-gradient-to)
     );
