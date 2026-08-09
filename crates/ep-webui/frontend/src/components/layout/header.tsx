@@ -60,7 +60,8 @@ export function Header({ onMenuClick }: HeaderProps) {
         >
           <Menu className="h-4 w-4" />
         </Button>
-        <span className="text-base font-semibold tracking-tight">
+        {/* 品牌字标：电光青→靛渐变（W4 渐变补齐，§3.1 许可位） */}
+        <span className="text-gradient text-base font-semibold tracking-tight">
           EntryPoint
         </span>
       </div>
