@@ -1,18 +1,14 @@
-//! 管线库视图（两态重做默认态）— 卡片网格 + 新建/打开入口 + 空态。
-//! 自 pipeline_editor.rs 拆分搬移（scan_pipeline_library / library_card
-//! 逻辑保持），升格为正式库视图：glass 卡片新令牌、节点数摘要。
+//! 管线库扫描 — 编辑器工具栏库下拉菜单的数据源。
+//!
+//! 用户裁决（对齐 WebUI 成熟模式）：裁撤 W3 的「库视图 → 编辑器视图」
+//! 两态设计，管线页打开即编辑器；本模块不再绘制独立库视图，仅保留
+//! `config/pipelines/*.toml` 扫描纯函数（[`scan_pipeline_library`]），
+//! 供 `mod.rs::library_menu`（WebUI `PipelineLibraryBar` 下拉的 egui
+//! 等价实现）列出「名称 + 节点数」条目。
 
 use std::path::PathBuf;
 
 use ep_core::pipeline::dag::Pipeline;
-
-use crate::pages::trfb;
-use crate::ui::{
-    card_frame_hover, grid_columns, keyboard_scroll, page_header, primary_button, subtle_button,
-    Palette,
-};
-
-use super::{edit, VizState};
 
 /// 管线库条目：`config/pipelines/*.toml` 扫描结果（路径 + 展示名/描述 + 节点数）
 #[derive(Debug, Clone, PartialEq)]
@@ -68,187 +64,6 @@ pub(super) fn scan_pipeline_library(dir: &std::path::Path) -> Vec<LibraryEntry> 
         .collect()
 }
 
-/// 库视图（两态默认态）：页头动作区（新建 / 打开文件）+ 卡片网格。
-/// 点击卡片 = 既有加载流程并进入编辑器视图。
-pub(super) fn draw_library_view(
-    ui: &mut egui::Ui,
-    lang: &str,
-    pal: &Palette,
-    st: &mut VizState,
-) {
-    page_header(
-        ui,
-        &crate::i18n::tr(lang, "desktopApp.pipeline.libraryTitle", &[]),
-        |ui| {
-            if ui
-                .add(subtle_button(
-                    pal,
-                    format!(
-                        "📂 {}",
-                        trfb(lang, "desktopApp.pipeline.libraryOpen", "打开文件…", &[])
-                    ),
-                ))
-                .on_hover_text(trfb(
-                    lang,
-                    "desktopApp.pipeline.openTitle",
-                    "打开管线 TOML",
-                    &[],
-                ))
-                .clicked()
-            {
-                if let Some(file) = rfd::FileDialog::new()
-                    .set_title(trfb(
-                        lang,
-                        "desktopApp.pipeline.openTitle",
-                        "打开管线 TOML",
-                        &[],
-                    ))
-                    .add_filter("TOML", &["toml"])
-                    .pick_file()
-                {
-                    st.file_path = file.to_string_lossy().to_string();
-                    edit::load_pipeline(st, lang);
-                    if st.pipeline.is_some() {
-                        st.mode = super::PageMode::Editor;
-                    }
-                }
-            }
-            if ui
-                .add(primary_button(
-                    pal,
-                    format!(
-                        "＋ {}",
-                        trfb(lang, "desktopApp.pipeline.libraryNew", "新建管线", &[])
-                    ),
-                ))
-                .on_hover_text(trfb(
-                    lang,
-                    "desktopApp.pipeline.newTip",
-                    "新建含输入/输出的空白管线",
-                    &[],
-                ))
-                .clicked()
-            {
-                edit::new_pipeline(st);
-                st.mode = super::PageMode::Editor;
-            }
-        },
-    );
-    ui.label(
-        egui::RichText::new(trfb(
-            lang,
-            "desktopApp.pipeline.librarySubtitle",
-            "从管线库选择一个管线开始编排，或新建空白管线",
-            &[],
-        ))
-        .small()
-        .color(pal.text_dim),
-    );
-    ui.add_space(8.0);
-
-    let entries = scan_pipeline_library(&pipeline_library_dir());
-    if entries.is_empty() {
-        crate::ui::empty_state(
-            ui,
-            pal,
-            "🧩",
-            &trfb(
-                lang,
-                "desktopApp.pipeline.libraryEmptyTitle",
-                "管线库为空",
-                &[],
-            ),
-            &trfb(
-                lang,
-                "desktopApp.pipeline.libraryEmptyHint",
-                "config/pipelines 下暂无 .toml 管线；点右上「新建管线」开始",
-                &[],
-            ),
-        );
-        return;
-    }
-
-    keyboard_scroll(
-        ui,
-        "pipeline_library",
-        egui::ScrollArea::vertical(),
-        |ui| {
-            let cols = grid_columns(ui.available_width(), 300.0, ui.spacing().item_spacing.x, entries.len());
-            crate::ui::card_grid(ui, cols, &entries, |ui, entry| {
-                let resp = library_card(ui, lang, pal, entry);
-                if resp.clicked() {
-                    st.file_path = entry.path.to_string_lossy().to_string();
-                    edit::load_pipeline(st, lang);
-                    if st.pipeline.is_some() {
-                        st.mode = super::PageMode::Editor;
-                    }
-                }
-            });
-        },
-    );
-}
-
-/// 单条管线卡片（glass 新令牌）：名称 + 节点数徽章 + 描述 + 路径；
-/// hover 时描边升级 border_glow → border_glow_strong + primary 辉光。
-fn library_card(ui: &mut egui::Ui, lang: &str, pal: &Palette, entry: &LibraryEntry) -> egui::Response {
-    let rect_id = ui.id().with(("library_card", entry.path.as_os_str()));
-
-    let inner = card_frame_hover(pal, false).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.vertical(|ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(entry.name.as_str()).strong());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    crate::ui::badge(
-                        ui,
-                        pal,
-                        pal.primary,
-                        trfb(
-                            lang,
-                            "desktopApp.pipeline.nodeCount",
-                            "{{count}} 节点",
-                            &[("count", &entry.node_count.to_string())],
-                        ),
-                    );
-                });
-            });
-            if !entry.description.is_empty() {
-                ui.label(
-                    egui::RichText::new(entry.description.as_str())
-                        .small()
-                        .color(pal.text_dim),
-                );
-            }
-            ui.label(
-                egui::RichText::new(entry.path.to_string_lossy().into_owned())
-                    .monospace()
-                    .small()
-                    .color(pal.text_faint),
-            );
-        });
-    });
-    let rect = inner.response.rect;
-    let resp = ui.interact(rect, rect_id, egui::Sense::click());
-    if resp.hovered() {
-        // hover 升级：强发光描边 + primary 辉光阴影近似
-        ui.painter().rect(
-            rect,
-            egui::CornerRadius::same(crate::ui::CARD_ROUNDING),
-            egui::Color32::TRANSPARENT,
-            egui::Stroke::new(1.5_f32, pal.border_glow_strong),
-            egui::StrokeKind::Inside,
-        );
-        ui.ctx().request_repaint();
-    }
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(trfb(
-            lang,
-            "desktopApp.pipeline.libraryLoadTip",
-            "点击加载进编辑器",
-            &[],
-        ))
-}
-
 // ── Tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -294,7 +109,7 @@ mod tests {
         assert_eq!(entries[0].description, "");
         assert_eq!(entries[1].description, "描述 B");
         assert!(entries.iter().all(|e| e.path.extension() == Some("toml".as_ref())));
-        // 两态重做：解析成功条目携带节点数摘要（空 [pipeline] = 0 节点）
+        // 解析成功条目携带节点数摘要（空 [pipeline] = 0 节点）
         assert!(entries.iter().all(|e| e.node_count == 0));
     }
 
@@ -329,7 +144,7 @@ mod tests {
         assert!(entries.iter().all(|e| e.node_count == 0));
     }
 
-    /// 两态重做：带节点的管线条目节点数摘要正确
+    /// 带节点的管线条目节点数摘要正确（库下拉菜单展示依赖）
     #[test]
     fn library_scan_reports_node_count() {
         let dir = library_tmp_dir("count");

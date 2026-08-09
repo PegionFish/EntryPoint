@@ -1,18 +1,21 @@
-//! 管线编辑器 — 两态重做（统一 UI 方案 §7.3，W3 波次）。
+//! 管线编辑器 — 对齐 WebUI 成熟模式（用户裁决：裁撤两态库视图）。
 //!
-//! ## 两态信息架构
+//! ## 信息架构（与 WebUI `pipeline.tsx` 一致）
 //!
-//! - **库视图**（默认态 [`PageMode::Library`]）：管线库卡片网格 + 新建/打开
-//!   入口（`library.rs`；自 Task #26 空态列表升格）；
-//! - **编辑器视图**（[`PageMode::Editor`]）：工具栏（返回库入口 + 保存/验证/
-//!   执行）+ 三栏（palette | 画布 | 参数面板），画布含缩放控件/MiniMap 等
-//!   5 项 egui 自研替代（`canvas.rs`）。
+//! 页面打开即编辑器：工具栏含库下拉菜单「当前管线」、新建、打开文件…、
+//! 保存/验证/执行；主体为三栏（palette | 画布 | 参数面板），画布含缩放
+//! 控件/MiniMap 等 5 项 egui 自研替代（`canvas.rs`）。无管线时显示画布
+//! 空态 + 引导。
 //!
-//! ## 模块拆分（自单文件 pipeline_editor.rs 纯搬移）
+//! WebUI 的 `PipelineLibraryBar` 下拉切换在桌面端以 egui ComboBox 等价
+//! 实现：列出 `config/pipelines/*.toml`（名称 + 节点数），标注当前项；
+//! dirty 时切换/新建/打开均经确认对话框拦截。
+//!
+//! ## 模块拆分
 //!
 //! - [`canvas`]：画布交互与绘制（缩放锚定/框选/MiniMap/拖放落点/视觉升级）；
 //! - [`panel`]：palette（拖放载荷源）+ 右侧参数面板 + 节点编辑器 + VRAM 账本；
-//! - [`library`]：库视图（卡片网格 + 扫描纯函数）；
+//! - [`library`]：管线库扫描纯函数（库下拉菜单数据源）；
 //! - [`edit`]：数据变更（建删节点/连线校验/草稿/加载保存校验执行）；
 //! - [`toml_serde`]：TOML 序列化（§6.2 文件形状）。
 //!
@@ -39,7 +42,8 @@ use crate::pages::{
     device_snapshot, module_data, tasks_snapshot, trfb, ModuleData, ParamDraft,
 };
 use crate::ui::{
-    badge, confirm_dialog_with_lang, primary_button_with_glow, subtle_button, Palette,
+    badge, confirm_dialog_with_lang, empty_state, primary_button_with_glow, subtle_button,
+    Palette,
 };
 
 const NODE_W: f32 = 160.0;
@@ -67,14 +71,15 @@ const ZOOM_MAX: f32 = 3.0;
 
 // ── Persistent state ──────────────────────────────────────────────
 
-/// 两态页面状态机（§7.3）：库视图 ↔ 编辑器视图
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
-pub(super) enum PageMode {
-    /// 库视图（默认态）：管线库卡片列表 + 新建入口
-    #[default]
-    Library,
-    /// 编辑器视图：画布 + 工具栏 + 参数面板
-    Editor,
+/// dirty 保护下待确认的切换动作（对齐 WebUI `confirmDiscardIfDirty`）
+#[derive(Clone)]
+pub(super) enum PendingAction {
+    /// 从库下拉菜单切换加载指定管线文件
+    Switch(PathBuf),
+    /// 新建空白管线
+    New,
+    /// 打开文件…（确认后弹系统文件选择器）
+    Open,
 }
 
 /// palette 拖放载荷（映射表 #9：palette → 画布拖放建节点）
@@ -87,7 +92,6 @@ pub(super) enum PalettePayload {
 
 #[derive(Clone)]
 pub(super) struct VizState {
-    mode: PageMode,
     file_path: String,
     pipeline: Option<Pipeline>,
     /// 有未保存改动
@@ -112,8 +116,10 @@ pub(super) struct VizState {
     drafts: HashMap<String, NodeDraft>,
     /// 执行选择的输入文件（提交执行时随请求发出）
     exec_input: Option<PathBuf>,
-    /// 「返回管线库」确认对话框（dirty 时拦截）
-    confirm_back_open: bool,
+    /// 未保存改动确认对话框是否打开（切换/新建/打开时拦截）
+    confirm_switch_open: bool,
+    /// 确认对话框通过后要执行的动作
+    pending_action: Option<PendingAction>,
     /// 执行对话框（映射表 #11：ExecuteDialog 模态）
     exec_dialog_open: bool,
     /// 执行对话框输入文件文本态
@@ -123,7 +129,6 @@ pub(super) struct VizState {
 impl Default for VizState {
     fn default() -> Self {
         Self {
-            mode: PageMode::Library,
             file_path: String::new(),
             pipeline: None,
             dirty: false,
@@ -140,7 +145,8 @@ impl Default for VizState {
             pending_connect: None,
             drafts: HashMap::new(),
             exec_input: None,
-            confirm_back_open: false,
+            confirm_switch_open: false,
+            pending_action: None,
             exec_dialog_open: false,
             exec_input_text: String::new(),
         }
@@ -186,8 +192,8 @@ fn sid() -> egui::Id {
 
 // ── Page entry ────────────────────────────────────────────────────
 
-/// 管线编辑器入口（两态）：`cmd_tx` 为后台命令通道（执行对话框经它提交
-/// [`AppCmd`]；None 时执行走"待接线"提示）。
+/// 管线编辑器入口（对齐 WebUI：打开即编辑器）：`cmd_tx` 为后台命令通道
+/// （执行对话框经它提交 [`AppCmd`]；None 时执行走"待接线"提示）。
 pub fn show_full(
     ui: &mut egui::Ui,
     config: &AppConfig,
@@ -202,22 +208,17 @@ pub fn show_full(
     let devices = device_snapshot(ui.ctx());
     let tasks = tasks_snapshot(ui.ctx());
 
-    // 状态机守卫：编辑器态但管线已被清空（加载失败等）→ 回落库视图
-    if st.mode == PageMode::Editor && st.pipeline.is_none() {
-        st.mode = PageMode::Library;
-    }
+    // 工具栏常驻（对应 WebUI PipelineToolbar + PipelineLibraryBar）：
+    // 库下拉「当前管线」菜单 + 新建 + 打开文件… | 保存 / 验证 / 执行 / 任务
+    editor_toolbar(ui, lang, &pal, &mut st, cmd_tx, tasks.as_ref());
+    ui.separator();
 
-    match st.mode {
-        PageMode::Library => {
-            library::draw_library_view(ui, lang, &pal, &mut st);
+    match st.pipeline.clone() {
+        // 画布空态 + 引导（与 WebUI 空画布一致：无独立库视图）
+        None => {
+            draw_empty_canvas(ui, lang, &pal);
         }
-        PageMode::Editor => {
-            let pipeline = st.pipeline.clone().unwrap();
-
-            // 编辑器工具栏（含明显的「返回管线库」入口）
-            editor_toolbar(ui, lang, &pal, &mut st, cmd_tx, tasks.as_ref());
-            ui.separator();
-
+        Some(pipeline) => {
             if st.positions.is_empty() && !pipeline.nodes.is_empty() {
                 st.positions = compute_layout(&pipeline);
             }
@@ -243,27 +244,28 @@ pub fn show_full(
     }
 
     // ── 模态对话框 ──
-    // 返回管线库确认（dirty 拦截：未保存改动将丢弃）
-    if st.confirm_back_open {
+    // 未保存改动确认（dirty 拦截：切换/新建/打开将丢弃改动）
+    if st.confirm_switch_open {
         let res = confirm_dialog_with_lang(
             ui.ctx(),
             &pal,
-            "pe_back_to_library",
+            "pe_unsaved_confirm",
             &trfb(lang, "desktopApp.pipeline.unsavedTitle", "未保存的改动", &[]),
             &trfb(
                 lang,
                 "desktopApp.pipeline.unsavedMsg",
-                "管线有未保存的改动，返回管线库将丢弃这些改动。",
+                "管线有未保存的改动，继续操作将丢弃这些改动。",
                 &[],
             ),
-            &trfb(lang, "desktopApp.pipeline.unsavedConfirm", "丢弃并返回", &[]),
+            &trfb(lang, "desktopApp.pipeline.unsavedConfirm", "丢弃并继续", &[]),
             true,
             lang,
         );
         if let Some(confirmed) = res {
-            st.confirm_back_open = false;
+            st.confirm_switch_open = false;
+            let action = st.pending_action.take();
             if confirmed {
-                reset_to_library(&mut st);
+                apply_pending_action(&mut st, lang, action);
             }
         }
     }
@@ -290,33 +292,72 @@ pub fn show_full(
     ui.data_mut(|d| *d.get_temp_mut_or_default::<VizState>(sid()) = st);
 }
 
-/// 返回库视图并重置编辑器态（保留 mode=Library 的空态语义）
-fn reset_to_library(st: &mut VizState) {
-    st.mode = PageMode::Library;
-    st.pipeline = None;
-    st.positions.clear();
-    st.selected = None;
-    st.selected_edge = None;
-    st.multi_select.clear();
-    st.marquee = None;
-    st.drafts.clear();
-    st.dirty = false;
-    st.file_path.clear();
-    st.validation_msg = None;
-    st.validation_ok = false;
-    st.pending_connect = None;
-    st.offset = egui::Vec2::ZERO;
-    st.zoom = 1.0;
-    st.request_fit = false;
-    st.confirm_back_open = false;
-    st.exec_dialog_open = false;
-    st.exec_input_text.clear();
+/// 画布空态 + 引导（无管线时）：对齐 WebUI 空画布形态。
+fn draw_empty_canvas(ui: &mut egui::Ui, lang: &str, pal: &Palette) {
+    let avail = ui.available_size();
+    ui.allocate_ui(avail, |ui| {
+        ui.vertical_centered(|ui| {
+            // 垂直居中（empty_state 自带 ~69pt 内容高度，按半高上移）
+            ui.add_space((avail.y / 2.0 - 70.0).max(8.0));
+            empty_state(
+                ui,
+                pal,
+                "🧩",
+                &tr(lang, "desktopApp.pipeline.emptyTitle", &[]),
+                &tr(lang, "desktopApp.pipeline.emptyHintEdit", &[]),
+            );
+        });
+    });
+}
+
+/// 执行确认通过的待决动作（切换加载 / 新建 / 打开文件）
+fn apply_pending_action(st: &mut VizState, lang: &str, action: Option<PendingAction>) {
+    match action {
+        Some(PendingAction::Switch(path)) => load_library_entry(st, lang, &path),
+        Some(PendingAction::New) => edit::new_pipeline(st),
+        Some(PendingAction::Open) => open_file_dialog(st, lang),
+        None => {}
+    }
+}
+
+/// dirty 守卫：无未保存改动直接执行动作；否则弹确认对话框
+fn request_action(st: &mut VizState, lang: &str, action: PendingAction) {
+    if st.dirty {
+        st.pending_action = Some(action);
+        st.confirm_switch_open = true;
+    } else {
+        apply_pending_action(st, lang, Some(action));
+    }
+}
+
+/// 加载库条目（路径 → file_path → 既有加载流程）
+fn load_library_entry(st: &mut VizState, lang: &str, path: &std::path::Path) {
+    st.file_path = path.to_string_lossy().to_string();
+    edit::load_pipeline(st, lang);
+}
+
+/// 「打开文件…」系统文件选择器（TOML 过滤）
+fn open_file_dialog(st: &mut VizState, lang: &str) {
+    if let Some(file) = rfd::FileDialog::new()
+        .set_title(trfb(
+            lang,
+            "desktopApp.pipeline.openTitle",
+            "打开管线 TOML",
+            &[],
+        ))
+        .add_filter("TOML", &["toml"])
+        .pick_file()
+    {
+        load_library_entry(st, lang, &file);
+    }
 }
 
 // ── Editor toolbar ────────────────────────────────────────────────
 
-/// 编辑器工具栏：← 返回库 | 管线名(+dirty/任务徽章) | 保存 | 验证 |
-/// ⚡执行(primary 辉光) | 任务刷新。缩放 −/＋/fit 在画布 overlay。
+/// 编辑器工具栏（对齐 WebUI PipelineToolbar + PipelineLibraryBar）：
+/// 库下拉「当前管线」菜单 | 新建 | 打开文件… | 管线名(+dirty/任务徽章)
+/// | 保存 | 验证 | ⚡执行(primary 辉光) | 任务刷新。
+/// 缩放 −/＋/fit 在画布 overlay。
 fn editor_toolbar(
     ui: &mut egui::Ui,
     lang: &str,
@@ -326,28 +367,48 @@ fn editor_toolbar(
     tasks: Option<&crate::pages::TasksSnapshot>,
 ) {
     ui.horizontal(|ui| {
-        // 返回管线库（明显入口）：dirty → 确认对话框；否则直接返回
+        // 库下拉菜单（PipelineLibraryBar 等价）：列出 config/pipelines/*.toml，
+        // 切换加载，标注当前项；dirty 时经确认对话框拦截
+        library_menu(ui, lang, st);
+        ui.separator();
+
+        // 新建（dirty 守卫）
         if ui
             .add(subtle_button(
                 pal,
                 format!(
-                    "← {}",
-                    trfb(lang, "desktopApp.pipeline.backToLibrary", "返回管线库", &[])
+                    "＋ {}",
+                    trfb(lang, "desktopApp.pipeline.libraryNew", "新建管线", &[])
                 ),
             ))
             .on_hover_text(trfb(
                 lang,
-                "desktopApp.pipeline.backToLibraryTip",
-                "返回管线库视图（未保存改动需确认）",
+                "desktopApp.pipeline.newTip",
+                "新建含输入/输出的空白管线",
                 &[],
             ))
             .clicked()
         {
-            if st.dirty {
-                st.confirm_back_open = true;
-            } else {
-                reset_to_library(st);
-            }
+            request_action(st, lang, PendingAction::New);
+        }
+        // 打开文件…（dirty 守卫）
+        if ui
+            .add(subtle_button(
+                pal,
+                format!(
+                    "📂 {}",
+                    trfb(lang, "desktopApp.pipeline.libraryOpen", "打开文件…", &[])
+                ),
+            ))
+            .on_hover_text(trfb(
+                lang,
+                "desktopApp.pipeline.openTitle",
+                "打开管线 TOML",
+                &[],
+            ))
+            .clicked()
+        {
+            request_action(st, lang, PendingAction::Open);
         }
         ui.separator();
 
@@ -466,6 +527,82 @@ fn editor_toolbar(
             }
         });
     });
+}
+
+/// 管线库下拉菜单（WebUI `PipelineLibraryBar` 下拉的 egui 等价实现）：
+/// 扫描 `config/pipelines/*.toml`（名称 + 节点数），点击切换加载（dirty
+/// 守卫），✓ 标注当前管线；库为空时给出目录提示。
+fn library_menu(ui: &mut egui::Ui, lang: &str, st: &mut VizState) {
+    // 触发器文案：当前管线名（+dirty *）；无管线时显示「管线库」
+    let selected_text = match &st.pipeline {
+        Some(p) => format!(
+            "📂 {}{}",
+            p.name.if_empty_fallback(&p.id),
+            if st.dirty { " *" } else { "" }
+        ),
+        None => format!(
+            "📂 {}",
+            trfb(lang, "desktopApp.pipeline.libraryTitle", "管线库", &[])
+        ),
+    };
+
+    let mut chosen: Option<std::path::PathBuf> = None;
+    let combo = egui::ComboBox::from_id_salt(egui::Id::new("pe_library_menu"))
+        .selected_text(selected_text)
+        .show_ui(ui, |ui| {
+            ui.set_min_width(300.0);
+            let entries =
+                library::scan_pipeline_library(&library::pipeline_library_dir());
+            if entries.is_empty() {
+                ui.label(
+                    egui::RichText::new(trfb(
+                        lang,
+                        "desktopApp.pipeline.libraryMenuEmpty",
+                        "config/pipelines 下暂无 .toml 管线",
+                        &[],
+                    ))
+                    .small()
+                    .weak(),
+                );
+            } else {
+                for entry in &entries {
+                    let entry_path = entry.path.to_string_lossy().into_owned();
+                    let is_current = !st.file_path.is_empty() && st.file_path == entry_path;
+                    let count = trfb(
+                        lang,
+                        "desktopApp.pipeline.nodeCount",
+                        "{{count}} 节点",
+                        &[("count", &entry.node_count.to_string())],
+                    );
+                    let label = format!(
+                        "{}{} · {}",
+                        if is_current { "✓ " } else { "" },
+                        entry.name,
+                        count
+                    );
+                    let resp = ui.selectable_label(false, label);
+                    let resp = if !entry.description.is_empty() {
+                        resp.on_hover_text(entry.description.as_str())
+                    } else {
+                        resp
+                    };
+                    if resp.clicked() && !is_current {
+                        chosen = Some(entry.path.clone());
+                    }
+                }
+            }
+        });
+    combo
+        .response
+        .on_hover_text(trfb(
+            lang,
+            "desktopApp.pipeline.libraryMenuTip",
+            "切换管线库中的管线（未保存改动需确认）",
+            &[],
+        ));
+    if let Some(path) = chosen {
+        request_action(st, lang, PendingAction::Switch(path));
+    }
 }
 
 /// 路径缩略（hover 展示全路径）
