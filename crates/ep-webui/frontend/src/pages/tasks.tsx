@@ -10,7 +10,6 @@ import {
   GitBranch,
   Inbox,
   Loader2,
-  Puzzle,
   RefreshCw,
   TriangleAlert,
 } from 'lucide-react'
@@ -30,14 +29,6 @@ import { SegmentedTabs } from '@/components/shared/segmented-tabs'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table'
 import { statusMeta } from '@/lib/constants'
 import { cn, formatBytes, formatUptime } from '@/lib/utils'
 
@@ -186,26 +177,6 @@ function isActive(m: ModuleResponse): boolean {
   return ACTIVE_STATUSES.has((m.service_status || m.status).toLowerCase())
 }
 
-/** 模块状态 → common 状态标签键（归一化规则与 constants.ts 的 statusMeta 一致） */
-const MODULE_STATUS_KEYS: Record<string, string> = {
-  running: 'common:status.running',
-  stopped: 'common:status.stopped',
-  starting: 'common:status.starting',
-  preparing: 'common:status.preparing',
-  error: 'common:status.error',
-  not_ready: 'common:status.notReady',
-}
-
-function moduleStatusKey(status: string | null | undefined): string | null {
-  if (!status) return null
-  const key = status
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, '_')
-    .replace('notready', 'not_ready')
-  return MODULE_STATUS_KEYS[key] ?? null
-}
-
 /** 模块分类 → tasks 命名空间分类标签键；未知分类原样展示 */
 const CATEGORY_KEYS: Record<string, string> = {
   asr: 'category.asr',
@@ -222,27 +193,6 @@ const CATEGORY_KEYS: Record<string, string> = {
 
 function categoryKey(category: string): string | null {
   return CATEGORY_KEYS[category.toLowerCase()] ?? null
-}
-
-/** 模块状态徽章：圆点 + 翻译标签，过渡态带脉冲动画 */
-function StatusBadge({ status }: { status: string }) {
-  const { t } = useTranslation('tasks')
-  const meta = statusMeta(status)
-  const key = moduleStatusKey(status)
-  const label =
-    key !== null ? t(key) : status.trim() || t('common:status.unknown')
-  return (
-    <Badge variant="outline" className={meta.badge}>
-      <span
-        className={cn(
-          'size-1.5 rounded-full',
-          meta.dot,
-          meta.transitional && 'animate-pulse',
-        )}
-      />
-      {label}
-    </Badge>
-  )
 }
 
 /** 任务 / 节点状态徽章：圆点 + 翻译标签，运行中带脉冲动画 */
@@ -868,15 +818,6 @@ export function TasksPage() {
           <div className="hidden h-8 w-px bg-border sm:block" />
           <div>
             <div className="font-mono text-3xl font-bold">
-              {modules === null ? '–' : modules.length}
-            </div>
-            <div className="mt-0.5 text-xs text-muted-foreground">
-              {t('stats.totalModules')}
-            </div>
-          </div>
-          <div className="hidden h-8 w-px bg-border sm:block" />
-          <div>
-            <div className="font-mono text-3xl font-bold">
               {tasks === null ? '–' : tasks.length}
             </div>
             <div className="mt-0.5 text-xs text-muted-foreground">
@@ -951,67 +892,6 @@ export function TasksPage() {
                   </div>
                 )
               })}
-            </div>
-          )}
-        </section>
-
-        {/* ── 全部模块 ── */}
-        <section>
-          <SectionHeader
-            icon={Puzzle}
-            title={t('stats.totalModules')}
-            count={modules?.length}
-          />
-          {modules === null ? (
-            <div className="space-y-2">
-              {Array.from({ length: 4 }).map((_, i) => (
-                <Skeleton key={i} className="h-12 rounded-lg" />
-              ))}
-            </div>
-          ) : modules.length === 0 ? (
-            <EmptyState
-              icon={Inbox}
-              title={t('moduleTable.emptyTitle')}
-              hint={t('moduleTable.emptyHint')}
-            />
-          ) : (
-            <div className="overflow-hidden rounded-lg border border-border">
-              <Table>
-                <TableHeader>
-                  <TableRow className="hover:bg-transparent">
-                    <TableHead>{t('common:label.name')}</TableHead>
-                    <TableHead>{t('moduleTable.category')}</TableHead>
-                    <TableHead>{t('moduleTable.version')}</TableHead>
-                    <TableHead>{t('common:label.status')}</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {modules.map((m) => {
-                    const catKey = categoryKey(m.category)
-                    return (
-                      <TableRow key={m.id}>
-                        <TableCell>
-                          <div className="font-medium">{m.name}</div>
-                          {m.description && (
-                            <div className="max-w-md truncate text-xs text-muted-foreground">
-                              {m.description}
-                            </div>
-                          )}
-                        </TableCell>
-                        <TableCell className="text-muted-foreground">
-                          {catKey !== null ? t(catKey) : m.category}
-                        </TableCell>
-                        <TableCell className="font-mono text-xs text-muted-foreground">
-                          {m.version}
-                        </TableCell>
-                        <TableCell>
-                          <StatusBadge status={m.service_status || m.status} />
-                        </TableCell>
-                      </TableRow>
-                    )
-                  })}
-                </TableBody>
-              </Table>
             </div>
           )}
         </section>
