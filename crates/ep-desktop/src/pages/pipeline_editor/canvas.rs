@@ -398,6 +398,11 @@ fn draw_controls_overlay(
             pal.text,
         );
         let r = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
+        // D-4：自绘按钮补 a11y 名称（i18n 键与 hover 文案同源，避免无名 Custom）
+        let a11y_name = tip.clone();
+        r.widget_info(move || {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, a11y_name.clone())
+        });
         let r = r.on_hover_text(tip.as_str());
         if r.clicked() {
             match *id {
@@ -419,13 +424,20 @@ const MINIMAP_H: f32 = 104.0;
 const MINIMAP_MARGIN: f32 = 12.0;
 
 fn minimap_frame_rect(canvas_rect: egui::Rect) -> egui::Rect {
-    egui::Rect::from_min_size(
+    let frame = egui::Rect::from_min_size(
         egui::pos2(
             canvas_rect.max.x - MINIMAP_MARGIN - MINIMAP_W,
             canvas_rect.max.y - MINIMAP_MARGIN - MINIMAP_H,
         ),
         egui::vec2(MINIMAP_W, MINIMAP_H),
-    )
+    );
+    // D-3：钳制在画布可视区内（右下角悬浮），极小画布时不越界
+    frame
+        .translate(egui::vec2(
+            (canvas_rect.min.x - frame.min.x).max(0.0),
+            (canvas_rect.min.y - frame.min.y).max(0.0),
+        ))
+        .intersect(canvas_rect)
 }
 
 /// 内容包围盒 → 缩略映射 (scale, offset)：等比缩放 + 居中（纯函数可测）
@@ -521,6 +533,12 @@ fn draw_minimap(
 
     // 点击/拖拽 → 视口居中于点击的画布坐标
     let r = ui.interact(frame, egui::Id::new("pe_minimap"), egui::Sense::click_and_drag());
+    // D-4 同源：补 a11y 名称（避免无名 Custom）
+    let minimap_name = trfb(lang, "desktopApp.pipeline.minimapTip", "点击/拖拽定位视口", &[]);
+    let minimap_name2 = minimap_name.clone();
+    r.widget_info(move || {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, minimap_name2.clone())
+    });
     if r.clicked() || r.dragged() {
         if let Some(pp) = r.interact_pointer_pos() {
             let tc = egui::pos2(
@@ -534,12 +552,7 @@ fn draw_minimap(
         }
     }
     r.on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(trfb(
-            lang,
-            "desktopApp.pipeline.minimapTip",
-            "点击/拖拽定位视口",
-            &[],
-        ));
+        .on_hover_text(minimap_name);
 }
 
 // ── Ports & hit testing ───────────────────────────────────────────
@@ -631,6 +644,10 @@ fn edge_hit(
 // ── Fit view ──────────────────────────────────────────────────────
 
 /// 适配视图：计算所有节点包围盒，缩放至画布可容纳并居中内容。
+///
+/// D-6：`canvas_size` 必须是**当前可视区**尺寸（draw_main 钳制后的真实
+/// 画布分配尺寸），不得用超宽虚拟画布作参照 —— 否则 fit 后节点仍被
+/// 窗口右缘裁切。三栏总宽钳制修复（D-1）后此处拿到的即为可视区尺寸。
 pub(super) fn apply_fit(st: &mut VizState, canvas_size: egui::Vec2) {
     if st.positions.is_empty() {
         st.zoom = 1.0;
@@ -1013,6 +1030,22 @@ mod tests {
         // 普通画布不受影响：仍用基础间距
         assert_eq!(grid_step(800.0, 600.0), GRID_SPACING);
         assert_eq!(grid_step(12800.0, 7070.0) % GRID_SPACING, 0.0);
+    }
+
+    /// D-3 回归：MiniMap 框始终在画布可视区内（右下角悬浮）；极小画布
+    /// 时经钳制不越界。
+    #[test]
+    fn minimap_frame_rect_stays_inside_canvas() {
+        // 正常画布：右下角内缩 margin
+        let canvas = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(800.0, 600.0));
+        let frame = minimap_frame_rect(canvas);
+        assert!(canvas.contains_rect(frame), "正常画布内 MiniMap 应完全在画布内");
+        assert_eq!(frame.size(), egui::vec2(MINIMAP_W, MINIMAP_H));
+
+        // 极小画布（比 MiniMap 还小）：钳制后仍不越界
+        let tiny = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(60.0, 40.0));
+        let frame = minimap_frame_rect(tiny);
+        assert!(tiny.contains_rect(frame), "极小画布 MiniMap 不得越界");
     }
 
     fn node(id: &str) -> PipelineNode {
