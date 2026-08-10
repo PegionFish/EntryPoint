@@ -32,10 +32,10 @@ use crate::pages::{
     ParamDraft,
 };
 use crate::ui::{
-    badge, card, card_grid, card_running, color_with_alpha, confirm_dialog_with_lang,
-    danger_button, empty_state, glow_breath_alpha, grid_columns, keyboard_scroll, page_header,
-    primary_button, primary_button_with_glow, section_title, status_badge, subtle_button,
-    Palette, CONTROL_ROUNDING,
+    badge, card, card_frame_active, card_grid, card_stroke, color_with_alpha,
+    confirm_dialog_with_lang, danger_button, empty_state, glow_breath_alpha, grid_col_width,
+    grid_columns, keyboard_scroll, page_header, primary_button, primary_button_with_glow,
+    section_title, status_badge, subtle_button, Palette, CONTROL_ROUNDING,
 };
 
 // ─── 页面持久状态 ────────────────────────────────────────────────────────────
@@ -109,6 +109,16 @@ struct ModulesUi {
     uninstall_keep: bool,
     // ── 删除模型确认（§5.1 卡内删除）──
     delete_confirm: Option<DeleteConfirm>,
+    // ── 变体一步激活：未就绪变体下载确认（W4-A5）──
+    variant_dl_confirm: Option<VariantDownloadConfirm>,
+}
+
+/// 未就绪变体下载确认上下文（W4-A5 一步激活：选中即激活，缺失时询问下载）
+#[derive(Debug, Clone)]
+struct VariantDownloadConfirm {
+    module_id: String,
+    model_id: String,
+    name: String,
 }
 
 /// 删除模型确认上下文
@@ -153,13 +163,19 @@ pub fn show(
         load_meta_cache(config, models, &mut st);
     }
 
-    // ── 页头：「模块管理」+ 顶部工具行（搜索框 + 工具按钮） ──
+    // ── 预分组与可见性（提升到页头供汇总徽章消费，W4-A6） ──
+    let by_module = group_models_by_module(models);
+    let visible_indices = visible_module_indices(modules, &by_module, &st);
+
+    // ── 页头：「模块管理」+ 右侧汇总徽章（W4-A6）+ 工具行（搜索框 + 工具按钮） ──
     page_header(
         ui,
         &tr(lang, "desktopPages.modules.title", &[]),
         |ui| {
             toolbar(ui, lang, &pal, cmd_tx, &mut st);
             search_box(ui, lang, &pal, &mut st);
+            // right_to_left 布局：最后加入者居最左（紧贴标题）
+            summary_badges(ui, lang, &pal, modules, &visible_indices);
         },
     );
     ui.add_space(8.0);
@@ -193,8 +209,8 @@ pub fn show(
             );
         } else {
             render_module_grid(
-                ui, lang, &pal, config, modules, models, &data, downloads, updates,
-                download_sources, packs, cmd_tx, &mut st,
+                ui, lang, &pal, config, modules, &by_module, &visible_indices, &data,
+                downloads, updates, download_sources, packs, cmd_tx, &mut st,
             );
         }
         ui.add_space(8.0);
@@ -584,6 +600,36 @@ fn tag_filter_row(ui: &mut egui::Ui, lang: &str, pal: &Palette, st: &mut Modules
 
 // ─── 模块卡网格（每模块一张卡；索引遍历以支持清空日志等 &mut 操作） ─────────
 
+/// 模块卡限宽（W4-B5）：单卡超过 460px 时封顶，网格整体居中
+const MODULE_CARD_MAX_WIDTH: f32 = 460.0;
+
+/// 预分组：module_id → 该模块的模型（变体）视图
+fn group_models_by_module(models: &[ModelView]) -> HashMap<String, Vec<&ModelView>> {
+    let mut by_module: HashMap<String, Vec<&ModelView>> = HashMap::new();
+    for mv in models {
+        by_module.entry(mv.module_id.clone()).or_default().push(mv);
+    }
+    by_module
+}
+
+/// 可见模块索引：tag 筛选 AND 关键词搜索（§5 差异矩阵补齐项）
+fn visible_module_indices(
+    modules: &[ModuleEntry],
+    by_module: &HashMap<String, Vec<&ModelView>>,
+    st: &ModulesUi,
+) -> Vec<usize> {
+    modules
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| {
+            let module_models = by_module.get(&m.id).cloned().unwrap_or_default();
+            module_matches_filter(st, &module_models)
+                && module_matches_search(&st.search_query, m, &module_models, &st.meta_cache)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_module_grid(
     ui: &mut egui::Ui,
@@ -591,7 +637,8 @@ fn render_module_grid(
     pal: &Palette,
     config: &AppConfig,
     modules: &mut [ModuleEntry],
-    models: &[ModelView],
+    by_module: &HashMap<String, Vec<&ModelView>>,
+    visible_indices: &[usize],
     data: &crate::pages::ModuleData,
     downloads: &HashMap<String, DownloadUiState>,
     updates: &HashMap<String, UpdateCheckResult>,
@@ -600,23 +647,6 @@ fn render_module_grid(
     cmd_tx: &UnboundedSender<AppCmd>,
     st: &mut ModulesUi,
 ) {
-    // 预分组：module_id → 该模块的模型（变体）视图
-    let mut by_module: HashMap<String, Vec<&ModelView>> = HashMap::new();
-    for mv in models {
-        by_module.entry(mv.module_id.clone()).or_default().push(mv);
-    }
-
-    // 可见性：tag 筛选 AND 关键词搜索（§5 差异矩阵补齐项）
-    let visible: Vec<bool> = modules
-        .iter()
-        .map(|m| {
-            let module_models = by_module.get(&m.id).cloned().unwrap_or_default();
-            module_matches_filter(st, &module_models)
-                && module_matches_search(&st.search_query, m, &module_models, &st.meta_cache)
-        })
-        .collect();
-
-    let visible_indices: Vec<usize> = (0..modules.len()).filter(|&i| visible[i]).collect();
     if visible_indices.is_empty() {
         empty_state(
             ui,
@@ -633,35 +663,83 @@ fn render_module_grid(
         return;
     }
 
-    // 汇总条（可见模块的运行状态计数）
-    summary_bar(ui, lang, pal, modules, &visible_indices);
-    ui.add_space(8.0);
-
     // 等宽列网格：列数按可用宽度计算并封顶于可见卡数（纯函数，过滤后重算
     // 不裁切，无空槽；记忆规范）；单元格经 card_grid 在独立垂直布局作用域内
     // 渲染并固定列宽，消除 scope 继承父级 horizontal 布局导致的横向溢出（P1-2 加固）。
-    let cols = grid_columns(ui.available_width(), 360.0, 12.0, visible_indices.len());
+    let spacing = ui.spacing().item_spacing.x;
+    let avail = ui.available_width();
+    let cols = grid_columns(avail, 360.0, spacing, visible_indices.len());
+    let natural_w = grid_col_width(avail, cols, spacing);
+    // W4-B5：单卡限宽 460px
+    let col_w = natural_w.min(MODULE_CARD_MAX_WIDTH);
+
     // 运行态呼吸辉光（§7.2）：存在运行中卡片时按 ~20fps 追加重绘
     let now_ms = ui.ctx().input(|i| i.time * 1000.0);
     let breath = glow_breath_alpha(now_ms);
-    let any_running = visible_indices
-        .iter()
-        .any(|&i| modules[i].status.is_running());
-    card_grid(ui, cols, &visible_indices, |ui, &idx| {
-        let module_models = by_module.get(&modules[idx].id).cloned().unwrap_or_default();
-        module_card(
-            ui, lang, pal, config, &mut modules[idx], &module_models, data,
-            downloads, updates, download_sources, packs, cmd_tx, st, breath,
+    // 运行标志预取：frame_for 闭包不可 &mut modules（draw 闭包独占），
+    // 经独立 Vec 共享只读状态绕开借用冲突
+    let running_flags: Vec<bool> = modules.iter().map(|m| m.status.is_running()).collect();
+    let any_running = visible_indices.iter().any(|&i| running_flags[i]);
+
+    let mut grid = |ui: &mut egui::Ui| {
+        card_grid(
+            ui,
+            "modules_grid",
+            cols,
+            visible_indices,
+            |_ui, &idx, hovered| {
+                // glass 风格卡（§7.2）：运行态呼吸辉光，静止态 hover 描边提亮
+                if running_flags[idx] {
+                    let stroke_alpha = (breath * 115.0) as u8;
+                    let shadow_alpha = (breath * 64.0) as u8;
+                    card_frame_active(
+                        pal,
+                        egui::Stroke::new(
+                            1.0_f32,
+                            color_with_alpha(pal.status_running, stroke_alpha),
+                        ),
+                        Some(color_with_alpha(pal.status_running, shadow_alpha)),
+                    )
+                } else {
+                    card_frame_active(
+                        pal,
+                        card_stroke(pal, hovered),
+                        hovered.then_some(pal.primary_glow),
+                    )
+                }
+            },
+            |ui, &idx| {
+                let module_models = by_module.get(&modules[idx].id).cloned().unwrap_or_default();
+                module_card(
+                    ui, lang, pal, config, &mut modules[idx], &module_models, data,
+                    downloads, updates, download_sources, packs, cmd_tx, st,
+                );
+            },
         );
-    });
+    };
+
+    if natural_w > MODULE_CARD_MAX_WIDTH {
+        // 限宽触发：总宽 < 可用宽，网格整体居中（W4-B5）
+        let total = col_w * cols as f32 + spacing * (cols - 1) as f32;
+        let pad = ((avail - total) / 2.0).max(0.0).floor();
+        ui.horizontal(|ui| {
+            ui.add_space(pad);
+            ui.scope(|ui| {
+                ui.set_width(total);
+                grid(ui);
+            });
+        });
+    } else {
+        grid(ui);
+    }
     if any_running {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(48));
     }
 }
 
-/// 可见模块的状态计数徽章（0 不显示）
-fn summary_bar(
+/// 可见模块的状态计数徽章（0 不显示）；页头右侧与标题同行（W4-A6）
+fn summary_badges(
     ui: &mut egui::Ui,
     lang: &str,
     pal: &Palette,
@@ -738,7 +816,6 @@ fn module_card(
     packs: &[PackEntry],
     cmd_tx: &UnboundedSender<AppCmd>,
     st: &mut ModulesUi,
-    breath: f32,
 ) {
     let manifest = data.manifest(&m.id).cloned();
     // 默认选中变体：激活变体（延迟初始化，避免每帧覆盖用户选择）
@@ -749,89 +826,88 @@ fn module_card(
         }
     }
 
-    // glass 风格卡（§7.2）：运行态呼吸辉光，静止态 hover 描边提亮
-    card_running(ui, pal, m.status.is_running(), breath, |ui| {
-        ui.set_width(ui.available_width());
+    // 卡内容：glass 风格 Frame 由 card_grid 的 frame_for 统一产出
+    //（运行态呼吸辉光 / 静止态 hover 描边提亮，§7.2；W4-B3 同行等高）
+    ui.set_width(ui.available_width());
 
-        // ── 卡头：名称 + 类别 + 运行状态徽章（四态色 StatusBadge；窄列时自动换行，不溢出） ──
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new(&m.name).strong());
-            ui.label(
-                egui::RichText::new(format!("v{}", m.version))
-                    .small()
-                    .color(pal.text_faint),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                status_badge(ui, pal, &m.status, service_label(lang, &m.status));
-            });
+    // ── 卡头：名称 + 类别 + 运行状态徽章（四态色 StatusBadge；窄列时自动换行，不溢出） ──
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new(&m.name).strong());
+        ui.label(
+            egui::RichText::new(format!("v{}", m.version))
+                .small()
+                .color(pal.text_faint),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            status_badge(ui, pal, &m.status, service_label(lang, &m.status));
         });
-        // 类别 + 端口/设备
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(category_label(lang, &m.category))
-                    .small()
-                    .color(pal.text_dim),
-            );
-            if let Some(port) = m.port {
-                ui.label(
-                    egui::RichText::new(format!(":{port}"))
-                        .monospace()
-                        .small()
-                        .color(pal.text_faint),
-                );
-            }
-            if let Some(dev) = &m.device {
-                ui.label(
-                    egui::RichText::new(dev.as_str())
-                        .monospace()
-                        .small()
-                        .color(pal.text_faint),
-                );
-            }
-        });
-        if let ServiceStatus::Error(err) = &m.status {
-            if !err.is_empty() {
-                ui.add_space(2.0);
-                ui.label(egui::RichText::new(err).small().color(pal.danger));
-            }
-        }
-        if !m.description.is_empty() {
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new(&m.description).small().color(pal.text_dim));
-        }
-
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(6.0);
-
-        match &manifest {
-            Some(mf) if !mf.models.is_empty() => {
-                // ── 变体选择器 + 选中变体信息 + 操作 ──
-                variant_section(
-                    ui, lang, pal, config, m, mf, module_models, downloads, updates,
-                    download_sources, packs, cmd_tx, st,
-                );
-            }
-            _ => {
-                // 无模型声明（native 服务 / 清单加载失败）：仅运行操作 + 日志
-                ui.label(
-                    egui::RichText::new(trfb(
-                        lang,
-                        "desktopPages.modules.noVariants",
-                        "该模块未声明模型变体（服务型模块）",
-                        &[],
-                    ))
-                    .small()
-                    .color(pal.text_faint),
-                );
-                ui.add_space(6.0);
-                service_action_row(ui, lang, pal, m, cmd_tx, st);
-            }
-        }
-
-        // ── 抽屉（运行/日志/tag） ──
-        drawer_area(ui, lang, pal, config, m, manifest.as_ref(), cmd_tx, st);
     });
+    // 类别 + 端口/设备
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(category_label(lang, &m.category))
+                .small()
+                .color(pal.text_dim),
+        );
+        if let Some(port) = m.port {
+            ui.label(
+                egui::RichText::new(format!(":{port}"))
+                    .monospace()
+                    .small()
+                    .color(pal.text_faint),
+            );
+        }
+        if let Some(dev) = &m.device {
+            ui.label(
+                egui::RichText::new(dev.as_str())
+                    .monospace()
+                    .small()
+                    .color(pal.text_faint),
+            );
+        }
+    });
+    if let ServiceStatus::Error(err) = &m.status {
+        if !err.is_empty() {
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new(err).small().color(pal.danger));
+        }
+    }
+    if !m.description.is_empty() {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(&m.description).small().color(pal.text_dim));
+    }
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(6.0);
+
+    match &manifest {
+        Some(mf) if !mf.models.is_empty() => {
+            // ── 变体选择器 + 选中变体信息 + 操作 ──
+            variant_section(
+                ui, lang, pal, config, m, mf, module_models, downloads, updates,
+                download_sources, packs, cmd_tx, st,
+            );
+        }
+        _ => {
+            // 无模型声明（native 服务 / 清单加载失败）：仅运行操作 + 日志
+            ui.label(
+                egui::RichText::new(trfb(
+                    lang,
+                    "desktopPages.modules.noVariants",
+                    "该模块未声明模型变体（服务型模块）",
+                    &[],
+                ))
+                .small()
+                .color(pal.text_faint),
+            );
+            ui.add_space(6.0);
+            service_action_row(ui, lang, pal, m, cmd_tx, st);
+        }
+    }
+
+    // ── 抽屉（运行/日志/tag） ──
+    drawer_area(ui, lang, pal, config, m, manifest.as_ref(), cmd_tx, st);
 }
 
 // ─── 变体选择器 + 选中变体信息 + 操作 ────────────────────────────────────────
@@ -859,14 +935,16 @@ fn variant_section(
         .cloned()
         .unwrap_or_else(|| active.clone());
 
-    // ── 变体选择器：radio + 每变体 就绪/缺失 徽章（变体不独立成块） ──
-    ui.label(
-        egui::RichText::new(trfb(lang, "desktopPages.modules.variants", "模型变体", &[]))
-            .small()
-            .strong()
-            .color(pal.text_dim),
-    );
-    ui.add_space(2.0);
+    // ── 变体选择器（W4-A5：单变体模块隐藏选择器；radio 一步激活） ──
+    if mf.models.len() > 1 {
+        ui.label(
+            egui::RichText::new(trfb(lang, "desktopPages.modules.variants", "模型变体", &[]))
+                .small()
+                .strong()
+                .color(pal.text_dim),
+        );
+        ui.add_space(2.0);
+    }
     for decl in &mf.models {
         let mv = module_models.iter().find(|v| v.model_id == decl.id);
         let chosen = selected == decl.id;
@@ -874,9 +952,22 @@ fn variant_section(
         // 变体行渲染（激活/就绪/缺失三态视觉区分沿用四态色徽章）
         let mut row = |ui: &mut egui::Ui| {
             ui.horizontal_wrapped(|ui| {
-                if ui.radio(chosen, "").clicked() && !chosen {
-                    st.sel_variant.insert(m.id.clone(), decl.id.clone());
-                }
+                if mf.models.len() > 1
+                    && ui.radio(chosen, "").clicked() && !chosen {
+                        st.sel_variant.insert(m.id.clone(), decl.id.clone());
+                        // 一步激活（W4-A5）：选中即写 config.active_models 并落盘
+                        apply_active_variant(ui, lang, config, m, decl.id.clone(), st);
+                        // 未就绪变体（缺失/不完整）：弹确认「立即下载？」
+                        if mv.is_some_and(|v| {
+                            matches!(v.status, ModelStatus::Missing | ModelStatus::Incomplete)
+                        }) {
+                            st.variant_dl_confirm = Some(VariantDownloadConfirm {
+                                module_id: m.id.clone(),
+                                model_id: decl.id.clone(),
+                                name: decl.name.clone(),
+                            });
+                        }
+                    }
                 let mut name = egui::RichText::new(&decl.name);
                 if is_active {
                     name = name.strong();
@@ -927,7 +1018,49 @@ fn variant_section(
             row(ui);
         }
     }
-    ui.add_space(6.0);
+    if mf.models.len() > 1 {
+        ui.add_space(6.0);
+    }
+
+    // ── 未就绪变体下载确认（W4-A5）：确认后立即发起下载 ──
+    if let Some(c) = st.variant_dl_confirm.clone() {
+        if c.module_id == m.id {
+            let title = tr(
+                lang,
+                "desktopPages.modules.variantDownloadConfirm.title",
+                &[],
+            );
+            let message = tr(
+                lang,
+                "desktopPages.modules.variantDownloadConfirm.message",
+                &[("name", &c.name)],
+            );
+            let confirm = tr(lang, "common.action.download", &[]);
+            match confirm_dialog_with_lang(
+                ui.ctx(),
+                pal,
+                &format!("dlg_variant_dl_{}", m.id),
+                &title,
+                &message,
+                &confirm,
+                false,
+                lang,
+            ) {
+                Some(true) => {
+                    if let Some(v) = module_models.iter().find(|v| v.model_id == c.model_id) {
+                        let source = download_sources
+                            .get(&download_key(&v.module_id, &v.model_id))
+                            .copied()
+                            .unwrap_or(None);
+                        send_download(cmd_tx, download_sources, v, source);
+                    }
+                    st.variant_dl_confirm = None;
+                }
+                Some(false) => st.variant_dl_confirm = None,
+                None => {}
+            }
+        }
+    }
 
     // ── 选中变体的元信息（qualified_id / 来源 / VRAM / 目录 / tag / pack 来源） ──
     let sel_mv = module_models.iter().find(|v| v.model_id == selected);
@@ -988,9 +1121,9 @@ fn variant_section(
     ui.separator();
     ui.add_space(6.0);
 
-    // ── 操作区：启动/停止/日志/直跑/tag/下载选中变体/激活变体应用 ──
+    // ── 操作区：启动/停止/日志/直跑/tag/下载选中变体（激活已由 radio 一步完成，W4-A5） ──
     action_row(
-        ui, lang, pal, config, m, mf, sel_mv.copied(), downloads, updates,
+        ui, lang, pal, m, mf, sel_mv.copied(), downloads, updates,
         download_sources, cmd_tx, st,
     );
 }
@@ -1064,7 +1197,6 @@ fn action_row(
     ui: &mut egui::Ui,
     lang: &str,
     pal: &Palette,
-    config: &AppConfig,
     m: &mut ModuleEntry,
     mf: &ModuleManifest,
     sel_mv: Option<&ModelView>,
@@ -1079,7 +1211,6 @@ fn action_row(
     ui.add_space(4.0);
 
     let selected = st.sel_variant.get(&m.id).cloned().unwrap_or_default();
-    let active = effective_active_variant(config, st, &m.id, mf);
     let sel_ready = sel_mv.map(|v| v.status == ModelStatus::Ready).unwrap_or(false);
     // P1 修复：复合键隔离跨模块同名变体（下载进度/更新结果/来源记忆）
     let downloading = sel_mv.and_then(|v| downloads.get(&download_key(&v.module_id, &v.model_id)));
@@ -1203,7 +1334,7 @@ fn action_row(
     });
     ui.add_space(4.0);
 
-    // 行 3：选中变体下载 + 激活变体应用（窄列时换行，激活按钮不丢失）
+    // 行 3：选中变体下载（激活已由 radio 一步完成，W4-A5）
     ui.horizontal_wrapped(|ui| {
         if let Some(dl) = downloading {
             // 下载进度 + 取消（复用模型页进度组件语义）
@@ -1250,31 +1381,6 @@ fn action_row(
                 );
             }
         }
-
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // 激活变体应用（选中 ≠ 激活 时可点；按钮层级打磨：次级操作一律 subtle）
-            let changed = !selected.is_empty() && selected != active;
-            let apply_btn = ui.add_enabled(
-                changed,
-                subtle_button(
-                    pal,
-                    trfb(lang, "desktopPages.modules.applyVariant", "激活变体应用", &[]),
-                ),
-            );
-            let apply_btn = if changed {
-                apply_btn
-            } else {
-                apply_btn.on_hover_text(trfb(
-                    lang,
-                    "desktopPages.models.config.current",
-                    "当前即为激活变体",
-                    &[],
-                ))
-            };
-            if apply_btn.clicked() {
-                apply_active_variant(ui, lang, config, m, selected.clone(), st);
-            }
-        });
     });
 }
 
