@@ -11,10 +11,9 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
-use ep_core::config::AppConfig;
 use ep_core::model::{ModelManager, ModelStatus, active_model_for};
 use ep_core::module::discovery::{DiscoveredModule, DiscoveryStatus};
-use ep_core::module::manifest::{CapabilityDecl, ModelDecl, ModuleManifest};
+use ep_core::module::manifest::CapabilityDecl;
 use ep_core::types::ServiceStatus;
 
 use super::err_response;
@@ -59,17 +58,8 @@ pub(crate) struct ModuleResponse {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-/// 解析模块当前激活的模型变体声明（版本单槽位语义 §5.2）。
-///
-/// 三级回退（config.active_models → manifest default=true → 首个变体）统一
-/// 委托 [`active_model_for`]，不再"死板取 default"；返回值必为 manifest 声明。
-fn active_model_decl<'a>(
-    config: &AppConfig,
-    manifest: &'a ModuleManifest,
-) -> Option<&'a ModelDecl> {
-    active_model_for(config, manifest)
-        .and_then(|id| manifest.models.iter().find(|m| m.id == id))
-}
+// 激活变体声明解析已上提为 api/mod.rs 的公共助手 [`super::active_model_decl`]
+// （F1 修复：手动启动与自动拉起预检共用唯一真源，杜绝口径漂移）。
 
 /// 服务状态 → 规范小写串（供 list_modules / module_status 共用）
 pub(crate) fn status_str(status: &ServiceStatus) -> &'static str {
@@ -235,7 +225,7 @@ pub async fn start_module(
     if !manifest.models.is_empty() {
         let (mgr, active) = {
             let config = state.config.read().await;
-            let active = active_model_decl(&config, &manifest)
+            let active = super::active_model_decl(&config, &manifest)
                 .map(|m| (m.id.clone(), m.name.clone()));
             (ModelManager::new(&config.models, &state.root), active)
         };
@@ -615,6 +605,8 @@ pub async fn set_model_variant(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ep_core::config::AppConfig;
+    use ep_core::module::manifest::{ModelDecl, ModuleManifest};
     use ep_core::types::DeviceId;
     use std::collections::HashMap;
     use std::path::PathBuf;

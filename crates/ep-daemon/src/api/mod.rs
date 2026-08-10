@@ -127,6 +127,20 @@ pub(crate) async fn module_start_env_vars(
     vars
 }
 
+/// 解析模块当前激活的模型变体声明（§5.2 单槽位三级回退，F1 修复）：
+/// 手动启动（modules.rs）与自动拉起（autostart.rs）的模型就绪预检共用
+/// 的唯一真源——[`ep_core::model::active_model_for`]（config.active_models
+/// → manifest default=true → 首个变体），不再各自实现导致口径漂移
+/// （旧版 autostart 死取 default/首个，忽略 active_models，默认变体缺失 +
+/// 活跃变体就绪时误报 409 MODEL_NOT_READY）；返回值必为 manifest 声明。
+pub(crate) fn active_model_decl<'a>(
+    config: &ep_core::config::AppConfig,
+    manifest: &'a ep_core::module::manifest::ModuleManifest,
+) -> Option<&'a ep_core::module::manifest::ModelDecl> {
+    ep_core::model::active_model_for(config, manifest)
+        .and_then(|id| manifest.models.iter().find(|m| m.id == id))
+}
+
 /// 模块 venv python 解释器路径（双平台口径与 ep-core [`ep_core::env::EnvManager::venv_python_path`]
 /// 一致：Windows `runtime/venvs/<id>/Scripts/python.exe`、其他平台 `bin/python`）
 pub(crate) fn module_venv_python_path(
