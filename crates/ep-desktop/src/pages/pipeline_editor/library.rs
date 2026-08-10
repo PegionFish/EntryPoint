@@ -17,7 +17,13 @@ pub(super) struct LibraryEntry {
     pub name: String,
     pub description: String,
     pub node_count: usize,
+    /// 随包内置管线（shipped）：不可从库菜单删除（对齐 WebUI builtin 语义）
+    pub shipped: bool,
 }
+
+/// 随包内置管线文件名（去扩展名）：与仓库 `config/pipelines/` 随发行
+/// 的管线一致；仅 custom（非此清单）管线可从库菜单删除。
+pub(super) const SHIPPED_PIPELINE_STEMS: &[&str] = &["audio_extract", "video_to_srt"];
 
 /// 管线库目录：`<EP_ROOT>/config/pipelines`（与整合包管线圈选同根解析）
 pub(super) fn pipeline_library_dir() -> PathBuf {
@@ -49,6 +55,7 @@ pub(super) fn scan_pipeline_library(dir: &std::path::Path) -> Vec<LibraryEntry> 
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            let shipped = is_shipped_stem(&stem);
             let (name, description, node_count) = match Pipeline::from_toml(&path) {
                 Ok(p) if !p.name.trim().is_empty() => (p.name, p.description, p.nodes.len()),
                 Ok(p) => (stem, String::new(), p.nodes.len()),
@@ -59,9 +66,65 @@ pub(super) fn scan_pipeline_library(dir: &std::path::Path) -> Vec<LibraryEntry> 
                 name,
                 description,
                 node_count,
+                shipped,
             }
         })
         .collect()
+}
+
+/// 目录下已有 `*.toml` 文件名（去扩展名）列表（纯函数可测）：
+/// 供另存为/导入注册的重名检测（[`unique_library_file_name`]）。目录
+/// 不存在返回空列表。
+pub(super) fn existing_stems(dir: &std::path::Path) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("toml"))
+        .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .collect()
+}
+
+/// 文件名（去扩展名）是否属于随包内置管线（不可删除）
+pub(super) fn is_shipped_stem(stem: &str) -> bool {
+    SHIPPED_PIPELINE_STEMS.contains(&stem)
+}
+
+/// 另存为/导入注册的文件名清洗：去 `.toml` 扩展名、剔除文件系统非法
+/// 字符与首尾点空白；清洗后为空回退 `pipeline`（纯函数可测）。
+pub(super) fn sanitize_library_file_name(raw: &str) -> String {
+    let stem = raw
+        .trim()
+        .strip_suffix(".toml")
+        .or_else(|| raw.trim().strip_suffix(".TOML"))
+        .unwrap_or(raw.trim());
+    let cleaned: String = stem
+        .chars()
+        .filter(|c| !(c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')))
+        .collect();
+    let cleaned = cleaned.trim_matches(['.', ' ']).to_string();
+    if cleaned.is_empty() {
+        "pipeline".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// 重名处理（纯函数可测）：`name` 在 `existing` 中不冲突原样返回；
+/// 冲突则追加 `_2`/`_3`… 直到不冲突。
+pub(super) fn unique_library_file_name(name: &str, existing: &[String]) -> String {
+    let has = |c: &str| existing.iter().any(|e| e.eq_ignore_ascii_case(c));
+    if !has(name) {
+        return name.to_string();
+    }
+    for i in 2..1000 {
+        let cand = format!("{name}_{i}");
+        if !has(&cand) {
+            return cand;
+        }
+    }
+    format!("{name}_{}", existing.len() + 1)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
@@ -159,5 +222,49 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].node_count, 2);
+    }
+
+    /// shipped 判定：内置清单命中 / 未命中
+    #[test]
+    fn shipped_stem_detection() {
+        assert!(is_shipped_stem("audio_extract"));
+        assert!(is_shipped_stem("video_to_srt"));
+        assert!(!is_shipped_stem("my_custom"));
+    }
+
+    /// existing_stems：仅收集 toml 文件 stem，忽略非 toml 与子目录
+    #[test]
+    fn existing_stems_collects_toml_stems_only() {
+        let dir = library_tmp_dir("stems");
+        std::fs::write(dir.join("a.toml"), "x").unwrap();
+        std::fs::write(dir.join("b.toml"), "x").unwrap();
+        std::fs::write(dir.join("c.txt"), "x").unwrap();
+        std::fs::create_dir(dir.join("d.toml")).unwrap();
+
+        let mut stems = existing_stems(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        stems.sort();
+        assert_eq!(stems, vec!["a".to_string(), "b".to_string()]);
+
+        // 目录不存在 → 空列表
+        assert!(existing_stems(&dir).is_empty());
+    }
+
+    /// 文件名清洗：去扩展名、剔除非法字符、空回退
+    #[test]
+    fn sanitize_library_file_name_rules() {
+        assert_eq!(sanitize_library_file_name("my_pipeline.toml"), "my_pipeline");
+        assert_eq!(sanitize_library_file_name("a<b>c:d"), "abcd");
+        assert_eq!(sanitize_library_file_name("..."), "pipeline");
+        assert_eq!(sanitize_library_file_name("  spaced  "), "spaced");
+    }
+
+    /// 重名递增：不冲突原样返回，冲突追加 _2/_3…（大小写不敏感）
+    #[test]
+    fn unique_library_file_name_increments_on_conflict() {
+        let existing = vec!["demo".to_string(), "demo_2".to_string()];
+        assert_eq!(unique_library_file_name("other", &existing), "other");
+        assert_eq!(unique_library_file_name("demo", &existing), "demo_3");
+        assert_eq!(unique_library_file_name("DEMO", &existing), "DEMO_3");
     }
 }

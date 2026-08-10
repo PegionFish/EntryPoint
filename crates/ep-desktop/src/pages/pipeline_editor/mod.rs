@@ -80,6 +80,21 @@ pub(super) enum PendingAction {
     New,
     /// 打开文件…（确认后弹系统文件选择器）
     Open,
+    /// 加载示例（内置模板生成示例 DAG，对齐 WebUI onLoadExample）
+    LoadExample,
+}
+
+/// 库下拉菜单底部动作（对齐 WebUI PipelineLibraryBar 行为语义）
+#[derive(Clone)]
+enum LibraryMenuAction {
+    /// 加载示例
+    LoadExample,
+    /// 另存为到 config/pipelines/（文件名输入对话框）
+    SaveAs,
+    /// 导出当前管线 TOML 到用户选择的路径
+    Export,
+    /// 导入注册：选 TOML 复制进 config/pipelines/ 并加载
+    Import,
 }
 
 /// palette 拖放载荷（映射表 #9：palette → 画布拖放建节点）
@@ -124,6 +139,12 @@ pub(super) struct VizState {
     exec_dialog_open: bool,
     /// 执行对话框输入文件文本态
     exec_input_text: String,
+    /// 另存为对话框（文件名输入 → config/pipelines/<名>.toml）
+    save_as_dialog_open: bool,
+    /// 另存为对话框文件名输入态
+    save_as_name: String,
+    /// 库删除确认对话框目标（仅 custom 管线；Some = 对话框打开）
+    delete_target: Option<PathBuf>,
 }
 
 impl Default for VizState {
@@ -149,6 +170,9 @@ impl Default for VizState {
             pending_action: None,
             exec_dialog_open: false,
             exec_input_text: String::new(),
+            save_as_dialog_open: false,
+            save_as_name: String::new(),
+            delete_target: None,
         }
     }
 }
@@ -273,6 +297,38 @@ pub fn show_full(
     if st.exec_dialog_open {
         exec_dialog(ui, lang, &pal, &mut st, config, &data, devices.as_ref(), cmd_tx);
     }
+    // 另存为对话框（文件名输入 → config/pipelines/，重名自动 _2/_3）
+    if st.save_as_dialog_open {
+        save_as_dialog(ui, lang, &pal, &mut st);
+    }
+    // 库删除确认对话框（仅 custom 管线可删，shipped 菜单侧已隐藏入口）
+    if let Some(target) = st.delete_target.clone() {
+        let name = target
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let res = confirm_dialog_with_lang(
+            ui.ctx(),
+            &pal,
+            "pe_delete_pipeline",
+            &trfb(lang, "desktopApp.pipeline.deleteTitle", "删除管线", &[]),
+            &trfb(
+                lang,
+                "desktopApp.pipeline.deleteMsg",
+                "从管线库删除「{{name}}」？此操作不可撤销。",
+                &[("name", &name)],
+            ),
+            &trfb(lang, "desktopApp.pipeline.deleteConfirm", "删除", &[]),
+            true,
+            lang,
+        );
+        if let Some(confirmed) = res {
+            st.delete_target = None;
+            if confirmed {
+                delete_library_entry(&mut st, lang, &target);
+            }
+        }
+    }
 
     // Status bar
     ui.separator();
@@ -310,12 +366,13 @@ fn draw_empty_canvas(ui: &mut egui::Ui, lang: &str, pal: &Palette) {
     });
 }
 
-/// 执行确认通过的待决动作（切换加载 / 新建 / 打开文件）
+/// 执行确认通过的待决动作（切换加载 / 新建 / 打开文件 / 加载示例）
 fn apply_pending_action(st: &mut VizState, lang: &str, action: Option<PendingAction>) {
     match action {
         Some(PendingAction::Switch(path)) => load_library_entry(st, lang, &path),
         Some(PendingAction::New) => edit::new_pipeline(st),
         Some(PendingAction::Open) => open_file_dialog(st, lang),
+        Some(PendingAction::LoadExample) => load_example(st, lang),
         None => {}
     }
 }
@@ -366,6 +423,9 @@ fn editor_toolbar(
     cmd_tx: Option<&UnboundedSender<AppCmd>>,
     tasks: Option<&crate::pages::TasksSnapshot>,
 ) {
+    // 窄窗降级（P1 防御）：内容区 <900px 时折叠次要元素（文件路径/任务
+    // 徽章与进度/任务按钮文案），防止 horizontal 工具栏重叠
+    let narrow = ui.available_width() < 900.0;
     ui.horizontal(|ui| {
         // 库下拉菜单（PipelineLibraryBar 等价）：列出 config/pipelines/*.toml，
         // 切换加载，标注当前项；dirty 时经确认对话框拦截
@@ -412,21 +472,23 @@ fn editor_toolbar(
         }
         ui.separator();
 
-        // 管线名 + dirty 标记 + 文件路径（弱化）
+        // 管线名 + dirty 标记 + 文件路径（弱化；窄窗时折叠徽章/路径）
         if let Some(p) = &st.pipeline {
             ui.strong(format!(
                 "{}{}",
                 p.name.if_empty_fallback(&p.id),
                 if st.dirty { " *" } else { "" }
             ));
-            // 任务状态徽章（任务快照回显）
-            if let Some(task) = latest_task_for(p, tasks) {
-                let (color, label) = task_status_badge(lang, pal, &task.status);
-                badge(ui, pal, color, label);
-                let progress = format!("{}/{}", task.completed_nodes, task.node_count);
-                ui.label(egui::RichText::new(progress).small().color(pal.text_dim));
+            // 任务状态徽章（任务快照回显；窄窗折叠）
+            if !narrow {
+                if let Some(task) = latest_task_for(p, tasks) {
+                    let (color, label) = task_status_badge(lang, pal, &task.status);
+                    badge(ui, pal, color, label);
+                    let progress = format!("{}/{}", task.completed_nodes, task.node_count);
+                    ui.label(egui::RichText::new(progress).small().color(pal.text_dim));
+                }
             }
-            if !st.file_path.is_empty() {
+            if !narrow && !st.file_path.is_empty() {
                 ui.label(
                     egui::RichText::new(abbreviate_path(&st.file_path, 32))
                         .monospace()
@@ -441,14 +503,18 @@ fn editor_toolbar(
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let pipeline_snap = st.pipeline.clone();
             if let Some(ref p) = pipeline_snap {
-                // 刷新该管线的任务列表（§6.8）
+                // 刷新该管线的任务列表（§6.8；窄窗仅图标）
                 if ui
                     .add(subtle_button(
                         pal,
-                        format!(
-                            "🔄 {}",
-                            trfb(lang, "desktopApp.pipeline.refreshTasks", "任务", &[])
-                        ),
+                        if narrow {
+                            "🔄".to_string()
+                        } else {
+                            format!(
+                                "🔄 {}",
+                                trfb(lang, "desktopApp.pipeline.refreshTasks", "任务", &[])
+                            )
+                        },
                     ))
                     .on_hover_text(trfb(
                         lang,
@@ -531,7 +597,9 @@ fn editor_toolbar(
 
 /// 管线库下拉菜单（WebUI `PipelineLibraryBar` 下拉的 egui 等价实现）：
 /// 扫描 `config/pipelines/*.toml`（名称 + 节点数），点击切换加载（dirty
-/// 守卫），✓ 标注当前管线；库为空时给出目录提示。
+/// 守卫），✓ 标注当前管线；shipped 条目打内置标、不显示删除；custom
+/// 条目行尾带 🗑 删除（确认对话框）。菜单底部：加载示例 / 另存为… /
+/// 导出… / 导入注册…（对齐 WebUI 行为语义）；库为空时给出目录提示。
 fn library_menu(ui: &mut egui::Ui, lang: &str, st: &mut VizState) {
     // 触发器文案：当前管线名（+dirty *）；无管线时显示「管线库」
     let selected_text = match &st.pipeline {
@@ -547,10 +615,12 @@ fn library_menu(ui: &mut egui::Ui, lang: &str, st: &mut VizState) {
     };
 
     let mut chosen: Option<std::path::PathBuf> = None;
+    let mut delete_req: Option<std::path::PathBuf> = None;
+    let mut action: Option<LibraryMenuAction> = None;
     let combo = egui::ComboBox::from_id_salt(egui::Id::new("pe_library_menu"))
         .selected_text(selected_text)
         .show_ui(ui, |ui| {
-            ui.set_min_width(300.0);
+            ui.set_min_width(320.0);
             let entries =
                 library::scan_pipeline_library(&library::pipeline_library_dir());
             if entries.is_empty() {
@@ -574,22 +644,94 @@ fn library_menu(ui: &mut egui::Ui, lang: &str, st: &mut VizState) {
                         "{{count}} 节点",
                         &[("count", &entry.node_count.to_string())],
                     );
+                    let shipped_tag = if entry.shipped {
+                        format!(
+                            " · {}",
+                            trfb(lang, "desktopApp.pipeline.shippedTag", "内置", &[])
+                        )
+                    } else {
+                        String::new()
+                    };
                     let label = format!(
-                        "{}{} · {}",
+                        "{}{} · {}{}",
                         if is_current { "✓ " } else { "" },
                         entry.name,
-                        count
+                        count,
+                        shipped_tag
                     );
-                    let resp = ui.selectable_label(false, label);
-                    let resp = if !entry.description.is_empty() {
-                        resp.on_hover_text(entry.description.as_str())
-                    } else {
-                        resp
-                    };
-                    if resp.clicked() && !is_current {
-                        chosen = Some(entry.path.clone());
-                    }
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        let resp = ui.selectable_label(false, label);
+                        let resp = if !entry.description.is_empty() {
+                            resp.on_hover_text(entry.description.as_str())
+                        } else {
+                            resp
+                        };
+                        if resp.clicked() && !is_current {
+                            chosen = Some(entry.path.clone());
+                        }
+                        // 删除仅 custom（非 shipped）可见（对齐 WebUI：内置不显示删除）
+                        if !entry.shipped
+                            && ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("🗑").size(11.0),
+                                    )
+                                    .frame(false),
+                                )
+                                .on_hover_text(trfb(
+                                    lang,
+                                    "desktopApp.pipeline.libraryDeleteTip",
+                                    "从管线库删除该自定义管线",
+                                    &[],
+                                ))
+                                .clicked()
+                        {
+                            delete_req = Some(entry.path.clone());
+                        }
+                    });
                 }
+            }
+            ui.separator();
+            // 加载示例（dirty 守卫在 apply 侧统一拦截）
+            if ui
+                .button(format!(
+                    "✨ {}",
+                    trfb(lang, "desktopApp.pipeline.libraryLoadExample", "加载示例", &[])
+                ))
+                .clicked()
+            {
+                action = Some(LibraryMenuAction::LoadExample);
+            }
+            // 另存为 / 导出：需已加载管线（对齐 WebUI canExport 语义）
+            ui.add_enabled_ui(st.pipeline.is_some(), |ui| {
+                if ui
+                    .button(format!(
+                        "📝 {}",
+                        trfb(lang, "desktopApp.pipeline.librarySaveAs", "另存为…", &[])
+                    ))
+                    .clicked()
+                {
+                    action = Some(LibraryMenuAction::SaveAs);
+                }
+                if ui
+                    .button(format!(
+                        "⬇ {}",
+                        trfb(lang, "desktopApp.pipeline.libraryExport", "导出…", &[])
+                    ))
+                    .clicked()
+                {
+                    action = Some(LibraryMenuAction::Export);
+                }
+            });
+            if ui
+                .button(format!(
+                    "⬆ {}",
+                    trfb(lang, "desktopApp.pipeline.libraryImport", "导入注册…", &[])
+                ))
+                .clicked()
+            {
+                action = Some(LibraryMenuAction::Import);
             }
         });
     combo
@@ -602,6 +744,409 @@ fn library_menu(ui: &mut egui::Ui, lang: &str, st: &mut VizState) {
         ));
     if let Some(path) = chosen {
         request_action(st, lang, PendingAction::Switch(path));
+    }
+    if let Some(path) = delete_req {
+        st.delete_target = Some(path);
+    }
+    match action {
+        Some(LibraryMenuAction::LoadExample) => {
+            request_action(st, lang, PendingAction::LoadExample);
+        }
+        Some(LibraryMenuAction::SaveAs) => {
+            st.save_as_name = default_save_as_name(st);
+            st.save_as_dialog_open = true;
+        }
+        Some(LibraryMenuAction::Export) => export_current_pipeline(st, lang),
+        Some(LibraryMenuAction::Import) => import_register(st, lang),
+        None => {}
+    }
+}
+
+// ── Library capabilities（对齐 WebUI PipelineLibraryBar 行为语义） ────
+
+/// 加载示例：复用新建逻辑生成示例 DAG（file_input → file_output），
+/// 带示例名/描述与稳定 id（对齐 WebUI onLoadExample）。
+fn load_example(st: &mut VizState, lang: &str) {
+    let name = trfb(lang, "desktopApp.pipeline.exampleName", "示例管线", &[]);
+    let desc = trfb(
+        lang,
+        "desktopApp.pipeline.exampleDesc",
+        "内置模板生成的示例管线：文件输入 → 文件输出",
+        &[],
+    );
+    edit::new_pipeline_with(st, Some(("example-pipeline", name, desc)));
+    st.validation_msg = Some(trfb(
+        lang,
+        "desktopApp.pipeline.exampleLoaded",
+        "已生成示例管线，可经「另存为」注册进管线库",
+        &[],
+    ));
+    st.validation_ok = true;
+}
+
+/// 另存为默认文件名：当前文件 stem → 管线 id → "pipeline"
+fn default_save_as_name(st: &VizState) -> String {
+    if !st.file_path.trim().is_empty() {
+        if let Some(stem) = std::path::Path::new(st.file_path.trim()).file_stem() {
+            return stem.to_string_lossy().into_owned();
+        }
+    }
+    st.pipeline
+        .as_ref()
+        .map(|p| {
+            if p.id.trim().is_empty() {
+                "pipeline".to_string()
+            } else {
+                p.id.clone()
+            }
+        })
+        .unwrap_or_else(|| "pipeline".to_string())
+}
+
+/// 另存为对话框（模态）：文件名输入 → config/pipelines/<名>.toml；
+/// 重名实时提示（自动 _2/_3 改名，不阻断）。
+fn save_as_dialog(ui: &mut egui::Ui, lang: &str, pal: &Palette, st: &mut VizState) {
+    let mut open = true;
+    let mut do_save = false;
+    // 闭包内不直接改 open（与 .open(&mut open) 借用冲突）：用独立标志回收
+    let mut close_req = false;
+    egui::Window::new(trfb(
+        lang,
+        "desktopApp.pipeline.saveAsTitle",
+        "另存为到管线库",
+        &[],
+    ))
+    .id(egui::Id::new("pe_save_as_dialog"))
+    .collapsible(false)
+    .resizable(false)
+    .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+    .open(&mut open)
+    .show(ui.ctx(), |ui| {
+        ui.set_min_width(360.0);
+        ui.label(
+            egui::RichText::new(trfb(
+                lang,
+                "desktopApp.pipeline.saveAsNameLabel",
+                "文件名",
+                &[],
+            ))
+            .color(pal.text_dim),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut st.save_as_name)
+                .desired_width(300.0)
+                .hint_text("my-pipeline"),
+        );
+        ui.label(
+            egui::RichText::new(trfb(
+                lang,
+                "desktopApp.pipeline.saveAsNameHint",
+                "保存为 config/pipelines/<文件名>.toml",
+                &[],
+            ))
+            .small()
+            .color(pal.text_faint),
+        );
+        // 重名处理：实时预览最终文件名（冲突 → _2/_3）
+        let input_empty = st.save_as_name.trim().is_empty();
+        if !input_empty {
+            let dir = library::pipeline_library_dir();
+            let sanitized = library::sanitize_library_file_name(&st.save_as_name);
+            let final_name =
+                library::unique_library_file_name(&sanitized, &library::existing_stems(&dir));
+            if final_name != sanitized {
+                ui.label(
+                    egui::RichText::new(trfb(
+                        lang,
+                        "desktopApp.pipeline.saveAsConflict",
+                        "已存在同名管线，将保存为 {{name}}.toml",
+                        &[("name", &final_name)],
+                    ))
+                    .small()
+                    .color(pal.warning),
+                );
+            }
+        } else {
+            ui.label(
+                egui::RichText::new(trfb(
+                    lang,
+                    "desktopApp.pipeline.saveAsEmpty",
+                    "文件名不能为空",
+                    &[],
+                ))
+                .small()
+                .color(pal.status_error),
+            );
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(subtle_button(pal, tr(lang, "common.action.cancel", &[])))
+                    .clicked()
+                {
+                    close_req = true;
+                }
+                let resp = primary_button_with_glow(
+                    ui,
+                    pal,
+                    tr(lang, "common.action.save", &[]),
+                );
+                if resp.clicked() && !input_empty {
+                    do_save = true;
+                }
+            });
+        });
+    });
+    if do_save {
+        st.save_as_dialog_open = false;
+        save_as_to_library(st, lang);
+    } else if close_req || !open {
+        st.save_as_dialog_open = false;
+    }
+}
+
+/// 另存为落盘：序列化（含画布坐标）→ config/pipelines/<重名处理后>.toml，
+/// 成功后当前文件指向新库条目（后续保存写回新文件）。
+fn save_as_to_library(st: &mut VizState, lang: &str) {
+    let Some(p) = edit::pipeline_with_positions(st) else {
+        return;
+    };
+    let dir = library::pipeline_library_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        st.validation_msg = Some(trfb(
+            lang,
+            "desktopApp.pipeline.saveAsFailed",
+            "另存失败: {{detail}}",
+            &[("detail", &e.to_string())],
+        ));
+        st.validation_ok = false;
+        return;
+    }
+    let sanitized = library::sanitize_library_file_name(&st.save_as_name);
+    let final_name = library::unique_library_file_name(&sanitized, &library::existing_stems(&dir));
+    let path = dir.join(format!("{final_name}.toml"));
+    match toml_serde::pipeline_to_toml(&p) {
+        Ok(text) => match std::fs::write(&path, text) {
+            Ok(()) => {
+                st.file_path = path.to_string_lossy().into_owned();
+                st.dirty = false;
+                st.validation_msg = Some(trfb(
+                    lang,
+                    "desktopApp.pipeline.savedAsDone",
+                    "已另存为: {{path}}",
+                    &[("path", &path.to_string_lossy())],
+                ));
+                st.validation_ok = true;
+            }
+            Err(e) => {
+                st.validation_msg = Some(trfb(
+                    lang,
+                    "desktopApp.pipeline.saveAsFailed",
+                    "另存失败: {{detail}}",
+                    &[("detail", &e.to_string())],
+                ));
+                st.validation_ok = false;
+            }
+        },
+        Err(e) => {
+            st.validation_msg = Some(trfb(
+                lang,
+                "desktopApp.pipeline.saveSerializeFailed",
+                "序列化失败: {{detail}}",
+                &[("detail", &e)],
+            ));
+            st.validation_ok = false;
+        }
+    }
+}
+
+/// 导出：当前管线 TOML 保存到用户选择的路径（rfd 保存对话框）；
+/// 不改变当前文件指向（对齐 WebUI 导出语义）。
+fn export_current_pipeline(st: &mut VizState, lang: &str) {
+    let Some(p) = edit::pipeline_with_positions(st) else {
+        st.validation_msg = Some(tr(lang, "desktopApp.pipeline.loadFileFirst", &[]));
+        st.validation_ok = false;
+        return;
+    };
+    let default_name = if !st.file_path.trim().is_empty() {
+        std::path::Path::new(st.file_path.trim())
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("{}.toml", p.id))
+    } else {
+        format!("{}.toml", p.id)
+    };
+    let Some(path) = rfd::FileDialog::new()
+        .set_title(trfb(
+            lang,
+            "desktopApp.pipeline.exportTitle",
+            "导出管线 TOML",
+            &[],
+        ))
+        .add_filter("TOML", &["toml"])
+        .set_file_name(&default_name)
+        .save_file()
+    else {
+        return;
+    };
+    match toml_serde::pipeline_to_toml(&p) {
+        Ok(text) => match std::fs::write(&path, text) {
+            Ok(()) => {
+                st.validation_msg = Some(trfb(
+                    lang,
+                    "desktopApp.pipeline.exportDone",
+                    "已导出: {{path}}",
+                    &[("path", &path.to_string_lossy())],
+                ));
+                st.validation_ok = true;
+            }
+            Err(e) => {
+                st.validation_msg = Some(trfb(
+                    lang,
+                    "desktopApp.pipeline.exportFailed",
+                    "导出失败: {{detail}}",
+                    &[("detail", &e.to_string())],
+                ));
+                st.validation_ok = false;
+            }
+        },
+        Err(e) => {
+            st.validation_msg = Some(trfb(
+                lang,
+                "desktopApp.pipeline.saveSerializeFailed",
+                "序列化失败: {{detail}}",
+                &[("detail", &e)],
+            ));
+            st.validation_ok = false;
+        }
+    }
+}
+
+/// 导入注册：选 TOML → 解析校验 → 复制进 config/pipelines/（文件名冲突
+/// 自动改名并提示）→ 加载注册后的库条目。
+fn import_register(st: &mut VizState, lang: &str) {
+    let Some(src) = rfd::FileDialog::new()
+        .set_title(trfb(
+            lang,
+            "desktopApp.pipeline.importTitle",
+            "选择要导入的管线 TOML",
+            &[],
+        ))
+        .add_filter("TOML", &["toml"])
+        .pick_file()
+    else {
+        return;
+    };
+    // 解析校验：只有合法管线 TOML 才注册（对齐 WebUI 导入校验语义）
+    if let Err(e) = Pipeline::from_toml(&src) {
+        st.validation_msg = Some(trfb(
+            lang,
+            "desktopApp.pipeline.importFailed",
+            "导入失败: {{detail}}",
+            &[("detail", &e.to_string())],
+        ));
+        st.validation_ok = false;
+        return;
+    }
+    let dir = library::pipeline_library_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        st.validation_msg = Some(trfb(
+            lang,
+            "desktopApp.pipeline.importFailed",
+            "导入失败: {{detail}}",
+            &[("detail", &e.to_string())],
+        ));
+        st.validation_ok = false;
+        return;
+    }
+    let raw_stem = src
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "pipeline".to_string());
+    let sanitized = library::sanitize_library_file_name(&raw_stem);
+    let final_name = library::unique_library_file_name(&sanitized, &library::existing_stems(&dir));
+    let dest = dir.join(format!("{final_name}.toml"));
+    match std::fs::copy(&src, &dest) {
+        Ok(_) => {
+            let conflict_note = if final_name != sanitized {
+                format!(
+                    " ({})",
+                    trfb(
+                        lang,
+                        "desktopApp.pipeline.saveAsConflictShort",
+                        "重名已改名为 {{name}}.toml",
+                        &[("name", &final_name)],
+                    )
+                )
+            } else {
+                String::new()
+            };
+            st.validation_msg = Some(format!(
+                "{}{}",
+                trfb(
+                    lang,
+                    "desktopApp.pipeline.importDone",
+                    "已导入注册: {{path}}",
+                    &[("path", &dest.to_string_lossy())],
+                ),
+                conflict_note
+            ));
+            st.validation_ok = true;
+            load_library_entry(st, lang, &dest);
+        }
+        Err(e) => {
+            st.validation_msg = Some(trfb(
+                lang,
+                "desktopApp.pipeline.importFailed",
+                "导入失败: {{detail}}",
+                &[("detail", &e.to_string())],
+            ));
+            st.validation_ok = false;
+        }
+    }
+}
+
+/// 库删除（确认后执行）：shipped 双保险拦截；删除当前文件时清指向并
+/// 将内存内容置为未保存（避免静默丢失）。
+fn delete_library_entry(st: &mut VizState, lang: &str, path: &std::path::Path) {
+    let name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if library::is_shipped_stem(&name) {
+        st.validation_msg = Some(trfb(
+            lang,
+            "desktopApp.pipeline.deleteShipped",
+            "内置管线不可删除",
+            &[],
+        ));
+        st.validation_ok = false;
+        return;
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            if !st.file_path.is_empty() && std::path::Path::new(&st.file_path) == path {
+                st.file_path.clear();
+                st.dirty = true;
+            }
+            st.validation_msg = Some(trfb(
+                lang,
+                "desktopApp.pipeline.deleteDone",
+                "已删除: {{name}}",
+                &[("name", &name)],
+            ));
+            st.validation_ok = true;
+        }
+        Err(e) => {
+            st.validation_msg = Some(trfb(
+                lang,
+                "desktopApp.pipeline.deleteFailed",
+                "删除失败: {{detail}}",
+                &[("detail", &e.to_string())],
+            ));
+            st.validation_ok = false;
+        }
     }
 }
 
