@@ -38,7 +38,7 @@ pub enum AutoStartError {
     ModuleNotFound(String),
     /// 模块存在但清单缺失/无效 → 500
     InvalidManifest(String),
-    /// 默认模型未就绪（目录缺失）→ 409（与手动启动端点语义一致）
+    /// 激活变体模型未就绪（目录缺失）→ 409（与手动启动端点语义一致）
     ModelNotReady {
         module_id: String,
         model: String,
@@ -64,7 +64,7 @@ impl std::fmt::Display for AutoStartError {
                 write!(f, "module '{id}' has no valid manifest")
             }
             Self::ModelNotReady { module_id, model } => {
-                write!(f, "default model '{model}' of module '{module_id}' is not ready")
+                write!(f, "active model '{model}' of module '{module_id}' is not ready")
             }
             Self::VenvPrepFailed(detail) => {
                 write!(f, "venv preparation failed: {detail}")
@@ -175,26 +175,29 @@ async fn start_via_existing_path(
     module_id: &str,
     manifest: &ModuleManifest,
 ) -> Result<(), AutoStartError> {
-    // 1. 模型前置检查（与手动启动端点同语义：default/首个模型缺失 → 拒绝）
+    // 1. 模型前置检查（与手动启动端点同语义：激活变体缺失 → 拒绝）。
+    //    F1 修复：变体选择经 [`super::active_model_decl`] 三级回退（config
+    //    active_models → manifest default → 首个）与手动启动共用唯一真源；
+    //    旧版死取 default/首个，默认变体缺失 + 活跃变体就绪时误报 409。
     if !manifest.models.is_empty() {
-        let mgr = {
+        let (mgr, active) = {
             let config = state.config.read().await;
-            ep_core::model::ModelManager::new(&config.models, &state.root)
+            let active = super::active_model_decl(&config, manifest)
+                .map(|m| (m.id.clone(), m.name.clone()));
+            (
+                ep_core::model::ModelManager::new(&config.models, &state.root),
+                active,
+            )
         };
         let statuses = mgr.check_model_status(module_id, manifest);
-        if let Some(model) = manifest
-            .models
-            .iter()
-            .find(|m| m.default)
-            .or(manifest.models.first())
-        {
+        if let Some((active_id, active_name)) = active {
             if matches!(
-                statuses.get(&model.id),
+                statuses.get(&active_id),
                 Some(ep_core::model::ModelStatus::Missing)
             ) {
                 return Err(AutoStartError::ModelNotReady {
                     module_id: module_id.to_string(),
-                    model: model.name.clone(),
+                    model: active_name,
                 });
             }
         }
@@ -456,6 +459,22 @@ output_type = "file"
         ))
     }
 
+    /// 同 [`test_state`]，但允许注入自定义配置（F1：active_models 场景）
+    fn test_state_with_config(
+        root: std::path::PathBuf,
+        config: AppConfig,
+        modules: Vec<DiscoveredModule>,
+        port_range: (u16, u16),
+    ) -> Arc<AppState> {
+        Arc::new(AppState::new(
+            root,
+            config,
+            vec![],
+            modules,
+            PortManager::new(port_range.0, port_range.1),
+        ))
+    }
+
     /// 在指定端口启动一个最小 HTTP 服务（任意请求一律 200），模拟模块的
     /// /health 端点，返回任务句柄。
     ///
@@ -634,6 +653,104 @@ default = true
             .get_instance("model-mod")
             .is_none());
         assert!(state.port_manager.read().await.get_port("model-mod").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── 4b. F1：默认变体缺失 + active_models 活跃变体就绪 → 放行拉起 ──────
+
+    /// 双变体模型声明：default=large（目录保持缺失）+ 非 default small
+    fn f1_two_variant_models_toml() -> &'static str {
+        r#"
+[[models]]
+id = "small"
+name = "测试小变体"
+source = "url"
+url = "auto"
+target_dir = "f1-small"
+default = false
+
+[[models]]
+id = "large"
+name = "测试大变体"
+source = "url"
+url = "auto"
+target_dir = "f1-large"
+default = true
+"#
+    }
+
+    #[tokio::test]
+    async fn ensure_active_variant_starts_when_default_missing() {
+        // F1 主场景（复现第二轮 E2E qwen3-tts 409）：default=large 未下载，
+        // active_models 指向 small 且已就绪 → 必须放行拉起而非 409。
+        let root = unique_root("f1-active");
+        let toml = test_manifest_toml("f1-mod", 30, f1_two_variant_models_toml());
+        let mut config = AppConfig::default();
+        config
+            .active_models
+            .insert("f1-mod".to_string(), "small".to_string());
+        let state = test_state_with_config(
+            root.clone(),
+            config,
+            vec![module_from_toml(&root, &toml)],
+            (39241, 39250),
+        );
+        // 活跃变体 small Ready（默认 cache_dir=models）；large 目录保持缺失
+        let small_dir = root.join("models").join("f1-small");
+        std::fs::create_dir_all(&small_dir).unwrap();
+        std::fs::write(small_dir.join("model.bin"), b"weights").unwrap();
+
+        // 先 allocate 再起 mock（序列约束见 spawn_mock_health_server_on 注释）
+        let port = state
+            .port_manager
+            .write()
+            .await
+            .allocate("f1-mod")
+            .expect("预分配端口");
+        let server = spawn_mock_health_server_on(port).await;
+
+        ensure_module_running_with_timeout(&state, "f1-mod", Duration::from_secs(15))
+            .await
+            .expect("活跃变体就绪时，默认变体缺失不得误报 409（F1）");
+        assert_eq!(
+            state.process_manager.read().await.get_status("f1-mod"),
+            Some(&ServiceStatus::Running)
+        );
+
+        cleanup(&state, "f1-mod", Some(server)).await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn ensure_default_missing_without_active_config_still_errors() {
+        // F1 对照面：无 active_models 配置时回退 default=large，其缺失 →
+        // 仍须 409 ModelNotReady（不得因修复而放行真正未就绪的模块）。
+        let root = unique_root("f1-default");
+        let toml = test_manifest_toml("f1d-mod", 30, f1_two_variant_models_toml());
+        // 仅小变体就绪，但无配置 → 预检应落在缺失的 default 大变体上
+        let small_dir = root.join("models").join("f1-small");
+        std::fs::create_dir_all(&small_dir).unwrap();
+        std::fs::write(small_dir.join("model.bin"), b"weights").unwrap();
+        let state = test_state(
+            root.clone(),
+            vec![module_from_toml(&root, &toml)],
+            (39251, 39260),
+        );
+
+        let err = ensure_module_running_with_timeout(&state, "f1d-mod", Duration::from_secs(5))
+            .await
+            .expect_err("默认变体缺失且无活跃配置时必须失败");
+        assert!(
+            matches!(&err, AutoStartError::ModelNotReady { model, .. } if model == "测试大变体"),
+            "unexpected error: {err}"
+        );
+        assert!(state
+            .process_manager
+            .read()
+            .await
+            .get_instance("f1d-mod")
+            .is_none());
+        assert!(state.port_manager.read().await.get_port("f1d-mod").is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
