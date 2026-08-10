@@ -126,26 +126,29 @@ impl Palette {
             border_glow: egui::Color32::from_rgb(228, 228, 231),
             border_glow_strong: egui::Color32::from_rgb(148, 163, 184),
             surface_glass: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 224),
-            grid_dot: egui::Color32::from_rgba_unmultiplied(15, 23, 42, 20),
+            // 画布点阵：双端统一口径 slate-500 @0.16
+            grid_dot: egui::Color32::from_rgba_unmultiplied(100, 116, 139, 41), // #64748B @0.16
             text: egui::Color32::from_rgb(9, 9, 11),
             text_dim: egui::Color32::from_rgb(113, 113, 122),
             text_faint: egui::Color32::from_rgb(161, 161, 170),
-            // 浅色下主色加深保证白底对比度
+            // 浅色下主色加深以保证白底对比度
             primary: egui::Color32::from_rgb(2, 132, 199),   // #0284C7
             primary_hover: egui::Color32::from_rgb(3, 105, 161), // #0369A1
             accent_to: egui::Color32::from_rgb(79, 70, 229), // #4F46E5
-            primary_glow: egui::Color32::TRANSPARENT,        // 浅色关闭发光
+            // 浅色辉光弱化档（双端统一口径）：深色值 alpha ×0.4，不再全透明
+            primary_glow: egui::Color32::from_rgba_unmultiplied(56, 189, 248, 36), // 0.35×0.4≈0.14
             status_ready: egui::Color32::from_rgb(22, 163, 74),  // #16A34A
             status_running: egui::Color32::from_rgb(8, 147, 178), // #0891B2
             status_error: egui::Color32::from_rgb(225, 29, 72), // #E11D48
             status_stopped: egui::Color32::from_rgb(113, 113, 122),
-            status_glow_running: egui::Color32::TRANSPARENT, // 浅色关闭发光
+            status_glow_running: egui::Color32::from_rgba_unmultiplied(34, 211, 238, 41), // 0.4×0.4≈0.16
             danger: egui::Color32::from_rgb(239, 68, 68),
             success: egui::Color32::from_rgb(22, 163, 74),
             warning: egui::Color32::from_rgb(202, 138, 4),
-            info: egui::Color32::from_rgb(2, 132, 199),
+            // starting / notready：双端统一口径，与深色同值（#38BDF8 / #475569）
+            info: egui::Color32::from_rgb(56, 189, 248),
             neutral: egui::Color32::from_rgb(113, 113, 122),
-            notready: egui::Color32::from_rgb(161, 161, 170),
+            notready: egui::Color32::from_rgb(71, 85, 105),
         }
     }
 
@@ -290,8 +293,21 @@ mod tests {
         let l = Palette::light();
         assert_ne!(d.bg_base, l.bg_base);
         assert_ne!(d.bg_card, l.bg_card);
-        // 浅色主题关闭发光（辉光弱化为透明，§10.5）
-        assert_eq!(l.primary_glow, egui::Color32::TRANSPARENT);
-        assert_eq!(l.status_glow_running, egui::Color32::TRANSPARENT);
+        // 浅色辉光弱化档（双端统一口径）：深色值 alpha ×0.4，不再全透明
+        assert_eq!(
+            l.primary_glow,
+            egui::Color32::from_rgba_unmultiplied(56, 189, 248, 36)
+        );
+        assert_eq!(
+            l.status_glow_running,
+            egui::Color32::from_rgba_unmultiplied(34, 211, 238, 41)
+        );
+        // grid-dot 浅色统一 slate-500@0.16；starting/notready 与深色同值
+        assert_eq!(
+            l.grid_dot,
+            egui::Color32::from_rgba_unmultiplied(100, 116, 139, 41)
+        );
+        assert_eq!(l.info, egui::Color32::from_rgb(0x38, 0xBD, 0xF8));
+        assert_eq!(l.notready, egui::Color32::from_rgb(0x47, 0x55, 0x69));
     }
 }

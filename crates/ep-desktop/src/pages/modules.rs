@@ -472,6 +472,7 @@ fn pack_stage_label(lang: &str, stage: &str) -> String {
 fn cache_dir_row(ui: &mut egui::Ui, lang: &str, pal: &Palette, config: &AppConfig) {
     let root = ep_core::config::resolve_root();
     let cache_dir = config.resolve_model_cache_dir(&root);
+    let cache_dir_text = cache_dir.display().to_string();
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new(format!(
@@ -480,14 +481,17 @@ fn cache_dir_row(ui: &mut egui::Ui, lang: &str, pal: &Palette, config: &AppConfi
             ))
             .color(pal.text_dim),
         );
+        // 长路径截断 + hover 全路径（P1 修复：horizontal 内 mono Label 不再溢出）
         ui.add(
             egui::Label::new(
-                egui::RichText::new(cache_dir.display().to_string())
+                egui::RichText::new(cache_dir_text.as_str())
                     .monospace()
                     .color(pal.text_dim),
             )
+            .wrap_mode(egui::TextWrapMode::Truncate)
             .selectable(true),
-        );
+        )
+        .on_hover_text(cache_dir_text.as_str());
         if ui
             .add(subtle_button(
                 pal,

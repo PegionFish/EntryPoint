@@ -158,6 +158,11 @@ fn palette_entry(
         );
     }
     let resp = resp.on_hover_text(tip);
+    // a11y：自绘 palette 行补 widget_info（标签名 + Button 角色，对齐 canvas.rs D-4）
+    let a11y_label = label.to_string();
+    resp.widget_info(move || {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, a11y_label.clone())
+    });
     // 点击添加（既有行为）
     if resp.clicked() {
         add_here(st);

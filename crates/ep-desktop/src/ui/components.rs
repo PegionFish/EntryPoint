@@ -71,13 +71,14 @@ pub fn card_frame_hover(pal: &Palette, hovered: bool) -> egui::Frame {
 
 /// 卡片容器 Frame（hover 感知 + 自定义内边距）：内容密度分级（W4-B1）——
 /// 稀疏区块 16px、密集区块 24px，其余观感与 [`card_frame_hover`] 一致。
+/// 浅色主题下辉光为弱化档（令牌已在 Palette 层降 alpha，§10.5 统一口径）。
 pub fn card_frame_padding(pal: &Palette, hovered: bool, padding: u16) -> egui::Frame {
     let mut f = egui::Frame::new()
         .fill(pal.bg_card)
         .stroke(card_stroke(pal, hovered))
         .corner_radius(egui::CornerRadius::same(CARD_ROUNDING))
         .inner_margin(egui::Margin::same(padding as i8));
-    if hovered && pal.dark {
+    if hovered {
         f = f.shadow(egui::epaint::Shadow {
             offset: [0, 0],
             blur: 12,
@@ -110,7 +111,7 @@ pub fn card_frame_active(
         .stroke(stroke)
         .corner_radius(egui::CornerRadius::same(CARD_ROUNDING))
         .inner_margin(egui::Margin::same(CARD_PADDING as i8));
-    if let (Some(color), true) = (glow_shadow, pal.dark) {
+    if let Some(color) = glow_shadow {
         f = f.shadow(egui::epaint::Shadow {
             offset: [0, 0],
             blur: 16,
@@ -307,7 +308,11 @@ pub fn switch_row(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
+                // 开关本体占位（右对齐）：先预留 34px + 间距，剩余宽度即标签列上限，
+                // 防止超长标签把开关挤出卡片（P2 修复）
+                let label_max = (ui.available_width() - 44.0).max(120.0);
                 ui.vertical(|ui| {
+                    ui.set_max_width(label_max);
                     ui.label(egui::RichText::new(label).color(pal.text));
                     if !description.is_empty() {
                         ui.label(
@@ -324,6 +329,17 @@ pub fn switch_row(
     let response = ui
         .interact(inner.response.rect, id, egui::Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand);
+    // a11y：行级 checkbox 角色 + 标签名 + 选中态（对齐 canvas.rs widget_info 模式）
+    let a11y_label = label.to_string();
+    let a11y_checked = *value;
+    response.widget_info(move || {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Checkbox,
+            true,
+            a11y_checked,
+            a11y_label.clone(),
+        )
+    });
     if response.clicked() {
         *value = !*value;
     }
@@ -733,7 +749,7 @@ pub fn primary_button(pal: &Palette, text: impl Into<egui::WidgetText>) -> egui:
 /// 带辉光的主操作按钮（§3.4 primary：填充 + 中档发光）。
 ///
 /// egui 0.31 的 Button 无 shadow 能力，以透明 Frame 包裹外发辉光；
-/// 浅色主题 primary_glow 为透明，自动退化为普通主按钮（§10.5）。
+/// 浅色主题 primary_glow 为弱化档（深色值 ×0.4，双端统一口径）。
 pub fn primary_button_with_glow(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -868,7 +884,8 @@ mod tests {
         assert_ne!(card_stroke(&l, true).color, l.border_glow);
     }
 
-    /// 活跃态卡片（§7.1）：自定义描边原样透传；浅色主题不附辉光阴影。
+    /// 活跃态卡片（§7.1）：自定义描边原样透传；浅色主题附弱化档辉光阴影
+    /// （双端统一口径：浅色辉光不再全透明，取深色值 ×0.4 alpha）。
     #[test]
     fn card_frame_active_stroke_and_shadow() {
         let pal = Palette::dark();
@@ -876,8 +893,13 @@ mod tests {
         let f = card_frame_active(&pal, stroke, Some(pal.status_glow_running));
         assert_eq!(f.stroke, stroke);
         assert!(f.shadow.color != egui::Color32::TRANSPARENT, "深色应附辉光阴影");
-        let light = card_frame_active(&Palette::light(), stroke, Some(pal.status_glow_running));
-        assert_eq!(light.shadow.color, egui::Color32::TRANSPARENT, "浅色关闭辉光");
+        let lp = Palette::light();
+        let light = card_frame_active(&lp, stroke, Some(lp.status_glow_running));
+        assert_eq!(
+            light.shadow.color, lp.status_glow_running,
+            "浅色附弱化档辉光（不再全透明）"
+        );
+        assert!(light.shadow.color.a() < pal.status_glow_running.a(), "弱化档 alpha 低于深色");
     }
 
     /// 半透明派生色：RGB 基本不变、alpha 精确替换（from_rgba_unmultiplied
