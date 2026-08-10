@@ -286,8 +286,12 @@ fn task_card(
         breath,
         |ui| {
         // 行1：管线名 + 状态徽章 + 队列位置（queued）+ 任务 ID（右对齐 mono）
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(&task.pipeline_name).strong());
+        // horizontal_wrapped：超长管线名自动换行，不再溢出卡片（防御性修复）
+        ui.horizontal_wrapped(|ui| {
+            ui.add(
+                egui::Label::new(egui::RichText::new(&task.pipeline_name).strong())
+                    .wrap_mode(egui::TextWrapMode::Wrap),
+            );
             badge(ui, pal, color, label);
             if let Some(pos) = queue_positions.get(&task.id) {
                 let pos_s = pos.to_string();
@@ -473,10 +477,14 @@ fn artifacts_section(
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     ui.label(egui::RichText::new("📄").color(pal.text_faint));
-                    ui.label(
-                        egui::RichText::new(&artifact.rel_display)
-                            .monospace()
-                            .color(pal.text),
+                    // 长相对路径截断 + hover 全路径（P1 修复：horizontal 内不再溢出）
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&artifact.rel_display)
+                                .monospace()
+                                .color(pal.text),
+                        )
+                        .wrap_mode(egui::TextWrapMode::Truncate),
                     )
                     .on_hover_text(artifact.path.to_string_lossy());
                     ui.label(

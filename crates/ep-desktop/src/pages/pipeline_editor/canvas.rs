@@ -36,6 +36,11 @@ pub(super) fn draw_canvas(
     data: &ModuleData,
 ) {
     let (canvas_rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+    // a11y：画布主区补 widget_info（无名 Custom → 带标签的画布区域，D-4 同源）
+    let canvas_a11y = trfb(lang, "desktopApp.pipeline.canvasA11y", "管线画布", &[]);
+    resp.widget_info(move || {
+        egui::WidgetInfo::labeled(egui::WidgetType::Other, true, canvas_a11y.clone())
+    });
     let origin = canvas_rect.min;
 
     // overlay 几何（缩放控件左下 / MiniMap 右下）——先算后用于交互门控

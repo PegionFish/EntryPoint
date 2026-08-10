@@ -13,8 +13,8 @@ use crate::ui::{
     section_title, stat_cards, status_badge, Palette, StatItem,
 };
 
-/// 页面内容四周的留白（px）
-const PAGE_MARGIN: f32 = 18.0;
+/// 页面内容四周的留白（px，对齐 §3.3 的 24px）
+const PAGE_MARGIN: f32 = 24.0;
 /// 区块之间的垂直间距（px）
 const SECTION_GAP: f32 = 20.0;
 

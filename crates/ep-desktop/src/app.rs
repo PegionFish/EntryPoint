@@ -1155,9 +1155,10 @@ fn nav_item(
     }
 
     // 无障碍名称（AX/UIA）：自绘导航行无 label 时为无名 "Custom" 节点，
-    // 补与导航文案一致的 i18n 文本，读屏器可区分五个页面入口
-    ui.ctx().accesskit_node_builder(response.id, |node| {
-        node.set_label(label);
+    // 补与导航文案一致的 i18n 页面名标签（widget_info 模式对齐 canvas.rs D-4）
+    let a11y_label = label.to_string();
+    response.widget_info(move || {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, active, a11y_label.clone())
     });
 
     if compact {
