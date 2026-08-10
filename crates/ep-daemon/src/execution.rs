@@ -92,7 +92,10 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
-use ep_core::pipeline::dag::{NodeKind, Pipeline, PipelineNode, ValidationError};
+use ep_core::module::manifest::CapabilityDecl;
+use ep_core::pipeline::dag::{
+    direct_output_extension, NodeKind, Pipeline, PipelineNode, ValidationError,
+};
 use ep_core::pipeline::runner::TaskDetail;
 use ep_core::pipeline::vram;
 use ep_core::pipeline::PipelineRunnerImpl;
@@ -1410,8 +1413,9 @@ pub async fn submit_direct(
     params: Value,
     input_path: PathBuf,
 ) -> Result<String, SubmitError> {
-    // 1. 模块 + manifest capability 校验（快速失败，不占闸门）
-    let has_capability = {
+    // 1. 模块 + manifest capability 校验（快速失败，不占闸门）；
+    //    同时取回能力声明供产物扩展名推导（F2：跨格式能力不再误标）
+    let capability_decl = {
         let modules = state.modules.read().await;
         let module = modules
             .iter()
@@ -1427,14 +1431,15 @@ pub async fn submit_direct(
             .interface
             .capabilities
             .iter()
-            .any(|c| c.name == capability)
+            .find(|c| c.name == capability)
+            .cloned()
     };
-    if !has_capability {
+    let Some(capability_decl) = capability_decl else {
         return Err(SubmitError::CapabilityNotFound(
             module_id.to_string(),
             capability.to_string(),
         ));
-    }
+    };
 
     // 2. 输入文件存在性
     if !input_path.is_file() {
@@ -1442,7 +1447,13 @@ pub async fn submit_direct(
     }
 
     // 3. 退化三节点 DAG → 同一提交路径（闸门/注册表/WS/产物全套复用）
-    let pipeline = build_direct_pipeline(module_id, capability, params, &input_path);
+    let pipeline = build_direct_pipeline(
+        module_id,
+        capability,
+        params,
+        &input_path,
+        Some(&capability_decl),
+    );
     submit_pipeline(state, pipeline, None).await
 }
 
@@ -1450,15 +1461,17 @@ pub async fn submit_direct(
 ///
 /// 输出节点不带 `path` 参数 → 引擎按 `extension` 参数派生
 /// `{work_dir}/output_output.<ext>`，随产物归集进入任务目录可下载
-///（§5.3 结果预览/下载）。`extension` 取输入文件扩展名（直跑为单文件
-/// 处理，产物与输入同族格式；D-7 修复，与桌面端 build_direct_pipeline
-/// 同口径）。
+///（§5.3 结果预览/下载）。`extension` 经 ep-core 公共推导源
+/// [`direct_output_extension`] 三级优先级得出（F2 修复：① 请求
+/// `output_format` → ② capability 跨格式语义映射 → ③ 输入扩展名回退，
+/// 与桌面端 build_direct_pipeline 同口径）。
 #[allow(dead_code)] // 经 submit_direct 消费（B4 接线前测试直接调用）
 pub fn build_direct_pipeline(
     module_id: &str,
     capability: &str,
     params: Value,
     input_path: &Path,
+    capability_decl: Option<&CapabilityDecl>,
 ) -> Pipeline {
     let make_node = |id: &str, kind: NodeKind, label: &str, params: Value| PipelineNode {
         id: id.to_string(),
@@ -1469,12 +1482,8 @@ pub fn build_direct_pipeline(
         timeout_secs: None,
         retry_count: None,
     };
-    // 输出扩展名：输入文件扩展名（与 executor file_output 同口径的字符过滤）
-    let output_params = input_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>())
-        .filter(|e| !e.is_empty())
+    // 输出扩展名：三级优先级推导（含与 executor file_output 同口径的字符过滤）
+    let output_params = direct_output_extension(&params, capability_decl, input_path)
         .map(|ext| json!({ "extension": ext }))
         .unwrap_or_else(|| json!({}));
     Pipeline {
@@ -1744,6 +1753,7 @@ mod tests {
 
     use ep_core::config::AppConfig;
     use ep_core::port::PortManager;
+    use ep_core::types::DataType;
 
     static SEQ: AtomicUsize = AtomicUsize::new(0);
 
@@ -2815,6 +2825,7 @@ builtin = "file_output"
             "denoise",
             serde_json::json!({ "atten_lim_db": 60 }),
             Path::new("/tmp/in.wav"),
+            None,
         );
         assert_eq!(pipeline.id, "direct/deep-filter", "B4 契约 id 形状");
         assert_eq!(pipeline.nodes.len(), 3);
@@ -2832,7 +2843,7 @@ builtin = "file_output"
             pipeline.nodes[0].params["path"],
             "/tmp/in.wav"
         );
-        // D-7：file_output 携带 extension（取输入扩展名），不再落盘 .out
+        // D-7：file_output 携带 extension（无声明时取输入扩展名），不再落盘 .out
         assert_eq!(pipeline.nodes[2].params["extension"], "wav");
         assert_eq!(
             pipeline.nodes[1].kind,
@@ -2855,6 +2866,77 @@ builtin = "file_output"
         assert_eq!(pipeline.edges[0].to, ("run".to_string(), "input".to_string()));
         assert_eq!(pipeline.edges[1].from, ("run".to_string(), "output".to_string()));
         assert_eq!(pipeline.edges[1].to, ("output".to_string(), "input".to_string()));
+    }
+
+    // ── 18b. F2：直跑产物扩展名接线（带 capability 声明的三级推导） ────────
+
+    /// 构造测试 capability 声明（仅 input/output 类型参与推导）
+    fn cap_decl(input: DataType, output: DataType) -> CapabilityDecl {
+        CapabilityDecl {
+            name: "test".to_string(),
+            description: String::new(),
+            input_type: input,
+            output_type: output,
+            max_file_size_mb: None,
+            supports_batch: false,
+            params: None,
+        }
+    }
+
+    #[test]
+    fn test_build_direct_pipeline_cross_format_extensions() {
+        // TTS text→audio：txt 输入产物标 .wav（F2 主场景，不再误标 .txt）
+        let tts = cap_decl(DataType::Text, DataType::Audio);
+        let p = build_direct_pipeline(
+            "qwen3-tts",
+            "synthesize",
+            serde_json::json!({ "voice": "default" }),
+            Path::new("/tmp/tts_input.txt"),
+            Some(&tts),
+        );
+        assert_eq!(p.nodes[2].params["extension"], "wav");
+
+        // faster-whisper audio→json：显式 output_format=srt → .srt
+        let asr = cap_decl(DataType::Audio, DataType::Json);
+        let p = build_direct_pipeline(
+            "faster-whisper",
+            "transcribe",
+            serde_json::json!({ "output_format": "srt" }),
+            Path::new("/tmp/speech.wav"),
+            Some(&asr),
+        );
+        assert_eq!(p.nodes[2].params["extension"], "srt");
+        // 同能力不传 output_format → 语义映射 json
+        let p = build_direct_pipeline(
+            "faster-whisper",
+            "transcribe",
+            serde_json::json!({}),
+            Path::new("/tmp/speech.wav"),
+            Some(&asr),
+        );
+        assert_eq!(p.nodes[2].params["extension"], "json");
+
+        // rembg image→image 同格式回归：产物仍随输入 .png，不被映射改写
+        let rembg = cap_decl(DataType::Image, DataType::Image);
+        let p = build_direct_pipeline(
+            "rembg",
+            "remove_bg",
+            serde_json::json!({}),
+            Path::new("/tmp/photo.png"),
+            Some(&rembg),
+        );
+        assert_eq!(p.nodes[2].params["extension"], "png");
+
+        // deep-filter audio→audio 同格式回归：输入 .flac 产物仍 .flac
+        let df = cap_decl(DataType::Audio, DataType::Audio);
+        let p = build_direct_pipeline(
+            "deep-filter",
+            "denoise",
+            serde_json::json!({}),
+            Path::new("/tmp/noisy.flac"),
+            Some(&df),
+        );
+        assert_eq!(p.nodes[2].params["extension"], "flac");
     }
 
     // ── 19. 直跑错误路径：模块不存在 / capability 不存在 / 输入缺失 ─────────
