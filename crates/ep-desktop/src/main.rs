@@ -7,9 +7,9 @@ use std::time::Duration;
 use chrono::Utc;
 use ep_core::config::AppConfig;
 use ep_core::model::{DownloadHandle, ModelManager, ModelStatus};
-use ep_core::module::manifest::{ModuleManifest, ParamSchema, RuntimeType};
+use ep_core::module::manifest::{CapabilityDecl, ModuleManifest, ParamSchema, RuntimeType};
 use ep_core::module::{DiscoveredModule, ModelDecl, ModelSource};
-use ep_core::pipeline::dag::{Edge, NodeKind, Pipeline, PipelineNode};
+use ep_core::pipeline::dag::{direct_output_extension, Edge, NodeKind, Pipeline, PipelineNode};
 use ep_core::pipeline::runner::TaskDetail;
 use ep_core::pipeline::PipelineRunnerImpl;
 use ep_core::port::PortManager;
@@ -303,14 +303,17 @@ fn record_to_summary(r: &TaskRecord) -> ep_core::pipeline::runner::TaskSummary {
 ///
 /// 输出节点不带 `path` 参数 → 引擎按 `extension` 参数派生
 /// `{work_dir}/output_output.<ext>`，随产物归集进入任务目录。
-/// **D-7 修复**：`extension` 取输入文件扩展名（直跑为单文件处理，产物
-/// 与输入同族格式；如 remove_bg 输入 .png → 产物 .png）。不传时引擎
-/// 默认 `.out`，导致产物被 Notepad 打开。
+/// **F2 修复**：`extension` 经 ep-core 公共推导源 [`direct_output_extension`]
+/// 三级优先级得出（① 请求 `output_format` → ② capability 跨格式语义映射，
+/// 如 TTS txt 输入 → `.wav` → ③ 输入扩展名回退，rembg 等同格式能力保持
+/// 输入扩展名；D-7 现行为不回归）。不传时引擎默认 `.out`，导致产物被
+/// Notepad 打开。
 fn build_direct_pipeline(
     module_id: &str,
     capability: &str,
     params: serde_json::Value,
     input_path: &Path,
+    capability_decl: Option<&CapabilityDecl>,
 ) -> Pipeline {
     let make_node = |id: &str, kind: NodeKind, label: &str, params: serde_json::Value| {
         PipelineNode {
@@ -323,12 +326,8 @@ fn build_direct_pipeline(
             retry_count: None,
         }
     };
-    // 输出扩展名：输入文件扩展名（与 executor file_output 同口径的字符过滤）
-    let output_params = input_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>())
-        .filter(|e| !e.is_empty())
+    // 输出扩展名：三级优先级推导（含与 executor file_output 同口径的字符过滤）
+    let output_params = direct_output_extension(&params, capability_decl, input_path)
         .map(|ext| serde_json::json!({ "extension": ext }))
         .unwrap_or_else(|| serde_json::json!({}));
     Pipeline {
@@ -2516,6 +2515,7 @@ async fn background_loop(
                                     &capability,
                                     value,
                                     &input_path,
+                                    Some(&cap),
                                 );
                                 if let Some(task_id) = submit_pipeline_task(
                                     &tx,
@@ -2745,6 +2745,7 @@ mod tests {
             "transcribe",
             serde_json::json!({ "beam_size": 5 }),
             Path::new("/data/in.mp3"),
+            None,
         );
         assert_eq!(pipeline.id, "direct/faster-whisper");
         assert_eq!(pipeline.nodes.len(), 3);
@@ -2774,8 +2775,8 @@ mod tests {
             other => panic!("run node must be module, got {other:?}"),
         }
         assert_eq!(pipeline.nodes[1].params["beam_size"], 5);
-        // output：file_output 无 path（引擎派生输出名）；D-7：extension 取
-        // 输入扩展名（in.mp3 → mp3），不再落盘 .out
+        // output：file_output 无 path（引擎派生输出名）；无声明时 D-7 现行为：
+        // extension 取输入扩展名（in.mp3 → mp3），不再落盘 .out
         match &pipeline.nodes[2].kind {
             NodeKind::Builtin { builtin } => assert_eq!(builtin, "file_output"),
             other => panic!("output node must be builtin file_output, got {other:?}"),
@@ -2790,10 +2791,60 @@ mod tests {
             "c",
             serde_json::json!({}),
             Path::new("/data/noext"),
+            None,
         );
         assert!(no_ext.nodes[2].params.get("extension").is_none());
         // 退化 DAG 恒通过校验（含 file_input 要求）
         assert!(pipeline.validate().is_ok());
+    }
+
+    // ── F2：直跑产物扩展名跨格式推导（与 daemon 同口径，ep-core 公共源） ──
+
+    #[test]
+    fn direct_pipeline_cross_format_extension() {
+        use ep_core::types::DataType;
+        let decl = |input: DataType, output: DataType| CapabilityDecl {
+            name: "test".to_string(),
+            description: String::new(),
+            input_type: input,
+            output_type: output,
+            max_file_size_mb: None,
+            supports_batch: false,
+            params: None,
+        };
+
+        // TTS text→audio：txt 输入产物标 .wav（不再误标 .txt）
+        let tts = decl(DataType::Text, DataType::Audio);
+        let p = build_direct_pipeline(
+            "qwen3-tts",
+            "synthesize",
+            serde_json::json!({ "voice": "default" }),
+            Path::new("/data/tts_input.txt"),
+            Some(&tts),
+        );
+        assert_eq!(p.nodes[2].params["extension"], "wav");
+
+        // faster-whisper audio→json：显式 output_format=srt → .srt
+        let asr = decl(DataType::Audio, DataType::Json);
+        let p = build_direct_pipeline(
+            "faster-whisper",
+            "transcribe",
+            serde_json::json!({ "output_format": "srt" }),
+            Path::new("/data/speech.wav"),
+            Some(&asr),
+        );
+        assert_eq!(p.nodes[2].params["extension"], "srt");
+
+        // rembg image→image 同格式回归：产物仍随输入 .png
+        let rembg = decl(DataType::Image, DataType::Image);
+        let p = build_direct_pipeline(
+            "rembg",
+            "remove_bg",
+            serde_json::json!({}),
+            Path::new("/data/photo.png"),
+            Some(&rembg),
+        );
+        assert_eq!(p.nodes[2].params["extension"], "png");
     }
 
     // ── 直跑参数类型化（schema 驱动） ───────────────────────────────────────

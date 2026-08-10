@@ -8,7 +8,8 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::config::PipelineConfig;
-use crate::types::DeviceId;
+use crate::module::manifest::CapabilityDecl;
+use crate::types::{DataType, DeviceId};
 
 // ─── 错误类型 ────────────────────────────────────────────────────────────────
 
@@ -628,6 +629,64 @@ pub fn resolve_device_soft_constraint(
             )),
         )
     }
+}
+
+/// 直跑退化 DAG `file_output` 产物扩展名推导（F2 修复：跨格式能力误标，
+/// daemon `execution::build_direct_pipeline` 与桌面端 `build_direct_pipeline`
+/// 两端共用的唯一推导源，杜绝口径漂移）。
+///
+/// 优先级：
+/// 1. 请求参数显式声明的 `output_format`（如 faster-whisper 传 `srt` → `.srt`）；
+/// 2. capability `output_type` 语义映射——仅当与 `input_type` **不同**
+///    （跨格式能力）时采用：audio→`wav` / image→`png` / text→`txt` /
+///    json→`json`；video/file 无固定扩展名，落到 3；
+/// 3. 回退输入文件扩展名（rembg/deep-filter 等同格式能力保持输入扩展名，
+///    与 D-7 修复后的现行为一致）。
+///
+/// 返回值已做与执行器 `file_output` 同口径的字符清洗（仅留 ASCII 字母数字）；
+/// 空串 → `None`（调用方不带 `extension` 参数，引擎回落 `.out`）。
+pub fn direct_output_extension(
+    params: &serde_json::Value,
+    capability: Option<&CapabilityDecl>,
+    input_path: &Path,
+) -> Option<String> {
+    fn sanitize(raw: &str) -> Option<String> {
+        let ext: String = raw
+            .trim()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect();
+        (!ext.is_empty()).then_some(ext)
+    }
+
+    // ① 请求参数显式声明的 output_format
+    if let Some(fmt) = params.get("output_format").and_then(|v| v.as_str()) {
+        if let Some(ext) = sanitize(fmt) {
+            return Some(ext);
+        }
+    }
+
+    // ② capability output_type 语义映射（仅跨格式能力生效）
+    if let Some(cap) = capability {
+        if cap.output_type != cap.input_type {
+            let mapped = match cap.output_type {
+                DataType::Audio => Some("wav"),
+                DataType::Image => Some("png"),
+                DataType::Text => Some("txt"),
+                DataType::Json => Some("json"),
+                DataType::Video | DataType::File => None,
+            };
+            if let Some(ext) = mapped {
+                return Some(ext.to_string());
+            }
+        }
+    }
+
+    // ③ 回退输入文件扩展名（同格式能力保持现行为）
+    input_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(sanitize)
 }
 
 // ─── 单元测试 ────────────────────────────────────────────────────────────────
@@ -1574,5 +1633,109 @@ position = { x = 240.5, y = -80.0 }
         let v = serde_json::to_value(&node).unwrap();
         assert_eq!(v["position"]["x"], 12.5);
         assert_eq!(v["position"]["y"], 34.0);
+    }
+
+    // ── F2：直跑产物扩展名推导（direct_output_extension 三级优先级） ──────
+
+    fn cap_decl(input: DataType, output: DataType) -> CapabilityDecl {
+        CapabilityDecl {
+            name: "test".to_string(),
+            description: String::new(),
+            input_type: input,
+            output_type: output,
+            max_file_size_mb: None,
+            supports_batch: false,
+            params: None,
+        }
+    }
+
+    #[test]
+    fn direct_output_extension_output_format_wins() {
+        // ① 请求参数 output_format 优先于一切（faster-whisper 传 srt）
+        let params = serde_json::json!({ "output_format": "srt" });
+        let cap = cap_decl(DataType::Audio, DataType::Json);
+        assert_eq!(
+            direct_output_extension(&params, Some(&cap), Path::new("/data/in.wav")),
+            Some("srt".to_string())
+        );
+        // 非字符串 / 空值不参与（回退后续优先级）
+        let empty = serde_json::json!({ "output_format": "  " });
+        assert_eq!(
+            direct_output_extension(&empty, Some(&cap), Path::new("/data/in.wav")),
+            Some("json".to_string())
+        );
+    }
+
+    #[test]
+    fn direct_output_extension_cross_format_mapping() {
+        // ② 跨格式能力语义映射：TTS text→audio → wav（F2 主场景）
+        let no_fmt = serde_json::json!({ "voice": "default" });
+        let tts = cap_decl(DataType::Text, DataType::Audio);
+        assert_eq!(
+            direct_output_extension(&no_fmt, Some(&tts), Path::new("/data/tts_input.txt")),
+            Some("wav".to_string())
+        );
+        // OCR image→json → json
+        let ocr = cap_decl(DataType::Image, DataType::Json);
+        assert_eq!(
+            direct_output_extension(&no_fmt, Some(&ocr), Path::new("/data/page.png")),
+            Some("json".to_string())
+        );
+        // audio→text → txt；json→image → png
+        let asr = cap_decl(DataType::Audio, DataType::Text);
+        assert_eq!(
+            direct_output_extension(&no_fmt, Some(&asr), Path::new("/data/a.mp3")),
+            Some("txt".to_string())
+        );
+        let gen = cap_decl(DataType::Json, DataType::Image);
+        assert_eq!(
+            direct_output_extension(&no_fmt, Some(&gen), Path::new("/data/spec.json")),
+            Some("png".to_string())
+        );
+    }
+
+    #[test]
+    fn direct_output_extension_same_format_keeps_input_ext() {
+        // ③ 同格式能力回退输入扩展名（现役 5 模块回归点）
+        let no_fmt = serde_json::json!({});
+        let rembg = cap_decl(DataType::Image, DataType::Image);
+        assert_eq!(
+            direct_output_extension(&no_fmt, Some(&rembg), Path::new("/data/photo.png")),
+            Some("png".to_string())
+        );
+        // rembg 输入 jpg 时产物仍随输入 jpg，不被映射成 png
+        assert_eq!(
+            direct_output_extension(&no_fmt, Some(&rembg), Path::new("/data/photo.jpg")),
+            Some("jpg".to_string())
+        );
+        let denoise = cap_decl(DataType::Audio, DataType::Audio);
+        assert_eq!(
+            direct_output_extension(&no_fmt, Some(&denoise), Path::new("/data/in.flac")),
+            Some("flac".to_string())
+        );
+        // video/file 跨格式无固定扩展名 → 同样回退输入扩展名
+        let split = cap_decl(DataType::Video, DataType::File);
+        assert_eq!(
+            direct_output_extension(&no_fmt, Some(&split), Path::new("/data/v.mkv")),
+            Some("mkv".to_string())
+        );
+    }
+
+    #[test]
+    fn direct_output_extension_no_capability_and_sanitize() {
+        let no_fmt = serde_json::json!({});
+        // 无 capability 声明 → 输入扩展名（D-7 现行为）
+        assert_eq!(
+            direct_output_extension(&no_fmt, None, Path::new("/tmp/in.wav")),
+            Some("wav".to_string())
+        );
+        // 无扩展名且无映射可用 → None（调用方不带 extension 参数）
+        assert_eq!(direct_output_extension(&no_fmt, None, Path::new("/data/noext")), None);
+        // 字符清洗：output_format 含非法字符仅留字母数字
+        let dirty = serde_json::json!({ "output_format": "s.r/t" });
+        assert_eq!(
+            direct_output_extension(&dirty, None, Path::new("/data/in.wav")),
+            Some("srt".to_string())
+        );
     }
 }
