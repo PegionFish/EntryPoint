@@ -547,6 +547,18 @@ pub(super) fn delete_selected(st: &mut VizState) {
 
 // ── Actions ───────────────────────────────────────────────────────
 
+/// 当前管线快照（画布坐标已烘焙进 node.position）：保存/另存为/导出共用。
+pub(super) fn pipeline_with_positions(st: &VizState) -> Option<Pipeline> {
+    let mut p = st.pipeline.clone()?;
+    for node in &mut p.nodes {
+        node.position = st.positions.get(&node.id).map(|pos| NodePosition {
+            x: f64::from(pos.x),
+            y: f64::from(pos.y),
+        });
+    }
+    Some(p)
+}
+
 pub(super) fn load_pipeline(st: &mut VizState, lang: &str) {
     let path = std::path::Path::new(&st.file_path);
     match Pipeline::from_toml(path) {
@@ -582,8 +594,14 @@ pub(super) fn load_pipeline(st: &mut VizState, lang: &str) {
     }
 }
 
-/// 新建空白管线：file_input → file_output
+/// 新建空白管线：file_input → file_output。`example` = 内置模板示例档：
+/// 带示例名/描述与稳定 id（映射 WebUI onLoadExample 语义）。
 pub(super) fn new_pipeline(st: &mut VizState) {
+    new_pipeline_with(st, None);
+}
+
+/// 新建管线（可选示例元信息：id/名称/描述）
+pub(super) fn new_pipeline_with(st: &mut VizState, example: Option<(&str, String, String)>) {
     let input = PipelineNode {
         id: "input".to_string(),
         kind: NodeKind::Builtin {
@@ -611,9 +629,15 @@ pub(super) fn new_pipeline(st: &mut VizState) {
         to: ("output".to_string(), "input".to_string()),
     };
     st.pipeline = Some(Pipeline {
-        id: "new-pipeline".to_string(),
-        name: String::new(),
-        description: String::new(),
+        id: example
+            .as_ref()
+            .map(|(id, _, _)| (*id).to_string())
+            .unwrap_or_else(|| "new-pipeline".to_string()),
+        name: example.as_ref().map(|(_, n, _)| n.clone()).unwrap_or_default(),
+        description: example
+            .as_ref()
+            .map(|(_, _, d)| d.clone())
+            .unwrap_or_default(),
         nodes: vec![input, output],
         edges: vec![edge],
         max_instances: None,
@@ -727,7 +751,7 @@ pub(super) fn submit_execution(
 
 /// 保存 TOML：序列化写回 file_path；空路径或"另存"走 rfd 对话框。
 pub(super) fn save_pipeline(st: &mut VizState, lang: &str, save_as: bool) {
-    let Some(p) = st.pipeline.clone() else {
+    let Some(p) = pipeline_with_positions(st) else {
         st.validation_msg = Some(crate::i18n::tr(
             lang,
             "desktopApp.pipeline.loadFileFirst",
@@ -736,15 +760,6 @@ pub(super) fn save_pipeline(st: &mut VizState, lang: &str, save_as: bool) {
         st.validation_ok = false;
         return;
     };
-
-    // 画布坐标 → node.position（随保存落盘）
-    let mut p = p;
-    for node in &mut p.nodes {
-        node.position = st.positions.get(&node.id).map(|pos| NodePosition {
-            x: f64::from(pos.x),
-            y: f64::from(pos.y),
-        });
-    }
 
     if save_as || st.file_path.trim().is_empty() {
         let mut dlg = rfd::FileDialog::new()
