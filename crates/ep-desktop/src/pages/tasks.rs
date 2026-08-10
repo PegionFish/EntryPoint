@@ -29,7 +29,8 @@ use crate::pages::modules::{category_label, service_label};
 use crate::pages::{format_size, open_path, publish_tasks_snapshot, trfb};
 use crate::ui::{
     badge, card, card_running, empty_state, glow_breath_alpha, keyboard_scroll, page_header,
-    progress_gradient, section_title, segmented_tabs, status_badge, subtle_button, Palette,
+    progress_gradient, section_title, segmented_tabs, stat_cards, status_badge, subtle_button,
+    Palette, StatItem,
 };
 
 /// 产物目录递归扫描的最大深度（`files/{node_id}/…` 布局足够，防御深目录）
@@ -82,6 +83,49 @@ fn filter_state_id() -> egui::Id {
     egui::Id::new("tasks_page_filter")
 }
 
+/// 任务统计条带（W4-B7）：四态大数字，非零时按语义色强调
+fn stats_band(ui: &mut egui::Ui, lang: &str, pal: &Palette, tasks: &[TaskSummary]) {
+    let running = tasks
+        .iter()
+        .filter(|t| matches!(t.status, TaskStatus::Running))
+        .count();
+    let queued = tasks
+        .iter()
+        .filter(|t| matches!(t.status, TaskStatus::Pending))
+        .count();
+    let completed = tasks
+        .iter()
+        .filter(|t| matches!(t.status, TaskStatus::Completed))
+        .count();
+    let failed = tasks
+        .iter()
+        .filter(|t| matches!(t.status, TaskStatus::Failed(_)))
+        .count();
+    let stats = [
+        StatItem {
+            label: tr(lang, "common.status.running", &[]),
+            value: running.to_string(),
+            color: if running > 0 { pal.status_running } else { pal.text },
+        },
+        StatItem {
+            label: tr(lang, "common.status.queued", &[]),
+            value: queued.to_string(),
+            color: if queued > 0 { pal.warning } else { pal.text },
+        },
+        StatItem {
+            label: tr(lang, "common.status.completed", &[]),
+            value: completed.to_string(),
+            color: if completed > 0 { pal.status_ready } else { pal.text },
+        },
+        StatItem {
+            label: tr(lang, "common.status.failed", &[]),
+            value: failed.to_string(),
+            color: if failed > 0 { pal.status_error } else { pal.text },
+        },
+    ];
+    stat_cards(ui, pal, "tasks_stats", &stats);
+}
+
 /// 任务中心页入口：`cmd_tx` 为后台命令通道（queued/running 任务卡内取消）。
 pub fn show_full(
     ui: &mut egui::Ui,
@@ -98,6 +142,11 @@ pub fn show_full(
 
     page_header(ui, &tr(lang, "tasks.page.title", &[]), |_| {});
     ui.add_space(8.0);
+
+    // 统计条带（W4-B7）：运行中/排队/已完成/失败大数字 + 渐变下划线，
+    // 与仪表盘统计共用 stat_cards 组件
+    stats_band(ui, lang, &pal, tasks);
+    ui.add_space(12.0);
 
     // queued（S2 形状下为 Pending）任务的队列位置映射：task_id → 位置（1 起）
     let queue_positions = compute_queue_positions(tasks);

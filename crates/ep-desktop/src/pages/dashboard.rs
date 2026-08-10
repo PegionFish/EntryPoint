@@ -8,9 +8,9 @@ use crate::app::ModuleEntry;
 use crate::i18n::tr;
 use crate::pages::modules::{category_label, service_label};
 use crate::ui::{
-    accent_underline, badge, card, card_frame_active, card_grid, card_stroke, color_with_alpha,
-    empty_state, glow_breath_alpha, grid_columns, keyboard_scroll, page_header,
-    progress_gradient, section_title, status_badge, Palette,
+    badge, card, card_frame_active, card_grid, card_stroke, color_with_alpha, empty_state,
+    glow_breath_alpha, grid_columns, keyboard_scroll, page_header, progress_gradient,
+    section_title, stat_cards, status_badge, Palette, StatItem,
 };
 
 /// 页面内容四周的留白（px）
@@ -66,12 +66,6 @@ pub fn show(
 
 // ─── 统计卡片 ────────────────────────────────────────────────────────────────
 
-struct StatCard {
-    label: String,
-    value: String,
-    color: egui::Color32,
-}
-
 fn stats_section(
     ui: &mut egui::Ui,
     lang: &str,
@@ -85,61 +79,31 @@ fn stats_section(
         .filter(|m| matches!(m.status, ServiceStatus::Error(_)))
         .count();
 
+    // 统计条带（共用组件 stat_cards，W4-B7/Leader 增补①）：大号等宽数字
+    // + 2px 青→靖蓝渐变下划线（§3.1）+ 全大写灰阶小标签
     let stats = [
-        StatCard {
+        StatItem {
             label: tr(lang, "desktopPages.dashboard.stat.devices", &[]),
             value: devices.len().to_string(),
             color: pal.text,
         },
-        StatCard {
+        StatItem {
             label: tr(lang, "desktopPages.dashboard.stat.modules", &[]),
             value: modules.len().to_string(),
             color: pal.text,
         },
-        StatCard {
+        StatItem {
             label: tr(lang, "desktopPages.dashboard.stat.running", &[]),
             value: running.to_string(),
             color: if running > 0 { pal.status_running } else { pal.text },
         },
-        StatCard {
+        StatItem {
             label: tr(lang, "desktopPages.dashboard.stat.errors", &[]),
             value: errors.to_string(),
             color: if errors > 0 { pal.status_error } else { pal.text },
         },
     ];
-
-    // 列数封顶于卡片数：铺满可用宽度，不产生右侧空槽（P1-1 统一宽度策略）
-    let cols = grid_columns(ui.available_width(), 170.0, 12.0, stats.len());
-    card_grid(ui, cols, &stats, |ui, s| {
-        card(ui, pal, |ui| {
-            // 统计条带仪表盘化（§1.1 主张 4）：大号等宽数字 + 2px 渐变下划线
-            // + 全大写灰阶小标签
-            ui.vertical_centered(|ui| {
-                ui.add_space(12.0);
-                let resp = ui.label(
-                    egui::RichText::new(s.value.as_str())
-                        .font(egui::FontId::monospace(stat_number_size(ui)))
-                        .strong()
-                        .color(s.color),
-                );
-                ui.add_space(5.0);
-                accent_underline(ui, pal, resp.rect.width().max(32.0));
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(s.label.to_uppercase())
-                        .text_style(egui::TextStyle::Small)
-                        .color(pal.text_faint),
-                );
-                ui.add_space(12.0);
-            });
-        });
-    });
-}
-
-/// 统计大数字字号（text-4xl = 36px，随配置字号等比缩放；§3.2）
-fn stat_number_size(ui: &egui::Ui) -> f32 {
-    let body = ui.style().text_styles[&egui::TextStyle::Body].size;
-    36.0 * (body / crate::theme::BASE_FONT_SIZE)
+    stat_cards(ui, pal, "dashboard_stats", &stats);
 }
 
 // ─── 依赖检测 ────────────────────────────────────────────────────────────────
@@ -241,115 +205,121 @@ fn device_section(ui: &mut egui::Ui, lang: &str, pal: &Palette, devices: &[Compu
     let cols = grid_columns(ui.available_width(), 260.0, 12.0, devices.len());
     let now_ms = ui.ctx().input(|i| i.time * 1000.0);
     let breath = glow_breath_alpha(now_ms);
-    let mut any_active = false;
-    card_grid(ui, cols, devices, |ui, dev| {
-        // 运行态判定：有利用率或显存占用（§7.1 运行态呼吸辉光载体）
-        let active = dev.utilization.is_some_and(|u| u > 0)
-            || dev.used_memory_mb.is_some_and(|m| m > 0);
-        any_active |= active;
-        device_card(ui, lang, pal, dev, active, breath);
-    });
+    card_grid(
+        ui,
+        "dashboard_devices",
+        cols,
+        devices,
+        |_ui, dev, hovered| {
+            // 运行态判定：有利用率或显存占用（§7.1 运行态呼吸辉光载体）
+            if device_active(dev) {
+                // 呼吸辉光 2.4s：描边 alpha 0.35–0.7 × 辉光基档（§1.1 主张 3）
+                let stroke_alpha = (breath * 115.0) as u8;
+                let shadow_alpha = (breath * 64.0) as u8;
+                card_frame_active(
+                    pal,
+                    egui::Stroke::new(
+                        1.0_f32,
+                        color_with_alpha(pal.status_running, stroke_alpha),
+                    ),
+                    Some(color_with_alpha(pal.status_running, shadow_alpha)),
+                )
+            } else {
+                // 静止态 hover 只提描边亮度，零位移（§1.1 主张 3）
+                card_frame_active(
+                    pal,
+                    card_stroke(pal, hovered),
+                    hovered.then_some(pal.primary_glow),
+                )
+            }
+        },
+        |ui, dev| device_card_body(ui, lang, pal, dev),
+    );
     // 呼吸辉光时间驱动：存在活跃设备时按 ~20fps 追加重绘
     //（§1.1 主张 6；空闲仍回到 REPAINT_WATCHDOG 心跳）
-    if any_active {
+    if devices.iter().any(device_active) {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(48));
     }
 }
 
-/// 单张设备卡：运行态青色呼吸辉光描边 + 辉光阴影；静止态 hover 只提描边亮度
-fn device_card(
-    ui: &mut egui::Ui,
-    lang: &str,
-    pal: &Palette,
-    dev: &ComputeDevice,
-    active: bool,
-    breath: f32,
-) {
-    let id = ui.next_auto_id();
-    let prev_hovered = ui.ctx().data(|d| d.get_temp::<bool>(id).unwrap_or(false));
-    let (stroke, shadow) = if active {
-        // 呼吸辉光 2.4s：描边 alpha 0.35–0.7 × 辉光基档（§1.1 主张 3）
-        let stroke_alpha = (breath * 115.0) as u8;
-        let shadow_alpha = (breath * 64.0) as u8;
-        (
-            egui::Stroke::new(1.0_f32, color_with_alpha(pal.status_running, stroke_alpha)),
-            Some(color_with_alpha(pal.status_running, shadow_alpha)),
-        )
-    } else {
-        (
-            card_stroke(pal, prev_hovered),
-            if prev_hovered {
-                Some(pal.primary_glow)
-            } else {
-                None
-            },
-        )
-    };
+/// 设备运行态判定：有利用率或显存占用
+fn device_active(dev: &ComputeDevice) -> bool {
+    dev.utilization.is_some_and(|u| u > 0) || dev.used_memory_mb.is_some_and(|m| m > 0)
+}
 
-    let inner = card_frame_active(pal, stroke, shadow).show(ui, |ui| {
-        // 名称 + 后端徽章
+/// 高占用告警色（warning/danger 语义不变）：>95% danger、>80% warning
+fn usage_alert(pal: &Palette, frac: f32) -> Option<egui::Color32> {
+    if frac > 0.95 {
+        Some(pal.danger)
+    } else if frac > 0.80 {
+        Some(pal.warning)
+    } else {
+        None
+    }
+}
+
+/// 单张设备卡内容：名称 + 后端徽章、显存渐变占用条、利用率渐变占用条
+///（Leader 增补②：对齐 WebUI 带渐变的进度条风格）、温度文本
+fn device_card_body(ui: &mut egui::Ui, lang: &str, pal: &Palette, dev: &ComputeDevice) {
+    // 名称 + 后端徽章
+    ui.horizontal(|ui| {
+        ui.strong(&dev.name);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            badge(ui, pal, pal.info, dev.backend.to_string());
+        });
+    });
+    ui.add_space(8.0);
+
+    // 显存（CPU 等无显存数据的设备跳过）；高占用保留 warning/danger 单色告警
+    if let (Some(total), Some(used)) = (dev.total_memory_mb, dev.used_memory_mb) {
+        let frac = (used as f32 / total.max(1) as f32).min(1.0);
+        progress_gradient(ui, pal, frac, usage_alert(pal, frac));
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(format!("{used} / {total} MB"))
+                .monospace()
+                .small()
+                .color(pal.text_dim),
+        );
+    }
+
+    // 利用率：带渐变的占用条（Leader 增补②，对齐 WebUI device-card 进度条）
+    if let Some(u) = dev.utilization {
+        ui.add_space(6.0);
+        let frac = (u as f32 / 100.0).clamp(0.0, 1.0);
         ui.horizontal(|ui| {
-            ui.strong(&dev.name);
+            ui.label(
+                egui::RichText::new(tr(lang, "desktopPages.dashboard.devices.utilizationTitle", &[]))
+                    .small()
+                    .color(pal.text_faint),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                badge(ui, pal, pal.info, dev.backend.to_string());
+                ui.label(
+                    egui::RichText::new(format!("{u}%"))
+                        .monospace()
+                        .small()
+                        .color(pal.text_dim),
+                );
             });
         });
-        ui.add_space(8.0);
+        ui.add_space(3.0);
+        progress_gradient(ui, pal, frac, usage_alert(pal, frac));
+    }
 
-        // 显存（CPU 等无显存数据的设备跳过）；高占用保留 warning/danger 单色告警
-        if let (Some(total), Some(used)) = (dev.total_memory_mb, dev.used_memory_mb) {
-            let frac = (used as f32 / total.max(1) as f32).min(1.0);
-            let alert = if frac > 0.95 {
-                Some(pal.danger)
-            } else if frac > 0.80 {
-                Some(pal.warning)
-            } else {
-                None
-            };
-            progress_gradient(ui, pal, frac, alert);
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(format!("{used} / {total} MB"))
-                    .monospace()
-                    .small()
-                    .color(pal.text_dim),
-            );
-        }
-
-        // 利用率 / 温度（数值 mono 对齐，§3.2）
-        let mut meta: Vec<String> = Vec::new();
-        if let Some(u) = dev.utilization {
-            let value = u.to_string();
-            meta.push(tr(
-                lang,
-                "desktopPages.dashboard.devices.utilization",
-                &[("value", &value)],
-            ));
-        }
-        if let Some(t) = dev.temperature {
-            let value = t.to_string();
-            meta.push(tr(
+    // 温度：保留文本呈现（数值 mono，§3.2）
+    if let Some(t) = dev.temperature {
+        ui.add_space(6.0);
+        let value = t.to_string();
+        ui.label(
+            egui::RichText::new(tr(
                 lang,
                 "desktopPages.dashboard.devices.temperature",
                 &[("value", &value)],
-            ));
-        }
-        if !meta.is_empty() {
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(meta.join(" · "))
-                    .monospace()
-                    .color(pal.text_dim),
-            );
-        }
-    });
-
-    // hover 状态跨帧传递：只提描边亮度，零位移（§1.1 主张 3）
-    let hovered = inner.response.hovered();
-    if hovered != prev_hovered {
-        ui.ctx().data_mut(|d| d.insert_temp(id, hovered));
-        ui.ctx().request_repaint();
+            ))
+            .monospace()
+            .color(pal.text_dim),
+        );
     }
 }
 

@@ -66,11 +66,17 @@ pub fn card_frame(pal: &Palette) -> egui::Frame {
 /// 卡片容器 Frame（hover 感知）：悬停时描边由 border-glow 提亮为
 /// border-glow-strong，深色下附加主色弱发光阴影（§3.4 hover = 弱发光）。
 pub fn card_frame_hover(pal: &Palette, hovered: bool) -> egui::Frame {
+    card_frame_padding(pal, hovered, CARD_PADDING)
+}
+
+/// 卡片容器 Frame（hover 感知 + 自定义内边距）：内容密度分级（W4-B1）——
+/// 稀疏区块 16px、密集区块 24px，其余观感与 [`card_frame_hover`] 一致。
+pub fn card_frame_padding(pal: &Palette, hovered: bool, padding: u16) -> egui::Frame {
     let mut f = egui::Frame::new()
         .fill(pal.bg_card)
         .stroke(card_stroke(pal, hovered))
         .corner_radius(egui::CornerRadius::same(CARD_ROUNDING))
-        .inner_margin(egui::Margin::same(CARD_PADDING as i8));
+        .inner_margin(egui::Margin::same(padding as i8));
     if hovered && pal.dark {
         f = f.shadow(egui::epaint::Shadow {
             offset: [0, 0],
@@ -80,6 +86,16 @@ pub fn card_frame_hover(pal: &Palette, hovered: bool) -> egui::Frame {
         });
     }
     f
+}
+
+/// 内容密度分级内边距（W4-B1）：控件数 ≤3 的稀疏区块 16px，≥4 用 24px；
+/// 紧凑断点宽度以下一律 16px（与 [`card_padding`] 断点规则叠加）。
+pub fn density_padding(available_width: f32, control_count: usize) -> u16 {
+    if available_width < COMPACT_WIDTH || control_count <= 3 {
+        COMPACT_CARD_PADDING
+    } else {
+        CARD_PADDING
+    }
 }
 
 /// 活跃态卡片 Frame（§7.1 设备卡运行态呼吸辉光）：自定义描边色 +
@@ -237,10 +253,24 @@ pub fn section_title(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).size(16.0).strong());
 }
 
-/// 居中空态：大图标 + 标题 + 提示
+/// 区块头三段式（W4-A3，对齐 WebUI CardHeader）：图标字形 + 标题，
+/// 标题下一行 text_faint 描述。描述为空时省略。
+pub fn section_header(ui: &mut egui::Ui, pal: &Palette, icon: &str, title: &str, description: &str) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        ui.label(egui::RichText::new(icon).size(15.0).color(pal.primary));
+        ui.label(egui::RichText::new(title).size(16.0).strong());
+    });
+    if !description.is_empty() {
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new(description).small().color(pal.text_faint));
+    }
+}
+
+/// 居中空态：大图标 + 标题 + 提示（W4-B6：上下留白 66px → 32px）
 pub fn empty_state(ui: &mut egui::Ui, pal: &Palette, icon: &str, title: &str, hint: &str) {
     ui.vertical_centered(|ui| {
-        ui.add_space(36.0);
+        ui.add_space(20.0);
         ui.label(egui::RichText::new(icon).size(30.0).color(pal.text_faint));
         ui.add_space(10.0);
         ui.label(egui::RichText::new(title).color(pal.text_dim));
@@ -248,37 +278,101 @@ pub fn empty_state(ui: &mut egui::Ui, pal: &Palette, icon: &str, title: &str, hi
             ui.add_space(3.0);
             ui.label(egui::RichText::new(hint).small().color(pal.text_faint));
         }
-        ui.add_space(20.0);
+        ui.add_space(12.0);
     });
 }
 
 // ─── 表单组件（§9 SwitchRow/FormRow） ─────────────────────────────────────
 
-/// 开关行（SwitchRow，§9）：带可见文案的 checkbox + 弱化描述。
+/// 开关行（SwitchRow，W4-A1 行控件化，对齐 WebUI settings.tsx SwitchRow）：
+/// Frame 行容器 = 层 2 底（bg_raised）+ 1px border_glow 描边 + 8px 圆角；
+/// hover 提亮描边（零位移）；**整行可点**（`Sense::click`），文案左、开关右。
 ///
-/// 修复设置页空标签 checkbox 缺陷：旧实现把文案放在 Grid 标签列、
-/// checkbox 本体传空串，控件自身无可读文本；本组件让控件直接携带标签。
-pub fn switch_row(ui: &mut egui::Ui, pal: &Palette, value: &mut bool, label: &str, description: &str) {
-    ui.checkbox(value, label);
-    if !description.is_empty() {
-        ui.label(egui::RichText::new(description).small().color(pal.text_faint));
+/// 开关本体为纯绘制胶囊（34×18，开=主色/关=中性深灰），无独立子控件，
+/// 避免行级点击与控件点击双触发。返回行级 [`egui::Response`] 供测试/扩展。
+pub fn switch_row(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    value: &mut bool,
+    label: &str,
+    description: &str,
+) -> egui::Response {
+    let id = ui.next_auto_id();
+    let prev_hovered = ui.ctx().data(|d| d.get_temp::<bool>(id).unwrap_or(false));
+    let inner = egui::Frame::new()
+        .fill(pal.bg_raised)
+        .stroke(card_stroke(pal, prev_hovered))
+        .corner_radius(egui::CornerRadius::same(CONTROL_ROUNDING))
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(label).color(pal.text));
+                    if !description.is_empty() {
+                        ui.label(
+                            egui::RichText::new(description).small().color(pal.text_faint),
+                        );
+                    }
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    paint_switch(ui, pal, *value);
+                });
+            });
+        });
+    // 整行点击：在行矩形上二次注册交互（不追加布局空间）
+    let response = ui
+        .interact(inner.response.rect, id, egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if response.clicked() {
+        *value = !*value;
     }
+    let hovered = response.hovered();
+    if hovered != prev_hovered {
+        ui.ctx().data_mut(|d| d.insert_temp(id, hovered));
+        ui.ctx().request_repaint();
+    }
+    response
+}
+
+/// 开关视觉（switch_row 专用）：34×18 胶囊轨道 + 圆形滑钮，纯绘制无交互。
+fn paint_switch(ui: &mut egui::Ui, pal: &Palette, on: bool) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(34.0, 18.0), egui::Sense::hover());
+    let painter = ui.painter();
+    let track = if on { pal.primary } else { pal.notready };
+    painter.rect_filled(rect, rect.height() / 2.0, track);
+    let knob_x = if on { rect.max.x - 9.0 } else { rect.min.x + 9.0 };
+    painter.circle_filled(
+        egui::pos2(knob_x, rect.center().y),
+        6.0,
+        egui::Color32::from_rgb(248, 250, 252),
+    );
 }
 
 /// 数值控件容器（§3.4 数值件「可编辑外观」）：层 2 底色 + 1px 描边 +
 /// 控件圆角，把 DragValue 包成带底带框的输入盒观感。
+/// 返回 InnerResponse（`.rect` 供校验失败滚动定位，W4-A4）。
 pub fn numeric_field<R>(
     ui: &mut egui::Ui,
     pal: &Palette,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
-) -> R {
+) -> egui::InnerResponse<R> {
+    numeric_field_stroke(ui, pal, egui::Stroke::new(1.0_f32, pal.border), add_contents)
+}
+
+/// 数值控件容器（自定义描边）：校验失败时传 danger 红描边（W4-A4）。
+pub fn numeric_field_stroke<R>(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    stroke: egui::Stroke,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
     egui::Frame::new()
         .fill(pal.bg_raised)
-        .stroke(egui::Stroke::new(1.0_f32, pal.border))
+        .stroke(stroke)
         .corner_radius(egui::CornerRadius::same(CONTROL_ROUNDING))
         .inner_margin(egui::Margin::symmetric(8, 3))
         .show(ui, add_contents)
-        .inner
 }
 
 // ─── 数据可视化（§1.1 主张 4 仪表盘化） ──────────────────────────────────
@@ -454,26 +548,108 @@ pub fn grid_col_width(available_width: f32, cols: usize, spacing: f32) -> f32 {
 /// 每个单元格在独立的**垂直布局**作用域内渲染并固定为列宽：
 /// 单元格内容不再继承外层横向布局，文本按列宽换行，
 /// 从布局作用域层面消除水平溢出路径（P1-2 加固）。
+///
+/// **同行等高（W4-B3）**：Frame 由本函数经 `frame_for` 统一产出，
+/// 行内最大卡高经临时存储跨帧回填（内层 `set_min_height`），
+/// 约两帧收敛后同行卡片底部对齐；hover 状态同样跨帧持久化。
+/// `frame_for(ui, item, hovered)` 由调用方按条目状态（运行态呼吸/hover）构造 Frame。
 pub fn card_grid<T>(
     ui: &mut egui::Ui,
+    id_salt: &str,
     cols: usize,
     items: &[T],
+    mut frame_for: impl FnMut(&mut egui::Ui, &T, bool) -> egui::Frame,
     mut draw: impl FnMut(&mut egui::Ui, &T),
 ) {
     let cols = cols.max(1);
     let spacing = ui.spacing().item_spacing.x;
     // 列宽在外层一次性计算：所有行等宽、行内总宽恰为可用宽度，不产生右缘裁切
     let col_w = grid_col_width(ui.available_width(), cols, spacing);
-    for chunk in items.chunks(cols) {
+    let grid_id = ui.id().with(id_salt);
+    let rows_key = grid_id.with("row_heights");
+    let hover_key = grid_id.with("cell_hovers");
+    let prev_rows: Vec<f32> = ui.ctx().data(|d| d.get_temp(rows_key).unwrap_or_default());
+    let prev_hovers: Vec<bool> = ui.ctx().data(|d| d.get_temp(hover_key).unwrap_or_default());
+    let row_count = items.len().div_ceil(cols);
+    let mut cur_rows = vec![0.0_f32; row_count];
+    let mut cur_hovers = vec![false; items.len()];
+    for (row, chunk) in items.chunks(cols).enumerate() {
         ui.horizontal(|ui| {
-            for item in chunk {
+            for (ci, item) in chunk.iter().enumerate() {
+                let index = row * cols + ci;
                 ui.vertical(|ui| {
                     ui.set_width(col_w);
-                    draw(ui, item);
+                    let hovered = prev_hovers.get(index).copied().unwrap_or(false);
+                    let inner = frame_for(ui, item, hovered).show(ui, |ui| {
+                        // 同行等高：上一帧行内最大高度回填（Frame 随之拉伸）
+                        if let Some(&h) = prev_rows.get(row) {
+                            ui.set_min_height(h);
+                        }
+                        draw(ui, item);
+                    });
+                    cur_rows[row] = cur_rows[row].max(inner.response.rect.height());
+                    cur_hovers[index] = inner.response.hovered();
                 });
             }
         });
     }
+    if cur_rows != prev_rows {
+        ui.ctx().data_mut(|d| d.insert_temp(rows_key, cur_rows));
+        ui.ctx().request_repaint();
+    }
+    if cur_hovers != prev_hovers {
+        ui.ctx().data_mut(|d| d.insert_temp(hover_key, cur_hovers));
+        ui.ctx().request_repaint();
+    }
+}
+
+// ─── 统计大数字条带（仪表盘化 §1.1 主张 4） ─────────────────────────────────────
+
+/// 统计项：标签 + 大数字 + 语义色
+pub struct StatItem {
+    pub label: String,
+    pub value: String,
+    pub color: egui::Color32,
+}
+
+/// 统计大数字字号（text-4xl = 36px，随配置字号等比缩放；§3.2）
+pub fn stat_number_size(ui: &egui::Ui) -> f32 {
+    let body = ui.style().text_styles[&egui::TextStyle::Body].size;
+    36.0 * (body / crate::theme::BASE_FONT_SIZE)
+}
+
+/// 统计大数字条带：每格一张稀疏卡（16px 内边距）——大号等宽数字 +
+/// 2px 青→靖蓝渐变下划线（§3.1）+ 全大写灰阶小标签。
+/// 仪表盘统计与任务页统计条带（W4-B7）共用。
+pub fn stat_cards(ui: &mut egui::Ui, pal: &Palette, id_salt: &str, stats: &[StatItem]) {
+    let cols = grid_columns(ui.available_width(), 170.0, 12.0, stats.len());
+    card_grid(
+        ui,
+        id_salt,
+        cols,
+        stats,
+        |_ui, _item, hovered| card_frame_padding(pal, hovered, COMPACT_CARD_PADDING),
+        |ui, s| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(8.0);
+                let resp = ui.label(
+                    egui::RichText::new(s.value.as_str())
+                        .font(egui::FontId::monospace(stat_number_size(ui)))
+                        .strong()
+                        .color(s.color),
+                );
+                ui.add_space(5.0);
+                accent_underline(ui, pal, resp.rect.width().max(32.0));
+                ui.add_space(7.0);
+                ui.label(
+                    egui::RichText::new(s.label.to_uppercase())
+                        .text_style(egui::TextStyle::Small)
+                        .color(pal.text_faint),
+                );
+                ui.add_space(8.0);
+            });
+        },
+    );
 }
 
 // ─── 键盘滚动（P2-1） ───────────────────────────────────────────────────────

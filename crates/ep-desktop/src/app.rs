@@ -943,7 +943,20 @@ impl eframe::App for App {
                     });
                 } else {
                     ui.vertical_centered(|ui| {
-                        ui.heading("EntryPoint");
+                        // 字标渐变：逐字符 accent_at 青→靖蓝插值近似（W4-C/§3.1）
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            let chars: Vec<char> = "EntryPoint".chars().collect();
+                            let last = (chars.len() - 1).max(1) as f32;
+                            for (i, ch) in chars.iter().enumerate() {
+                                ui.label(
+                                    egui::RichText::new(ch.to_string())
+                                        .text_style(egui::TextStyle::Heading)
+                                        .strong()
+                                        .color(pal.accent_at(i as f32 / last)),
+                                );
+                            }
+                        });
                     });
                 }
                 ui.add_space(6.0);
@@ -971,8 +984,14 @@ impl eframe::App for App {
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.add_space(8.0);
                     if !compact {
+                        // 版本真源：Cargo.toml [workspace.package] version（经
+                        // CARGO_PKG_VERSION 编译期注入），与 build.ps1/build.sh
+                        // 的 dist 目录名/VERSION.txt 同源——勿在此硬编码版本号
+                        // （此前硬编码 v0.2.0 导致界面与包名 v0.1.0 不同步）。
                         ui.label(
-                            egui::RichText::new("v0.2.0").small().color(pal.text_faint),
+                            egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                                .small()
+                                .color(pal.text_faint),
                         );
                     }
                     // 主题切换（持久化到 config/app.toml）
@@ -1075,12 +1094,30 @@ fn nav_item(
         let rounding = egui::CornerRadius::same(8);
         if active {
             painter.rect_filled(rect, rounding, pal.bg_raised);
-            // 左侧 3px 圆角指示条
+            // 左侧 3px 圆角指示条：青→靖蓝垂直分段渐变近似（W4-C/§3.1，
+            // 替代原单色 primary 竖条）
             let bar = egui::Rect::from_min_max(
                 egui::pos2(rect.min.x + 1.0, rect.min.y + 9.0),
                 egui::pos2(rect.min.x + 4.0, rect.max.y - 9.0),
             );
-            painter.rect_filled(bar, egui::CornerRadius::same(2), pal.primary);
+            let segs = 6_usize;
+            let seg_h = bar.height() / segs as f32;
+            for i in 0..segs {
+                let y0 = bar.min.y + i as f32 * seg_h;
+                let y1 = if i + 1 == segs {
+                    bar.max.y
+                } else {
+                    bar.min.y + (i + 1) as f32 * seg_h
+                };
+                let seg = egui::Rect::from_min_max(
+                    egui::pos2(bar.min.x, y0),
+                    egui::pos2(bar.max.x, y1),
+                );
+                let t = i as f32 / (segs - 1) as f32;
+                // 首/尾段带圆角，中段直拼
+                let r = if i == 0 || i + 1 == segs { 2 } else { 0 };
+                painter.rect_filled(seg, egui::CornerRadius::same(r), pal.accent_at(t));
+            }
         } else if response.hovered() {
             // hover 背景：bg_base 向 bg_raised 插值，两套主题下均弱于激活态
             painter.rect_filled(rect, rounding, pal.bg_base.lerp_to_gamma(pal.bg_raised, 0.6));

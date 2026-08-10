@@ -23,7 +23,8 @@ rfd.workspace = true
 # Wave 3 C4：直跑参数类型化（serde_json::Value）+ 任务记录时间戳（TaskRecord）
 serde_json.workspace = true
 chrono.workspace = true
+# W4-A2：设置页 dirty 门控——AppConfig toml 序列化比对基线
+toml.workspace = true
 
 [dev-dependencies]
-# 测试构造 ModuleManifest fixture
-toml.workspace = true
+# 测试构造 ModuleManifest fixture（toml 已升为常规依赖，此处保留注释说明历史用途）
