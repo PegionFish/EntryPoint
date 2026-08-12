@@ -25,8 +25,40 @@ use ep_core::types::ServiceStatus;
 
 use crate::state::AppState;
 
+// ─── Windows 错误弹窗根治（0xc0000142 静默降级） ───────────────────────
+//
+// daemon 拉起 python/uv 探测时，若解释器 DLL 初始化失败
+//（STATUS_DLL_INIT_FAILED = 0xc0000142），Windows 默认会弹「应用程序无法正常
+// 启动」系统错误对话框。`SetErrorMode` 的错误模式会被子进程继承，在启动
+// 早期置位后，探测失败仅返回非零退出码 / spawn 错误，由调用侧降级分支
+// 静默处理（仅日志 + 友好状态），不再弹窗。
+//（自 ep-desktop 移植，2026-08-13 桌面端退役）
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+extern "system" {
+    fn SetErrorMode(u_mode: u32) -> u32;
+}
+
+/// 抑制本进程及子进程的严重错误对话框（仅 Windows；其他平台 no-op）。
+#[cfg(target_os = "windows")]
+fn suppress_error_dialogs() {
+    const SEM_FAILCRITICALERRORS: u32 = 0x0001;
+    const SEM_NOGPFAULTERRORBOX: u32 = 0x0002;
+    const SEM_NOOPENFILEERRORBOX: u32 = 0x8000;
+    unsafe {
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn suppress_error_dialogs() {}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // 在任何子进程拉起前尽早置位（server 与 --run-module 双入口共用），
+    // 确保探测/模块子进程继承无弹错误模式
+    suppress_error_dialogs();
+
     // Parse CLI args
     let args: Vec<String> = std::env::args().collect();
     let module_pos = args.iter().position(|a| a == "--run-module");
@@ -988,5 +1020,18 @@ mod tests {
         crate::stop_all_modules(&state).await;
         let pm = state.process_manager.read().await;
         assert!(pm.list_running().is_empty());
+    }
+}
+
+/// 桌面端退役移植项（§2.1）：Windows 子进程错误弹窗抑制的存在性门禁。
+/// SetErrorMode 置位后无返回值可断言，调用不崩溃即通过；
+/// 真正行为验证在 D2 实机抽查（缺失 venv 探测不弹系统对话框）。
+#[cfg(all(test, target_os = "windows"))]
+mod error_dialog_tests {
+    use super::suppress_error_dialogs;
+
+    #[test]
+    fn suppress_error_dialogs_callable() {
+        suppress_error_dialogs();
     }
 }
