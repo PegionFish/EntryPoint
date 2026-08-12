@@ -432,8 +432,8 @@ Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平�
 | Rust 源文件数 | ~90 .rs files |
 | 前端源文件数 | 58 (.ts/.tsx) |
 | 前端代码行数 | ~14000 行 |
-| 桌面端代码行数 | ~9000 行 |
-| Crate 数 | 6 (ep-core, ep-daemon, ep-desktop, ep-webui, ep-pack, ep-pack-cli) |
+| 桌面端代码行数 | ~9000 行（2026-08-13 随 ep-desktop 退役删除） |
+| Crate 数 | 5 (ep-core, ep-daemon, ep-webui, ep-pack, ep-pack-cli) |
 | Release 构建时间 | ~4m（含前端） |
 | Git commits | 60+ |
 | E2E 测试 | ✅ 整合包全链/直跑/wait/callback/VRAM/闸门/取消 19 项（D1）+ 既有真实媒体全流程（Linux 侧）+ video-to-srt 条件回归 Windows 真机复跑通过（2026-08-05） |
@@ -444,3 +444,36 @@ Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平�
 ## TODO（待办）
 
 - 无遗留 TODO（build.sh --distro 已收口；#50 已裁决并落地；已知限制按上节如实记录）
+
+---
+
+## 桌面端退役（Sunset）— 2026-08-13
+
+**裁决**：退役 `crates/ep-desktop`，WebUI 为唯一 UI，产品交付 = ep-daemon + WebUI 静态资源（server 包）。
+依据：第三轮双端 E2E（`reports/e2e_uiux_report_20260813.md`）WebUI 显著领先 + 9000 行 egui 重复实现 daemon 已有逻辑的持续漂移成本。
+方案全文见 [docs/DESKTOP_SUNSET_PLAN.md](docs/DESKTOP_SUNSET_PLAN.md)（含已否决的 WebView 薄壳替代方案留档）。
+
+**范围**（Wave 0 双代理审计冻结的基线）：
+- 删除：`crates/ep-desktop/` 整目录、`packaging/PKGBUILD.gui`、`packaging/entrypoint.desktop`、4 个 locale 文件（desktopPages/desktopApp × zh-CN/en）
+- 清理：`Cargo.toml` workspace 成员 + GUI 依赖块（eframe/egui/egui_extras/rfd）、ep-core `UiConfig`/`AppConfig.ui`/`refresh_all_devices`、i18n 命名空间、前端 `types.ts` 的 `ui` 字段
+- 移植：Windows `SetErrorMode` 子进程错误弹窗抑制 → ep-daemon（server + `--run-module` 双入口）
+- 体验：`start-daemon.bat` 自动开默认浏览器（`--no-browser` 可选）；`build.ps1/build.sh` gui 调用打印迁移提示非零退出
+- 保留：`scheduler.rs` pub 面（`ep-core/tests/integration_compute.rs` 合法消费）；`reports/` 桌面评估类报告（历史证据）
+
+**commit 链**：
+- `d94716d` chore(sunset/B3): 旧配置含 `[ui]` 节可解析回归测试
+- `0f079a1` chore(sunset/B1): SetErrorMode 移植 daemon 双入口 + cfg(windows) 测试
+- `d215ebf` chore(sunset/B2): start-daemon.bat 自动开浏览器 + --no-browser
+- `4facb11` chore(sunset/C1): 退役 ep-desktop crate（workspace 成员 + GUI 依赖 + lock 重生成）
+- `07c438f` chore(sunset/C6): ep-core 死代码 + locale 文件 + 前端 types.ts 清理
+- `94d0b43` chore(sunset/C2): build.ps1 移除 gui 模式 + 迁移提示
+- `5ed806f` chore(sunset/C3): build.sh 移除 gui/macOS 分支
+- `d60f16d` chore(sunset/C4): 删除 gui 打包文件
+- `aa3bc6d` chore(sunset/C5): 删除 `[ui]` 配置节与文档章节
+- `(C7/C8 待补)` 文档 server-only 化 + 历史文档横幅
+
+**验收**（Wave 3 门禁，见 commit 链末段）：
+- workspace = 5 crate；`cargo tree` 无 egui/eframe/accesskit 残留
+- `build.ps1 gui` → 迁移提示非零退出；server 包产物无 entrypoint.exe
+- `cargo clippy --workspace --all-targets` 零警告 + `cargo test --workspace` 全过
+- WebUI 实机冒烟全过 + 控制台零错误（`runtime/e2e-r3` 矩阵复跑）
