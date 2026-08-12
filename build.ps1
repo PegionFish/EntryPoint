@@ -1,12 +1,10 @@
 #!/usr/bin/env pwsh
-# EntryPoint 编译打包脚本（Windows）
-# 用法: .\build.ps1 <gui|server> [-Target debug|release] [-SkipTest] [-SkipClippy] [-Clean] [-OutputDir <dir>]
-#   gui    — 桌面 GUI 客户端包（zip：entrypoint.exe + 配置 + 模块，解压即用）
+# EntryPoint 编译打包脚本（Windows）— server 模式（桌面端已于 2026-08-13 退役）
+# 用法: .\build.ps1 server [-Target debug|release] [-SkipTest] [-SkipClippy] [-Clean] [-OutputDir <dir>]
 #   server — 服务器包（zip：ep-daemon + WebUI 静态资源 + 配置 + 模块）
 
 param(
     [Parameter(Mandatory, Position = 0)]
-    [ValidateSet("gui", "server")]
     [string]$Mode,
 
     [ValidateSet("debug", "release")]
@@ -21,6 +19,19 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProjectRoot = $PSScriptRoot
+
+# 桌面端退役迁移提示（2026-08-13）：gui 模式不再提供，明确提示后以非零码退出
+if ($Mode -eq "gui") {
+    Write-Host "`n[FAIL] gui 模式已随桌面端退役（2026-08-13）。" -ForegroundColor Red
+    Write-Host "  WebUI 为唯一 UI，请改用 server 模式构建：" -ForegroundColor Yellow
+    Write-Host "    .\build.ps1 server" -ForegroundColor Cyan
+    Write-Host "  历史说明见 docs/DESKTOP_SUNSET_PLAN.md。`n" -ForegroundColor Yellow
+    exit 1
+}
+if ($Mode -ne "server") {
+    Write-Host "`n[FAIL] 未知模式: $Mode（仅支持 server）`n" -ForegroundColor Red
+    exit 1
+}
 
 # ── 工具查找 ──
 $Cargo = "$env:USERPROFILE\.cargo\bin\cargo.exe"
@@ -43,7 +54,7 @@ $Version = if ($VersionLine) { $VersionLine.Matches[0].Groups[1].Value } else { 
 if ($Version -notmatch '^\d+\.\d+\.\d+') { Write-Error "无法从 Cargo.toml 解析版本号，拒绝打包（请检查 [workspace.package] version）"; exit 1 }
 $Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $ProfileDir = if ($Target -eq "release") { "release" } else { "debug" }
-$CrateName = if ($Mode -eq "gui") { "ep-desktop" } else { "ep-daemon" }
+$CrateName = "ep-daemon"
 $PackageBase = "EntryPoint-v${Version}-win64-${Mode}"
 
 function Write-Step { param($m) Write-Host "`n=== $m ===" -ForegroundColor Cyan }
@@ -148,12 +159,12 @@ New-Item -ItemType Directory -Force -Path "$packageDir\config\pipelines" | Out-N
 New-Item -ItemType Directory -Force -Path "$packageDir\workspace" | Out-Null
 
 $binSrc = Join-Path $ProjectRoot "target\$ProfileDir"
-$exeName = if ($Mode -eq "gui") { "entrypoint.exe" } else { "ep-daemon.exe" }
+$exeName = "ep-daemon.exe"
 if (-not (Test-Path "$binSrc\$exeName")) { Write-Err "二进制不存在: $binSrc\$exeName（请先编译）" }
 Copy-Item "$binSrc\$exeName" "$packageDir\bin\" -Force
 Write-Ok "二进制: bin\$exeName"
 
-# ep-pack CLI（仲裁 #36：gui/server 包均附带，bin 名 ep-pack）
+# ep-pack CLI（仲裁 #36：server 包附带，bin 名 ep-pack）
 if (-not (Test-Path "$binSrc\ep-pack.exe")) { Write-Err "ep-pack 二进制不存在: $binSrc\ep-pack.exe（请先编译）" }
 Copy-Item "$binSrc\ep-pack.exe" "$packageDir\bin\" -Force
 Write-Ok "ep-pack CLI: bin\ep-pack.exe"
@@ -199,26 +210,20 @@ if (Test-Path $cudaLibs) {
     Write-Info "runtime\cuda-libs 不存在，跳过（可选目录）"
 }
 
-# 服务器包：WebUI 静态资源 → webui\
-if ($Mode -eq "server") {
-    $webuiStatic = Join-Path $ProjectRoot "crates\ep-webui\static"
-    if (Test-Path $webuiStatic) {
-        New-Item -ItemType Directory -Force -Path "$packageDir\webui" | Out-Null
-        Copy-Item "$webuiStatic\*" "$packageDir\webui\" -Recurse -Force
-        Write-Ok "webui\ 已复制"
-    } else {
-        Write-Info "警告: crates\ep-webui\static 不存在（请先构建 WebUI 前端）"
-    }
+# WebUI 静态资源 → webui\
+$webuiStatic = Join-Path $ProjectRoot "crates\ep-webui\static"
+if (Test-Path $webuiStatic) {
+    New-Item -ItemType Directory -Force -Path "$packageDir\webui" | Out-Null
+    Copy-Item "$webuiStatic\*" "$packageDir\webui\" -Recurse -Force
+    Write-Ok "webui\ 已复制"
+} else {
+    Write-Info "警告: crates\ep-webui\static 不存在（请先构建 WebUI 前端）"
 }
 
 # 启动脚本
-if ($Mode -eq "gui") {
-    $launcher = "@echo off`r`ncd /d `"%~dp0`"`r`nstart `"`" bin\entrypoint.exe`r`n"
-    Set-Content -Path "$packageDir\start-desktop.bat" -Value $launcher -Encoding ASCII
-} else {
-    # 启动体验（C2/§3）：双击 → 独立控制台拉起 daemon → 延迟后自动开默认浏览器；
-    # 传 --no-browser 跳过开浏览器（无人值守/远程部署场景）
-    $launcher = @'
+# 启动体验（C2/§3）：双击 → 独立控制台拉起 daemon → 延迟后自动开默认浏览器；
+# 传 --no-browser 跳过开浏览器（无人值守/远程部署场景）
+$launcher = @'
 @echo off
 rem EntryPoint daemon launcher — 双击启动，随后自动打开浏览器
 rem 用法: start-daemon.bat [--no-browser]
@@ -231,8 +236,7 @@ if "%OPEN_BROWSER%"=="1" (
     start "" http://127.0.0.1:9800
 )
 '@
-    Set-Content -Path "$packageDir\start-daemon.bat" -Value $launcher -Encoding ASCII
-}
+Set-Content -Path "$packageDir\start-daemon.bat" -Value $launcher -Encoding ASCII
 Write-Ok "启动脚本已生成"
 
 # 文档 + 版本信息
