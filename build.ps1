@@ -216,7 +216,21 @@ if ($Mode -eq "gui") {
     $launcher = "@echo off`r`ncd /d `"%~dp0`"`r`nstart `"`" bin\entrypoint.exe`r`n"
     Set-Content -Path "$packageDir\start-desktop.bat" -Value $launcher -Encoding ASCII
 } else {
-    $launcher = "@echo off`r`ncd /d `"%~dp0`"`r`nbin\ep-daemon.exe`r`n"
+    # 启动体验（C2/§3）：双击 → 独立控制台拉起 daemon → 延迟后自动开默认浏览器；
+    # 传 --no-browser 跳过开浏览器（无人值守/远程部署场景）
+    $launcher = @'
+@echo off
+rem EntryPoint daemon launcher — 双击启动，随后自动打开浏览器
+rem 用法: start-daemon.bat [--no-browser]
+cd /d "%~dp0"
+set "OPEN_BROWSER=1"
+if /i "%~1"=="--no-browser" set "OPEN_BROWSER=0"
+start "EntryPoint Daemon" bin\ep-daemon.exe
+if "%OPEN_BROWSER%"=="1" (
+    timeout /t 2 /nobreak >nul
+    start "" http://127.0.0.1:9800
+)
+'@
     Set-Content -Path "$packageDir\start-daemon.bat" -Value $launcher -Encoding ASCII
 }
 Write-Ok "启动脚本已生成"
