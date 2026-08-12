@@ -470,10 +470,17 @@ Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平�
 - `5ed806f` chore(sunset/C3): build.sh 移除 gui/macOS 分支
 - `d60f16d` chore(sunset/C4): 删除 gui 打包文件
 - `aa3bc6d` chore(sunset/C5): 删除 `[ui]` 配置节与文档章节
-- `(C7/C8 待补)` 文档 server-only 化 + 历史文档横幅
+- `4053b8f` chore(sunset/C7): 文档 server-only 化（README/DESIGN/PROGRESS）
+- `fb2a922` chore(sunset/C8): 历史文档 sunset 横幅 + 活跃代码零引用核验
+- （最终验收记录随本节一并落盘，见 git log 顶部）
 
-**验收**（Wave 3 门禁，见 commit 链末段）：
-- workspace = 5 crate；`cargo tree` 无 egui/eframe/accesskit 残留
-- `build.ps1 gui` → 迁移提示非零退出；server 包产物无 entrypoint.exe
-- `cargo clippy --workspace --all-targets` 零警告 + `cargo test --workspace` 全过
-- WebUI 实机冒烟全过 + 控制台零错误（`runtime/e2e-r3` 矩阵复跑）
+**验收**（Wave 3 门禁，2026-08-13 实测，全部 ✅）：
+- [x] workspace = 5 crate；`cargo tree` 无 egui/eframe/accesskit 残留
+- [x] `build.ps1 gui` → 打印迁移提示并以非零码退出（实测退出码 1）
+- [x] `build.ps1 server` 全流程绿：clippy 零警告 / 测试全过 / release 编译 / 产物 = bin(ep-daemon+ep-pack+VC 运行库) + webui + config + modules + start-daemon.bat，**无 entrypoint.exe**
+- [x] `cargo clippy --workspace --all-targets` 零警告；`cargo test --workspace` 全过（ep-core 466 / ep-daemon 274 / e2e 264 / ep-pack 72 / cli 33；1 次既有 flake `test_submit_queue_full_rejected` 重跑恢复，与本次改动无关）
+- [x] SetErrorMode 抑制已移植（B1，server/run-module 双入口最早期 + cfg(windows) 测试在案）；实机 daemon 启动期子进程探测（deps/ffmpeg/python/uv）无系统弹窗、无崩溃
+- [x] 含 `[ui]` 节的旧 config/app.toml 可被新 daemon 正常加载（B3 回归测试在案）；`GET /api/config` 响应已无 `ui` 字段
+- [x] WebUI 实机冒烟（打包产物 + Edge headless + CDP）：仪表盘/模块/管线/任务/设置 5 页零控制台错误零警告；API 10 端点全 200（health/config/devices/modules/pipelines/tasks/models/packs/deps/rembg-status）
+- [x] README 快速开始 = server-only 路径（双击 start-daemon.bat → 浏览器）
+- [x] 用户本地 config/app.toml 值未入库，工作区原样保留
