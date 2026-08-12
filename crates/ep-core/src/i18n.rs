@@ -1,10 +1,11 @@
-//! 三端共享 i18n 基础设施 — 嵌入式翻译加载器（ep-core / ep-daemon / ep-desktop 共用）。
+//! 共享 i18n 基础设施 — 嵌入式翻译加载器（ep-core / ep-daemon 共用；
+//! 2026-08-13 桌面端退役后 ep-desktop 不再消费）。
 //!
 //! # 共享契约（冻结，勿单方面修改）
 //!
-//! - 翻译文件目录：`<repo>/i18n/locales/{zh-CN,en}/`，每语言 14 个命名空间文件：
+//! - 翻译文件目录：`<repo>/i18n/locales/{zh-CN,en}/`，每语言 12 个命名空间文件：
 //!   `common, dashboard, modules, models, pipeline, tasks, settings, components,
-//!   desktopPages, desktopApp, apiCore, apiModels, apiPipelines, packs`（`.json`）。
+//!   apiCore, apiModels, apiPipelines, packs`（`.json`）。
 //! - **格式：扁平键**（如 `"upload.title": "上传模型"`），禁止嵌套对象；
 //!   值必须是字符串。zh-CN / en 两语言键集必须完全一致
 //!   （`tests::zh_en_keysets_identical_for_all_namespaces` 是长期门禁）。
@@ -15,22 +16,23 @@
 //!
 //! # 文案与日志的边界
 //!
-//! - **用户可见文案**（API 错误响应、桌面端 UI、toast 等）一律走本模块，
+//! - **用户可见文案**（API 错误响应、WebUI 提示等）一律走本模块，
 //!   跟随 `config.general.language`。
 //! - **日志永远英文**：`tracing` 宏（info!/warn!/error!/debug!）中的消息
 //!   不经过 i18n，始终使用英文字面量，不随语言配置变化。
 //!
 //! # 嵌入方式
 //!
-//! 全部 14×2 个 JSON 经 `include_str!` 编译期嵌入二进制（daemon 与桌面端
+//! 全部 12×2 个 JSON 经 `include_str!` 编译期嵌入二进制（daemon 与桌面端
 //! 无需在运行时携带 i18n/ 目录），首次调用时经 `OnceLock` 惰性解析为
 //! `lang → ns → key → String`。
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-/// 契约规定的 14 个命名空间（与 `i18n/locales/*/` 下的文件名一一对应）。
+/// 契约规定的 12 个命名空间（与 `i18n/locales/*/` 下的文件名一一对应）。
 /// `packs` 为 Wave S 新增（整合包管理区，键由 Wave 3 C8 统一落盘）。
+/// 2026-08-13 桌面端退役：desktopPages / desktopApp 两个命名空间随 ep-desktop 移除。
 pub const NAMESPACES: &[&str] = &[
     "common",
     "dashboard",
@@ -40,8 +42,6 @@ pub const NAMESPACES: &[&str] = &[
     "tasks",
     "settings",
     "components",
-    "desktopPages",
-    "desktopApp",
     "apiCore",
     "apiModels",
     "apiPipelines",
@@ -93,8 +93,6 @@ fn tables() -> &'static LangMap {
                 ("tasks", include_str!("../../../i18n/locales/zh-CN/tasks.json")),
                 ("settings", include_str!("../../../i18n/locales/zh-CN/settings.json")),
                 ("components", include_str!("../../../i18n/locales/zh-CN/components.json")),
-                ("desktopPages", include_str!("../../../i18n/locales/zh-CN/desktopPages.json")),
-                ("desktopApp", include_str!("../../../i18n/locales/zh-CN/desktopApp.json")),
                 ("apiCore", include_str!("../../../i18n/locales/zh-CN/apiCore.json")),
                 ("apiModels", include_str!("../../../i18n/locales/zh-CN/apiModels.json")),
                 ("apiPipelines", include_str!("../../../i18n/locales/zh-CN/apiPipelines.json")),
@@ -112,8 +110,6 @@ fn tables() -> &'static LangMap {
                 ("tasks", include_str!("../../../i18n/locales/en/tasks.json")),
                 ("settings", include_str!("../../../i18n/locales/en/settings.json")),
                 ("components", include_str!("../../../i18n/locales/en/components.json")),
-                ("desktopPages", include_str!("../../../i18n/locales/en/desktopPages.json")),
-                ("desktopApp", include_str!("../../../i18n/locales/en/desktopApp.json")),
                 ("apiCore", include_str!("../../../i18n/locales/en/apiCore.json")),
                 ("apiModels", include_str!("../../../i18n/locales/en/apiModels.json")),
                 ("apiPipelines", include_str!("../../../i18n/locales/en/apiPipelines.json")),
@@ -175,14 +171,14 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    /// 长期门禁：14 个命名空间在 zh-CN / en 下的键集必须完全一致。
+    /// 长期门禁：12 个命名空间在 zh-CN / en 下的键集必须完全一致。
     #[test]
     fn zh_en_keysets_identical_for_all_namespaces() {
         let tables = tables();
         let zh = &tables["zh-CN"];
         let en = &tables["en"];
-        assert_eq!(zh.len(), NAMESPACES.len(), "zh-CN: all 14 namespaces present");
-        assert_eq!(en.len(), NAMESPACES.len(), "en: all 14 namespaces present");
+        assert_eq!(zh.len(), NAMESPACES.len(), "zh-CN: all 12 namespaces present");
+        assert_eq!(en.len(), NAMESPACES.len(), "en: all 12 namespaces present");
         for ns in NAMESPACES {
             let zh_keys: BTreeSet<&String> = zh[*ns].keys().collect();
             let en_keys: BTreeSet<&String> = en[*ns].keys().collect();

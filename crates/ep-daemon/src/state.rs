@@ -160,7 +160,7 @@ impl AppState {
 
         // P1-8（仲裁 #12）：ProcessManager 注入共享 CUDA 库目录（Linux
         // LD_LIBRARY_PATH / Windows PATH 前置，平台分支在 process.rs 内部）
-        // 与网络代理环境变量。桌面端同款接线归 C4（ep-desktop main.rs）。
+        // 与网络代理环境变量。
         let cuda_libs_dir =
             ep_core::process::resolve_cuda_libs_dir(&root, &config.compute.cuda_libs_dir);
         let network_env = config.network.env_vars();

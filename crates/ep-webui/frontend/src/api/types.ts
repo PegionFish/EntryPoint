@@ -121,7 +121,6 @@ export interface AppConfig {
   network: { http_proxy: string; https_proxy: string; no_proxy: string }
   /** 整合包配置（§8.3，门禁 #38） */
   packs?: { staging_dir?: string }
-  ui: { scale_factor: number; font_size: number; dashboard_refresh_secs: number }
   /** 每模块激活模型变体（§5.2 单槽位）：module_id → model_id；后端恒返回，旧前端类型缺失故设可选 */
   active_models?: Record<string, string>
 }

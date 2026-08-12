@@ -1,7 +1,8 @@
 import i18n from 'i18next'
 import { initReactI18next } from 'react-i18next'
-// 仓库级翻译文件（扁平键格式），由桌面端/后端共享维护。
-// desktopPages/desktopApp/apiCore/apiModels/apiPipelines 命名空间仅供桌面端/后端使用，前端不加载。
+// 仓库级翻译文件（扁平键格式），由后端共享维护。
+// apiCore/apiModels/apiPipelines 命名空间仅供后端使用，前端不加载
+//（desktopPages/desktopApp 已随桌面端 2026-08-13 退役移除）。
 import zhCommon from '@i18n/locales/zh-CN/common.json'
 import zhDashboard from '@i18n/locales/zh-CN/dashboard.json'
 import zhModules from '@i18n/locales/zh-CN/modules.json'
