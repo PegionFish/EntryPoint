@@ -765,6 +765,26 @@ mod tests {
         assert_eq!(restored.network.no_proxy, "localhost,127.0.0.1");
     }
 
+    /// 桌面端退役（2026-08-13）后旧配置可能仍含 `[ui]` 节：
+    /// 必须能被新 daemon 正常加载（serde 默认忽略未知字段，无 deny_unknown_fields），
+    /// 解析不得报错、已知字段不受影响。
+    #[test]
+    fn legacy_ui_section_parses_ignored() {
+        let toml_str = r#"
+[server]
+host = "127.0.0.1"
+port = 9800
+
+[ui]
+scale_factor = 1.25
+font_size = 16.0
+dashboard_refresh_secs = 5
+"#;
+        let config: AppConfig = toml::from_str(toml_str).expect("legacy [ui] section must parse");
+        assert_eq!(config.server.host, "127.0.0.1");
+        assert_eq!(config.server.port, 9800);
+    }
+
     // ── NetworkConfig ──────────────────────────────────────────────────
 
     #[test]
