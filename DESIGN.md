@@ -15,7 +15,7 @@
 
 ## 1. 项目概述
 
-EntryPoint 是一个 **Windows/Linux 原生桌面应用 + WebUI 管理界面**，用于统一管控本地部署的多个 AI 模型服务。桌面端（egui）提供本地操作体验，WebUI（React）支持浏览器远程管控。
+EntryPoint 是一个 **server 形态的 AI 模型编排平台**（ep-daemon + WebUI 管理界面），用于统一管控本地部署的多个 AI 模型服务。WebUI（React）为唯一 UI，浏览器访问即用；桌面端已于 2026-08-13 退役（见 docs/DESKTOP_SUNSET_PLAN.md）。
 
 核心能力：
 
@@ -1036,17 +1036,6 @@ EntryPoint/
 │   │       │   └── nodes/
 │   │       ├── config.rs
 │   │       └── lib.rs
-│   ├── ep-desktop/                # egui 桌面前端
-│   │   └── src/
-│   │       ├── app.rs
-│   │       ├── pages/
-│   │       │   ├── dashboard.rs
-│   │       │   ├── modules.rs
-│   │       │   ├── pipeline_editor.rs
-│   │       │   ├── tasks.rs
-│   │       │   └── settings.rs
-│   │       ├── widgets/
-│   │       └── main.rs
 │   └── ep-webui/                  # WebUI（axum 静态服务 + React 前端）
 │       ├── src/
 │       │   └── lib.rs             # 静态资源嵌入

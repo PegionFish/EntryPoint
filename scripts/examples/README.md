@@ -91,4 +91,4 @@ HTTPServer(("0.0.0.0", 8090), Handler).serve_forever()
   任务跟踪、回调语义、安全边界）
 - [docs/PIPELINE_SPEC.md](../../docs/PIPELINE_SPEC.md) — 管线定义与节点开发
 - [docs/PACK_AUTHORING.md](../../docs/PACK_AUTHORING.md) — 整合包作者指南
-  （配套 CLI：`ep-pack`，随 GUI/服务器包附带）
+  （配套 CLI：`ep-pack`，随服务器包附带）

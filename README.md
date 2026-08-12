@@ -4,8 +4,7 @@ EntryPoint是一款AI创意/内容处理工具管控平台，能够统一调度�
 
 ## 特性
 
-- 🖥️ 原生桌面 GUI（egui + Rust）— 模型管理、可视化管线编辑器、深色/浅色主题
-- 🌐 WebUI 管理界面（React + TypeScript）— 浏览器远程管控
+- 🌐 WebUI 管理界面（React + TypeScript）— 浏览器访问即用（唯一 UI，桌面端已于 2026-08-13 退役）
 - 🎮 多 GPU 调度 — 不同模型跑在不同显卡上
 - 🔧 服务生命周期管理 — 启动/停止/监控/日志捕获/健康检查
 - 🔗 DAG 管线引擎 — 在线执行（React Flow 编辑器 + 服务端持久化 + 实时节点状态），视频→降噪→ASR→翻译→SRT 一键完成
@@ -16,7 +15,7 @@ EntryPoint是一款AI创意/内容处理工具管控平台，能够统一调度�
   - 浏览器上传：文件夹多文件 / zip / tar.gz，服务端流式落盘 + 解包 + 路径安全校验
   - 本地导入：服务器上已有目录导入，下载与导入均写入 `.ep_meta.json` 元数据
 - 🐧 Linux 服务器部署 — systemd 服务 + 防火墙配置
-- 📦 Arch Linux 打包 — PKGBUILD + .desktop 启动器
+- 📦 Arch Linux 打包 — PKGBUILD + systemd 服务
 
 ## 文档
 
@@ -62,30 +61,26 @@ npm run dev
 
 ## 构建与打包
 
-使用统一构建脚本（GUI 客户端与服务器分开打包）：
+统一构建脚本（server 模式；桌面端已退役，无 gui 模式）：
 
 ### Windows
 
 ```powershell
-.\build.ps1 gui        # 桌面 GUI 客户端 zip（解压即用）
-.\build.ps1 server     # 服务器 zip（ep-daemon + WebUI）
+.\build.ps1 server     # 服务器 zip（ep-daemon + WebUI + start-daemon.bat）
 ```
 
 可选参数：`-Target debug|release`（默认 release）、`-SkipTest`、`-SkipClippy`、`-Clean`、`-OutputDir <dir>`（默认 dist）。
 
-### Linux / macOS
+### Linux
 
 ```bash
-./build.sh gui         # GUI 客户端包
-./build.sh server      # 服务器包（仅 Linux；macOS 不支持）
+./build.sh server      # 服务器包（tar.gz 兜底 + deb/rpm/PKGBUILD）
 ```
 
-- Linux GUI/server：tar.gz 兜底包 + 自动探测 deb（dpkg-deb）/ rpm（rpmbuild）/ Arch PKGBUILD（dist/arch-<mode>/）
-- macOS：仅 GUI，产出 EntryPoint.app 并压缩为 zip
 - 可选参数：`-t debug|release`、`--skip-test`、`--skip-clippy`、`--clean`、`-o <dir>`
 
 构建产物：
-- 二进制：`target/release/entrypoint`（GUI）、`target/release/ep-daemon`（服务器）
+- 二进制：`target/release/ep-daemon`（服务器 daemon）
 - 打包产物：`dist/` 下的 zip / tar.gz / deb / rpm
 
 ## Linux 部署指南
@@ -137,18 +132,13 @@ journalctl -u entrypoint -n 100
 
 详细部署文档见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
 
-## 桌面端构建
+## Windows 快速开始（server 包）
 
-```bash
-# Linux / macOS
-./build.sh gui
-# Windows
-./build.ps1 gui
-```
+1. 构建：`.\build.ps1 server`（或直接解压已发布的 zip）
+2. 双击包内 `start-daemon.bat` — 自动拉起 ep-daemon 并打开默认浏览器访问 `http://127.0.0.1:9800`
+3. 可选：`start-daemon.bat --no-browser` 跳过自动开浏览器（无人值守场景）
 
-产物：`target/release/entrypoint`（egui 原生窗口应用；Linux 另含 tar.gz/deb/rpm/PKGBUILD，macOS 为 .app+zip）
-
-功能：模型管理（下载/上传/导入三路径、双源自选下载、实时进度）、可视化管线编辑器（节点画布+贝塞尔连线+在线执行）、任务中心（节点级状态+产物下载）、实时日志、仪表盘（统计卡片+依赖检测）、深色/浅色主题切换、Toast 通知。
+WebUI 为唯一 UI（桌面端已于 2026-08-13 退役，决策依据见 docs/DESKTOP_SUNSET_PLAN.md）。
 
 ## Arch Linux 打包
 
@@ -159,13 +149,13 @@ cd packaging
 makepkg -si
 ```
 
-包含：PKGBUILD、entrypoint.desktop（桌面启动器）、entrypoint.service（systemd 服务）、entrypoint.install（安装钩子）。
+包含：PKGBUILD（server）、entrypoint.service（systemd 服务）、entrypoint.install（安装钩子）。
 
 > 注：`makepkg` 需在 Arch Linux 环境执行。RHEL/Fedora 上仅提供打包定义。
 
 ## 状态
 
-✅ 核心功能已完成，WebUI + 桌面 GUI 反向移植已实现，E2E 全流程测试通过（2026-08-04）
+✅ 核心功能已完成，WebUI 全流程测试通过；桌面端已于 2026-08-13 退役（WebUI 为唯一 UI）
 
 - ✅ 288 个 Rust 测试全部通过，clippy 零警告
 - ✅ 真实媒体 E2E：`video_to_srt` 管线全流程跑通（视频→音频提取→ASR large-v3→SRT 产物下载，GPU 不可用时自动 CPU 回退）
