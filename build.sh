@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
-# EntryPoint 编译打包脚本（Linux / macOS）
-# 用法: ./build.sh <gui|server> [-t debug|release] [-d <distro>] [--skip-test] [--skip-clippy] [--clean] [-o <dir>]
-#   gui    — 桌面 GUI 客户端包
-#            Linux: tar.gz 兑底 + deb/rpm/PKGBUILD（探测到工具则产）
-#            macOS: EntryPoint.app 并压缩为 zip（仅支持 gui）
+# EntryPoint 编译打包脚本（Linux）— server 模式（桌面端已于 2026-08-13 退役）
+# 用法: ./build.sh server [-t debug|release] [-d <distro>] [--skip-test] [--skip-clippy] [--clean] [-o <dir>]
 #   server — 服务器包（daemon + WebUI + systemd 安装脚本）
 #            Linux: tar.gz 兑底 + deb/rpm/PKGBUILD（探测到工具则产）
 set -euo pipefail
@@ -12,7 +9,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_ROOT"
 
 # 版本单一来源：Cargo.toml [workspace.package] version（勿在此处另写死版本号）；
-# 与桌面端界面版本（env!("CARGO_PKG_VERSION")）同源，保证包名/VERSION.txt/界面一致。
+# 与 daemon 界面版本（env!("CARGO_PKG_VERSION")）同源，保证包名/VERSION.txt/界面一致。
 # 解析失败必须显式报错而非回退 0.0.0（否则静默产出错误命名的包）。
 VERSION="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' "$PROJECT_ROOT/Cargo.toml" | head -1)"
 if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
@@ -30,8 +27,7 @@ DISTRO="auto"
 # ── 帮助与日志 ────────────────────────────────────────────────────────────────
 usage() {
     cat <<EOF
-用法: $0 <gui|server> [选项]
-  gui    桌面 GUI 客户端包（Linux: tar.gz/deb/rpm/PKGBUILD; macOS: .app+zip）
+用法: $0 server [选项]
   server 服务器包（daemon + WebUI + systemd，Linux: tar.gz/deb/rpm/PKGBUILD）
 选项:
   -t, --target debug|release   构建类型（默认 release）
@@ -43,7 +39,6 @@ usage() {
   -o, --output-dir <dir>       输出目录（默认 dist）
   -h, --help                   显示帮助
 示例:
-  ./build.sh gui                # 按当前发行版打包 GUI 客户端
   ./build.sh server --distro <name>   # 指定目标发行版打包服务器
 EOF
     exit 0
@@ -58,9 +53,14 @@ info() { echo "  $*"; }
 [[ $# -lt 1 ]] && usage
 MODE="$1"; shift
 case "$MODE" in
-    gui|server) ;;
+    server) ;;
+    gui)
+        echo "  [FAIL] gui 模式已随桌面端退役（2026-08-13）。" >&2
+        echo "  WebUI 为唯一 UI，请改用: ./build.sh server" >&2
+        echo "  历史说明见 docs/DESKTOP_SUNSET_PLAN.md。" >&2
+        exit 1 ;;
     -h|--help) usage ;;
-    *) die "未知模式: $MODE（可选 gui|server）" ;;
+    *) die "未知模式: $MODE（仅支持 server）" ;;
 esac
 
 while [[ $# -gt 0 ]]; do
@@ -221,12 +221,11 @@ if [[ "$ARCH_ID" == "aarch64" ]]; then
     RPM_ARCH="aarch64"
 fi
 
-if [[ "$OS_ID" == "macos" && "$MODE" == "server" ]]; then
-    die "macOS 仅支持 GUI 客户端打包（./build.sh gui）"
+if [[ "$OS_ID" == "macos" ]]; then
+    die "macOS 不再支持（桌面端已于 2026-08-13 退役，仅 Linux server 模式）"
 fi
 
-CRATE="ep-desktop"
-[[ "$MODE" == "server" ]] && CRATE="ep-daemon"
+CRATE="ep-daemon"
 
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 PROFILE_DIR="$TARGET"
@@ -304,54 +303,17 @@ mkdir -p "$STAGING/bin" "$STAGING/config/pipelines" "$STAGING/modules" "$STAGING
 mkdir -p "$WORK_DIR"
 
 BIN_SRC="$PROJECT_ROOT/target/$PROFILE_DIR"
-EXE_NAME="entrypoint"
-[[ "$MODE" == "server" ]] && EXE_NAME="ep-daemon"
+EXE_NAME="ep-daemon"
 [[ -f "$BIN_SRC/$EXE_NAME" ]] || die "二进制不存在: $BIN_SRC/$EXE_NAME"
 
-if [[ "$OS_ID" == "macos" ]]; then
-    # macOS: 二进制直接放入 .app 的 MacOS 目录（macOS 仅 gui 模式）
-    APP_DIR="$STAGING/EntryPoint.app"
-    mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
-    cp "$BIN_SRC/$EXE_NAME" "$APP_DIR/Contents/MacOS/entrypoint"
-    chmod +x "$APP_DIR/Contents/MacOS/entrypoint"
-    # 缺少 Info.plist 时 Finder 双击无法启动；生成最小 plist（CFBundleExecutable=entrypoint）
-    cat > "$APP_DIR/Contents/Info.plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleName</key>
-    <string>EntryPoint</string>
-    <key>CFBundleDisplayName</key>
-    <string>EntryPoint</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.pegionfish.entrypoint</string>
-    <key>CFBundleExecutable</key>
-    <string>entrypoint</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleVersion</key>
-    <string>${VERSION}</string>
-    <key>CFBundleShortVersionString</key>
-    <string>${VERSION}</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>11.0</string>
-    <key>NSHighResolutionCapable</key>
-    <true/>
-</dict>
-</plist>
-EOF
-    RES="$APP_DIR/Contents/Resources"
-else
-    # 包内二进制名与角色一致：gui=entrypoint / server=ep-daemon
-    # （与 start-*.sh、systemd ExecStart=/opt/entrypoint/bin/ep-daemon 对齐）
-    cp "$BIN_SRC/$EXE_NAME" "$STAGING/bin/$EXE_NAME"
-    chmod +x "$STAGING/bin/$EXE_NAME"
-    RES="$STAGING"
-fi
+# 包内二进制名与角色一致：ep-daemon
+# （与 start-daemon.sh、systemd ExecStart=/opt/entrypoint/bin/ep-daemon 对齐）
+cp "$BIN_SRC/$EXE_NAME" "$STAGING/bin/$EXE_NAME"
+chmod +x "$STAGING/bin/$EXE_NAME"
+RES="$STAGING"
 ok "二进制已就位: bin/$EXE_NAME"
 
-# ep-pack CLI（仲裁 #36：gui/server 包均附带，bin 名 ep-pack）
+# ep-pack CLI（仲裁 #36：server 包附带，bin 名 ep-pack）
 [[ -f "$BIN_SRC/ep-pack" ]] || die "ep-pack 二进制不存在: $BIN_SRC/ep-pack"
 mkdir -p "$RES/bin"
 cp "$BIN_SRC/ep-pack" "$RES/bin/ep-pack"
@@ -431,25 +393,13 @@ EOF
 fi
 
 # 启动脚本
-if [[ "$MODE" == "gui" ]]; then
-    cat > "$RES/start-desktop.sh" <<'EOF'
-#!/usr/bin/env bash
-cd "$(dirname "$0")"
-exec bin/entrypoint
-EOF
-    chmod +x "$RES/start-desktop.sh"
-    if [[ -f "$PROJECT_ROOT/packaging/entrypoint.desktop" ]]; then
-        cp "$PROJECT_ROOT/packaging/entrypoint.desktop" "$RES/"
-    fi
-else
-    cat > "$RES/start-daemon.sh" <<'EOF'
+cat > "$RES/start-daemon.sh" <<'EOF'
 #!/usr/bin/env bash
 # 前台启动 daemon（生产环境建议用 install.sh 注册 systemd 服务）
 cd "$(dirname "$0")"
 exec bin/ep-daemon
 EOF
-    chmod +x "$RES/start-daemon.sh"
-fi
+chmod +x "$RES/start-daemon.sh"
 ok "启动脚本已生成"
 
 # 文档 + 版本信息
@@ -475,45 +425,25 @@ pkg_tgz() {
     ok "tar.gz: $DIST_DIR/$name ($(du -h "$DIST_DIR/$name" | cut -f1))"
 }
 
-pkg_macos_zip() {
-    local name="${PACKAGE_BASE}.zip"
-    if command -v ditto >/dev/null 2>&1; then
-        (cd "$STAGING" && ditto -c -k --sequesterRsrc --keepParent EntryPoint.app "$DIST_DIR/$name")
-    else
-        (cd "$STAGING" && zip -r "$DIST_DIR/$name" EntryPoint.app)
-    fi
-    echo "$name" >> "$MANIFEST"
-    ok "zip: $DIST_DIR/$name ($(du -h "$DIST_DIR/$name" | cut -f1))"
-}
-
 # 统一文件树 → /opt/entrypoint + /usr/bin 包装器（供 deb/rpm 使用）
 stage_fhs() {
     local root="$1"
     mkdir -p "$root/opt/entrypoint" "$root/usr/bin" "$root/usr/lib/systemd/system"
     cp -a "$STAGING/." "$root/opt/entrypoint/"
-    # ep-pack CLI 包装器（仲裁 #36：gui/server 均附带）
+    # ep-pack CLI 包装器（仲裁 #36：server 附带）
     cat > "$root/usr/bin/ep-pack" <<'EOF'
 #!/bin/sh
 export EP_ROOT=/opt/entrypoint
 exec /opt/entrypoint/bin/ep-pack "$@"
 EOF
     chmod +x "$root/usr/bin/ep-pack"
-    if [[ "$MODE" == "server" ]]; then
-        cat > "$root/usr/bin/ep-daemon" <<'EOF'
+    cat > "$root/usr/bin/ep-daemon" <<'EOF'
 #!/bin/sh
 export EP_ROOT=/opt/entrypoint
 exec /opt/entrypoint/bin/ep-daemon "$@"
 EOF
-        chmod +x "$root/usr/bin/ep-daemon"
-        cp "$STAGING/entrypoint.service" "$root/usr/lib/systemd/system/entrypoint.service"
-    else
-        cat > "$root/usr/bin/entrypoint" <<'EOF'
-#!/bin/sh
-export EP_ROOT=/opt/entrypoint
-exec /opt/entrypoint/bin/entrypoint "$@"
-EOF
-        chmod +x "$root/usr/bin/entrypoint"
-    fi
+    chmod +x "$root/usr/bin/ep-daemon"
+    cp "$STAGING/entrypoint.service" "$root/usr/lib/systemd/system/entrypoint.service"
 }
 
 pkg_deb() {
@@ -523,8 +453,7 @@ pkg_deb() {
     stage_fhs "$root"
     mkdir -p "$root/DEBIAN"
     local pkgname="entrypoint-${MODE}"
-    local desc="EntryPoint AI 模块编排平台"
-    [[ "$MODE" == "server" ]] && desc="EntryPoint AI 模块编排平台（服务器）"
+    local desc="EntryPoint AI 模块编排平台（服务器）"
     cat > "$root/DEBIAN/control" <<EOF
 Package: $pkgname
 Version: $VERSION
@@ -535,14 +464,12 @@ Depends: ${DISTRO_DEPS:-ffmpeg, python3, python3-venv}
 Maintainer: EntryPoint <https://github.com/PegionFish/EntryPoint>
 Description: $desc
 EOF
-    if [[ "$MODE" == "server" ]]; then
-        cat > "$root/DEBIAN/postinst" <<'EOF'
+    cat > "$root/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 systemctl daemon-reload 2>/dev/null || true
 systemctl enable entrypoint 2>/dev/null || true
 EOF
-        chmod +x "$root/DEBIAN/postinst"
-    fi
+    chmod +x "$root/DEBIAN/postinst"
     dpkg-deb --build --root-owner-group "$root" "$DIST_DIR/${pkgname}_${VERSION}-1_${DEB_ARCH}.deb" >/dev/null
     echo "${pkgname}_${VERSION}-1_${DEB_ARCH}.deb" >> "$MANIFEST"
     ok "deb: $DIST_DIR/${pkgname}_${VERSION}-1_${DEB_ARCH}.deb"
@@ -555,8 +482,7 @@ pkg_rpm() {
     local br="$top/BUILDROOT/entrypoint-${MODE}-${VERSION}-1.${RPM_ARCH}"
     mkdir -p "$top/BUILD" "$top/RPMS" "$top/SOURCES" "$top/SPECS"
     stage_fhs "$br"
-    local desc="EntryPoint AI 模块编排平台"
-    [[ "$MODE" == "server" ]] && desc="EntryPoint AI 模块编排平台（服务器）"
+    local desc="EntryPoint AI 模块编排平台（服务器）"
     cat > "$top/SPECS/entrypoint-${MODE}.spec" <<EOF
 Name: entrypoint-${MODE}
 Version: ${VERSION}
@@ -576,9 +502,6 @@ $desc
 %files
 /opt/entrypoint
 /usr/bin/ep-pack
-EOF
-    if [[ "$MODE" == "server" ]]; then
-        cat >> "$top/SPECS/entrypoint-${MODE}.spec" <<'EOF'
 /usr/bin/ep-daemon
 /usr/lib/systemd/system/entrypoint.service
 
@@ -586,9 +509,6 @@ EOF
 systemctl daemon-reload 2>/dev/null || true
 systemctl enable entrypoint 2>/dev/null || true
 EOF
-    else
-        printf '/usr/bin/entrypoint\n' >> "$top/SPECS/entrypoint-${MODE}.spec"
-    fi
     rpmbuild -bb --define "_topdir $top" "$top/SPECS/entrypoint-${MODE}.spec" >/dev/null
     cp "$top"/RPMS/${RPM_ARCH}/entrypoint-${MODE}-${VERSION}-1.${RPM_ARCH}.rpm "$DIST_DIR/"
     echo "entrypoint-${MODE}-${VERSION}-1.${RPM_ARCH}.rpm" >> "$MANIFEST"
@@ -597,7 +517,6 @@ EOF
 
 pkg_arch() {
     local src="$PROJECT_ROOT/packaging/PKGBUILD"
-    [[ "$MODE" == "gui" ]] && src="$PROJECT_ROOT/packaging/PKGBUILD.gui"
     if [[ ! -f "$src" ]]; then info "跳过 Arch（未找到 $src）"; return 0; fi
     local dir="$DIST_DIR/arch-$MODE"
     mkdir -p "$dir"
@@ -608,7 +527,7 @@ pkg_arch() {
     pkgver="$(awk -F= '/^pkgver=/{print $2; exit}' "$src")"
     stage="$dir/$pkgname-$pkgver"
     mkdir -p "$stage"
-    # makepkg 构建所需文件（daemon/gui + ep-pack-cli + WebUI 前端 + package() 引用资源）；
+    # makepkg 构建所需文件（daemon + ep-pack-cli + WebUI 前端 + package() 引用资源）；
     # 含 Cargo.lock 以支持 PKGBUILD 的 cargo build --locked
     for f in Cargo.toml Cargo.lock crates modules config packaging LICENSE README.md; do
         [[ -e "$PROJECT_ROOT/$f" ]] && cp -a "$PROJECT_ROOT/$f" "$stage/"
@@ -623,8 +542,8 @@ pkg_arch() {
     sha="$(sha256sum "$src_tar" | cut -d' ' -f1)"
     # 回填真实 sha256sums（与刚产出的源包一一对应；原 'SKIP' 属弱校验，此处做实）
     sed "s/sha256sums=('SKIP')/sha256sums=('$sha')/" "$src" > "$dir/PKGBUILD"
-    # server PKGBUILD 声明 install=entrypoint.install，需随附才能 makepkg
-    if [[ "$MODE" == "server" && -f "$PROJECT_ROOT/packaging/entrypoint.install" ]]; then
+    # PKGBUILD 声明 install=entrypoint.install，需随附才能 makepkg
+    if [[ -f "$PROJECT_ROOT/packaging/entrypoint.install" ]]; then
         cp "$PROJECT_ROOT/packaging/entrypoint.install" "$dir/"
     fi
     echo "arch-$MODE/PKGBUILD" >> "$MANIFEST"
@@ -632,18 +551,14 @@ pkg_arch() {
     ok "Arch: $dir/PKGBUILD (sha256=$sha) + 源包 $pkgname-$pkgver.tar.gz"
 }
 
-if [[ "$OS_ID" == "macos" ]]; then
-    pkg_macos_zip
-else
-    pkg_tgz
-    # 按目标发行版产出对应包格式（工具缺失则跳过，tar.gz 兜底保证有产物）
-    case "$DISTRO_FAMILY" in
-        deb) pkg_deb ;;
-        rpm) pkg_rpm ;;
-        pkg) pkg_arch ;;
-        *)   info "仅产出 tar.gz 兑底包" ;;
-    esac
-fi
+pkg_tgz
+# 按目标发行版产出对应包格式（工具缺失则跳过，tar.gz 兜底保证有产物）
+case "$DISTRO_FAMILY" in
+    deb) pkg_deb ;;
+    rpm) pkg_rpm ;;
+    pkg) pkg_arch ;;
+    *)   info "仅产出 tar.gz 兑底包" ;;
+esac
 
 # ── 清单 ─────────────────────────────────────────────────────────────────────
 step "打包清单"
