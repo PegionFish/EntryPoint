@@ -32,7 +32,7 @@ use crate::state::AppState;
 // 启动」系统错误对话框。`SetErrorMode` 的错误模式会被子进程继承，在启动
 // 早期置位后，探测失败仅返回非零退出码 / spawn 错误，由调用侧降级分支
 // 静默处理（仅日志 + 友好状态），不再弹窗。
-//（自 ep-desktop 移植，2026-08-13 桌面端退役）
+//（自桌面端移植，2026-08-13 退役）
 #[cfg(target_os = "windows")]
 #[link(name = "kernel32")]
 extern "system" {
