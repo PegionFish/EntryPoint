@@ -169,7 +169,7 @@
 
 | 数据 | 间隔 | 来源 |
 | --- | --- | --- |
-| 仪表盘设备 / 模块概览 | `ui.dashboard_refresh_secs`（配置，默认 5s） | `GET /api/devices`、`GET /api/modules` |
+| 仪表盘设备 / 模块概览 | 5s（WebUI 前端轮询；`[ui]` 配置节已随桌面端退役） | `GET /api/devices`、`GET /api/modules` |
 | 模块状态 | 5s（仅打开详情时） | `GET /api/modules/:id/status` |
 | 模型列表 | 按需 + 操作后刷新 | `GET /api/models` |
 

@@ -162,22 +162,7 @@ keep_workspace = true
 workspace_dir = "workspace"
 ```
 
-### 1.7 `[ui]` — 界面设置
-
-| 字段 | 类型 | 默认值 | 说明 |
-|---|---|---|---|
-| `scale_factor` | f32 | `1.0` | UI 缩放（高 DPI 适配） |
-| `font_size` | f32 | `14.0` | 基础字号 |
-| `dashboard_refresh_secs` | u32 | `2` | 仪表盘刷新间隔 |
-
-```toml
-[ui]
-scale_factor = 1.0
-font_size = 14.0
-dashboard_refresh_secs = 2
-```
-
-### 1.8 `[server]` — HTTP 服务（daemon）
+### 1.7 `[server]` — HTTP 服务（daemon）
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
@@ -192,7 +177,7 @@ port = 9800
 allow_public = false
 ```
 
-### 1.9 `[network]` — 网络代理
+### 1.8 `[network]` — 网络代理
 
 统一控制模型下载、依赖安装与模块子进程的出口代理。取代此前"子进程隐式继承 daemon 环境变量"的不可控方式：所有需要联网的子进程显式注入这里配置的环境变量。
 
@@ -221,7 +206,7 @@ no_proxy = "localhost,127.0.0.1"
 # https_proxy = "http://127.0.0.1:7890"
 ```
 
-### 1.10 `[packs]` — 整合包（PACK_UNIFY_PLAN §8.3）
+### 1.9 `[packs]` — 整合包（PACK_UNIFY_PLAN §8.3）
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
@@ -232,7 +217,7 @@ no_proxy = "localhost,127.0.0.1"
 staging_dir = ".pack-staging"
 ```
 
-### 1.11 `[active_models]` — 每模块激活变体（版本单槽位）
+### 1.10 `[active_models]` — 每模块激活变体（版本单槽位）
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
@@ -297,10 +282,6 @@ constraints = "config/constraints.txt"
 max_parallel = 4
 default_timeout_secs = 600
 keep_workspace = true
-
-[ui]
-scale_factor = 1.0
-font_size = 14.0
 
 [network]
 http_proxy = ""
