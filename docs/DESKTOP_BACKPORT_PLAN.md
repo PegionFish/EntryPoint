@@ -1,5 +1,7 @@
 # EntryPoint 桌面 GUI 反向移植 + 架构优化 + Arch 打包 — 执行方案
 
+> ⚠️ **Sunset 横幅（2026-08-13）**：本文档所述 **ep-desktop 桌面端已于 2026-08-13 退役**，WebUI 为唯一 UI（server 形态交付）。本页保留为历史记录，不再维护；详见 [DESKTOP_SUNSET_PLAN.md](DESKTOP_SUNSET_PLAN.md)。
+
 > 版本：v4 (最终) | 日期：2026-07-30
 >
 > 状态：待确认

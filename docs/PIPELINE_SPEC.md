@@ -1,5 +1,7 @@
 # 管线规范 (Pipeline Specification)
 
+> ⚠️ **Sunset 横幅（2026-08-13）**：本文档所述 **ep-desktop 桌面端已于 2026-08-13 退役**，WebUI 为唯一 UI（server 形态交付）。本页保留为历史记录，不再维护；详见 [DESKTOP_SUNSET_PLAN.md](DESKTOP_SUNSET_PLAN.md)。
+
 > 版本：1.1 | 适用于 EntryPoint v0.x
 >
 > v1.1 变更：新增「节点开发指南」章节（§11，决策 5：module/builtin 两条路径全面文档化）；

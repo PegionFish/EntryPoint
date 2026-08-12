@@ -1,4 +1,6 @@
-﻿# EntryPoint 统一 UI 重设计方案（WebUI + 桌面端）
+# EntryPoint 统一 UI 重设计方案（WebUI + 桌面端）
+
+> ⚠️ **Sunset 横幅（2026-08-13）**：本文档所述 **ep-desktop 桌面端已于 2026-08-13 退役**，WebUI 为唯一 UI（server 形态交付）。本页保留为历史记录，不再维护；详见 [DESKTOP_SUNSET_PLAN.md](DESKTOP_SUNSET_PLAN.md)。
 
 - 状态：提案（待裁决）
 - 范围：只改设计/文档口径；实施须按第 11 节波次另行立项

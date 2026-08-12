@@ -1,5 +1,7 @@
 # 夜间自治开发计划 — EntryPoint Phase 1→2 冲刺
 
+> ⚠️ **Sunset 横幅（2026-08-13）**：本文档所述 **ep-desktop 桌面端已于 2026-08-13 退役**，WebUI 为唯一 UI（server 形态交付）。本页保留为历史记录，不再维护；详见 [DESKTOP_SUNSET_PLAN.md](DESKTOP_SUNSET_PLAN.md)。
+
 > 创建时间: 2026-07-26 晚
 > 目标: 天亮前完成 Phase 1 收尾 + Phase 2 核心，产出可运行的桌面应用原型
 > 策略: 多代理并行 + 自循环验证

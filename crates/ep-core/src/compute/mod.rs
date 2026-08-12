@@ -246,7 +246,7 @@ pub fn detect_all_devices(disabled: &[ComputeBackend]) -> Vec<ComputeDevice> {
     devices
 }
 
-// `refresh_all_devices`（原仅桌面端常驻调度器消费）已随 ep-desktop 退役
+// `refresh_all_devices`（原仅桌面端常驻调度器消费）已随桌面端退役
 //（2026-08-13）删除：daemon 无调用方，检测器刷新由调用侧自行驱动。
 
 #[cfg(test)]

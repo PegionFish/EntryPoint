@@ -1,5 +1,5 @@
 //! 共享 i18n 基础设施 — 嵌入式翻译加载器（ep-core / ep-daemon 共用；
-//! 2026-08-13 桌面端退役后 ep-desktop 不再消费）。
+//! 2026-08-13 桌面端退役后不再消费）。
 //!
 //! # 共享契约（冻结，勿单方面修改）
 //!
@@ -32,7 +32,7 @@ use std::sync::OnceLock;
 
 /// 契约规定的 12 个命名空间（与 `i18n/locales/*/` 下的文件名一一对应）。
 /// `packs` 为 Wave S 新增（整合包管理区，键由 Wave 3 C8 统一落盘）。
-/// 2026-08-13 桌面端退役：desktopPages / desktopApp 两个命名空间随 ep-desktop 移除。
+/// 2026-08-13 桌面端退役：desktopPages / desktopApp 两个命名空间随桌面端移除。
 pub const NAMESPACES: &[&str] = &[
     "common",
     "dashboard",
