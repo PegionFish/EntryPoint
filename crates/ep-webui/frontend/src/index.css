@@ -42,8 +42,8 @@
   --duration-base: 200ms;
   --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
 
-  /* 四态状态色（§1.2 权威重定值，双端统一，breaking；
-     浅色取加深值对齐桌面对比度口径，见 ep-desktop palette.rs light()） */
+  /* 四态状态色（§1.2 权威重定值，breaking；
+     浅色取加深值对齐对比度口径（桌面端已退役）） */
   --status-ready: #16a34a;
   --status-running: #0891b2;
   --status-stopped: #71717a;

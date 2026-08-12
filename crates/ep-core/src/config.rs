@@ -336,26 +336,6 @@ impl Default for PipelineConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UiConfig {
-    #[serde(default = "default_scale_factor")]
-    pub scale_factor: f32,
-    #[serde(default = "default_font_size")]
-    pub font_size: f32,
-    #[serde(default = "default_dashboard_refresh")]
-    pub dashboard_refresh_secs: u32,
-}
-
-impl Default for UiConfig {
-    fn default() -> Self {
-        Self {
-            scale_factor: 1.0,
-            font_size: 14.0,
-            dashboard_refresh_secs: 2,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     #[serde(default = "default_host")]
     pub host: String,
@@ -438,8 +418,6 @@ pub struct AppConfig {
     pub python: PythonConfig,
     #[serde(default)]
     pub pipeline: PipelineConfig,
-    #[serde(default)]
-    pub ui: UiConfig,
     /// 网络代理配置（下载 / 依赖安装 / 模块进程出口）
     #[serde(default)]
     pub network: NetworkConfig,
@@ -704,15 +682,6 @@ fn default_timeout() -> u32 {
 fn default_workspace_dir() -> String {
     "workspace".into()
 }
-fn default_scale_factor() -> f32 {
-    1.0
-}
-fn default_font_size() -> f32 {
-    14.0
-}
-fn default_dashboard_refresh() -> u32 {
-    2
-}
 fn default_no_proxy() -> String {
     "localhost,127.0.0.1".into()
 }
@@ -755,10 +724,6 @@ mod tests {
         assert_eq!(restored.pipeline.default_timeout_secs, 600);
         assert!(restored.pipeline.keep_workspace);
         assert_eq!(restored.pipeline.workspace_dir, "workspace");
-
-        assert!((restored.ui.scale_factor - 1.0).abs() < f32::EPSILON);
-        assert!((restored.ui.font_size - 14.0).abs() < f32::EPSILON);
-        assert_eq!(restored.ui.dashboard_refresh_secs, 2);
 
         assert_eq!(restored.network.http_proxy, "");
         assert_eq!(restored.network.https_proxy, "");
