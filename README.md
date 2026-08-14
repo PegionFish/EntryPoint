@@ -69,7 +69,7 @@ npm run dev
 .\build.ps1 server     # 服务器 zip（ep-daemon + WebUI + start-daemon.bat）
 ```
 
-可选参数：`-Target debug|release`（默认 release）、`-SkipTest`、`-SkipClippy`、`-Clean`、`-OutputDir <dir>`（默认 dist）。
+可选参数：`-Target debug|release`（默认 release）、`-SkipTest`、`-SkipClippy`、`-SkipFrontend`、`-Clean`、`-OutputDir <dir>`（默认 dist）。
 
 ### Linux
 
@@ -77,7 +77,9 @@ npm run dev
 ./build.sh server      # 服务器包（tar.gz 兜底 + deb/rpm/PKGBUILD）
 ```
 
-- 可选参数：`-t debug|release`、`--skip-test`、`--skip-clippy`、`--clean`、`-o <dir>`
+- 可选参数：`-t debug|release`、`--skip-test`、`--skip-clippy`、`--skip-frontend`、`--clean`、`-o <dir>`
+
+> **WebUI 前端自动构建**：打包时会自动构建 WebUI 前端（在 `crates/ep-webui/frontend` 执行 `npm ci && npm run build`，产物输出到 `crates/ep-webui/static`），需已安装 Node.js/npm。可用 `-SkipFrontend`（build.ps1）/ `--skip-frontend`（build.sh）跳过构建，直接使用现有 static 产物。npm 缺失但已有 static 产物时降级为警告继续（产物可能陈旧）；static 产物缺失则直接报错退出，杜绝静默空包。
 
 构建产物：
 - 二进制：`target/release/ep-daemon`（服务器 daemon）
