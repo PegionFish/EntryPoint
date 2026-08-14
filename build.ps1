@@ -47,7 +47,7 @@ if (-not (Test-Path $Rustc)) {
 $Git = Get-Command git -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
 
 # 版本单一来源：Cargo.toml [workspace.package] version（勿在此另写死版本号）；
-# 与桌面端界面版本（env!("CARGO_PKG_VERSION")）同源，保证包名/VERSION.txt/界面一致。
+# 运行时二进制经 env!("CARGO_PKG_VERSION") 同源，保证包名/VERSION.txt/版本显示一致。
 # 解析失败必须显式报错而非回退 0.0.0（否则静默产出错误命名的包）。
 $VersionLine = Select-String -Path "$ProjectRoot\Cargo.toml" -Pattern '^version\s*=\s*"([^"]+)"' -ErrorAction SilentlyContinue | Select-Object -First 1
 $Version = if ($VersionLine) { $VersionLine.Matches[0].Groups[1].Value } else { "" }
@@ -171,7 +171,7 @@ Write-Ok "ep-pack CLI: bin\ep-pack.exe"
 
 # VC 运行库（免装 VC++ Redistributable）
 # 说明（§3.1/§15.3）：Windows 侧共享 CUDA 库目录 runtime\cuda-libs 的 PATH 前置
-# 由 daemon/桌面端运行时代码处理（ep-core process.rs 按 DLL 搜索序注入模块子进程），
+# 由 daemon 运行时代码处理（ep-core process.rs 按 DLL 搜索序注入模块子进程），
 # 打包脚本无需在此注入 PATH；若存在 runtime\cuda-libs 则按存在性随包附带（见下）。
 $crtDir = Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Directory -Filter "Microsoft.VC14*.CRT" -ErrorAction SilentlyContinue |
     Where-Object { $_.Parent.Name -eq "x64" -and $_.Parent.Parent.Name -match "^\d+\.\d+" } |
