@@ -1,6 +1,6 @@
 #!/usr/bin/env pwsh
 # EntryPoint 编译打包脚本（Windows）— server 模式（桌面端已于 2026-08-13 退役）
-# 用法: .\build.ps1 server [-Target debug|release] [-SkipTest] [-SkipClippy] [-Clean] [-OutputDir <dir>]
+# 用法: .\build.ps1 server [-Target debug|release] [-SkipTest] [-SkipClippy] [-SkipFrontend] [-Clean] [-OutputDir <dir>]
 #   server — 服务器包（zip：ep-daemon + WebUI 静态资源 + 配置 + 模块）
 
 param(
@@ -12,6 +12,7 @@ param(
 
     [switch]$SkipTest,
     [switch]$SkipClippy,
+    [switch]$SkipFrontend,
     [switch]$Clean,
 
     [string]$OutputDir = "dist"
@@ -210,15 +211,50 @@ if (Test-Path $cudaLibs) {
     Write-Info "runtime\cuda-libs 不存在，跳过（可选目录）"
 }
 
-# WebUI 静态资源 → webui\
+# WebUI 前端 → webui\：打包时先自动构建（npm ci + npm run build）再复制 static；
+# -SkipFrontend 跳过构建直接用现有 static 产物。static 缺失/index.html 缺失一律报错退出，
+# 杜绝静默打包陈旧/空的前端 bundle。
 $webuiStatic = Join-Path $ProjectRoot "crates\ep-webui\static"
-if (Test-Path $webuiStatic) {
-    New-Item -ItemType Directory -Force -Path "$packageDir\webui" | Out-Null
-    Copy-Item "$webuiStatic\*" "$packageDir\webui\" -Recurse -Force
-    Write-Ok "webui\ 已复制"
+if ($SkipFrontend) {
+    Write-Info "跳过 WebUI 前端构建 (-SkipFrontend)，使用现有 static 产物"
 } else {
-    Write-Info "警告: crates\ep-webui\static 不存在（请先构建 WebUI 前端）"
+    Write-Step "构建 WebUI 前端"
+    $npmCmd = Get-Command npm -ErrorAction SilentlyContinue
+    if ($npmCmd) {
+        Write-Ok "npm: $($npmCmd.Source)"
+        $frontendDir = Join-Path $ProjectRoot "crates\ep-webui\frontend"
+        Push-Location $frontendDir
+        $prevErr = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        $npmCiOut = & npm ci 2>&1
+        $npmCiExit = $LASTEXITCODE
+        $ErrorActionPreference = $prevErr
+        if ($npmCiExit -ne 0) {
+            $npmCiOut | Select-Object -Last 20 | ForEach-Object { Write-Host "  [FAIL] $_" -ForegroundColor Red }
+            Write-Err "npm ci 失败"
+        }
+        Write-Ok "npm ci 完成"
+        $prevErr = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        $npmBuildOut = & npm run build 2>&1
+        $npmBuildExit = $LASTEXITCODE
+        $ErrorActionPreference = $prevErr
+        if ($npmBuildExit -ne 0) {
+            $npmBuildOut | Select-Object -Last 20 | ForEach-Object { Write-Host "  [FAIL] $_" -ForegroundColor Red }
+            Write-Err "npm run build 失败"
+        }
+        Pop-Location
+        Write-Ok "WebUI 前端构建完成"
+    } elseif (Test-Path "$webuiStatic\index.html") {
+        Write-Info "警告: npm 不可用，使用现有 static 产物（可能陈旧）"
+    } else {
+        Write-Err "npm 不可用且 crates\ep-webui\static 产物缺失——请安装 Node.js/npm，或先手动构建前端（-SkipFrontend 仅适用于已有产物）"
+    }
 }
+if (-not (Test-Path "$webuiStatic\index.html")) { Write-Err "crates\ep-webui\static\index.html 不存在（前端构建不完整，请检查 npm run build 输出）" }
+New-Item -ItemType Directory -Force -Path "$packageDir\webui" | Out-Null
+Copy-Item "$webuiStatic\*" "$packageDir\webui\" -Recurse -Force
+Write-Ok "webui\ 已复制"
 
 # 启动脚本
 # 启动体验（C2/§3）：双击 → 独立控制台拉起 daemon → 延迟后自动开默认浏览器；

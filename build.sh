@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # EntryPoint 编译打包脚本（Linux）— server 模式（桌面端已于 2026-08-13 退役）
-# 用法: ./build.sh server [-t debug|release] [-d <distro>] [--skip-test] [--skip-clippy] [--clean] [-o <dir>]
+# 用法: ./build.sh server [-t debug|release] [-d <distro>] [--skip-test] [--skip-clippy] [--skip-frontend] [--clean] [-o <dir>]
 #   server — 服务器包（daemon + WebUI + systemd 安装脚本）
 #            Linux: tar.gz 兑底 + deb/rpm/PKGBUILD（探测到工具则产）
 set -euo pipefail
@@ -20,6 +20,7 @@ MODE=""
 TARGET="release"
 SKIP_TEST=0
 SKIP_CLIPPY=0
+SKIP_FRONTEND=0
 CLEAN=0
 OUTPUT_DIR="dist"
 DISTRO="auto"
@@ -35,6 +36,7 @@ usage() {
                                已适配 glibc 约束/依赖包名/包格式；未知发行版仅 tar.gz
       --skip-test              跳过 cargo test
       --skip-clippy            跳过 cargo clippy
+      --skip-frontend          跳过 WebUI 前端构建（使用现有 crates/ep-webui/static 产物）
       --clean                  cargo clean 后重建
   -o, --output-dir <dir>       输出目录（默认 dist）
   -h, --help                   显示帮助
@@ -69,6 +71,7 @@ while [[ $# -gt 0 ]]; do
         -d|--distro) DISTRO="$2"; shift 2 ;;
         --skip-test) SKIP_TEST=1; shift ;;
         --skip-clippy) SKIP_CLIPPY=1; shift ;;
+        --skip-frontend) SKIP_FRONTEND=1; shift ;;
         --clean) CLEAN=1; shift ;;
         -o|--output-dir) OUTPUT_DIR="$2"; shift 2 ;;
         -h|--help) usage ;;
@@ -343,11 +346,29 @@ else
     info "runtime/cuda-libs 不存在，跳过（可选目录）"
 fi
 
+# WebUI 前端 → webui/：打包时先自动构建（npm ci && npm run build）再复制 static；
+# --skip-frontend 跳过构建直接用现有 static 产物。npm 缺失且 static 缺失一律报错退出，
+# 杜绝静默打包陈旧/空的前端 bundle。
+WEBUI_STATIC="$PROJECT_ROOT/crates/ep-webui/static"
+if [[ "$SKIP_FRONTEND" == "1" ]]; then
+    info "跳过 WebUI 前端构建 (--skip-frontend)，使用现有 static 产物"
+elif command -v npm >/dev/null 2>&1; then
+    step "构建 WebUI 前端"
+    ok "npm: $(command -v npm)"
+    (cd "$PROJECT_ROOT/crates/ep-webui/frontend" && npm ci && npm run build) || die "WebUI 前端构建失败（npm ci / npm run build）"
+    ok "WebUI 前端构建完成"
+elif [[ -f "$WEBUI_STATIC/index.html" ]]; then
+    info "警告: npm 不可用，使用现有 static 产物（可能陈旧）"
+else
+    die "npm 不可用且 crates/ep-webui/static 产物缺失——请安装 Node.js/npm，或先手动构建前端（--skip-frontend 仅适用于已有产物）"
+fi
+
 # 服务器包附加内容
 if [[ "$MODE" == "server" ]]; then
+    [[ -f "$WEBUI_STATIC/index.html" ]] || die "crates/ep-webui/static/index.html 不存在（前端构建不完整，请检查 npm run build 输出）"
     mkdir -p "$RES/webui"
-    cp -a "$PROJECT_ROOT/crates/ep-webui/static/." "$RES/webui/" 2>/dev/null || \
-        info "警告: crates/ep-webui/static 不存在（请先构建 WebUI 前端）"
+    cp -a "$WEBUI_STATIC/." "$RES/webui/"
+    ok "webui/ 已复制"
     cat > "$RES/entrypoint.service" <<EOF
 [Unit]
 Description=EntryPoint AI Module Orchestrator
