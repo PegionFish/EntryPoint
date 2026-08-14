@@ -666,25 +666,26 @@ kind = "module"
 module_id = "faster-whisper"
 capability = "transcribe"
 label = "语音识别"
-params = { language = "auto", timestamps = true }
+params = { language = "auto", timestamps = true, output_format = "srt" }
 
 [[nodes]]
 id = "translate"
-kind = "external_api"
+kind = "builtin"
+builtin = "llm"
 label = "LLM 翻译"
 params = {
-    api_base = "https://api.siliconflow.cn/v1",
+    base_url = "https://api.siliconflow.cn/v1",
     model = "deepseek-ai/DeepSeek-V3",
-    target_lang = "zh",
-    prompt_template = "将以下字幕文本翻译为{target_lang}，保持时间戳格式：\n{text}"
+    api_key_env = "SILICONFLOW_API_KEY",
+    system_prompt = "将以下字幕文本翻译为中文，保持时间戳格式：{input}"
 }
 
 [[nodes]]
-id = "srt"
+id = "save"
 kind = "builtin"
-builtin = "srt_export"
-label = "导出 SRT"
-params = { max_chars_per_line = 42 }
+builtin = "file_output"
+label = "保存字幕"
+params = { extension = "srt" }
 
 [[edges]]
 from = ["input", "output"]
@@ -704,8 +705,11 @@ to = ["translate", "input"]
 
 [[edges]]
 from = ["translate", "output"]
-to = ["srt", "input"]
+to = ["save", "input"]
 ```
+
+> 注：早期设计中的 SRT 导出 builtin 节点未实现，SRT 导出改由模块产物协议
+> 承担（MODULE_SPEC.md §5）；现行可运行形状见 PIPELINE_SPEC.md §9。
 
 ### 4.8 ConfigStore — 配置持久化
 
@@ -912,7 +916,9 @@ async def predict(capability: str, file: UploadFile = None, params: str = "{}"):
     return {"status": "error", "message": f"Unknown capability: {capability}"}
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    # 绑定地址读 EP_HOST（平台注入，缺省回环）——硬编码非回环地址会触发
+    # Windows 防火墙弹窗，详见 docs/ADAPTER_API.md §1.2
+    uvicorn.run(app, host=os.getenv("EP_HOST", "127.0.0.1"), port=PORT)
 ```
 
 #### 设计要点

@@ -358,6 +358,7 @@ requirements_by_backend = { cuda = "requirements-cuda.txt", rocm = "requirements
 | `EP_MODEL_DIR` | 当前（激活变体）模型目录 | `D:\AI_Models\faster-whisper-large-v3` |
 | `EP_MODELS_ROOT` | 模型缓存根目录（含所有变体子目录，供 `params.model` 变体覆盖解析，见 ADAPTER_API.md §1.3） | `D:\AI_Models` |
 | `EP_MODEL_ID` | 当前模型 ID | `large-v3` |
+| `EP_HOST` | adapter 绑定地址（固定回环 `127.0.0.1`，避免非回环监听触发 Windows 防火墙弹窗，见 ADAPTER_API.md §1.2） | `127.0.0.1` |
 | `EP_PORT` | 分配端口 | `18001` |
 | `EP_DEVICE` | 设备标识 | `cuda:0` / `cpu` / `npu:0` |
 | `EP_DEVICE_INDEX` | 设备索引 | `0` |
@@ -365,7 +366,8 @@ requirements_by_backend = { cuda = "requirements-cuda.txt", rocm = "requirements
 | `EP_WORKSPACE` | 当前任务工作目录（管线运行时） | `...\workspace\task-abc123` |
 | `EP_LOG_LEVEL` | 日志级别 | `info` / `debug` |
 
-**adapter.py 必须读取 `EP_PORT` 并监听该端口。**
+**adapter.py 必须读取 `EP_PORT` 并监听该端口；绑定地址读取 `EP_HOST`
+（缺省 `127.0.0.1`，只绑回环，见 ADAPTER_API.md §1.2）。**
 
 ---
 
@@ -592,7 +594,10 @@ python-multipart>=0.0.6
 faster-whisper>=1.0.0
 ```
 
-### 7.2 原生 CLI 模块：deep-filter
+### 7.2 Python HTTP 模块（轻量 ONNX 模型）：deep-filter
+
+> 仓库现役实况（`modules/deep-filter/module.toml`）：Python 运行时 + HTTP 接口，
+> ONNX 小模型走 URL 直链下载（HuggingFace 仓库资产）。
 
 ```toml
 # modules/deep-filter/module.toml
@@ -601,18 +606,83 @@ faster-whisper>=1.0.0
 id = "deep-filter"
 name = "DeepFilter 音频降噪"
 version = "0.5.6"
-description = "基于深度学习的实时语音增强/降噪"
+description = "基于 DeepFilterNet 的深度学习语音增强/降噪"
 category = "denoise"
 genre = "deep-filter"
+authors = ["EntryPoint Community"]
 license = "MIT"
 homepage = "https://github.com/Rikorose/DeepFilterNet"
+tags = ["denoise", "audio", "enhancement", "realtime"]
+
+[runtime]
+type = "python"
+python_version = ">=3.10,<3.13"
+requirements = "requirements.txt"
+entrypoint = "adapter.py"
+start_command = "{venv_python} {MODULE_DIR}/{entrypoint}"
+
+[compute]
+backends = ["cuda", "cpu"]
+default_backend = "cpu"
+vram_estimate_mb = 512
+min_vram_mb = 256
+
+[compute.env]
+cuda = { CUDA_VISIBLE_DEVICES = "{device_index}" }
+
+[[models]]
+id = "df3"
+name = "DeepFilterNet3 (默认)"
+source = "url"
+url = "https://huggingface.co/Serkan007/DeepFilterNet3-ONNX/resolve/main/DeepFilterNet3_onnx.tar.gz"
+target_dir = "deep-filter-df3"
+size_estimate_mb = 8
+default = true
+
+[interface]
+type = "http"
+health_endpoint = "/health"
+ready_timeout_secs = 30
+
+[[interface.capabilities]]
+name = "denoise"
+description = "AI 语音降噪，输出增强后的音频文件"
+input_type = "audio"
+output_type = "audio"
+max_file_size_mb = 500
+
+[interface.capabilities.params]
+attenuation = { type = "integer", default = 100, min = 0, max = 100, description = "降噪强度 (dB)" }
+min_db = { type = "float", default = -60.0, min = -100.0, max = 0.0, step = 1.0, description = "最小增益 (dB)" }
+```
+
+调用走统一 HTTP 契约（ADAPTER_API.md）：`POST /predict/denoise`；能力声明的
+`output_type = "audio"` 用于端口类型校验，adapter 实际返回文件产物时须写
+`output_type = "file"` + `result` 为路径字符串（ADAPTER_API.md §2.3 result 规则）。
+
+### 7.2.1 原生 CLI 模块形态（示意，仓库暂无现役实例）
+
+> 以下为 `type = "native"` + `interface = "cli"` 的**示意**写法，说明字段形状；
+> 仓库现役 5 个模块均为 Python HTTP 形态。
+
+```toml
+# 示意：modules/<native-tool>/module.toml
+
+[module]
+id = "native-tool"
+name = "原生 CLI 工具示例"
+version = "1.0.0"
+description = "原生二进制 + CLI 接口示例"
+category = "custom"
+genre = "native-tool"
 
 [runtime]
 type = "native"
+start_command = "{binary} {input} -o {output}"
 
 [runtime.binaries]
-windows-x86_64 = "bin/windows-x86_64/deep-filter.exe"
-linux-x86_64 = "bin/linux-x86_64/deep-filter"
+windows-x86_64 = "bin/windows-x86_64/native-tool.exe"
+linux-x86_64 = "bin/linux-x86_64/native-tool"
 
 [compute]
 backends = ["cpu"]
@@ -622,19 +692,14 @@ default_backend = "cpu"
 type = "cli"
 
 [[interface.capabilities]]
-name = "denoise"
-description = "AI 语音降噪，输出增强后的音频"
+name = "process"
+description = "处理输入文件"
 input_type = "audio"
 output_type = "audio"
-
-[interface.capabilities.params]
-attenuation = { type = "integer", default = 100, min = 0, max = 100, description = "降噪强度 (dB)" }
 ```
 
-CLI 调用时系统构建命令：
-```
-deep-filter.exe input.wav -o output.wav --attenuation 100
-```
+CLI 调用时系统按 `start_command` 构建命令（`{input}` / `{output}` 替换为
+任务工作目录路径，§2.2），进程退出码 0 = 成功。
 
 ### 7.3 Python HTTP 模块（NPU 支持）：qwen3-asr
 

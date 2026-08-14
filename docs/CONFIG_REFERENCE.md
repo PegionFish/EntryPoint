@@ -150,7 +150,8 @@ constraints = "config/constraints.txt"
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `max_parallel` | u32 | `4` | 最大并行节点数 |
-| `default_timeout_secs` | u32 | `600` | 节点默认超时 |
+| `default_timeout_secs` | u32 | `600` | 任务级**空闲看门狗**超时（秒）：任务持续此时长无任何节点进度/心跳才判死（`0` = 停用看门狗）。**不再是任务总时长硬上限**——只要执行器持续产生心跳（节点开始/完成/失败，及长调用期间的周期心跳），任务可运行任意时长 |
+| `default_node_timeout_secs` | u32 | `0` | 节点级**硬超时**全局缺省（秒）：节点未声明 `timeout_secs` 且管线未声明 `[pipeline] node_timeout_secs` 时，作为单节点 wall-clock 硬超时。`0`（缺省）= 跟随 `default_timeout_secs`（旧配置行为不变） |
 | `keep_workspace` | bool | `true` | 任务完成后保留工作目录 |
 | `workspace_dir` | string | `"workspace"` | 工作目录路径 |
 
@@ -158,6 +159,7 @@ constraints = "config/constraints.txt"
 [pipeline]
 max_parallel = 4
 default_timeout_secs = 600
+default_node_timeout_secs = 0
 keep_workspace = true
 workspace_dir = "workspace"
 ```
@@ -281,6 +283,7 @@ constraints = "config/constraints.txt"
 [pipeline]
 max_parallel = 4
 default_timeout_secs = 600
+default_node_timeout_secs = 0
 keep_workspace = true
 
 [network]
@@ -313,15 +316,17 @@ staging_dir = ".pack-staging"
 |---|---|---|
 | `EP_ROOT` | 应用根目录 | `G:\AI_Applications\EntryPoint` |
 | `EP_MODULE_DIR` | 模块目录 | `...\modules\faster-whisper` |
-| `EP_MODULE_ID` | 模块 ID（保留，当前版本暂未注入） | `faster-whisper` |
-| `EP_MODEL_DIR` | 当前模型目录 | `D:\AI_Models\faster-whisper-large-v3` |
-| `EP_MODEL_ID` | 当前模型 ID（保留，当前版本暂未注入） | `large-v3` |
+| `EP_MODULE_ID` | 模块 ID（已注入） | `faster-whisper` |
+| `EP_MODEL_DIR` | 当前（激活变体）模型目录 | `D:\AI_Models\faster-whisper-large-v3` |
+| `EP_MODELS_ROOT` | 模型缓存根目录（含所有变体子目录，供 `params.model` 变体覆盖解析，见 ADAPTER_API.md §1.3） | `D:\AI_Models` |
+| `EP_MODEL_ID` | 当前模型 ID（已注入；模块无激活模型时缺省） | `large-v3` |
+| `EP_HOST` | adapter 绑定地址（固定回环 `127.0.0.1`，根治 Windows 防火墙弹窗；adapter 以 `os.getenv("EP_HOST", "127.0.0.1")` 读取，见 ADAPTER_API.md §1.2） | `127.0.0.1` |
 | `EP_PORT` | 分配端口 | `18001` |
 | `EP_DEVICE` | 设备标识 | `cuda:0` / `cpu` / `npu:0` |
 | `EP_DEVICE_INDEX` | 设备索引 | `0` |
 | `EP_BACKEND` | 计算后端 | `cuda` / `rocm` / `openvino` / `cpu` |
 | `EP_WORKSPACE` | 任务工作目录 | `...\workspace\task-abc123` |
-| `EP_LOG_LEVEL` | 日志级别（保留，当前版本暂未注入；模块适配器自行兜底默认值） | `info` |
+| `EP_LOG_LEVEL` | 日志级别（已注入，固定 `info`） | `info` |
 
 ### 3.2 计算后端相关环境变量（`compute.env` 接线，已实现）
 
@@ -463,12 +468,15 @@ workspace/<task-id>/
 
 ```
 EntryPoint/                        ← 应用根目录
-├── entrypoint[.exe]               ← 主程序
+├── bin/                           ← 二进制（Windows server 包布局；源码树为 target/release/）
+│   ├── ep-daemon[.exe]            ← 主程序（daemon：托管 WebUI + REST API/WebSocket）
+│   └── ep-pack[.exe]              ← 整合包 CLI
 ├── config/
 │   ├── app.toml                   ← 全局配置（本文档 §1）
+│   ├── constraints.txt            ← 全局 pip constraints（§1.5）
 │   └── pipelines/                 ← 管线定义
-│       ├── video-to-srt.toml
-│       └── asr-compare.toml
+│       ├── video_to_srt.toml
+│       └── audio_extract.toml
 ├── modules/                       ← 模块目录
 │   └── <module-id>/
 │       ├── module.toml
@@ -486,16 +494,15 @@ EntryPoint/                        ← 应用根目录
 ├── .pack-staging/                 ← 整合包导入/构建暂存（[packs].staging_dir，随用随清）
 ├── workspace/                     ← 管线任务工作目录
 │   └── <task-id>/
-├── logs/                          ← 日志
-│   ├── entrypoint.log
-│   └── modules/
-│       ├── faster-whisper.log
-│       └── ...
 └── docs/                          ← 文档
     ├── MODULE_SPEC.md
     ├── ADAPTER_API.md
     ├── PIPELINE_SPEC.md
-    └── CONFIG_REFERENCE.md
+    ├── CONFIG_REFERENCE.md
+    └── WEBUI_GUIDE.md
+
+# 注：当前不产生 logs/ 目录——daemon 日志走控制台 / systemd journal，
+# 模块日志由 daemon 捕获后在 WebUI 日志查看器展示（§3.3）。
 
 <model_cache_dir>/                 ← 模型缓存（用户可指定位置）
 ├── faster-whisper-large-v3/
@@ -525,11 +532,14 @@ EntryPoint/                        ← 应用根目录
 1. 检测 config/app.toml 是否存在
    - 不存在 → 从内置模板生成默认配置
 2. 检测 Python 和 uv
-   - 缺失 → 弹窗引导安装（Windows 自动打开下载 URL）
+   - 缺失 → daemon 日志告警，WebUI 仪表盘「依赖环境」区展示缺失项
+     （模块 venv 准备/依赖安装会失败，需先安装）
 3. 扫描 modules/ 目录
    - 解析所有 module.toml
    - 标记各模块状态（就绪/缺依赖/缺模型）
 4. 检测计算设备
    - 枚举所有可用后端和设备
-5. 进入主界面
+5. daemon 开始托管 WebUI 与 REST API（默认 http://127.0.0.1:9800，
+   以 [server] 配置为准）→ 浏览器访问该地址即可使用；
+   Windows server 包的 start-daemon.bat 会自动打开默认浏览器
 ```

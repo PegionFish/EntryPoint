@@ -1,11 +1,14 @@
 # 管线规范 (Pipeline Specification)
 
-> ⚠️ **Sunset 横幅（2026-08-13）**：本文档所述 **ep-desktop 桌面端已于 2026-08-13 退役**，WebUI 为唯一 UI（server 形态交付）。本页保留为历史记录，不再维护；详见 [DESKTOP_SUNSET_PLAN.md](DESKTOP_SUNSET_PLAN.md)。
+> ⚠️ **横幅（2026-08-13）**：本文档中涉及 **ep-desktop 桌面端** 的描述已随
+> 2026-08-13 桌面端退役作废（WebUI 为唯一 UI）；**规范本体（DAG 管线格式与
+> 执行语义）是现役管线引擎的唯一规范，持续有效并维护**；退役背景详见
+> [DESKTOP_SUNSET_PLAN.md](DESKTOP_SUNSET_PLAN.md)。
 
 > 版本：1.1 | 适用于 EntryPoint v0.x
 >
 > v1.1 变更：新增「节点开发指南」章节（§11，决策 5：module/builtin 两条路径全面文档化）；
-> `external_api` 节点更名 `llm`（builtin，旧名保留为别名，§5.8/§11.4，决策 4）；
+> `external_api` 节点更名 `llm`（builtin，旧名保留为别名，§5.7/§11.4，决策 4）；
 > `[pipeline] max_instances` 管线级并发上限（§2.2）；§5 内置节点参考对齐实现
 > （file_input/file_output/ffmpeg 参数修正，未实现节点显式标注）。
 
@@ -181,10 +184,11 @@ to = ["denoise", "input"]
 ## 5. 内置节点参考
 
 > **实现状态**：当前执行器实现的 builtin 节点为 `file_input` / `file_output` /
-> `ffmpeg` / `llm`（§5.8）四个；其余（`srt_export` / `text_concat` /
-> `json_transform` / `delay`）为规范预留形状，**尚未实现**——加载含这些节点的
-> 管线会在执行时报 `unknown builtin node type`。字幕导出等需求请用模块节点的
-> 产物协议替代（MODULE_SPEC.md §5，`params.output_format = "srt"`）。
+> `ffmpeg` / `llm`（§5.7，`external_api` 为其可执行别名）；其余
+> （`text_concat` / `json_transform` / `delay`）为规范预留形状，**尚未实现**——
+> 加载含这些节点的管线会在执行时报 `unknown builtin node type`。
+> 字幕导出等需求请用模块节点的产物协议替代（MODULE_SPEC.md §5，
+> `params.output_format = "srt"`）。
 
 ### 5.1 `file_input` — 文件输入源
 
@@ -249,39 +253,7 @@ params = { args = ["-i", "{input}", "-vn", "-acodec", "pcm_s16le", "-ar", "16000
 输入端口：`input`
 输出端口：`output`
 
-### 5.4 `srt_export` — SRT 字幕导出（未实现，预留）
-
-将带时间戳的文本/JSON 转换为 SRT 字幕文件。
-
-```toml
-[[nodes]]
-id = "srt"
-kind = "builtin"
-builtin = "srt_export"
-params = { max_chars_per_line = 42, max_lines = 2 }
-```
-
-| 参数 | 类型 | 默认 | 说明 |
-|---|---|---|---|
-| `max_chars_per_line` | u32 | 42 | 每行最大字符数 |
-| `max_lines` | u32 | 2 | 每条字幕最大行数 |
-| `offset_ms` | i32 | 0 | 时间偏移（毫秒） |
-| `encoding` | string | `"utf-8"` | 输出编码 |
-
-输入端口：`input`（JSON segments 或带时间戳文本）
-输出端口：`output`（.srt 文件路径）
-
-**输入格式（JSON segments）：**
-```json
-{
-  "segments": [
-    {"start": 0.0, "end": 2.5, "text": "你好世界"},
-    {"start": 2.5, "end": 5.0, "text": "这是测试"}
-  ]
-}
-```
-
-### 5.5 `text_concat` — 文本拼接（未实现，预留）
+### 5.4 `text_concat` — 文本拼接（未实现，预留）
 
 合并多个文本输入。
 
@@ -300,7 +272,7 @@ params = { separator = "\n\n" }
 输入端口：`input`（可接收多条边）
 输出端口：`output`
 
-### 5.6 `json_transform` — JSON 变换（未实现，预留）
+### 5.5 `json_transform` — JSON 变换（未实现，预留）
 
 使用 JSONPath 或简单模板提取/变换 JSON 数据。
 
@@ -318,7 +290,7 @@ params = { extract = "$.segments[*].text", join_with = "\n" }
 | `join_with` | string | — | 数组元素连接符 |
 | `template` | string | — | 输出模板（`{value}` 占位） |
 
-### 5.7 `delay` — 延迟/节流（未实现，预留）
+### 5.6 `delay` — 延迟/节流（未实现，预留）
 
 在节点间插入等待（用于 API 限流）。
 
@@ -330,7 +302,7 @@ builtin = "delay"
 params = { seconds = 2 }
 ```
 
-### 5.8 `llm` — OpenAI 兼容 LLM 调用
+### 5.7 `llm` — OpenAI 兼容 LLM 调用
 
 接入 OpenAI 兼容 chat/completions 端点（翻译、摘要、字幕润色等文本生成）。
 `external_api` 为可执行别名，两者完全等价。**完整参数表与错误语义见 §11.4。**
@@ -468,6 +440,10 @@ condition = "input.language != 'zh'"   # 仅非中文时翻译
 
 ### 9.1 视频转字幕（带降噪 + 翻译）
 
+> 可运行形状（与执行器 builtin 清单对齐：仅 `file_input` / `file_output` /
+> `ffmpeg` / `llm`，§5；SRT 导出走模块产物协议 MODULE_SPEC.md §5，
+> 仓库自带管线 `config/pipelines/video_to_srt.toml` 即此写法）。
+
 ```toml
 # config/pipelines/video-to-srt.toml
 
@@ -483,15 +459,15 @@ id = "input"
 kind = "builtin"
 builtin = "file_input"
 label = "输入视频"
-params = { accept = "video" }
 position = [50, 200]
+# path 参数缺省：WebUI 运行对话框 / POST /api/pipelines/execute 的 inputs 提供（§5.1）
 
 [[nodes]]
 id = "extract"
 kind = "builtin"
 builtin = "ffmpeg"
 label = "提取音频"
-params = { args = "-i {input} -vn -acodec pcm_s16le -ar 16000 -ac 1 {output}" }
+params = { args = ["-i", "{input}", "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "{output}"], output_extension = "wav" }
 position = [250, 200]
 
 [[nodes]]
@@ -509,40 +485,25 @@ module_id = "faster-whisper"
 capability = "transcribe"
 label = "语音识别"
 params = { language = "auto", timestamps = true, beam_size = 5 }
-timeout_secs = 600
+timeout_secs = 7200
 position = [650, 200]
 
 [[nodes]]
 id = "translate"
-kind = "external_api"
+kind = "builtin"
+builtin = "llm"
 label = "LLM 翻译"
-endpoint = "https://api.siliconflow.cn/v1"
-api_type = "openai"
-api_key_env = "SILICONFLOW_API_KEY"
-params = {
-    model = "deepseek-ai/DeepSeek-V3",
-    target_lang = "zh",
-    system_prompt = "将以下英文字幕翻译为中文，保持 segments 格式不变，仅翻译 text 字段。",
-    temperature = 0.3
-}
+params = { base_url = "https://api.siliconflow.cn/v1", model = "deepseek-ai/DeepSeek-V3", api_key_env = "SILICONFLOW_API_KEY", system_prompt = "将以下字幕文本翻译为中文，保持时间戳与序号格式不变：{input}", temperature = 0.3 }
 timeout_secs = 120
 position = [850, 200]
-
-[[nodes]]
-id = "srt"
-kind = "builtin"
-builtin = "srt_export"
-label = "导出 SRT"
-params = { max_chars_per_line = 42, max_lines = 2 }
-position = [1050, 200]
 
 [[nodes]]
 id = "save"
 kind = "builtin"
 builtin = "file_output"
-label = "保存文件"
-params = { suffix = ".srt" }
-position = [1250, 200]
+label = "保存字幕"
+params = { extension = "srt" }
+position = [1050, 200]
 
 # ── 边 ────────────────────────────────────────────────────
 
@@ -564,12 +525,13 @@ to = ["translate", "input"]
 
 [[edges]]
 from = ["translate", "output"]
-to = ["srt", "input"]
-
-[[edges]]
-from = ["srt", "output"]
 to = ["save", "input"]
 ```
+
+> 说明：ASR 节点若需直接产出 SRT 文件产物（不经翻译），可加
+> `params.output_format = "srt"`（执行器注入 `output_path`，模块返回
+> `output_type = "file"`，MODULE_SPEC.md §5）；随后 `file_output`
+> （`extension = "srt"`）收录该文件产物。仓库自带管线即此形状。
 
 ### 9.2 多模型 ASR 对比
 
@@ -583,7 +545,6 @@ description = "同一音频分别用 faster-whisper 和 qwen3-asr 识别，对�
 id = "input"
 kind = "builtin"
 builtin = "file_input"
-params = { accept = "audio" }
 
 [[nodes]]
 id = "asr-whisper"
@@ -606,14 +567,14 @@ id = "save-whisper"
 kind = "builtin"
 builtin = "file_output"
 label = "Whisper 结果"
-params = { suffix = ".json" }
+params = { extension = "json" }
 
 [[nodes]]
 id = "save-qwen"
 kind = "builtin"
 builtin = "file_output"
 label = "Qwen 结果"
-params = { suffix = ".json" }
+params = { extension = "json" }
 
 # 扇出：同一输入 → 两个 ASR
 [[edges]]
@@ -645,7 +606,6 @@ description = "音频 → ASR → 翻译 → TTS 生成配音"
 id = "input"
 kind = "builtin"
 builtin = "file_input"
-params = { accept = "audio" }
 
 [[nodes]]
 id = "asr"
@@ -656,10 +616,9 @@ params = { language = "en", timestamps = true }
 
 [[nodes]]
 id = "translate"
-kind = "external_api"
-endpoint = "https://api.siliconflow.cn/v1"
-api_key_env = "SILICONFLOW_API_KEY"
-params = { model = "deepseek-ai/DeepSeek-V3", target_lang = "zh" }
+kind = "builtin"
+builtin = "llm"
+params = { base_url = "https://api.siliconflow.cn/v1", model = "deepseek-ai/DeepSeek-V3", api_key_env = "SILICONFLOW_API_KEY" }
 
 [[nodes]]
 id = "tts"
@@ -673,7 +632,7 @@ params = { voice = "default", speed = 1.0 }
 id = "save"
 kind = "builtin"
 builtin = "file_output"
-params = { suffix = ".wav" }
+params = { extension = "wav" }
 
 [[edges]]
 from = ["input", "output"]

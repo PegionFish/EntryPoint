@@ -1,6 +1,7 @@
 # EntryPoint 部署指南
 
-本文档描述如何在 Linux 服务器上构建、部署和运行 EntryPoint。
+本文档描述如何构建、部署和运行 EntryPoint：§1–§10 面向 Linux 服务器，
+§11 面向 Windows（server zip 包）。
 
 ---
 
@@ -216,7 +217,8 @@ sudo journalctl -u entrypoint -n 50      # 查看服务日志
 http://<服务器IP>:9800
 ```
 
-首次访问即可看到仪表盘，包含设备状态、模块列表等。
+首次访问即可看到仪表盘，包含设备状态、模块列表等。逐页使用方法见
+[WEBUI_GUIDE.md](WEBUI_GUIDE.md)。
 
 ### WebUI 主要能力
 
@@ -366,3 +368,78 @@ journalctl -u entrypoint -f
 3. **最小权限**：service 文件使用非 root 用户运行
 4. **防火墙**：仅开放必要端口（9800 + 模块端口范围 18000-19000 按需）
 5. **模型目录权限**：模型缓存目录设置为运行用户所有
+
+---
+
+## 11. Windows 部署
+
+Windows 以 **server zip 包**形态分发（`build.ps1 server` 产出，或直接使用已发布
+zip），无安装器：解压即用，WebUI 为唯一 UI。
+
+### 11.1 前置要求
+
+| 项目 | 要求 | 说明 |
+|---|---|---|
+| 系统 | Windows 10/11 x64 | 包内已附带 VC 运行库 DLL（无需另装 VC++ Redistributable） |
+| Python | 3.10–3.12 | 模块 venv 准备需要；需在 PATH 中可用 |
+| uv | 最新 | Python 依赖安装 |
+| ffmpeg | 5.x+ | 系统 PATH 或应用根目录 `runtime\bin`；缺失时含 ffmpeg 节点的管线（如 video_to_srt）会失败 |
+| CUDA | 可选 | 无 NVIDIA GPU/驱动时自动回退 CPU |
+
+### 11.2 解压与启动
+
+1. 解压 zip 到目标目录（如 `D:\EntryPoint`），包内布局：
+
+   ```
+   EntryPoint/
+   ├── bin\ep-daemon.exe      ← 主程序
+   ├── bin\ep-pack.exe        ← 整合包 CLI
+   ├── config\                ← 配置与自带管线
+   ├── modules\               ← 自带模块
+   ├── webui\                 ← WebUI 静态资源
+   ├── workspace\
+   └── start-daemon.bat       ← 启动脚本
+   ```
+
+2. 双击 `start-daemon.bat`：拉起 ep-daemon，随后自动打开默认浏览器访问
+   `http://127.0.0.1:9800`。
+3. 无人值守/远程场景：`start-daemon.bat --no-browser` 跳过自动开浏览器。
+
+### 11.3 开机自启（可选）
+
+如需登录后自动启动，可用任务计划程序（以下命令需管理员 PowerShell，
+路径按实际安装位置修改）：
+
+```powershell
+schtasks /Create /SC ONLOGON /TN "EntryPoint Daemon" `
+  /TR "D:\EntryPoint\start-daemon.bat --no-browser"
+schtasks /Run /TN "EntryPoint Daemon"   # 立即试跑一次
+```
+
+> 此为**可选**方案；不需要开机自启时直接双击 `start-daemon.bat` 即可。
+> 删除任务：`schtasks /Delete /TN "EntryPoint Daemon"`。
+
+### 11.4 Windows 防火墙
+
+- **模块子进程**：所有模块 adapter 由平台注入 `EP_HOST=127.0.0.1` 只绑回环
+  （ADAPTER_API.md §1.2），**不会**触发防火墙弹窗，也无需为模块端口段
+  （18000–19000）添加入站规则。
+- **daemon 本身**：取决于 `config/app.toml [server].host`——
+  - 绑 `127.0.0.1`（包内自带配置默认值，仅本机访问）：无需任何入站规则；
+  - 绑 `0.0.0.0` 或局域网地址（代码缺省值，供局域网多机访问）：需在
+    Windows 防火墙放行 9800/tcp：
+
+    ```powershell
+    netsh advfirewall firewall add rule name="EntryPoint WebUI" `
+      dir=in action=allow protocol=TCP localport=9800
+    ```
+
+    （与 §5.1 Linux firewalld 口径一致；`allow_public = false` 时仍仅限
+    RFC 1918 私有地址访问，见 §3。）
+
+### 11.5 日志与更新
+
+- 日志：daemon 输出在独立控制台窗口（`start-daemon.bat` 拉起），模块日志在
+  WebUI 日志查看器实时查看；关闭控制台窗口即停止服务。
+- 更新：解压新版 zip 覆盖 `bin\` / `webui\` / `modules\`（保留 `config\`、
+  `models\`、`runtime\` 用户数据）；重启前先停止运行中的模块（同 §9 提醒）。
