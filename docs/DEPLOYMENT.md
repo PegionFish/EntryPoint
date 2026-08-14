@@ -366,7 +366,8 @@ journalctl -u entrypoint -f
 1. **默认局域网模式**：`allow_public = false` 时仅允许私有 IP 访问，适合内网部署
 2. **公网部署**：建议前置 Nginx/Caddy 反向代理 + HTTPS，再设置 `allow_public = true`
 3. **最小权限**：service 文件使用非 root 用户运行
-4. **防火墙**：仅开放必要端口（9800 + 模块端口范围 18000-19000 按需）
+4. **防火墙**：仅开放必要端口（9800 + 模块端口范围 18000-19000 按需；
+   模块 adapter 经平台注入的 `EP_HOST` 仅绑本机回环，该端口段无需对外放行）
 5. **模型目录权限**：模型缓存目录设置为运行用户所有
 
 ---
@@ -425,9 +426,8 @@ schtasks /Run /TN "EntryPoint Daemon"   # 立即试跑一次
   （ADAPTER_API.md §1.2），**不会**触发防火墙弹窗，也无需为模块端口段
   （18000–19000）添加入站规则。
 - **daemon 本身**：取决于 `config/app.toml [server].host`——
-  - 绑 `127.0.0.1`（包内自带配置默认值，仅本机访问）：无需任何入站规则；
-  - 绑 `0.0.0.0` 或局域网地址（代码缺省值，供局域网多机访问）：需在
-    Windows 防火墙放行 9800/tcp：
+  - 绑 `0.0.0.0` 或局域网地址（**代码缺省值，包内配置同**）：首启会出现
+    Windows 防火墙确认弹窗，需放行 9800/tcp（也可用以下命令预先添加规则）：
 
     ```powershell
     netsh advfirewall firewall add rule name="EntryPoint WebUI" `
@@ -436,6 +436,8 @@ schtasks /Run /TN "EntryPoint Daemon"   # 立即试跑一次
 
     （与 §5.1 Linux firewalld 口径一致；`allow_public = false` 时仍仅限
     RFC 1918 私有地址访问，见 §3。）
+  - 绑 `127.0.0.1`（手动修改 `config/app.toml [server].host` 后，仅本机
+    访问）：无需任何入站规则。
 
 ### 11.5 日志与更新
 

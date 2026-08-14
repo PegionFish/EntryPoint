@@ -445,7 +445,7 @@ condition = "input.language != 'zh'"   # 仅非中文时翻译
 > 仓库自带管线 `config/pipelines/video_to_srt.toml` 即此写法）。
 
 ```toml
-# config/pipelines/video-to-srt.toml
+# config/pipelines/video_to_srt.toml
 
 [pipeline]
 id = "video-to-srt"

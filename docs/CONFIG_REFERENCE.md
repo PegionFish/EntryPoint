@@ -325,8 +325,11 @@ staging_dir = ".pack-staging"
 | `EP_DEVICE` | 设备标识 | `cuda:0` / `cpu` / `npu:0` |
 | `EP_DEVICE_INDEX` | 设备索引 | `0` |
 | `EP_BACKEND` | 计算后端 | `cuda` / `rocm` / `openvino` / `cpu` |
-| `EP_WORKSPACE` | 任务工作目录 | `...\workspace\task-abc123` |
+| `EP_WORKSPACE` | 任务工作区根目录（任务级子目录经 predict 请求参数传递） | `...\workspace` |
 | `EP_LOG_LEVEL` | 日志级别（已注入，固定 `info`） | `info` |
+| `EP_ENTRYPOINT` | 启动命令模板辅助变量：module.toml `[runtime].entrypoint`（占位符 `{entrypoint}`） | `adapter.py` |
+| `EP_BINARY` | 启动命令模板辅助变量：module.toml `[runtime].binaries` 首个二进制路径（占位符 `{binary}`） | `bin/native-tool` |
+| `EP_VENV_PYTHON` | 启动命令模板辅助变量：平台自适应的模块 venv Python 解释器路径（占位符 `{venv_python}`；Windows `Scripts\python.exe` / Linux `bin/python`） | `...\runtime\venvs\faster-whisper\Scripts\python.exe` |
 
 ### 3.2 计算后端相关环境变量（`compute.env` 接线，已实现）
 
@@ -502,7 +505,7 @@ EntryPoint/                        ← 应用根目录
     └── WEBUI_GUIDE.md
 
 # 注：当前不产生 logs/ 目录——daemon 日志走控制台 / systemd journal，
-# 模块日志由 daemon 捕获后在 WebUI 日志查看器展示（§3.3）。
+# 模块日志由 daemon 捕获后在 WEBUI_GUIDE.md §4.1 日志抽屉展示。
 
 <model_cache_dir>/                 ← 模型缓存（用户可指定位置）
 ├── faster-whisper-large-v3/
@@ -531,15 +534,15 @@ EntryPoint/                        ← 应用根目录
 ```
 1. 检测 config/app.toml 是否存在
    - 不存在 → 从内置模板生成默认配置
-2. 检测 Python 和 uv
-   - 缺失 → daemon 日志告警，WebUI 仪表盘「依赖环境」区展示缺失项
-     （模块 venv 准备/依赖安装会失败，需先安装）
+2. 检测/自动安装系统依赖（ffmpeg 等，仅 Linux 包管理器路径）；
+   Python/uv 不做启动期检测——缺失会在首次模块 venv 准备/模型下载时
+   报错（模块页与 daemon 日志可见）
 3. 扫描 modules/ 目录
    - 解析所有 module.toml
    - 标记各模块状态（就绪/缺依赖/缺模型）
 4. 检测计算设备
    - 枚举所有可用后端和设备
-5. daemon 开始托管 WebUI 与 REST API（默认 http://127.0.0.1:9800，
-   以 [server] 配置为准）→ 浏览器访问该地址即可使用；
+5. daemon 开始托管 WebUI 与 REST API（监听地址以 [server].host 为准，
+   代码缺省 0.0.0.0），本机浏览器访问 http://127.0.0.1:9800 即可使用；
    Windows server 包的 start-daemon.bat 会自动打开默认浏览器
 ```
