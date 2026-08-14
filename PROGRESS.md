@@ -73,7 +73,7 @@
 - [x] Daemon API 测试: /health, /devices, /modules, /config 全部 200
 - [x] Desktop GUI 测试: 启动/导航/GPU检测/设置页面 全部通过
 - [x] RTX 5090 D 正确检测 (32607 MB, 42°C)
-- [x] 测试报告: reports/e2e_test_report.md
+- [x] 测试报告: e2e_test_report.md（报告已随 2026-08-15 收尾清理删除，结论见本档）
 ### Git
 - commit: TBD — "test(wave-5): e2e test results"
 
@@ -115,7 +115,7 @@
 - [x] API 路由修复：SPA fallback + 静态资源服务
 - [x] Release 构建验证：cargo build --release + npm run build
 - [x] E2E 测试：全部 API 端点 200，页面组件 TS 检查通过
-- [x] 测试报告：reports/webui_test_report.md
+- [x] 测试报告：webui_test_report.md（报告已随 2026-08-15 收尾清理删除，结论见本档）
 
 ### Wave 4 (WebUI) — ✅ 完成
 #### 完成
@@ -274,7 +274,7 @@
 - [x] 模型回环：rembg-u2net 删除 → 文件夹上传 → 删除 → zip 上传全通；isnet 经代理 URL 下载 178MB 进度采样完整、meta 写入；df3 全新安装路径（自动 venv 含 torch 约 16 分钟 + 下载 15s）
 - [x] HF 缓存回收：faster-whisper-large-v3 8.7G → 2.9G（-5.8G）
 - [x] 最终门禁：288 测试全过、clippy 零警告
-- [x] E2E 报告：reports/wave4_e2e_report.md
+- [x] E2E 报告：wave4_e2e_report.md（报告已随 2026-08-15 收尾清理删除，结论见本档）
 
 ### 已知限制（如实记录）
 - 首次下载自动 venv 准备含 torch 约 15-20 分钟，超常见客户端超时（重试即成功）

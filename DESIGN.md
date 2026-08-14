@@ -47,7 +47,6 @@ EntryPoint 是一个 **server 形态的 AI 模型编排平台**（ep-daemon + We
 
 | 层级 | 选型 | 说明 |
 |---|---|---|
-| 桌面 GUI | **egui + eframe** | 纯 Rust 即时模式 GUI，wgpu 自绘渲染，跨平台 |
 | **WebUI** | **React 19 + TypeScript** | 浏览器管理界面，远程管控（见 [DESIGN_SYSTEM.md](docs/DESIGN_SYSTEM.md)） |
 | WebUI 构建 | **Vite 8** | 前端构建 + 开发服务器（HMR） |
 | WebUI 样式 | **TailwindCSS 4 + shadcn/ui** | 原子化 CSS + 无障碍组件库（new-york 风格） |
@@ -58,7 +57,6 @@ EntryPoint 是一个 **server 形态的 AI 模型编排平台**（ep-daemon + We
 | 异步运行时 | **tokio** | 异步进程管理、HTTP、并发任务 |
 | HTTP 客户端 | **reqwest** | 调用模块 HTTP API、外部 LLM API、模型下载 |
 | 序列化 | **serde + toml / json** | 配置、模块清单、管线定义 |
-| 桌面节点编辑器 | **egui_node_graph** 或自研 | DAG 可视化（桌面端） |
 | 日志 | **tracing** | 结构化日志 |
 | Python 环境 | **uv**（系统安装） | 极速 venv 创建 + 依赖安装；不内嵌，调用系统 uv/python |
 | 模型下载 | **huggingface-hub** / **modelscope** (Python) | 标准模型下载，支持断点续传 |
@@ -72,7 +70,7 @@ EntryPoint 是一个 **server 形态的 AI 模型编排平台**（ep-daemon + We
 
 ```
 EntryPoint/                        ← 应用根目录（可整体复制）
-├── entrypoint.exe / entrypoint    ← 主程序二进制（Win/Linux 各一份）
+├── ep-daemon.exe / ep-daemon      ← 服务进程二进制（Win/Linux 各一份）
 ├── config/
 │   ├── app.toml                   ← 全局设置（含模型缓存路径）
 │   └── pipelines/                 ← 用户保存的管线
@@ -126,7 +124,7 @@ EntryPoint/                        ← 应用根目录（可整体复制）
 ```
 Windows → Linux:
 1. 复制整个 EntryPoint/ 文件夹
-2. 替换 entrypoint.exe 为 Linux 版 entrypoint 二进制
+2. 替换 ep-daemon.exe 为 Linux 版 ep-daemon 二进制
 3. 启动 → 自动检测平台 → 重建 venvs → 检查模型完整性 → 就绪
 ```
 
@@ -742,7 +740,7 @@ path = ""                           # 留空则自动检测系统 PATH
 ## 5. UI 页面规划
 
 > WebUI 视觉与交互规范见 [docs/DESIGN_SYSTEM.md](docs/DESIGN_SYSTEM.md)（唯一权威参考）。
-> 以下页面已在 WebUI 中实现（`crates/ep-webui/frontend/src/pages/`），桌面端（egui）保持同步。
+> 以下页面已在 WebUI 中实现（`crates/ep-webui/frontend/src/pages/`）。
 
 ### 5.1 仪表盘 (Dashboard) — ✅ 已实现
 - 计算设备卡片：每个设备的名称、后端类型、显存/内存用量、利用率、温度
@@ -943,6 +941,8 @@ if __name__ == "__main__":
 ---
 
 ## 7. 开发阶段
+
+> 本章为早期规划的历史记录，桌面端相关条目已随 2026-08-13 桌面退役作废。
 
 ### Phase 1 — 骨架 + 模块系统 (Foundation)
 - [ ] Cargo workspace 初始化
