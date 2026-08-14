@@ -255,6 +255,24 @@ GIT_HASH="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
 RUSTC_VER="$(rustc --version)"
 
+# ── WebUI 前端构建（fail-fast：前移至 cargo 编译之前）────────────────────────────
+# npm 环境异常/前端构建失败不再浪费整轮 release 编译时间。
+# 注意：static 为 git 跟踪文件且 vite 配置 emptyOutDir——构建会整体改写该目录。
+WEBUI_STATIC="$PROJECT_ROOT/crates/ep-webui/static"
+if [[ "$SKIP_FRONTEND" == "1" ]]; then
+    info "跳过 WebUI 前端构建 (--skip-frontend)，使用现有 static 产物"
+elif command -v npm >/dev/null 2>&1; then
+    step "构建 WebUI 前端"
+    ok "npm: $(command -v npm)"
+    (cd "$PROJECT_ROOT/crates/ep-webui/frontend" && npm ci && npm run build) || die "WebUI 前端构建失败（npm ci / npm run build）——可加 --skip-frontend 使用现有 static 产物重试"
+    ok "WebUI 前端构建完成"
+    info "static 产物已更新（git 跟踪文件），如有变更请随仓库提交"
+elif [[ -f "$WEBUI_STATIC/index.html" ]]; then
+    info "警告: npm 不可用，使用现有 static 产物（可能陈旧）"
+else
+    die "npm 不可用且 crates/ep-webui/static 产物缺失——请安装 Node.js/npm，或先手动构建前端（--skip-frontend 仅适用于已有产物）"
+fi
+
 # ── Clean ─────────────────────────────────────────────────────────────────────
 if [[ "$CLEAN" == "1" ]]; then
     step "清理构建产物"
@@ -346,22 +364,8 @@ else
     info "runtime/cuda-libs 不存在，跳过（可选目录）"
 fi
 
-# WebUI 前端 → webui/：打包时先自动构建（npm ci && npm run build）再复制 static；
-# --skip-frontend 跳过构建直接用现有 static 产物。npm 缺失且 static 缺失一律报错退出，
-# 杜绝静默打包陈旧/空的前端 bundle。
-WEBUI_STATIC="$PROJECT_ROOT/crates/ep-webui/static"
-if [[ "$SKIP_FRONTEND" == "1" ]]; then
-    info "跳过 WebUI 前端构建 (--skip-frontend)，使用现有 static 产物"
-elif command -v npm >/dev/null 2>&1; then
-    step "构建 WebUI 前端"
-    ok "npm: $(command -v npm)"
-    (cd "$PROJECT_ROOT/crates/ep-webui/frontend" && npm ci && npm run build) || die "WebUI 前端构建失败（npm ci / npm run build）"
-    ok "WebUI 前端构建完成"
-elif [[ -f "$WEBUI_STATIC/index.html" ]]; then
-    info "警告: npm 不可用，使用现有 static 产物（可能陈旧）"
-else
-    die "npm 不可用且 crates/ep-webui/static 产物缺失——请安装 Node.js/npm，或先手动构建前端（--skip-frontend 仅适用于已有产物）"
-fi
+# WebUI 前端 → webui/：构建动作已前移至 cargo 编译之前（fail-fast），
+# 此处 static 必然已就绪，仅做校验后复制。
 
 # 服务器包附加内容
 if [[ "$MODE" == "server" ]]; then

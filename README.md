@@ -79,7 +79,9 @@ npm run dev
 
 - 可选参数：`-t debug|release`、`--skip-test`、`--skip-clippy`、`--skip-frontend`、`--clean`、`-o <dir>`
 
-> **WebUI 前端自动构建**：打包时会自动构建 WebUI 前端（在 `crates/ep-webui/frontend` 执行 `npm ci && npm run build`，产物输出到 `crates/ep-webui/static`），需已安装 Node.js/npm。可用 `-SkipFrontend`（build.ps1）/ `--skip-frontend`（build.sh）跳过构建，直接使用现有 static 产物。npm 缺失但已有 static 产物时降级为警告继续（产物可能陈旧）；static 产物缺失则直接报错退出，杜绝静默空包。
+> **WebUI 前端自动构建**：打包时会自动构建 WebUI 前端（在 `crates/ep-webui/frontend` 执行 `npm ci && npm run build`，产物输出到 `crates/ep-webui/static`），需已安装 Node.js/npm。前端构建在 cargo 编译之前执行（fail-fast），npm 环境异常不会浪费整轮编译。可用 `-SkipFrontend`（build.ps1）/ `--skip-frontend`（build.sh）跳过构建，直接使用现有 static 产物。npm 缺失但已有 static 产物时降级为警告继续（产物可能陈旧）；static 产物缺失则直接报错退出，杜绝静默空包。
+>
+> **注意**：`crates/ep-webui/static/` 为 git 跟踪文件，且 vite 配置 `emptyOutDir`——打包自动重建会整体改写该目录。前端变更后应把更新后的 static 产物随仓库一并提交。
 
 构建产物：
 - 二进制：`target/release/ep-daemon`（服务器 daemon）
