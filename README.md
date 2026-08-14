@@ -116,7 +116,8 @@ sudo systemctl start entrypoint
 
 ### 3. 防火墙配置
 
-开放 WebUI 端口（默认 9800）：
+仓库自带 `config/app.toml` 缺省监听 `127.0.0.1`（仅本机）；如需局域网访问，
+先将 `[server].host` 改为 `0.0.0.0`（或局域网地址），再开放 WebUI 端口（默认 9800）：
 
 ```bash
 sudo firewall-cmd --permanent --add-port=9800/tcp
