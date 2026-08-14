@@ -701,6 +701,9 @@ output_type = "audio"
 CLI 调用时系统按 `start_command` 构建命令（`{input}` / `{output}` 替换为
 任务工作目录路径，§2.2），进程退出码 0 = 成功。
 
+> 注：该执行路径当前未实现（现役无 native CLI 实例），仅为字段形状示意；
+> 管线执行器对模块节点只走 HTTP（executor.rs `execute_module_node`）。
+
 ### 7.3 Python HTTP 模块（NPU 支持）：qwen3-asr
 
 ```toml

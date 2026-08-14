@@ -80,7 +80,7 @@ workspace 由 6 crate 收敛为 **5 crate**：`ep-core / ep-daemon / ep-webui / 
 | 8 | `README.md` | 删除「桌面端构建/Arch GUI/桌面功能」段落；改为 server-only 快速开始（双击 bat → 浏览器）；状态段更新 |
 | 9 | `DESIGN.md` 架构图（:1039 ep-desktop 节点） | 更新为 5-crate 架构 |
 | 10 | `PROGRESS.md` | 追加「桌面端退役」章节（裁决/范围/commit 链） |
-| 11 | 历史文档（NIGHTLY_PLAN / DESKTOP_BACKPORT_PLAN / UNIFIED_UI_REDESIGN_PROPOSAL / WEBUI_DEV_PLAN / PIPELINE_SPEC） | **不改写**，文首加 sunset 横幅（「本文档所述 ep-desktop 已于 2026-08-13 退役，见 DESKTOP_SUNSET_PLAN.md」）；注：除 PIPELINE_SPEC 外，上述文档（另含 PHASE1_PLAN）已随 2026-08-15 收尾清理删除 |
+| 11 | 历史文档（NIGHTLY_PLAN / DESKTOP_BACKPORT_PLAN / UNIFIED_UI_REDESIGN_PROPOSAL / WEBUI_DEV_PLAN / PIPELINE_SPEC） | **不改写**，文首加 sunset 横幅（「本文档所述 ep-desktop 已于 2026-08-13 退役，见 DESKTOP_SUNSET_PLAN.md」）；注：除 PIPELINE_SPEC 外，上述文档（另含 PHASE1_PLAN）已随 2026-08-15 收尾清理删除；补注（2026-08-15）：PIPELINE_SPEC 横幅已修订——规范本体持续有效，仅桌面端相关描述作废 |
 | 12 | `reports/` 桌面评估类报告 | 保留（历史证据），不动 |
 
 ---
