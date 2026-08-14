@@ -21,10 +21,17 @@ EntryPoint 核心仅通过此标准接口与模块通信，不感知底层框架
 | 项目 | 约定 |
 |---|---|
 | 协议 | HTTP/1.1（暂不要求 HTTPS） |
-| 监听地址 | `0.0.0.0:{EP_PORT}` |
+| 监听地址 | `{EP_HOST}:{EP_PORT}`（`EP_HOST` 由平台注入，固定 `127.0.0.1`；adapter 以 `os.getenv("EP_HOST", "127.0.0.1")` 读取，缺省回退同为回环地址） |
 | 内容类型 | `application/json` 或 `multipart/form-data` |
 | 字符编码 | UTF-8 |
 | 超时 | 由调用方控制（管线引擎设置 per-node 超时） |
+
+**为什么只绑回环地址**：平台通过环境变量 `EP_HOST`（ep-core `build_module_env` 注入，
+固定值 `127.0.0.1`）统一规定 adapter 的绑定地址。adapter 监听非回环地址
+（如 `0.0.0.0`）会在 Windows 上触发防火墙入站弹窗，且把推理端口暴露到局域网；
+所有模块服务只接受本机 daemon 的调用，绑回环即满足全部调用路径。该约定
+根治了 Windows 防火墙弹窗问题（现役 5 个仓库模块 adapter 均按此写法实现）。
+adapter **不得**硬编码 `0.0.0.0` 或其它非回环地址。
 
 ### 1.3 模型环境变量与变体覆盖
 
@@ -369,6 +376,7 @@ from fastapi.responses import JSONResponse
 import uvicorn
 
 # ── 环境变量 ──────────────────────────────────────────────
+EP_HOST = os.getenv("EP_HOST", "127.0.0.1")  # 平台注入的绑定地址（恒回环，§1.2）
 EP_PORT = int(os.environ.get("EP_PORT", "18000"))
 EP_MODEL_DIR = os.environ.get("EP_MODEL_DIR", "")
 EP_MODELS_ROOT = os.environ.get("EP_MODELS_ROOT", "")  # 模型缓存根目录（§1.3）
@@ -467,7 +475,7 @@ async def predict(
 # ── 启动 ──────────────────────────────────────────────────
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    uvicorn.run(app, host="0.0.0.0", port=EP_PORT, log_level="info")
+    uvicorn.run(app, host=EP_HOST, port=EP_PORT, log_level="info")
 ```
 
 ### 5.2 文件输出模板

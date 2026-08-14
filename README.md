@@ -21,8 +21,13 @@ EntryPoint是一款AI创意/内容处理工具管控平台，能够统一调度�
 
 - [设计文档](DESIGN.md)
 - [部署指南](docs/DEPLOYMENT.md)
+- [WebUI 使用指引](docs/WEBUI_GUIDE.md)
 - [WebUI 设计系统](docs/DESIGN_SYSTEM.md)
 - [模块接入规范](docs/MODULE_SPEC.md)
+- [Adapter REST API 规范](docs/ADAPTER_API.md)
+- [管线规范](docs/PIPELINE_SPEC.md)
+- [自动化集成指南](docs/AUTOMATION.md)
+- [整合包作者指南](docs/PACK_AUTHORING.md)
 - [配置参考](docs/CONFIG_REFERENCE.md)
 
 ## 开发环境搭建
