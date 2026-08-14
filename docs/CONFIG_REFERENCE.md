@@ -168,7 +168,7 @@ workspace_dir = "workspace"
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `host` | string | `"0.0.0.0"` | 监听地址 |
+| `host` | string | 代码缺省 `"0.0.0.0"`；仓库自带配置模板为 `"127.0.0.1"`（仅本机） | 监听地址 |
 | `port` | u16 | `9800` | 监听端口（WebUI 与 REST API） |
 | `allow_public` | bool | `false` | 是否允许公网访问。`false` 时启用 IP 过滤，仅放行 RFC 1918 私有地址 |
 
@@ -543,6 +543,6 @@ EntryPoint/                        ← 应用根目录
 4. 检测计算设备
    - 枚举所有可用后端和设备
 5. daemon 开始托管 WebUI 与 REST API（监听地址以 [server].host 为准，
-   代码缺省 0.0.0.0），本机浏览器访问 http://127.0.0.1:9800 即可使用；
+   代码缺省 0.0.0.0；仓库自带配置缺省 127.0.0.1），本机浏览器访问 http://127.0.0.1:9800 即可使用；
    Windows server 包的 start-daemon.bat 会自动打开默认浏览器
 ```

@@ -63,7 +63,7 @@ cd /server/EntryPoint
 
 ```toml
 [server]
-host = "0.0.0.0"       # 监听地址
+host = "127.0.0.1"     # 监听地址（仓库缺省仅本机访问；如需局域网访问改为 0.0.0.0 并放行防火墙，见 §11.4）
 port = 9800            # 监听端口
 allow_public = false   # 是否允许公网访问（默认仅局域网）
 ```
@@ -426,7 +426,8 @@ schtasks /Run /TN "EntryPoint Daemon"   # 立即试跑一次
   （ADAPTER_API.md §1.2），**不会**触发防火墙弹窗，也无需为模块端口段
   （18000–19000）添加入站规则。
 - **daemon 本身**：取决于 `config/app.toml [server].host`——
-  - 绑 `0.0.0.0` 或局域网地址（**代码缺省值，包内配置同**）：首启会出现
+  - 绑 `127.0.0.1`（**包内自带配置缺省值**，仅本机访问）：无需任何入站规则。
+  - 绑 `0.0.0.0` 或局域网地址（手动修改后；代码缺省值亦为 0.0.0.0）：首启会出现
     Windows 防火墙确认弹窗，需放行 9800/tcp（也可用以下命令预先添加规则）：
 
     ```powershell
@@ -436,8 +437,6 @@ schtasks /Run /TN "EntryPoint Daemon"   # 立即试跑一次
 
     （与 §5.1 Linux firewalld 口径一致；`allow_public = false` 时仍仅限
     RFC 1918 私有地址访问，见 §3。）
-  - 绑 `127.0.0.1`（手动修改 `config/app.toml [server].host` 后，仅本机
-    访问）：无需任何入站规则。
 
 ### 11.5 日志与更新
 
