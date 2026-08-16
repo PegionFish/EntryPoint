@@ -149,11 +149,21 @@ Windows PowerShell + FileSystemWatcher 双版本，含提交与回调接收骨�
 
 ## 5. 边界与安全声明
 
-- **输入路径**：所有 `path` / `input_path` 均为**服务器本地路径**；跨机器先
-  上传或挂载；
-- **认证**：API 当前**无认证**，仅 IP 过滤（`[server] allow_public = false` 时
-  只放行 RFC 1918 私有地址）。**公网暴露前必须先落地认证机制**（后续工作，
-  本期不做）——请仅在可信内网使用；
+- **契约分层**：`/api/v1/*`（统一推理门面，见 `docs/INFERENCE_API.md`）为
+  **外部稳定契约**，请求/响应形状与错误码变更走版本演进；`/api/*` 其余端点
+  为 **WebUI 内部契约**（含 i18n 本地化错误文案），集成方不应依赖其形状；
+- **输入路径**：WebUI 内部端点的 `path` / `input_path` 均为**服务器本地路径**，
+  跨机器先上传或挂载；v1 门面的 `input_path` 则**仅限 workspace/uploads 前缀
+  路径**（服务端做 canonicalize 前缀校验），跨机器一律走 multipart 上传；
+- **认证**：已提供可选的 `[api].token` 认证（**仅保护 `/api/v1/*`**，其余
+  端点不受影响）：在 `config/app.toml` 配置 `[api] token = "<长随机串>"` 后，
+  v1 端点要求 `Authorization: Bearer <token>` 或 `X-API-Key: <token>`，缺失/
+  不匹配返回 `401 {"error":{"code":"UNAUTHORIZED",...}}`；未配置 token 时行为
+  不变（直通）。除 token 外仍只有 IP 过滤（`[server] allow_public = false`
+  时只放行 RFC 1918 私有地址）；**`allow_public = true` 且不配 token 时，
+  v1 端点将以无认证状态暴露公网（daemon 启动时告警）——公网部署必须同时
+  配置 `[api].token`**；注意 token 不保护 WebUI 内部端点，公网场景仍需
+  反向代理层防护；
 - **并发**：全局 `[pipeline] max_parallel` + 管线级 `max_instances` 两级闸门，
   超额提交自动进 `queued` 排队，客户端无需自建限流；
 - **回调语义**：`callback_url` 为 best-effort（daemon → 你的 URL 的出站请求），

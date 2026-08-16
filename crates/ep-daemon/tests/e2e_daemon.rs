@@ -9,6 +9,7 @@
 //! | `e2e_wait_callback` | `POST /pipelines/execute` `wait:true` → 200+status+artifacts（真实执行 file_input→file_output）；`callback_url` 本地 mock 端点捕获终态 POST；回调端点不可达不阻塞任务 |
 //! | `e2e_vram_budget` | `POST /pipelines/vram-budget`：分层峰值 / over / unassigned / `allow_overcommit=false` 透传 |
 //! | `e2e_gate_cancel` | `max_parallel=1` 两任务并发 → 一个 queued（队列位置经 `GET /pipelines/{id}/tasks` 可见）→ 首个完成后续运行；取消排队任务绝不执行 |
+//! | `e2e_v1_inference` | v1 门面全链：`GET /v1/capabilities` 可查 → multipart 提交 202 → 轮询 `GET /v1/inference/result/{id}` 至终态 → 产物一律相对下载 URL（进程内 mock adapter 替代真实模块 HTTP） |
 //! | `e2e_video_to_srt` | video-to-srt 条件回归（本机无 ffmpeg 无模块 venv → 打印原因跳过；测试体按 §15.1 Linux 已验证流程编写） |
 //!
 //! # harness 说明（ep-daemon 为纯 bin crate）
@@ -111,7 +112,7 @@ mod common {
 
     /// 挂载完整 /api 路由树（api_router 路由不带 /api 前缀，main.rs 才 nest）
     pub fn app(state: std::sync::Arc<AppState>) -> Router {
-        crate::api::api_router().with_state(state)
+        crate::api::api_router(state.clone()).with_state(state)
     }
 
     pub fn json_request(method: Method, uri: &str, body: Value) -> Request<Body> {
@@ -759,6 +760,308 @@ beam_size = {{ type = "integer", min = 1, max = 20 }}
         assert!(error.contains("e2e-mod"), "{error}");
         assert!(record.artifacts.is_empty(), "失败任务无产物");
         assert_eq!(record.pipeline_id, "direct/e2e-mod", "直跑 pipeline_id 形状");
+    }
+}
+
+// ─── 2b. v1 统一推理门面全链 E2E：capabilities → 提交 → 轮询 → 相对产物 URL ──
+
+mod e2e_v1_inference {
+    //! v1 门面全链用例（任务书 §5 补充条目）：本机无 Python venv/真实模型，
+    //! 用进程内 mock adapter（在 PortManager 分配端口上提供 `/health` +
+    //! `/predict/run`）替代真实模块 HTTP 服务，keepalive 子进程保活
+    //! ProcessManager 实例（与 autostart.rs 内联测试同款模式，序列约束：
+    //! 先 allocate 再起 mock）；其余链路（上传落盘 → 校验序列 → 自动拉起 →
+    //! submit_direct_full → 引擎真实执行 → 产物归集）全部走生产代码。
+    // 测试锁跨 await 串行化（同 e2e_direct_exec 注释）
+    #![allow(clippy::await_holding_lock)]
+
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::extract::Multipart;
+    use axum::response::IntoResponse;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+    use serde_json::Value;
+
+    use ep_core::config::AppConfig;
+    use ep_core::module::discovery::{DiscoveredModule, DiscoveryStatus};
+    use ep_core::module::manifest::ModuleManifest;
+    use ep_core::port::PortManager;
+
+    use crate::api::execute::execution;
+    use crate::common::*;
+    use crate::state::AppState;
+
+    /// fake v1 模块：native 运行时 + keepalive 命令（进程存活，端口 HTTP
+    /// 服务由进程内 mock adapter 承担）；capability `run`（file → file）
+    fn v1_module_manifest() -> ModuleManifest {
+        toml::from_str(&format!(
+            r#"
+[module]
+id = "e2e-v1-mod"
+name = "E2E v1 门面模块"
+version = "0.1.0"
+description = "v1 e2e fixture"
+category = "asr"
+genre = "test"
+
+[runtime]
+type = "native"
+binaries = {{ "test" = "test" }}
+start_command = "{}"
+
+[compute]
+backends = ["cpu"]
+
+[interface]
+type = "http"
+health_endpoint = "/health"
+ready_timeout_secs = 15
+
+[[interface.capabilities]]
+name = "run"
+description = "run it"
+input_type = "file"
+output_type = "file"
+"#,
+            keepalive_command()
+        ))
+        .unwrap()
+    }
+
+    fn v1_state(root: PathBuf) -> Arc<AppState> {
+        let module = DiscoveredModule {
+            path: root.join("modules").join("e2e-v1-mod"),
+            manifest: Some(v1_module_manifest()),
+            status: DiscoveryStatus::Valid,
+        };
+        Arc::new(AppState::new(
+            root,
+            AppConfig::default(),
+            vec![],
+            vec![module],
+            // 独立区间：避开 e2e_direct_exec 的 48300-48320 与生产默认段
+            PortManager::new(48400, 48420),
+        ))
+    }
+
+    /// 进程内 mock adapter：`GET /health` → 200；`POST /predict/run` →
+    /// 解析 multipart（file + params）→ 写转换产物 → 返回 ModuleResponse
+    /// 形状（status/output_type/result）。产物路径优先用执行器注入的
+    /// `output_path`（仅当节点参数含 output_format 时注入），缺省时
+    /// 自派生临时路径——executor 只信任 result 返回的路径字符串。
+    /// 与 ep-core executor 模块调用契约（`/predict/{capability}` multipart
+    /// 投递）逐点对齐。
+    async fn spawn_mock_adapter(port: u16) -> tokio::task::JoinHandle<()> {
+        async fn predict(mut multipart: Multipart) -> impl IntoResponse {
+            let mut output_path: Option<String> = None;
+            let mut file_bytes: Vec<u8> = Vec::new();
+            while let Ok(Some(field)) = multipart.next_field().await {
+                match field.name().unwrap_or("") {
+                    "params" => {
+                        let text = field.text().await.unwrap_or_default();
+                        if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                            output_path = v
+                                .get("output_path")
+                                .and_then(|p| p.as_str())
+                                .map(String::from);
+                        }
+                    }
+                    "file" => {
+                        file_bytes = field.bytes().await.unwrap_or_default().to_vec();
+                    }
+                    _ => {}
+                }
+            }
+            // 无 output_path 注入时自派生（进程独占 tempdir，不与其他测试冲突）
+            let out = output_path.unwrap_or_else(|| {
+                std::env::temp_dir()
+                    .join(format!("ep-v1-mock-{}", std::process::id()))
+                    .join(format!(
+                        "mock-out-{}.txt",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0)
+                    ))
+                    .display()
+                    .to_string()
+            });
+            if let Some(parent) = std::path::Path::new(&out).parent() {
+                std::fs::create_dir_all(parent).expect("mock 产物目录");
+            }
+            let content = format!("v1-e2e-out({})", String::from_utf8_lossy(&file_bytes));
+            std::fs::write(&out, content).expect("mock 产物写盘");
+            Json(serde_json::json!({
+                "status": "completed",
+                "output_type": "file",
+                "result": out,
+            }))
+        }
+
+        let app = Router::new()
+            .route("/health", get(|| async { "OK" }))
+            .route("/predict/run", post(predict));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        })
+    }
+
+    /// v1 全链：capabilities 可查 → multipart 提交 202 → 轮询 result 至
+    /// completed → 产物 URL 一律相对路径（`/api/tasks/{id}/artifacts/{node}`）
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v1_full_chain_capabilities_submit_poll_relative_urls() {
+        let _guard = execution::lock_for_tests();
+        execution::clear_registry_for_tests();
+
+        let root = unique_root("v1-chain");
+        let state = v1_state(root.clone());
+
+        // 先 allocate（OS 占用探测在 mock bind 前）→ 再在同端口起 mock
+        let port = state
+            .port_manager
+            .write()
+            .await
+            .allocate("e2e-v1-mod")
+            .expect("预分配端口");
+        let adapter = spawn_mock_adapter(port).await;
+
+        // 1) capabilities 可查：形状 + 字段值
+        let resp = oneshot(app(state.clone()), get_request("/v1/capabilities")).await;
+        let (status, body) = response_json(resp).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        let caps = body["capabilities"].as_array().expect("capabilities 列表");
+        assert_eq!(caps.len(), 1, "{body}");
+        assert_eq!(caps[0]["module_id"], "e2e-v1-mod");
+        assert_eq!(caps[0]["capability"], "run");
+        assert_eq!(caps[0]["input_type"], "file");
+        assert_eq!(caps[0]["output_type"], "file");
+
+        // 2) multipart 提交（file 字段，wait 缺省 false）→ 202 {task_id}
+        let resp = oneshot(
+            app(state.clone()),
+            multipart_request(
+                "/v1/inference/e2e-v1-mod/run",
+                multipart_body_with_file("v1-in.txt", b"v1 e2e payload"),
+            ),
+        )
+        .await;
+        let (status, body) = response_json(resp).await;
+        assert_eq!(status, axum::http::StatusCode::ACCEPTED, "{body}");
+        let task_id = body["task_id"].as_str().expect("task_id").to_string();
+        assert!(task_id.starts_with("task-"));
+
+        // 3) 轮询 result 至终态（20s 预算）
+        let mut last = Value::Null;
+        let mut completed = false;
+        for _ in 0..400 {
+            let resp = oneshot(
+                app(state.clone()),
+                get_request(&format!("/v1/inference/result/{task_id}")),
+            )
+            .await;
+            let (status, body) = response_json(resp).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+            last = body.clone();
+            match body["status"].as_str().unwrap_or("") {
+                "completed" => {
+                    completed = true;
+                    break;
+                }
+                "failed" | "cancelled" => break,
+                _ => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+        assert!(completed, "v1 推理应真实执行完成: {last}");
+
+        // 4) 产物一律相对下载 URL（绝不回传服务器绝对路径），output 节点在列
+        let outputs = last["outputs"].as_array().expect("outputs 列表");
+        assert!(!outputs.is_empty(), "{last}");
+        for o in outputs {
+            let url = o["url"].as_str().expect("url 字段");
+            assert!(
+                url.starts_with(&format!("/api/tasks/{task_id}/artifacts/")),
+                "产物必须为相对下载 URL: {url}"
+            );
+        }
+        assert!(
+            outputs.iter().any(|o| o["node_id"] == "output"),
+            "output 节点产物应在列: {last}"
+        );
+
+        // teardown：停止 keepalive 子进程 + abort mock adapter
+        stop_all_running_modules(&state).await;
+        adapter.abort();
+    }
+
+    /// multipart body（file + wait 两字段）：m1 wait=true HTTP 层用例专用
+    fn multipart_body_with_file_and_wait(file_name: &str, data: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+        buf.extend_from_slice(
+            format!(
+                "Content-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\n\
+                 Content-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        buf.extend_from_slice(data);
+        buf.extend_from_slice(b"\r\n");
+        buf.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+        buf.extend_from_slice(b"Content-Disposition: form-data; name=\"wait\"\r\n\r\ntrue");
+        buf.extend_from_slice(b"\r\n");
+        buf.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+        buf
+    }
+
+    /// m1：wait=true multipart → 200 + status=completed + output_url 相对路径前缀
+    ///（HTTP 层同步路径覆盖，与上方异步轮询链互补）
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v1_wait_true_multipart_returns_completed_with_relative_output_url() {
+        let _guard = execution::lock_for_tests();
+        execution::clear_registry_for_tests();
+
+        let root = unique_root("v1-wait");
+        let state = v1_state(root.clone());
+
+        // 先 allocate（OS 占用探测在 mock bind 前）→ 再在同端口起 mock
+        let port = state
+            .port_manager
+            .write()
+            .await
+            .allocate("e2e-v1-mod")
+            .expect("预分配端口");
+        let adapter = spawn_mock_adapter(port).await;
+
+        let resp = oneshot(
+            app(state.clone()),
+            multipart_request(
+                "/v1/inference/e2e-v1-mod/run",
+                multipart_body_with_file_and_wait("v1-wait.txt", b"v1 wait payload"),
+            ),
+        )
+        .await;
+        let (status, body) = response_json(resp).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "wait=true → 200: {body}");
+        assert!(
+            body["task_id"].as_str().unwrap_or("").starts_with("task-"),
+            "{body}"
+        );
+        assert_eq!(body["status"], "completed", "{body}");
+        let url = body["output_url"].as_str().expect("output_url 应携带");
+        assert!(
+            url.starts_with("/api/tasks/"),
+            "output_url 必须为相对下载 URL 前缀: {url}"
+        );
+
+        // teardown：停止 keepalive 子进程 + abort mock adapter
+        stop_all_running_modules(&state).await;
+        adapter.abort();
     }
 }
 

@@ -2030,7 +2030,7 @@ mod tests {
 
     /// 挂载完整 /api 路由树（同 packs.rs 测试惯例）
     fn api_app(state: Arc<AppState>) -> Router {
-        crate::api::api_router().with_state(state)
+        crate::api::api_router(state.clone()).with_state(state)
     }
 
     fn get_request(uri: &str) -> Request<Body> {

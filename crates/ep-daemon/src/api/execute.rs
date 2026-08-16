@@ -270,8 +270,11 @@ fn find_builtin_pipeline(root: &Path, pipeline_id: &str) -> Option<Pipeline> {
 // ─── 单模型直跑（§5.3 / §8.1）───────────────────────────────────────────────
 
 /// 单条参数校验失败（纯数据，单测直接断言；handler 映射 400 + i18n 键）
+///
+/// `pub(crate)`：inference.rs（v1 门面）复用同一校验语义，错误码映射
+/// 各自负责（v1 用稳定机读码，不走 i18n）。
 #[derive(Debug, PartialEq)]
-enum ParamError {
+pub(crate) enum ParamError {
     /// 必填参数缺失（schema 无 default 且请求未提供）
     Missing(String),
     /// 类型不符：(参数名, 期望类型描述)
@@ -290,7 +293,7 @@ enum ParamError {
 /// - 请求中的未声明参数原样透传（宽容，引擎侧不读即无副作用）。
 ///
 /// 返回最终提交给引擎的参数对象（请求值 + 注入的默认值）。
-fn validate_and_fill_params(
+pub(crate) fn validate_and_fill_params(
     capability: &CapabilityDecl,
     request_params: Value,
 ) -> Result<Value, ParamError> {
@@ -347,7 +350,9 @@ fn check_param_type(name: &str, decl: &ParamSchema, value: &Value) -> Result<(),
 }
 
 /// 按 module_id 查找模块清单
-async fn find_module_manifest(state: &AppState, module_id: &str) -> Option<ModuleManifest> {
+///
+/// `pub(crate)`：inference.rs（v1 门面）共用同一查找口径。
+pub(crate) async fn find_module_manifest(state: &AppState, module_id: &str) -> Option<ModuleManifest> {
     let modules = state.modules.read().await;
     modules
         .iter()

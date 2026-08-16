@@ -511,6 +511,11 @@ pub struct SubmitOutcome {
 ///
 /// **签名冻结**（Wave S 契约；execute.rs 依赖）。等价于
 /// `submit_pipeline_full(…, SubmitOptions::default())`。
+///
+/// `#[allow(dead_code)]`：非测试路径的调用方已迁移至
+/// [`submit_direct_full`] / `submit_pipeline_full`，本函数仅保留给
+/// 既有测试与外部签名契约使用（与 submit_direct 同款处理）。
+#[allow(dead_code)]
 pub async fn submit_pipeline(
     state: &Arc<AppState>,
     pipeline: Pipeline,
@@ -1404,7 +1409,8 @@ async fn collect_module_ports(state: &Arc<AppState>) -> HashMap<String, u16> {
 /// 任务列表过滤；与配置管线 id 命名空间天然隔离）。
 ///
 /// **Wave S 冻结签名**；API 接线（`POST /api/execute/single`）由 B4 在
-/// `api/execute.rs` 完成。
+/// `api/execute.rs` 完成。等价于
+/// `submit_direct_full(…, SubmitOptions::default())`（仅返回 task_id）。
 #[allow(dead_code)] // B4 接线 /api/execute/single 前的骨架保留，勿删
 pub async fn submit_direct(
     state: &Arc<AppState>,
@@ -1413,6 +1419,33 @@ pub async fn submit_direct(
     params: Value,
     input_path: PathBuf,
 ) -> Result<String, SubmitError> {
+    submit_direct_full(
+        state,
+        module_id,
+        capability,
+        params,
+        input_path,
+        SubmitOptions::default(),
+    )
+    .await
+    .map(|outcome| outcome.task_id)
+}
+
+/// 提交单模型直跑（完整选项版，镜像 [`submit_pipeline_full`] 的
+/// wait/callback 语义）：校验模块 + capability → 编译退化三节点 DAG →
+/// 走同一闸门提交；`wait=true` 时阻塞至终态并在
+/// [`SubmitOutcome::record`] 携带终态快照。
+///
+/// 其余语义（autostart 前置约定、`direct/<module_id>` 命名空间、
+/// 排队期安全网）与 [`submit_direct`] 完全一致。
+pub async fn submit_direct_full(
+    state: &Arc<AppState>,
+    module_id: &str,
+    capability: &str,
+    params: Value,
+    input_path: PathBuf,
+    options: SubmitOptions,
+) -> Result<SubmitOutcome, SubmitError> {
     // 1. 模块 + manifest capability 校验（快速失败，不占闸门）；
     //    同时取回能力声明供产物扩展名推导（F2：跨格式能力不再误标）
     let capability_decl = {
@@ -1454,7 +1487,7 @@ pub async fn submit_direct(
         &input_path,
         Some(&capability_decl),
     );
-    submit_pipeline(state, pipeline, None).await
+    submit_pipeline_full(state, pipeline, None, options).await
 }
 
 /// 编译直跑退化 DAG：`input(file_input) → run(module) → output(file_output)`。
@@ -3030,6 +3063,99 @@ output_type = "json"
         .await
         .unwrap_err();
         assert!(matches!(err, SubmitError::InputMissing(_)));
+    }
+
+    // ── 19.1 submit_direct_full wait / 非 wait 两路（镜像 submit_pipeline_full 语义）
+
+    #[tokio::test]
+    async fn test_submit_direct_full_wait_and_async() {
+        use ep_core::module::manifest::ModuleManifest;
+
+        let _guard = lock_for_tests();
+        clear_registry_for_tests();
+
+        let root = unique_root("direct-full");
+        // 复用 mock-asr fixture：本环境无 Python venv，模块进程拉不起来——
+        // 任务终态必为 Failed，但 wait/非 wait 的提交语义仍可完整验证。
+        let manifest: ModuleManifest = toml::from_str(
+            r#"
+[module]
+id = "mock-asr"
+name = "Mock ASR"
+version = "0.1.0"
+description = "test"
+category = "asr"
+genre = "test"
+license = "MIT"
+
+[runtime]
+type = "python"
+
+[compute]
+backends = ["cpu"]
+
+[interface]
+type = "http"
+
+[[interface.capabilities]]
+name = "transcribe"
+description = "转写"
+input_type = "audio"
+output_type = "json"
+"#,
+        )
+        .unwrap();
+        let module = ep_core::module::discovery::DiscoveredModule {
+            manifest: Some(manifest),
+            path: root.join("modules/mock-asr"),
+            status: ep_core::module::discovery::DiscoveryStatus::Valid,
+        };
+        let state = Arc::new(AppState::new(
+            root.clone(),
+            AppConfig::default(),
+            vec![],
+            vec![module],
+            PortManager::new(18000, 19000),
+        ));
+
+        let input = root.join("direct-full-in.txt");
+        std::fs::write(&input, "direct-full").unwrap();
+
+        // wait=true：阻塞至终态，record 必为 Some 且已终结
+        let outcome = submit_direct_full(
+            &state,
+            "mock-asr",
+            "transcribe",
+            json!({}),
+            input.clone(),
+            SubmitOptions {
+                wait: true,
+                callback_url: None,
+            },
+        )
+        .await
+        .unwrap();
+        let record = outcome.record.expect("wait 模式必须携带记录");
+        assert_eq!(record.id, outcome.task_id);
+        assert!(record.status.is_terminal());
+        assert!(record.pipeline_id.starts_with("direct/"));
+
+        // wait=false：立即返回 task_id 且 record 为 None，轮询至终态
+        let outcome2 = submit_direct_full(
+            &state,
+            "mock-asr",
+            "transcribe",
+            json!({}),
+            input,
+            SubmitOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(outcome2.record.is_none());
+        let record2 = wait_terminal(&outcome2.task_id)
+            .await
+            .expect("任务应终结");
+        assert!(record2.status.is_terminal());
     }
 
     // ── 20. snapshot_by_pipeline + 队列位置标注 ─────────────────────────────

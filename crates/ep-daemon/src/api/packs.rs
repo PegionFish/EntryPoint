@@ -2464,7 +2464,7 @@ mod tests {
 
     /// 挂载完整 /api 路由树（同时验证 packs 与其他模块路由无冲突）
     fn app(state: Arc<AppState>) -> Router {
-        crate::api::api_router().with_state(state)
+        crate::api::api_router(state.clone()).with_state(state)
     }
 
     fn get_request(uri: &str) -> Request<Body> {

@@ -355,6 +355,30 @@ impl Default for ServerConfig {
     }
 }
 
+/// 统一推理 API（`/api/v1/*` 门面）配置。
+///
+/// 仅约束 v1 外部契约层：`token` 配置后 v1 端点要求
+/// `Authorization: Bearer <token>` 或 `X-API-Key: <token>`；
+/// 不配置则直通（内网可信场景）。`/api` 其余 WebUI 内部端点不受影响。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiConfig {
+    /// 总开关；false 时 v1 端点视为未启用（直通，不强制鉴权）
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 可选 Bearer token；None = 不启用鉴权
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            token: None,
+        }
+    }
+}
+
 // ─── AppConfig ──────────────────────────────────────────────────────────────
 
 /// 整合包配置（§8.3）
@@ -424,6 +448,9 @@ pub struct AppConfig {
     /// 整合包配置（§8.3）
     #[serde(default)]
     pub packs: PacksConfig,
+    /// 统一推理 API（`/api/v1/*`）配置：可选 token 鉴权
+    #[serde(default)]
+    pub api: ApiConfig,
     /// 每模块激活模型变体（单槽位语义 §5.2）：module_id → model_id；A6 消费
     #[serde(default)]
     pub active_models: std::collections::HashMap<String, String>,

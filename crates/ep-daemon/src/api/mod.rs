@@ -4,6 +4,7 @@ pub mod deps;
 pub mod devices;
 pub mod execute;
 pub mod health;
+pub mod inference;
 pub mod models;
 pub mod modules;
 pub mod packs;
@@ -25,7 +26,10 @@ use crate::state::AppState;
 /// Wave S 骨架：packs 路由已预注册（§8.1 共 7 条），stub handler 统一返回
 /// 501 + i18n `common.tip.comingSoon`（{"error":"功能即将上线"}），
 /// 接管代理与契约见 `packs.rs` 文件头注释。
-pub fn api_router() -> Router<Arc<AppState>> {
+///
+/// `state` 参数仅供 v1 门面的 token 中间件装配（`from_fn_with_state`
+/// 需要 state 实例值）；路由本体仍是 `Router<Arc<AppState>>`。
+pub fn api_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
         .merge(health::router())
         .merge(devices::router())
@@ -38,6 +42,8 @@ pub fn api_router() -> Router<Arc<AppState>> {
         .merge(tasks::router())
         .merge(deps::router())
         .merge(packs::router())
+        // 统一推理 API v1 门面（/v1/*，外部稳定契约；token 中间件仅作用其子路由）
+        .merge(inference::router(state))
         // 未匹配的 /api/* → 404 + JSON，避免落入 SPA 的 HTML fallback
         .fallback(api_not_found)
 }

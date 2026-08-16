@@ -41,3 +41,11 @@ workspace_dir = "workspace"
 http_proxy = ""
 https_proxy = ""
 no_proxy = "localhost,127.0.0.1"
+
+# 统一推理 API（/api/v1/*）：默认不设 token（内网可信场景直通）。
+# 对外/公网暴露前建议配置：token = "<随机长字符串>"
+# 配置后 v1 端点要求 Authorization: Bearer <token> 或 X-API-Key: <token>。
+# 详见 docs/INFERENCE_API.md。
+[api]
+enabled = true
+# token = ""

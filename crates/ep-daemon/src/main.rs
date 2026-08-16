@@ -231,6 +231,12 @@ async fn run_server(root: PathBuf, cfg: AppConfig) -> anyhow::Result<()> {
         let cfg = state.config.read().await;
         if cfg.server.allow_public {
             tracing::warn!("public access ENABLED — no built-in auth/encryption, use at your own risk");
+            // 公网暴露 + （v1 未启用鉴权或未配 token）→ 未认证推理 API 直接可达，明确告警
+            if !cfg.api.enabled || cfg.api.token.is_none() {
+                tracing::warn!(
+                    "public access ENABLED without [api].token — /api/v1/* inference endpoints are exposed without authentication; set [api].token in config/app.toml"
+                );
+            }
         } else {
             tracing::info!("public access blocked — only private/loopback IPs allowed (set allow_public=true to change)");
         }
@@ -409,7 +415,7 @@ async fn stop_all_modules(state: &Arc<AppState>) {
 fn build_app_router(state: Arc<AppState>, static_dir: &Path) -> Router {
     let index_path = static_dir.join("index.html");
     Router::new()
-        .nest("/api", api::api_router())
+        .nest("/api", api::api_router(state.clone()))
         .merge(ws::ws_router())
         .fallback_service(ServeDir::new(static_dir).fallback(ServeFile::new(index_path)))
         .layer(axum::middleware::from_fn_with_state(state.clone(), ip_filter))
@@ -438,6 +444,15 @@ fn is_timeout_exempt_path(path: &str) -> bool {
         return true;
     }
     if path == "/api/upload/input" {
+        return true;
+    }
+    // v1 同步推理提交（wait=true）：模型加载 + 长推理可能远超 300s 总时长
+    // 上限，任务级超时语义由管线引擎（空闲看门狗/节点硬超时）负责，此处
+    // 不叠加；结果查询端点（/api/v1/inference/result/）为快速读，不豁免，
+    // 恢复 300s 兜底（m8）
+    if path.starts_with("/api/v1/inference/")
+        && !path.starts_with("/api/v1/inference/result/")
+    {
         return true;
     }
     // 产物流式下载（ServeDir）：/api/task-files/*、/api/pack-files/*
