@@ -237,6 +237,22 @@ faster-whisper = "large-v3"
 qwen3-tts = "default"
 ```
 
+### 1.11 `[api]` — 统一推理 API（`/api/v1/*`）
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `enabled` | bool | `true` | v1 门面总开关。`false` 时不强制鉴权（直通） |
+| `token` | string | 无（不启用鉴权） | 可选 Bearer token。配置后 `/api/v1/*` 端点要求 `Authorization: Bearer <token>` 或 `X-API-Key: <token>`，不匹配返回 `401` |
+
+仅保护 `/api/v1/*` 外部契约层；`/api` 其余 WebUI 内部端点不受影响。
+端点用法、错误码与演进路线详见 `docs/INFERENCE_API.md`。
+
+```toml
+[api]
+enabled = true
+# token = ""   # 对外/公网暴露前建议配置随机长字符串
+```
+
 ---
 
 ## 2. 完整 app.toml 示例
@@ -293,6 +309,10 @@ no_proxy = "localhost,127.0.0.1"
 
 [packs]
 staging_dir = ".pack-staging"
+
+[api]
+enabled = true
+# token = ""   # 可选：配置后 /api/v1/* 要求 Bearer / X-API-Key
 
 [active_models]
 # faster-whisper = "large-v3"   # 每模块激活变体（变体切换端点自动写入）

@@ -46,10 +46,12 @@ pub fn router() -> Router<Arc<AppState>> {
 ///
 /// 最终文案由 `err_response` 按请求语言（config.general.language）本地化，
 /// 键定义见 `i18n/locales/*/apiModels.json`。
-struct UploadError {
-    status: StatusCode,
-    key: &'static str,
-    params: Vec<(&'static str, String)>,
+///
+/// `pub(crate)`：供 [`store_input_file`] 跨模块复用（inference.rs 共享落盘）。
+pub(crate) struct UploadError {
+    pub(crate) status: StatusCode,
+    pub(crate) key: &'static str,
+    pub(crate) params: Vec<(&'static str, String)>,
 }
 
 fn err(status: StatusCode, key: &'static str) -> UploadError {
@@ -834,7 +836,10 @@ async fn single_top_dir(extract_dir: &Path) -> Option<PathBuf> {
 // ─── 辅助 ───────────────────────────────────────────────────────────────────
 
 /// 生成暂存目录名（不引入 uuid crate：纳秒时间戳 + 进程内序号 + pid）
-fn staging_id() -> String {
+///
+/// `pub(crate)`：v1 推理门面（inference.rs）暂存输入文件命名复用同一口径
+///（原子序号消除纯纳秒命名的并发覆盖竞态）。
+pub(crate) fn staging_id() -> String {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let nanos = std::time::SystemTime::now()
@@ -998,23 +1003,8 @@ async fn upload_input(
     };
     let (temp_path, raw_name) = staged;
 
-    // 落盘到 workspace/uploads/
-    let uploads_dir = {
-        let cfg = state.config.read().await;
-        cfg.resolve_workspace_dir(&state.root).join("uploads")
-    };
-    if let Err(e) = tokio::fs::create_dir_all(&uploads_dir).await {
-        cleanup_temp_dir(&temp_dir).await;
-        return err_response(
-            &state,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "apiModels.uploadStagingFailed",
-            &[("detail", e.to_string())],
-        )
-        .await;
-    }
-
-    let placed = place_input_file(&temp_path, &uploads_dir, &raw_name).await;
+    // 落盘到 workspace/uploads/（共享助手，inference.rs 同路径复用）
+    let placed = store_input_file(&state, &temp_path, &raw_name).await;
 
     // 无论成败清理 tempdir（落盘成功后其中只剩空壳）
     cleanup_temp_dir(&temp_dir).await;
@@ -1029,6 +1019,37 @@ async fn upload_input(
         }
         Err(ue) => err_response(&state, ue.status, ue.key, &ue.params).await,
     }
+}
+
+/// 直跑输入文件落盘根目录（`<workspace>/uploads`）。
+///
+/// `pub(crate)`：inference.rs 的 `input_path` 前缀校验与同源上传共用
+/// 同一口径（resolve_workspace_dir + uploads），避免两处漂移。
+pub(crate) async fn input_uploads_dir(state: &AppState) -> PathBuf {
+    let cfg = state.config.read().await;
+    cfg.resolve_workspace_dir(&state.root).join("uploads")
+}
+
+/// 将已暂存的输入文件落盘到 `workspace/uploads/`（共享助手）。
+///
+/// 从 `upload_input` 抽取（行为不变）：解析 uploads 目录 → create_dir_all →
+/// [`place_input_file`]（文件名清洗/防穿越/重名序号/create_new 竞态安全均
+/// 保留在其中）。供 `POST /api/upload/input` 与 v1 推理门面的 multipart
+/// 入参两条路径共用。
+pub(crate) async fn store_input_file(
+    state: &AppState,
+    temp_path: &Path,
+    raw_name: &str,
+) -> Result<PathBuf, UploadError> {
+    let uploads_dir = input_uploads_dir(state).await;
+    if let Err(e) = tokio::fs::create_dir_all(&uploads_dir).await {
+        return Err(err_detail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "apiModels.uploadStagingFailed",
+            e,
+        ));
+    }
+    place_input_file(temp_path, &uploads_dir, raw_name).await
 }
 
 /// 清理 tempdir（NotFound 视为成功，其余仅告警）
