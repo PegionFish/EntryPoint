@@ -100,7 +100,7 @@ use ep_core::pipeline::runner::TaskDetail;
 use ep_core::pipeline::vram;
 use ep_core::pipeline::PipelineRunnerImpl;
 use ep_core::task_registry::TaskRegistry;
-use ep_core::types::{Artifact, PipelineRunner};
+use ep_core::types::{Artifact, DataType, PipelineRunner};
 
 use crate::state::{AppState, ProgressMessage};
 
@@ -1519,50 +1519,71 @@ pub fn build_direct_pipeline(
     let output_params = direct_output_extension(&params, capability_decl, input_path)
         .map(|ext| json!({ "extension": ext }))
         .unwrap_or_else(|| json!({}));
+    // JSON/Text 输出能力（如 ASR transcribe → json）：默认产物是内联数据，
+    // file_output 无文件输入必失败（Linux 真机 E2E 实测暴露）→ 省略 output
+    // 节点，内联产物由执行回调物化为文件后随产物归集可下载（见
+    // run_pipeline_blocking 的 on_node_complete）。例外：请求显式携带
+    // output_format（非 json，如 srt/txt）时执行器注入 output_path、模块
+    // 落真实文件，保持三节点形态。未知能力（无声明）亦保持原三节点形态。
+    let explicit_file_format = params
+        .get("output_format")
+        .and_then(|v| v.as_str())
+        .map(|s| {
+            let t = s.trim();
+            !t.is_empty() && t != "json"
+        })
+        .unwrap_or(false);
+    let output_is_file = capability_decl
+        .map(|c| {
+            !matches!(c.output_type, DataType::Json | DataType::Text) || explicit_file_format
+        })
+        .unwrap_or(true);
+    let mut nodes = vec![
+        make_node(
+            "input",
+            NodeKind::Builtin {
+                builtin: "file_input".to_string(),
+            },
+            "输入文件",
+            json!({ "path": input_path.display().to_string() }),
+        ),
+        make_node(
+            "run",
+            NodeKind::Module {
+                module_id: module_id.to_string(),
+                capability: capability.to_string(),
+                model_id: None,
+                device: None,
+            },
+            "模块执行",
+            params,
+        ),
+    ];
+    let mut edges = vec![ep_core::pipeline::dag::Edge {
+        from: ("input".to_string(), "output".to_string()),
+        to: ("run".to_string(), "input".to_string()),
+    }];
+    if output_is_file {
+        nodes.push(make_node(
+            "output",
+            NodeKind::Builtin {
+                builtin: "file_output".to_string(),
+            },
+            "结果输出",
+            output_params,
+        ));
+        edges.push(ep_core::pipeline::dag::Edge {
+            from: ("run".to_string(), "output".to_string()),
+            to: ("output".to_string(), "input".to_string()),
+        });
+    }
     Pipeline {
         // B4 契约：direct/<module_id> 形状（同模块直跑任务聚合，前端可过滤）
         id: format!("direct/{module_id}"),
         name: format!("直跑 {module_id}/{capability}"),
         description: "单模型直跑任务（§5.3 退化三节点 DAG）".to_string(),
-        nodes: vec![
-            make_node(
-                "input",
-                NodeKind::Builtin {
-                    builtin: "file_input".to_string(),
-                },
-                "输入文件",
-                json!({ "path": input_path.display().to_string() }),
-            ),
-            make_node(
-                "run",
-                NodeKind::Module {
-                    module_id: module_id.to_string(),
-                    capability: capability.to_string(),
-                    model_id: None,
-                    device: None,
-                },
-                "模块执行",
-                params,
-            ),
-            make_node(
-                "output",
-                NodeKind::Builtin {
-                    builtin: "file_output".to_string(),
-                },
-                "结果输出",
-                output_params,
-            ),
-        ],
-        edges: vec![
-            ep_core::pipeline::dag::Edge {
-                from: ("input".to_string(), "output".to_string()),
-                to: ("run".to_string(), "input".to_string()),
-            },
-            ep_core::pipeline::dag::Edge {
-                from: ("run".to_string(), "output".to_string()),
-                to: ("output".to_string(), "input".to_string()),
-            },
-        ],
+        nodes,
+        edges,
         max_instances: None,
         node_timeout_secs: None,
     }
@@ -1625,6 +1646,7 @@ fn run_task(
         let pid = pipeline_id.clone();
         let tid = task_id.clone();
         let act = activity_ms.clone();
+        let tdir = task_dir.clone();
         runner.on_node_complete = Some(Arc::new(move |node_id, artifact| {
             act.store(now_epoch_ms(), Ordering::SeqCst);
             let _ = tx.send(ProgressMessage {
@@ -1634,8 +1656,37 @@ fn run_task(
                 status: "completed".to_string(),
             });
             set_node_state(&tid, node_id, "completed", None);
-            if let Artifact::File(path) = artifact {
-                record_artifact(&tid, node_id, path);
+            match artifact {
+                Artifact::File(path) => record_artifact(&tid, node_id, path),
+                // 内联产物物化为任务目录内文件，随产物归集进入 files/ 可下载
+                //（直跑 JSON/Text 输出能力省略 file_output 节点后的产物通道）
+                Artifact::Json(value) => {
+                    let dest = tdir.join(format!("{node_id}_output.json"));
+                    let written = serde_json::to_string_pretty(value)
+                        .ok()
+                        .is_some_and(|s| std::fs::write(&dest, s).is_ok());
+                    if written {
+                        record_artifact(&tid, node_id, &dest);
+                    } else {
+                        warn!(
+                            task_id = %tid,
+                            node_id,
+                            "failed to materialize JSON artifact; result will not be downloadable"
+                        );
+                    }
+                }
+                Artifact::Text(text) => {
+                    let dest = tdir.join(format!("{node_id}_output.txt"));
+                    if std::fs::write(&dest, text).is_ok() {
+                        record_artifact(&tid, node_id, &dest);
+                    } else {
+                        warn!(
+                            task_id = %tid,
+                            node_id,
+                            "failed to materialize text artifact; result will not be downloadable"
+                        );
+                    }
+                }
             }
         }));
     }
@@ -2939,7 +2990,8 @@ builtin = "file_output"
             Some(&asr),
         );
         assert_eq!(p.nodes[2].params["extension"], "srt");
-        // 同能力不传 output_format → 语义映射 json
+        // 同能力不传 output_format → json 内联输出：省略 file_output 节点，
+        // 退化为两节点 DAG（产物由执行回调物化为 .json，Linux E2E 修复）
         let p = build_direct_pipeline(
             "faster-whisper",
             "transcribe",
@@ -2947,7 +2999,8 @@ builtin = "file_output"
             Path::new("/tmp/speech.wav"),
             Some(&asr),
         );
-        assert_eq!(p.nodes[2].params["extension"], "json");
+        assert_eq!(p.nodes.len(), 2, "json 输出不应带 file_output 节点");
+        assert_eq!(p.edges.len(), 1);
 
         // rembg image→image 同格式回归：产物仍随输入 .png，不被映射改写
         let rembg = cap_decl(DataType::Image, DataType::Image);
