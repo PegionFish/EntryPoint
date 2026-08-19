@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # EntryPoint 编译打包脚本（Linux）— server 模式（桌面端已于 2026-08-13 退役）
 # 用法: ./build.sh server [-t debug|release] [-d <distro>] [--skip-test] [--skip-clippy] [--skip-frontend] [--clean] [-o <dir>]
-#   server — 服务器包（daemon + WebUI + systemd 安装脚本）
-#            Linux: tar.gz 兑底 + deb/rpm/PKGBUILD（探测到工具则产）
+#   server — 服务器包（daemon + WebUI + deploy.sh 交互式部署脚本）
+#            Linux: ZIP 主产物（自包含，解压即用）+ tar.gz 兜底 + 按发行版族产 deb/rpm/PKGBUILD（探测到工具则产）
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,11 +29,11 @@ DISTRO="auto"
 usage() {
     cat <<EOF
 用法: $0 server [选项]
-  server 服务器包（daemon + WebUI + systemd，Linux: tar.gz/deb/rpm/PKGBUILD）
+  server 服务器包（daemon + WebUI + deploy.sh，Linux: ZIP 主产物/tar.gz/deb/rpm/PKGBUILD）
 选项:
   -t, --target debug|release   构建类型（默认 release）
   -d, --distro <name>          目标发行版（默认 auto：自动检测当前发行版）
-                               已适配 glibc 约束/依赖包名/包格式；未知发行版仅 tar.gz
+                               已适配 glibc 约束/依赖包名/包格式；未知发行版仅 ZIP + tar.gz
       --skip-test              跳过 cargo test
       --skip-clippy            跳过 cargo clippy
       --skip-frontend          跳过 WebUI 前端构建（使用现有 crates/ep-webui/static 产物）
@@ -200,7 +200,7 @@ DISTRO_DEPS="${DISTRO_GLIBC_MIN#*|}"
 DISTRO_GLIBC_MIN="${DISTRO_GLIBC_MIN%%|*}"
 step "目标发行版: $DISTRO (family: $DISTRO_FAMILY)"
 if [ "$DISTRO_FAMILY" = "generic" ]; then
-    info "提示: 发行版 $DISTRO 的包格式/依赖/glibc 约束暂未适配（可在 build.sh DISTRO_GLIBC_MIN 知识表补充），仅产出 tar.gz 兑底包"
+    info "提示: 发行版 $DISTRO 的包格式/依赖/glibc 约束暂未适配（可在 build.sh DISTRO_GLIBC_MIN 知识表补充），仅产出 ZIP + tar.gz 通用包"
 else
     check_glibc_compat "$DISTRO_GLIBC_MIN"
 fi
@@ -252,6 +252,9 @@ fi
 command -v cargo >/dev/null 2>&1 || die "cargo 未找到，请先安装 Rust: https://rustup.rs"
 command -v rustc >/dev/null 2>&1 || die "rustc 未找到"
 command -v git >/dev/null 2>&1 || die "git 未找到"
+# deploy.sh 是 ZIP/tar.gz 包内唯一部署入口（Wave 2）：缺失则产物不可部署，
+# 在编译之前 fail-fast，避免浪费整轮构建时间。
+[[ -f "$PROJECT_ROOT/scripts/deploy.sh" ]] || die "scripts/deploy.sh 缺失——请先完成 deploy.sh 开发（包内不允许产出无部署脚本的 ZIP/tar.gz）"
 ok "平台: $OS_ID/$ARCH_ID | 模式: $MODE | cargo: $(cargo --version)"
 
 GIT_HASH="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -326,7 +329,8 @@ rm -rf "$STAGING" "$WORK_DIR"
 mkdir -p "$STAGING/bin" "$STAGING/config/pipelines" "$STAGING/modules" "$STAGING/workspace"
 mkdir -p "$WORK_DIR"
 
-BIN_SRC="$PROJECT_ROOT/target/$PROFILE_DIR"
+# 支持 CARGO_TARGET_DIR 环境变量覆盖构建目录（worktree/CI 场景；cargo 自身亦读同名变量）
+BIN_SRC="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/$PROFILE_DIR"
 EXE_NAME="ep-daemon"
 [[ -f "$BIN_SRC/$EXE_NAME" ]] || die "二进制不存在: $BIN_SRC/$EXE_NAME"
 
@@ -396,34 +400,17 @@ Environment=LD_LIBRARY_PATH=/opt/entrypoint/runtime/cuda-libs
 [Install]
 WantedBy=multi-user.target
 EOF
-    cat > "$RES/install.sh" <<'EOF'
-#!/usr/bin/env bash
-# 安装 EntryPoint 服务器到 /opt/entrypoint 并注册 systemd 服务
-# 用法: bash install.sh   （需 root 或 sudo）
-set -euo pipefail
-SRC="$(cd "$(dirname "$0")" && pwd)"
-DEST="${DEST:-/opt/entrypoint}"
-if [[ "$(id -u)" != "0" ]]; then exec sudo -E "$0" "$@"; fi
-mkdir -p "$DEST"
-cp -a "$SRC/bin" "$SRC/webui" "$SRC/config" "$SRC/modules" "$SRC/workspace" "$DEST/"
-# runtime/（含可选 cuda-libs，§3.1）：存在才复制
-if [[ -d "$SRC/runtime" ]]; then cp -a "$SRC/runtime" "$DEST/"; fi
-install -m644 "$SRC/entrypoint.service" /etc/systemd/system/entrypoint.service
-systemctl daemon-reload
-systemctl enable entrypoint
-systemctl start entrypoint || true
-PORT="$(grep -E '^[[:space:]]*port[[:space:]]*=' "$DEST/config/app.toml" 2>/dev/null | grep -oE '[0-9]+' | head -1 || echo 9800)"
-echo "==> EntryPoint 服务器已安装并启动: http://localhost:$PORT"
-echo "    日志: journalctl -u entrypoint -f | 状态: systemctl status entrypoint"
-EOF
-    chmod +x "$RES/install.sh"
-    ok "服务器 systemd 服务 + install.sh 已生成"
+    # deploy.sh（Wave 2 交互式部署脚本，源码见 scripts/deploy.sh）置于包根，0755。
+    # 取代旧的内嵌 install.sh heredoc；缺失已在环境检查阶段 fail-fast，此处必然存在。
+    # entrypoint.service 仍随包保留，供高级用户手装 systemd（deb/rpm 经 stage_fhs 复用）。
+    install -m 0755 "$PROJECT_ROOT/scripts/deploy.sh" "$RES/deploy.sh"
+    ok "服务器 systemd 单元 + deploy.sh 已入包"
 fi
 
 # 启动脚本
 cat > "$RES/start-daemon.sh" <<'EOF'
 #!/usr/bin/env bash
-# 前台启动 daemon（生产环境建议用 install.sh 注册 systemd 服务）
+# 前台启动 daemon（生产环境建议运行包根 deploy.sh 交互式部署）
 cd "$(dirname "$0")"
 exec bin/ep-daemon
 EOF
@@ -445,6 +432,49 @@ ok "VERSION.txt 已生成"
 # ── 打包 ─────────────────────────────────────────────────────────────────────
 step "打包 ($MODE)"
 rm -rf "$MANIFEST"
+
+# ZIP 主产物（Wave 2）：自包含包，解压到任意目录后运行包根 deploy.sh 部署，
+# 不绑定 /opt 与发行版布局。工具链降级顺序：zip → python3 zipfile → bsdtar → 跳过。
+pkg_zip() {
+    local name="${PACKAGE_BASE}.zip"
+    local stage_base
+    stage_base="$(basename "$STAGING")"
+    if command -v zip >/dev/null 2>&1; then
+        # 首选 zip：-r 递归、-y 保留符号链接；unix 可执行位写入 external_attr，解压即还原
+        (cd "$DIST_DIR" && zip -rqy "$name" "$stage_base") || die "zip 打包失败: $name"
+    elif command -v python3 >/dev/null 2>&1; then
+        info "zip 缺失，降级 python3 -m zipfile（写入不保留 unix 权限位，随后按 staging 磁盘权限修复）"
+        (cd "$DIST_DIR" && python3 -m zipfile -c "$name" "$stage_base") || die "python3 zipfile 打包失败: $name"
+        # 修复：以 staging 磁盘权限重建归档，逐条目补 external_attr（可执行位等）
+        python3 - "$DIST_DIR/$name" "$DIST_DIR" <<'PY' || die "zip 权限位修复失败（python3 降级路径）"
+import os, stat, sys, zipfile
+arc, base = sys.argv[1], sys.argv[2]
+tmp = arc + '.fixtmp'
+with zipfile.ZipFile(arc) as zin, zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zout:
+    for item in zin.infolist():
+        src = os.path.join(base, item.filename)
+        if item.is_dir():
+            mode = 0o755
+        elif os.path.exists(src):
+            mode = stat.S_IMODE(os.stat(src).st_mode)
+        else:
+            mode = 0o644
+        item.external_attr = ((mode & 0xFFFF) << 16) | (0x10 if item.is_dir() else 0)
+        item.create_system = 3  # 标记 unix，确保 unzip 还原权限位
+        zout.writestr(item, zin.read(item.filename), compress_type=zipfile.ZIP_DEFLATED)
+os.replace(tmp, arc)
+PY
+    elif command -v bsdtar >/dev/null 2>&1; then
+        info "zip/python3 缺失，降级 bsdtar --format zip（libarchive 保留 unix 权限位）"
+        bsdtar --format zip -cf "$DIST_DIR/$name" -C "$DIST_DIR" "$stage_base" || die "bsdtar zip 打包失败: $name"
+    else
+        echo "  [WARN] zip / python3 / bsdtar 全部缺失：跳过 ZIP 主产物，本次仅产出 tar.gz 兜底包！" >&2
+        echo "  [WARN] 安装 zip（如 pacman -S zip）后重新打包，方可获得自包含 ZIP 主产物。" >&2
+        return 0
+    fi
+    echo "$name" >> "$MANIFEST"
+    ok "zip: $DIST_DIR/$name ($(du -h "$DIST_DIR/$name" | cut -f1))"
+}
 
 pkg_tgz() {
     local name="${PACKAGE_BASE}.tar.gz"
@@ -579,13 +609,14 @@ pkg_arch() {
     ok "Arch: $dir/PKGBUILD (sha256=$sha) + 源包 $pkgname-$pkgver.tar.gz"
 }
 
-pkg_tgz
-# 按目标发行版产出对应包格式（工具缺失则跳过，tar.gz 兜底保证有产物）
+pkg_zip   # 主产物置顶（自包含 ZIP：解压到任意目录后运行 deploy.sh 部署）
+pkg_tgz   # 兜底
+# 按目标发行版产出对应包格式（工具缺失则跳过，ZIP/tar.gz 保证有产物）
 case "$DISTRO_FAMILY" in
     deb) pkg_deb ;;
     rpm) pkg_rpm ;;
     pkg) pkg_arch ;;
-    *)   info "仅产出 tar.gz 兑底包" ;;
+    *)   info "仅产出 ZIP + tar.gz 通用包（不产发行版专属包）" ;;
 esac
 
 # ── 清单 ─────────────────────────────────────────────────────────────────────
