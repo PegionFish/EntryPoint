@@ -11,7 +11,9 @@ cd "$PROJECT_ROOT"
 # 版本单一来源：Cargo.toml [workspace.package] version（勿在此处另写死版本号）；
 # 与 daemon 界面版本（env!("CARGO_PKG_VERSION")）同源，保证包名/VERSION.txt/界面一致。
 # 解析失败必须显式报错而非回退 0.0.0（否则静默产出错误命名的包）。
-VERSION="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' "$PROJECT_ROOT/Cargo.toml" | head -1)"
+# 取值用 `sed -n 1p` 而非 `head -1`：head 读满首行即关闭管道，set -o pipefail
+# 下上游继续写入会收 SIGPIPE（exit 141）——sed 读完全量输入，无早断竞态
+VERSION="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' "$PROJECT_ROOT/Cargo.toml" | sed -n 1p)"
 if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
     echo "  [FAIL] 无法从 Cargo.toml 解析版本号，拒绝打包（请检查 [workspace.package] version）" >&2
     exit 1
@@ -176,7 +178,9 @@ check_glibc_compat() {
     local target_min="$1"
     [ -z "$target_min" ] && return 0
     local build_glibc
-    build_glibc="$(ldd --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)"
+    # 同 VERSION 解析：sed -n 1p 替代 head -1 防 SIGPIPE（pipefail 竞态）；
+    # 末位 `|| true`：ldd 缺失时 grep 无匹配退 1，交由下方空值分支提示跳过
+    build_glibc="$( { ldd --version 2>/dev/null || true; } | grep -oE '[0-9]+\.[0-9]+' | sed -n 1p || true)"
     if [ -z "$build_glibc" ]; then
         info "提示: 无法检测构建机 glibc 版本，跳过 glibc 兼容性检查"
         return 0
