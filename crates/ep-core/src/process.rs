@@ -354,10 +354,7 @@ impl ServiceInstance {
 /// 只杀直接子进程（cmd.exe）会留下实际服务的子孙树（如 python adapter）成为
 /// 占端口的孤儿进程。此处用系统自带 `taskkill /PID <pid> /T /F` 达成树级终止
 /// （/T = 连同所有子孙进程，/F = 强制），无需引入额外 windows 依赖。
-///
-/// 非 Windows：当前直接返回 false，调用方回退到杀直接子进程——
-/// `sh -c <单一命令>` 通常被优化为 exec（子进程即目标进程本身），直接 kill
-/// 可覆盖主要场景；复合命令（管道/后台）的子孙树不在当前保证范围内。
+/// Unix 实现见下方 `#[cfg(unix)]` 同名函数（LNX-02：进程组级信号回收）。
 #[cfg(target_os = "windows")]
 async fn kill_process_tree(pid: u32) -> bool {
     let pid_arg = pid.to_string();
@@ -381,7 +378,58 @@ async fn kill_process_tree(pid: u32) -> bool {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+/// Unix（LNX-02）：模块子进程经 `process_group(0)` spawn（见
+/// [`ProcessManager::start_module`]），pgid 即其 pid，子孙进程继承同一进程组，
+/// 因此可按组级信号回收整棵树：
+///
+/// 1. 向进程组发 SIGTERM（`kill(-pgid, SIGTERM)`，宽限退出）；
+/// 2. 最多轮询 5s（50ms 间隔，`kill(pgid, 0)` 判存活）；
+/// 3. 仍有存活成员 → 对整组升级 SIGKILL。
+///
+/// 返回 SIGTERM 是否成功发出；失败时调用方回退到杀直接子进程。
+#[cfg(unix)]
+async fn kill_process_tree(pid: u32) -> bool {
+    let pgid = -(pid as i32);
+
+    // SAFETY: libc::kill 仅投递信号，无内存副作用。
+    let term_sent = unsafe { libc::kill(pgid, libc::SIGTERM) } == 0;
+    if !term_sent {
+        warn!(
+            pid,
+            error = %std::io::Error::last_os_error(),
+            "failed to SIGTERM process group, falling back to direct kill"
+        );
+        return false;
+    }
+
+    // 宽限轮询：kill(pgid, 0) == 0 表示组内仍有存活成员
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        // SAFETY: signal 0 为存活探测，不投递实际信号。
+        let alive = unsafe { libc::kill(pgid, 0) } == 0;
+        if !alive {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // 宽限期耗尽仍有存活 → 整组 SIGKILL（无宽限）
+    // SAFETY: 同上，仅投递信号。
+    if unsafe { libc::kill(pgid, libc::SIGKILL) } != 0 {
+        warn!(
+            pid,
+            error = %std::io::Error::last_os_error(),
+            "failed to SIGKILL process group after grace period"
+        );
+    }
+    true
+}
+
+/// 其他平台兜底：无树级回收能力，返回 false，调用方回退到杀直接子进程。
+#[cfg(not(any(target_os = "windows", unix)))]
 async fn kill_process_tree(_pid: u32) -> bool {
     false
 }
@@ -464,6 +512,12 @@ impl ProcessManager {
         } else {
             let mut c = tokio::process::Command::new("sh");
             c.args(["-c", &command]);
+            // LNX-02：模块子进程自成进程组（pgid == 子进程 pid，子孙继承同组），
+            // 使 stop / 健康检查超时的树级回收能经 kill(-pgid, …) 整组发信号。
+            // 语义说明：新进程组不再接收终端 Ctrl+C（SIGINT），模块回收统一由
+            // daemon 显式负责（优雅退出路径见 ep-daemon shutdown_signal）。
+            #[cfg(unix)]
+            c.process_group(0);
             c
         };
 
@@ -563,10 +617,10 @@ impl ProcessManager {
 
     /// 停止模块服务，回收子进程及其整棵进程树。
     ///
-    /// Windows 下启动命令经 `cmd /C` 壳包裹（见 [`Self::start_module`]），
-    /// 只杀直接子进程（cmd.exe）会留下实际服务的子孙树（如 python adapter）
-    /// 成为占端口的孤儿进程；因此优先树级回收（[`kill_process_tree`]，
-    /// taskkill /T 语义），未成功时回退直接 kill，最后 reap 直接子进程。
+    /// 启动命令经壳包裹（Windows `cmd /C` / Unix `sh -c`，见 [`Self::start_module`]），
+    /// 只杀直接子进程会留下实际服务的子孙树（如 python adapter）成为占端口的
+    /// 孤儿进程；因此优先树级回收（[`kill_process_tree`]：Windows taskkill /T、
+    /// Unix 进程组级信号），未成功时回退直接 kill，最后 reap 直接子进程。
     pub async fn stop_module(&mut self, module_id: &str) -> Result<()> {
         let instance = self
             .instances
@@ -1201,6 +1255,112 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── LNX-02：Unix 进程组级进程树回收（process_group(0) + 组级信号） ────
+
+    /// 遍历 /proc 收集属于指定进程组的全部进程 pid。
+    ///
+    /// `/proc/<pid>/stat` 格式为 `pid (comm) state ppid pgrp …`，comm 可能含
+    /// 空格/括号，故从最后一个 `)` 之后解析（rest 字段：[0]=state [1]=ppid
+    /// [2]=pgrp）。进程退出后被 init 收殓，条目随之消失。
+    #[cfg(unix)]
+    fn pids_in_process_group(pgid: u32) -> Vec<u32> {
+        let mut members = Vec::new();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return members;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Ok(pid) = name.parse::<u32>() else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                continue;
+            };
+            let Some(rest) = stat.rsplit(')').next() else {
+                continue;
+            };
+            let fields: Vec<&str> = rest.split_whitespace().collect();
+            if let Some(Ok(group)) = fields.get(2).map(|s| s.parse::<u32>()) {
+                if group == pgid {
+                    members.push(pid);
+                }
+            }
+        }
+        members.sort_unstable();
+        members
+    }
+
+    /// stop_module 必须以进程组级信号回收整棵树（sh + 后台子孙），
+    /// 且端口随之释放。旧实现（stub 返回 false + 只杀直接子进程）会留下
+    /// 后台 sleep 子孙成为占资源的孤儿。
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_stop_module_reaps_process_tree_unix_process_group() {
+        let mut pm = ProcessManager::new();
+        // 两个后台 sleep 子孙 + wait 使 shell 保持存活：
+        // process_group(0) 下 sh 自成进程组（pgid == sh pid），子孙继承同组
+        let manifest = test_manifest(Some("sleep 300 & sleep 300 & wait"));
+        pm.start_module("tree-unix-mod", &manifest, DeviceId::Cpu, 19060, HashMap::new())
+            .await
+            .unwrap();
+
+        let pid = pm
+            .get_instance("tree-unix-mod")
+            .unwrap()
+            .pid()
+            .expect("child pid available while running");
+
+        // 等待组成员 ≥ 3（sh + 2 个 sleep 子孙）
+        let mut members = Vec::new();
+        for _ in 0..100 {
+            members = pids_in_process_group(pid);
+            if members.len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            members.len() >= 3,
+            "进程组应含 sh 与 2 个子孙，实际: {members:?}"
+        );
+
+        pm.stop_module("tree-unix-mod").await.unwrap();
+
+        // 组级回收后组内不应再有存活成员（孤儿由 init 接管收殓，轮询至多 5s）
+        let mut remaining = vec![0u32];
+        for _ in 0..100 {
+            remaining = pids_in_process_group(pid);
+            if remaining.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            remaining.is_empty(),
+            "子孙进程未被回收，组内仍有存活成员: {remaining:?}"
+        );
+
+        // kill(pid, 0) 逐个探测原成员：应已消失（ESRCH）；
+        // pid 若被复用则必然不再属于本组（组扫描为空），同样视为已回收
+        for member in &members {
+            // SAFETY: signal 0 仅探测存活，不投递实际信号。
+            if unsafe { libc::kill(*member as i32, 0) } == 0 {
+                assert!(
+                    !pids_in_process_group(pid).contains(member),
+                    "子孙进程 {member} 仍存活于进程组"
+                );
+            }
+        }
+
+        // 端口释放：模块停止后该端口可立即复用（无任何树成员残留占用）
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 19060));
+        assert!(
+            listener.is_ok(),
+            "stop_module 后端口 19060 应可重新绑定"
+        );
+        drop(listener);
     }
 
     // ─── A2 环境注入：CUDA 库路径（§3.1/§15.3 双平台分支） ─────────────────

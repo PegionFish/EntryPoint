@@ -377,9 +377,10 @@ impl EnvManager {
     /// 确保模块的虚拟环境就绪
     ///
     /// 流程：
-    /// 1. 构造 uv 子进程环境变量（网络代理 + `UV_CACHE_DIR`，§3.1 依赖栈统一）
+    /// 1. 构造 uv 子进程环境变量（网络代理 + `UV_CACHE_DIR` + `UV_PYTHON_INSTALL_DIR`，
+    ///    §3.1 依赖栈统一 / LNX-03 托管解释器入包）
     /// 2. 检查 `runtime/venvs/<module_id>/` 是否存在
-    /// 3. 不存在 → `uv venv --python <version> <path>`（注入 UV_CACHE_DIR）
+    /// 3. 不存在 → `uv venv --python <version> <path>`（注入上述 env）
     /// 4. 计算依赖哈希（requirements + constraints + link-mode 标记，P2-18）
     /// 5. 对比 `.ep_deps_hash`
     /// 6. 不一致 → `uv pip install -r <req> --python <venv_python> --link-mode hardlink [-c <constraints>]`
@@ -400,28 +401,10 @@ impl EnvManager {
         let venv_dir = self.venv_dir(module_id);
         let venv_python = self.venv_python_path(module_id);
 
-        // 0. uv 子进程环境变量：网络代理 + UV_CACHE_DIR（§3.1）
-        //    缓存入应用根 → 与 venv 同盘 → 硬链接去重生效；目录不存在先创建
-        let mut uv_env = self.network_env.clone();
-        if let Some(cache_dir) = self.uv_cache_dir_path() {
-            match std::fs::create_dir_all(&cache_dir) {
-                Ok(()) => {
-                    debug!(module = module_id, path = %cache_dir.display(), "using uv cache dir");
-                    uv_env.push((
-                        "UV_CACHE_DIR".to_string(),
-                        cache_dir.to_string_lossy().into_owned(),
-                    ));
-                }
-                Err(e) => {
-                    warn!(
-                        module = module_id,
-                        path = %cache_dir.display(),
-                        error = %e,
-                        "failed to create uv cache dir, falling back to uv default cache"
-                    );
-                }
-            }
-        }
+        // 0. uv 子进程环境变量：网络代理 + UV_CACHE_DIR + UV_PYTHON_INSTALL_DIR
+        //    （§3.1 / LNX-03）。缓存与托管解释器入应用根 → 与 venv 同盘 →
+        //    硬链接去重生效，且解压目录自包含（托管 Python 不落 ~/.local/share/uv）
+        let uv_env = self.build_uv_env(module_id);
 
         // 1. 创建 venv（如果不存在）
         //    created_now：本次新建的 venv 若安装失败须拆除（半壳 venv 只剩
@@ -612,6 +595,62 @@ impl EnvManager {
         } else {
             Some(self.root.join(&self.uv_cache_dir))
         }
+    }
+
+    /// uv 托管 Python 解释器安装目录（LNX-03）：`<root>/runtime/uv-python`。
+    ///
+    /// 注入 `UV_PYTHON_INSTALL_DIR` 后，`uv venv --python ">=3.10,<3.13"` 等
+    /// 自动下载的 CPython 落入应用根而非默认的 `~/.local/share/uv`，
+    /// 与 `UV_CACHE_DIR` 同口径，保证解压目录自包含。
+    pub fn uv_python_install_dir(&self) -> PathBuf {
+        self.root.join("runtime").join("uv-python")
+    }
+
+    /// 构造 uv 子进程环境变量（LNX-03 提取，单测可覆盖）：
+    /// 网络代理 + `UV_CACHE_DIR` + `UV_PYTHON_INSTALL_DIR`。
+    ///
+    /// 缓存/托管解释器目录不存在先创建；创建失败仅告警并回退 uv 默认位置，
+    /// 不阻断 venv 创建主流程。
+    fn build_uv_env(&self, module_id: &str) -> Vec<(String, String)> {
+        let mut uv_env = self.network_env.clone();
+        if let Some(cache_dir) = self.uv_cache_dir_path() {
+            match std::fs::create_dir_all(&cache_dir) {
+                Ok(()) => {
+                    debug!(module = module_id, path = %cache_dir.display(), "using uv cache dir");
+                    uv_env.push((
+                        "UV_CACHE_DIR".to_string(),
+                        cache_dir.to_string_lossy().into_owned(),
+                    ));
+                }
+                Err(e) => {
+                    warn!(
+                        module = module_id,
+                        path = %cache_dir.display(),
+                        error = %e,
+                        "failed to create uv cache dir, falling back to uv default cache"
+                    );
+                }
+            }
+        }
+        let python_dir = self.uv_python_install_dir();
+        match std::fs::create_dir_all(&python_dir) {
+            Ok(()) => {
+                debug!(module = module_id, path = %python_dir.display(), "using uv python install dir");
+                uv_env.push((
+                    "UV_PYTHON_INSTALL_DIR".to_string(),
+                    python_dir.to_string_lossy().into_owned(),
+                ));
+            }
+            Err(e) => {
+                warn!(
+                    module = module_id,
+                    path = %python_dir.display(),
+                    error = %e,
+                    "failed to create uv python install dir, falling back to uv default location"
+                );
+            }
+        }
+        uv_env
     }
 
     /// constraints 文件配置路径绝对路径（配置为空 → None，即停用 constraints）。
@@ -1329,6 +1368,60 @@ mod tests {
         // Path::join 语义：绝对路径原样返回
         assert_eq!(mgr.uv_cache_dir_path(), Some(PathBuf::from(abs_str)));
         assert_eq!(mgr.constraints_path(), Some(PathBuf::from(abs_str)));
+    }
+
+    // ── LNX-03：uv 托管 Python 解释器落包内（UV_PYTHON_INSTALL_DIR 注入） ──
+
+    #[test]
+    fn uv_python_install_dir_under_root() {
+        let mgr = EnvManager {
+            root: PathBuf::from("/opt/entrypoint"),
+            python_path: None,
+            uv_path: None,
+            network_env: Vec::new(),
+            uv_cache_dir: String::new(),
+            constraints: String::new(),
+        };
+        assert_eq!(
+            mgr.uv_python_install_dir(),
+            PathBuf::from("/opt/entrypoint/runtime/uv-python")
+        );
+    }
+
+    /// uv 子进程 env 必须同时携带 UV_CACHE_DIR 与 UV_PYTHON_INSTALL_DIR
+    ///（值指向应用根内），网络代理变量原样透传——解压目录自包含的判定锚点。
+    #[test]
+    fn build_uv_env_injects_cache_and_python_install_dir() {
+        let root = std::env::temp_dir().join(format!("ep_uv_env_build_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let mgr = EnvManager {
+            root: root.clone(),
+            python_path: None,
+            uv_path: None,
+            network_env: vec![(
+                "HTTP_PROXY".to_string(),
+                "http://127.0.0.1:7890".to_string(),
+            )],
+            uv_cache_dir: "runtime/.uv-cache".to_string(),
+            constraints: String::new(),
+        };
+
+        let env = mgr.build_uv_env("mod-env");
+        let get = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+        assert_eq!(
+            get("UV_CACHE_DIR").unwrap(),
+            root.join("runtime").join(".uv-cache").to_string_lossy()
+        );
+        assert_eq!(
+            get("UV_PYTHON_INSTALL_DIR").unwrap(),
+            root.join("runtime").join("uv-python").to_string_lossy()
+        );
+        assert_eq!(get("HTTP_PROXY").unwrap(), "http://127.0.0.1:7890");
+        // 注入前目录已创建（uv 无需自行建父目录）
+        assert!(root.join("runtime").join("uv-python").is_dir());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 端到端：constraints 变更使 is_venv_ready 失配 → 触发重装判定（P2-18）

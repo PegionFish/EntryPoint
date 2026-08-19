@@ -20,7 +20,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// 对指定端口执行 HTTP 健康检查。
 ///
-/// 轮询 `http://localhost:{port}{endpoint}` 直到返回 HTTP 200 或超过 `timeout`。
+/// 轮询 `http://127.0.0.1:{port}{endpoint}` 直到返回 HTTP 200 或超过 `timeout`。
 /// 轮询间隔为 500ms。
 pub async fn check_health(
     port: u16,
@@ -28,12 +28,15 @@ pub async fn check_health(
     timeout: Duration,
 ) -> HealthStatus {
     // 端点规范化：不以 / 开头时补上，避免拼出畸形 URL（P3 修复）
-    let url = format!("http://localhost:{}/{}", port, endpoint.trim_start_matches('/'));
+    // LNX-04：直连回环字面量 127.0.0.1（与 adapter 绑定面 EP_HOST=127.0.0.1
+    // 严格对齐），不走 localhost 主机名解析，消除 /etc/hosts 解析顺序依赖
+    // （如 localhost 优先解析为 ::1 而服务只监听 IPv4 时探测失败）
+    let url = format!("http://127.0.0.1:{}/{}", port, endpoint.trim_start_matches('/'));
     // 单次请求超时不超过 1s：与 monitor 的 1s 探测预算对齐（P2 修复），
     // 防止客户端 5s 超时吞掉整个探测预算
     let client_timeout = timeout.min(Duration::from_secs(1));
     // 健康检查永远只打本机地址：显式禁用代理，避免配置的出口代理
-    // （HTTP_PROXY 等）拦截 localhost 流量
+    // （HTTP_PROXY 等）拦截回环流量
     let client = reqwest::Client::builder()
         .timeout(client_timeout)
         .no_proxy()
@@ -224,7 +227,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_endpoint_without_leading_slash() {
-        // "health"（无前导 /）→ http://localhost:{port}health 是畸形 URL，
+        // "health"（无前导 /）→ http://127.0.0.1:{port}health 是畸形 URL，
         // 旧实现永远探测失败；规范化后应命中 /health
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
