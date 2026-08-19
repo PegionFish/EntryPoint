@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::types::ComputeBackend;
 
@@ -14,9 +14,18 @@ const CONFIG_FILE_NAME: &str = "app.toml";
 ///
 /// 优先级：
 /// 1. `EP_ROOT` 环境变量
-/// 2. 可执行文件所在目录的父目录（检查是否含 `config/` + `modules/`）
-/// 3. 当前工作目录（兜底）
+/// 2. 构建布局：可执行文件目录的上两级（`<root>/target/release/ep-daemon`），
+///    判据为含 `config/` + `modules/`
+/// 3. 部署布局：可执行文件目录的上一级（`<root>/bin/ep-daemon`，LNX-05），
+///    判据同上——解压目录自包含部署形态
+/// 4. macOS .app 束：`<app>/Contents/Resources`
+/// 5. 当前工作目录（兜底，warn 提示以便排障）
 pub fn resolve_root() -> PathBuf {
+    resolve_root_inner(std::env::current_exe().ok().as_deref())
+}
+
+/// [`resolve_root`] 的纯函数内核（exe 路径注入，单测可覆盖各布局分支）。
+fn resolve_root_inner(exe: Option<&Path>) -> PathBuf {
     // 1. 环境变量
     if let Ok(ep_root) = std::env::var("EP_ROOT") {
         let p = PathBuf::from(&ep_root);
@@ -27,7 +36,7 @@ pub fn resolve_root() -> PathBuf {
     }
 
     // 2. 可执行文件位置推断
-    if let Ok(exe) = std::env::current_exe() {
+    if let Some(exe) = exe {
         // 典型布局: <root>/target/release/ep-daemon → root = exe/../../..
         // 安装布局: /usr/bin/ep-daemon → 不适用，跳过
         if let Some(bin_dir) = exe.parent() {
@@ -37,6 +46,18 @@ pub fn resolve_root() -> PathBuf {
                         info!(root = %candidate.display(), "resolved root from executable path");
                         return candidate.to_path_buf();
                     }
+                }
+            }
+        }
+
+        // 部署布局（LNX-05）: <root>/bin/ep-daemon → root = exe/../..
+        // 解压目录自包含形态；判据与构建布局一致（config/ + modules/），
+        // 判据不满足时不会误命中（如 /usr/bin 安装）
+        if let Some(bin_dir) = exe.parent() {
+            if let Some(candidate) = bin_dir.parent() {
+                if candidate.join("config").is_dir() && candidate.join("modules").is_dir() {
+                    info!(root = %candidate.display(), "resolved root from deployment layout (<root>/bin)");
+                    return candidate.to_path_buf();
                 }
             }
         }
@@ -55,7 +76,7 @@ pub fn resolve_root() -> PathBuf {
 
     // 3. 当前工作目录
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    info!(root = %cwd.display(), "resolved root from current directory");
+    warn!(root = %cwd.display(), "resolved root from current directory (fallback)");
     cwd
 }
 
@@ -718,6 +739,78 @@ fn default_no_proxy() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── LNX-05：resolve_root 部署布局识别（<root>/bin/exe） ───────────────
+
+    /// 唯一时间戳 tempdir，避免并行测试互扰
+    fn unique_temp_root(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ep-root-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// 部署布局命中：`<root>/bin/fake-exe` + `config/` + `modules/` → 推断为该 root
+    #[test]
+    fn resolve_root_deployment_layout_bin_parent() {
+        if std::env::var_os("EP_ROOT").is_some() {
+            return; // EP_ROOT 最优先，设置时无法验证推断分支
+        }
+        let root = unique_temp_root("deploy");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::create_dir_all(root.join("modules")).unwrap();
+        let exe = root.join("bin").join("ep-daemon");
+        std::fs::write(&exe, b"").unwrap();
+
+        let resolved = resolve_root_inner(Some(&exe));
+        assert_eq!(resolved, root);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 部署布局判据缺失（无 config/+modules/）→ 不误命中，回退 cwd
+    #[test]
+    fn resolve_root_deployment_layout_missing_markers_falls_back_to_cwd() {
+        if std::env::var_os("EP_ROOT").is_some() {
+            return;
+        }
+        // 构建布局候选（temp_dir 的父目录）若恰带判据会抢先命中 → 跳过
+        if let Some(parent) = std::env::temp_dir().parent() {
+            if parent.join("config").is_dir() && parent.join("modules").is_dir() {
+                return;
+            }
+        }
+        let root = unique_temp_root("nomark");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        let exe = root.join("bin").join("ep-daemon");
+        std::fs::write(&exe, b"").unwrap();
+
+        let resolved = resolve_root_inner(Some(&exe));
+        assert_eq!(
+            resolved,
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// exe 不可用（current_exe 失败语义）→ 回退 cwd
+    #[test]
+    fn resolve_root_no_exe_falls_back_to_cwd() {
+        if std::env::var_os("EP_ROOT").is_some() {
+            return;
+        }
+        let resolved = resolve_root_inner(None);
+        assert_eq!(
+            resolved,
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        );
+    }
 
     #[test]
     fn default_roundtrip() {

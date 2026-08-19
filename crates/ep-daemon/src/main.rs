@@ -165,8 +165,9 @@ async fn run_module_standalone(module_id: &str, root: PathBuf, cfg: AppConfig) -
     );
     tracing::info!("Press Ctrl+C to stop");
 
-    // Wait for shutdown signal
-    tokio::signal::ctrl_c().await?;
+    // Wait for shutdown signal（LNX-01：Ctrl+C / SIGTERM 均触发优雅回收，
+    // standalone 路径与 server 路径共用同一信号处理）
+    shutdown_signal().await;
 
     tracing::info!("Shutting down module '{}'...", module_id);
     process_manager.stop_module(module_id).await?;
@@ -533,7 +534,34 @@ async fn ip_filter(
     next.run(request).await
 }
 
+/// 等待关闭信号（LNX-01）。
+///
+/// 所有平台支持 Ctrl+C；unix 下额外注册 SIGTERM——systemd stop 发送的是
+/// SIGTERM，此前仅监听 ctrl_c 时默认处置为立即终止，`stop_all_modules`
+/// （优雅回收模块子进程 + 释放端口）永不执行。SIGTERM handler 注册失败时
+/// eprintln 警告并回退到仅 Ctrl+C（不 panic）。
 async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = sigterm.recv() => {
+                        tracing::info!("received SIGTERM, initiating graceful shutdown");
+                    },
+                }
+                return;
+            }
+            Err(e) => {
+                eprintln!(
+                    "failed to install SIGTERM handler: {e}; falling back to CTRL+C only"
+                );
+            }
+        }
+    }
+
     tokio::signal::ctrl_c()
         .await
         .expect("failed to install CTRL+C signal handler");

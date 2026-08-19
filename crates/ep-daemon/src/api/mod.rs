@@ -187,7 +187,13 @@ pub(crate) async fn ensure_module_venv_ready(
     };
     let root = state.root.clone();
     let mid = module_id.to_string();
-    let py_ver = manifest.runtime.python_version.clone().unwrap_or_default();
+    // LNX-09：缺省口径与 ep-core lifecycle.rs prepare_module 对齐——
+    // 旧 unwrap_or_default 产出空串，`uv venv --python ""` 必然失败
+    let py_ver = manifest
+        .runtime
+        .python_version
+        .clone()
+        .unwrap_or_else(|| ">=3.10".into());
     let req_rel = manifest
         .runtime
         .requirements
