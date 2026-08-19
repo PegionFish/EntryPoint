@@ -514,6 +514,20 @@ fn npu_fallback_windows() -> Vec<ComputeDevice> {
     parse_npu_presence_names(&names)
 }
 
+/// 去除 lspci 设备名尾部的 "(rev NN)" 修订号后缀
+#[cfg(any(unix, test))]
+fn strip_rev_suffix(name: &str) -> &str {
+    let trimmed = name.trim_end();
+    let Some(open) = trimmed.rfind("(rev ") else {
+        return trimmed;
+    };
+    if trimmed[open..].ends_with(')') {
+        trimmed[..open].trim_end()
+    } else {
+        trimmed
+    }
+}
+
 /// 解析 lspci 输出中的 Intel NPU / iGPU（Linux 兜底）
 #[cfg(any(unix, test))]
 pub(crate) fn parse_lspci_devices(output: &str) -> Vec<ComputeDevice> {
@@ -523,7 +537,9 @@ pub(crate) fn parse_lspci_devices(output: &str) -> Vec<ComputeDevice> {
     for line in output.lines() {
         let lower = line.to_ascii_lowercase();
         // 虚拟化/软件渲染设备：无物理 GPU，OpenVINO 不可用（VM 内 QEMU/VMware
-        // 模拟设备、llvmpipe 软件渲染等，真机/VM 实测存在）
+        // 模拟设备、llvmpipe 软件渲染等，真机/VM 实测存在）。
+        // "non-vga"：类 0000 未分类设备（如 Arrow Lake-S 8086:7f2f SoC 设备）
+        // 行内恰好含 "vga" 子串会被 GPU 分支误收（真机实测误报 GPU.1）
         if lower.contains("virtual")
             || lower.contains("llvmpipe")
             || lower.contains("vmware")
@@ -532,15 +548,20 @@ pub(crate) fn parse_lspci_devices(output: &str) -> Vec<ComputeDevice> {
             || lower.contains("cirrus")
             || lower.contains("virtio gpu")
             || lower.contains("vbox")
+            || lower.contains("non-vga")
         {
             continue;
         }
-        // lspci 行形如 "<slot> <class>: <vendor device>"，名称取 ": " 之后
+        // lspci 行形如 "<slot> <class>: <vendor device>"，名称取 ": " 之后；
+        // 显示名规范化：去尾部 "(rev NN)" 修订号与 "Intel Corporation " 前缀，
+        // 与 Windows 侧简洁口径对齐（如 "Core Ultra 200 Series Processors NPU"）
         let name = line
             .split_once(": ")
             .map(|(_, n)| n.trim())
             .filter(|n| !n.is_empty())
             .unwrap_or(line.trim());
+        let name = strip_rev_suffix(name);
+        let name = name.strip_prefix("Intel Corporation ").unwrap_or(name);
         if lower.contains("npu") || lower.contains("ai boost") {
             devices.push(make_openvino_device(
                 format!("NPU.{npu_seq}"),
@@ -883,20 +904,40 @@ NPU 0: Intel(R) AI Boost, Memory: 2048 MB, Utilization: 3%
 
     #[test]
     fn test_parse_lspci_devices() {
+        // 名称规范化：去 "Intel Corporation " 前缀与 "(rev NN)" 后缀
         let output = "\
-00:02.0 VGA compatible controller: Intel Corporation Meteor Lake-P Integrated Graphics
-00:0b.0 Processing accelerators: Intel Corporation Meteor Lake NPU
-01:00.0 VGA compatible controller: NVIDIA Corporation AD102 [GeForce RTX 4090]
+00:02.0 VGA compatible controller: Intel Corporation Meteor Lake-P Integrated Graphics (rev 08)
+00:0b.0 Processing accelerators: Intel Corporation Meteor Lake NPU (rev 20)
+01:00.0 VGA compatible controller: NVIDIA Corporation AD102 [GeForce RTX 4090] (rev a1)
 ";
         let devices = parse_lspci_devices(output);
         assert_eq!(devices.len(), 2); // NVIDIA 行不属于 OpenVINO
         assert_eq!(devices[0].id, DeviceId::OpenVINO("GPU.0".to_string()));
-        assert_eq!(
-            devices[0].name,
-            "Intel Corporation Meteor Lake-P Integrated Graphics"
-        );
+        assert_eq!(devices[0].name, "Meteor Lake-P Integrated Graphics");
         assert_eq!(devices[1].id, DeviceId::OpenVINO("NPU.0".to_string()));
-        assert_eq!(devices[1].name, "Intel Corporation Meteor Lake NPU");
+        assert_eq!(devices[1].name, "Meteor Lake NPU");
+    }
+
+    #[test]
+    fn test_parse_lspci_skips_non_vga_unclassified() {
+        // Arrow Lake-S 真机实测：8086:7f2f 类 0000 未分类设备，行内 "Non-VGA"
+        // 含 "vga" 子串，曾被 GPU 分支误收为第二块 iGPU——必须过滤
+        let output = "\
+00:02.0 VGA compatible controller: Intel Corporation Arrow Lake-S [Intel Graphics] (rev 06)
+80:14.5 Non-VGA unclassified device: Intel Corporation Device 7f2f (rev 10)
+";
+        let devices = parse_lspci_devices(output);
+        assert_eq!(devices.len(), 1, "Non-VGA 未分类设备不得误报为 GPU");
+        assert_eq!(devices[0].id, DeviceId::OpenVINO("GPU.0".to_string()));
+        assert_eq!(devices[0].name, "Arrow Lake-S [Intel Graphics]");
+    }
+
+    #[test]
+    fn test_strip_rev_suffix() {
+        assert_eq!(strip_rev_suffix("Foo (rev 06)"), "Foo");
+        assert_eq!(strip_rev_suffix("Foo (rev a1)"), "Foo");
+        assert_eq!(strip_rev_suffix("Foo"), "Foo");
+        assert_eq!(strip_rev_suffix("Foo (rev 06"), "Foo (rev 06"); // 未闭合不误删
     }
 
     #[test]
@@ -911,7 +952,7 @@ NPU 0: Intel(R) AI Boost, Memory: 2048 MB, Utilization: 3%
 ";
         let devices = parse_lspci_devices(output);
         assert_eq!(devices.len(), 1);
-        assert_eq!(devices[0].name, "Intel Corporation UHD Graphics 770");
+        assert_eq!(devices[0].name, "UHD Graphics 770");
     }
 
     #[test]
