@@ -484,3 +484,93 @@ Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平�
 - [x] WebUI 实机冒烟（打包产物 + Edge headless + CDP）：仪表盘/模块/管线/任务/设置 5 页零控制台错误零警告；API 10 端点全 200（health/config/devices/modules/pipelines/tasks/models/packs/deps/rembg-status）
 - [x] README 快速开始 = server-only 路径（双击 start-daemon.bat → 浏览器）
 - [x] 用户本地 config/app.toml 值未入库，工作区原样保留
+
+---
+
+## Linux 真机落地 + 自包含交付（2026-08-19）
+
+> 目标：Linux 真机（Arch rolling）完整运行验证 + 交付物升级为 ZIP 自包含包 +
+> 交互式 deploy.sh（Debian/Fedora/RHEL/Arch 四族依赖与 systemd 自动管理）。
+> 用户裁决：解压目录自包含（不绑定 /opt 与发行版布局）、可完整安装但不开机自启、
+> 模型全部跑通、分发 ZIP 不带模型权重。
+> 方式：Wave 1 四代理并行审计 → Wave 2 三代理并行实施 → Wave 3 集成门禁 →
+> Wave 4 真机 E2E（含实测缺陷修复）→ Wave 5 交付收口。
+
+### Wave 0 基线门禁 ✅（commit 9eeba97）
+- Linux 全工作区编译/clippy/测试首跑：clippy 零警告；测试暴露 1 个 AddrInUse flake
+  （autostart allocate→bind TOCTOU）→ 重试加固修复
+- 收编在途适配改动：env.rs 跨平台/半壳 venv 自愈、build.sh Arch rolling
+  VERSION_ID 未定义崩溃修复、ep-pack Windows 盘符前缀拒绝、port.rs/models.rs
+  并行测试 TOCTOU 加固、.gitattributes LF 统一
+- GitHub 通道打通：全局 gitconfig 失效代理（127.0.0.1:10808 无监听）仓库级覆盖
+  + 远端切 SSH（HTTPS 无凭据）
+
+### Wave 1 并行审计 ×4 ✅
+- **运行时（LNX-01..10）**：P1×3——SIGTERM 未监听（systemd stop 优雅回收旁路）、
+  Linux kill_process_tree 空 stub、uv 托管 Python 不在包内；P2×7（localhost 健康
+  检查/resolve_root 部署布局/依赖自动装开关等）
+- **打包交付**：三套安装脚本/unit 漂移清单 + deploy.sh 完整设计（子命令矩阵、
+  RPM Fusion ffmpeg 论证、unit 模板、升级/回滚）
+- **测试兼容**：cfg 门控分布（Linux −4 windows-only +9 unix-only）、并行 flake
+  风险分级（下载闸门/执行锁/端口/环境变量）、e2e harness 评估
+- **E2E 就绪**：模块需求清单、Python 3.14 不阻塞论证（uv 托管 3.12）、
+  模型本地盘点、分步 recipe、风险表（PyPI 慢网为 torch 系主要成本）
+
+### Wave 2 并行实施 ✅（三代理；漏配 worktree 隔离致共享 checkout，
+显式路径清单提交应急止损，无交叉污染——此后改动型子代理强制 worktree 隔离）
+- `a4df10c` build.sh：pkg_zip 主产物（zip→python zipfile→bsdtar 降级链，
+  unix 权限保留）、deploy.sh 入包 fail-fast、删内嵌 install.sh、CARGO_TARGET_DIR 支持
+- `85cb4dd` scripts/deploy.sh（1003 行）：9 子命令 / 20 flags；四族依赖矩阵
+  （RPM Fusion free 装完整 ffmpeg + ffmpeg-free 兜底、uv pacman/astral 双路）；
+  set_toml_key 合并式配置向导；unit 现场渲染（User=目录属主、EP_ROOT 显式注入、
+  TimeoutStopSec=30、无 ProtectHome、**全文无 systemctl enable**）；
+  firewalld/ufw 智能分支 + 回环跳过；SELinux semanage；幂等升级/软卸载/--purge；
+  11 项 /tmp 自测全过（系统零变更）
+- `c5344de` 运行时六修复：SIGTERM 优雅退出（server/standalone 双入口）、
+  process_group(0) + 进程组级 SIGTERM→5s 宽限→SIGKILL 树回收、
+  UV_PYTHON_INSTALL_DIR 入包、健康检查 127.0.0.1、resolve_root <root>/bin/exe
+  布局识别、python_version 缺省口径统一；含进程组回收真子进程测试
+
+### Wave 3 集成门禁 ✅
+- ff 合并 + clippy 零警告 + **1148/1148 测试通过**
+- `3869047` build.sh SIGPIPE 竞态修复（release 打包实测 exit 141：
+  `ldd --version | head -1` 早断 → sed -n 1p 全量读取）
+- release 构建 + ZIP/tar.gz/PKGBUILD 全产物链路打通
+
+### Wave 4 真机 E2E ✅（部署目录 /home/bob/ep-deploy-test，systemd 服务运行，未 enable）
+- **部署链路**：deploy.sh check 9 项全过 → install --yes 一次通过
+  （依赖幂等跳过/配置合并写入/unit 注册 User=bob/健康自检通过/防火墙回环跳过）
+- **SIGTERM 优雅回收真机实证**：systemctl stop 逐个回收运行中模块
+  （rembg/faster-whisper/paddleocr）→ "Daemon shut down gracefully"，多次重启复现
+- **API 冒烟**：health/devices/modules/config/pipelines/tasks/deps/v1-capabilities 全 200
+- **内置 audio-extract 管线**：completed + 产物落盘
+- **模块真实推理**（模型本地 5.6GB 入部署目录，venv 全部从零重建，RTX 5090 D GPU）：
+  - rembg ✅ 25s venv → RGBA PNG 抠图产物
+  - faster-whisper ✅ large-v3 GPU 中文转写（词级时间戳 + 概率）
+  - paddleocr ✅ "Hello OCR 2026" 置信度 0.9998 + bbox（含 bcebos 权重自下载）
+  - deep-filter / qwen3-tts：torch venv 重建验证中（8.5GB wheel 缓存就位），
+    推理未等待收口（用户裁决跳过）
+- **WebUI**：资源/SPA fallback/API 层全通；Firefox 无头渲染受 SWGL 环境限制（记录）
+- **实测缺陷修复**：
+  - `7003149` v1 facade JSON/Text 输出直跑必挂 → 两节点退化 DAG + 内联产物物化
+    + output_url 优选（run 节点产物优先于 input）
+  - `5e92c0f` UV_HTTP_TIMEOUT 30s→300s（networkx 解压中途超时拖垮整次安装实测）
+  - `6935989` lspci "Non-VGA" 未分类设备误报第二块 iGPU + 设备名规范化
+    （去 Intel Corporation 前缀/(rev NN) 后缀）
+- **实证约定**：systemd PrivateTmp → 输入文件须在部署目录内；v1 接口强制
+  workspace/uploads 前缀；active_models 变体切换（qwen3-tts 1.7b→0.6b）经
+  PUT /api/config 合并生效
+- **设备检测实证**（本机 = Core Ultra 7 270K Plus + RTX 5090 D）：
+  cuda:0 + openvino:NPU.0 + openvino:GPU.0 + cpu；5 模块均未声明 openvino
+  后端 → NPU/iGPU 暂无模块消费（遗留）
+
+### Wave 4b 管线多端口特性（并行 worktree 实施中）
+- 需求（用户场景）：视频拆轨分流 → 音频降噪→ASR→LLM 双语 SRT / 视频分支并行
+  → 终端混流合一。引擎侧：ffmpeg 节点 `{output:<name>}`/`{input:<port>}`
+  命名端口 + llm 文本产物物化 + video_bilingual_srt 示例管线
+- WebUI 编辑器多端口手柄为后续波次
+
+### Wave 5 交付收口
+- 最终门禁：clippy 零警告 + 1150/1150 测试通过
+- DEPLOYMENT.md 全量重写（ZIP 自包含模型）、README Linux 章节更新
+- 最终 ZIP 产物验证与统一 push（见 git log）

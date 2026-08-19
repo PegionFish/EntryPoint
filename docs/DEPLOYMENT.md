@@ -1,446 +1,262 @@
-# EntryPoint 部署指南
+# EntryPoint 部署指南（Linux）
 
-本文档描述如何构建、部署和运行 EntryPoint：§1–§10 面向 Linux 服务器，
-§11 面向 Windows（server zip 包）。
+本文档描述 EntryPoint 服务器版（ep-daemon + WebUI）的 Linux 部署。
+交付模型：**解压目录自包含**——ZIP 解压到任意目录，一切运行在该目录内，
+不复制到 `/opt`、不绑定发行版目录布局。
 
----
-
-## 1. 前置要求
-
-| 项目 | 要求 | 说明 |
-|---|---|---|
-| 操作系统 | RHEL 9 / Rocky Linux 9 / 同类 | 其他 Linux 发行版亦可（需调整包管理命令） |
-| CUDA | 13.0+ | NVIDIA GPU 加速（可选，无 GPU 时回退 CPU） |
-| Rust | stable (1.97+) | 通过 rustup 安装 |
-| Node.js | 20+ | 前端构建 |
-| uv | 最新 | Python 虚拟环境管理 |
-| ffmpeg | 5.x+ | 音视频处理 |
-
-### 安装依赖
-
-```bash
-# Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-
-# Node.js 20 (RHEL/Rocky)
-sudo dnf module install nodejs:20
-
-# uv
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# ffmpeg
-sudo dnf install ffmpeg
-# 或使用静态构建：https://johnvansickle.com/ffmpeg/
-```
+> Windows 部署（start-daemon.bat）见 README「Windows 快速开始」。
 
 ---
 
-## 2. 构建
+## 1. 交付物
 
-使用统一构建脚本（服务器包）：
+`./build.sh server` 产出（`dist/` 下）：
 
-```bash
-cd /server/EntryPoint
-./build.sh server
+| 产物 | 定位 |
+|---|---|
+| `EntryPoint-vX-linux-<arch>-server.zip` | **主交付物**：通用自包含包，含交互式 `deploy.sh` |
+| `...server.tar.gz` | 兜底（无 zip 工具环境） |
+| `entrypoint-server_*.deb` / `*.rpm` | 原生包管理集成（FHS 布局，适合批量/镜像） |
+| `arch-server/PKGBUILD` + 源包 | Arch `makepkg` 原生构建 |
+
+**ZIP 内容**：
+
+```
+EntryPoint-vX-linux-x86_64-server/
+├── bin/ep-daemon          # daemon 二进制
+├── bin/ep-pack            # 整合包 CLI
+├── deploy.sh              # ★ 交互式部署/配置脚本（见 §3）
+├── start-daemon.sh        # 前台调试启动
+├── entrypoint.service     # systemd unit 参考模板（deploy.sh 会现场渲染，此文件供高级用户手装）
+├── webui/                 # WebUI 静态资源
+├── config/                # app.toml + 内置管线 + constraints.txt
+├── modules/               # Python 模块适配器（不含模型权重）
+├── workspace/             # 运行期工作目录
+├── VERSION.txt
+└── README.md
 ```
 
-脚本依次执行：
-
-1. **Rust 后端**：`cargo build --release -p ep-daemon`
-   - 产物：`target/release/ep-daemon`
-2. **打包**：tar.gz 兜底包（含 systemd 服务 + install.sh）+ 自动探测 deb/rpm/PKGBUILD
-
-构建完成后，解压 tar.gz 运行 `install.sh` 即可部署到 `/opt/entrypoint`。
+**模型权重不入包**（体积原因）：首次部署后通过 WebUI 模块页下载 / 浏览器上传 /
+本地路径导入；已有权重目录可直接放入 `<EP_ROOT>/models/`（见 §7）。
 
 ---
 
-## 3. 配置
+## 2. 快速部署（三步）
 
-主配置文件：`config/app.toml`
+支持发行版族：**Debian/Ubuntu、Fedora、RHEL/CentOS/Rocky/Alma、Arch/Manjaro**
+（自动探测；未知发行版跳过依赖安装并警告）。
 
-### 服务器配置（[server] 段）
-
-```toml
-[server]
-host = "127.0.0.1"     # 监听地址（仓库缺省仅本机访问；如需局域网访问改为 0.0.0.0 并放行防火墙，见 §11.4）
-port = 9800            # 监听端口
-allow_public = false   # 是否允许公网访问（默认仅局域网）
+```bash
+unzip EntryPoint-vX-linux-x86_64-server.zip
+cd EntryPoint-vX-linux-x86_64-server
+./deploy.sh install          # 交互式；或 ./deploy.sh install --yes 全取缺省
 ```
 
-**安全说明**：
-- `allow_public = false`（默认）：启用 IP 过滤中间件，仅允许 RFC 1918 私有地址（10.x / 172.16-31.x / 192.168.x）访问
-- `allow_public = true`：关闭 IP 过滤，允许任何来源访问。**仅在配置了反向代理 + HTTPS 时使用**
+完成后浏览器访问 `http://127.0.0.1:9800`（端口以配置为准）。
 
-### 其他常用配置
+install 流程（每步可交互覆盖，`--yes` 取缺省）：
 
-```toml
-[compute]
-strategy = "least_memory"     # 设备分配策略：manual | least_memory | round_robin | single
-refresh_interval_secs = 5     # 设备状态刷新间隔
-
-[models]
-cache_dir = "./models"        # 模型缓存目录
-hf_endpoint = "https://huggingface.co"  # HuggingFace 端点（可换镜像，仅对 HuggingFace 源生效）
-default_source = "huggingface"          # 默认下载源：huggingface | modelscope | url
-
-[ports]
-range_start = 18000           # 模块端口分配范围
-range_end = 19000
-
-[network]                     # 出口代理：注入模型下载 / 依赖安装 / 模块子进程
-http_proxy = ""               # 空 = 不覆盖，继承 daemon 进程的系统环境变量
-https_proxy = ""
-no_proxy = "localhost,127.0.0.1"
-# 服务器需走代理访问 HuggingFace 时：
-# http_proxy = "http://127.0.0.1:7890"
-# https_proxy = "http://127.0.0.1:7890"
-```
-
-> 代理仅对**新启动的子进程**生效；修改后已运行的模块需重启。
-> 通过 WebUI「设置」页或 `PUT /api/config` 修改配置会直接落盘到 `config/app.toml`，重启不丢失。
-
-完整配置参考见 [CONFIG_REFERENCE.md](CONFIG_REFERENCE.md)。
+1. **发行版族探测** → deb / rpm / arch / unknown
+2. **系统依赖**：ffmpeg、python3、curl（幂等探测，已装跳过）+ **uv**
+3. **配置向导**：host / port / allow_public / API token / 代理（合并式写入
+   `config/app.toml`，保留其余内容与用户既有值）
+4. **systemd 服务**（可选，缺省注册）：unit 现场渲染（见 §5），启动后
+   轮询 `/api/health` 自检；失败打印 `journalctl -n 50` 指引
+5. **防火墙**：host 为回环地址时自动跳过；否则 firewalld → ufw 顺序探测放行
+6. **SELinux**（rpm 族且 Enforcing）：`semanage port` 添加 `http_port_t` 标签
 
 ---
 
-## 4. 安装 systemd 服务
+## 3. deploy.sh 命令参考
 
-```bash
-./scripts/install-service.sh
+| 子命令 | 作用 |
+|---|---|
+| `install` | 完整安装/升级（幂等：重跑即升级，保留 config/models/runtime/workspace） |
+| `uninstall` | 软卸载：停服务 + 删 unit，**保留数据**；`--purge` 删除整个部署目录 |
+| `status` | 服务状态 + 健康探测 + 版本 + 依赖体检 |
+| `start` / `stop` | systemctl 封装（无 unit 时提示前台方式） |
+| `logs [-f] [-n N]` | journalctl 封装 |
+| `configure` | 单独重跑配置向导 |
+| `check` | 只读诊断（依赖/端口/权限/unit 一致性），退出码 0/1 |
+
+常用 flags：
+
+```text
+--yes                    非交互，全部取缺省
+--host / --port          监听地址/端口
+--allow-public           允许公网访问（host 非回环时建议配合 --api-token）
+--api-token <s> / --no-token
+--with-service / --no-service    是否注册 systemd 服务
+--user <name>            服务用户（缺省 = 部署目录属主）
+--skip-deps              跳过系统依赖安装
+--distro <family>        强制发行版族（deb|rpm|arch）
+--ffmpeg-source fusion|free      rpm 族 ffmpeg 来源（见 §4）
+--no-firewall / --skip-selinux
+--purge                  配合 uninstall：删除部署目录
 ```
 
-该脚本执行：
-1. 复制 `scripts/entrypoint.service` 到 `/etc/systemd/system/`
-2. `systemctl daemon-reload`
-3. `systemctl enable entrypoint`（开机自启）
+---
 
-### 服务管理
+## 4. 发行版依赖矩阵
 
-```bash
-# 启动
-sudo systemctl start entrypoint
+| 依赖 | Debian/Ubuntu | Fedora | RHEL 系 | Arch |
+|---|---|---|---|---|
+| ffmpeg | `apt-get install ffmpeg` | RPM Fusion free | RPM Fusion free（或官方 `ffmpeg-free` 兜底） | `pacman -S ffmpeg` |
+| python3 | `python3` | `python3` | `python3` | `python` |
+| uv | astral installer（curl） | 同左 | 同左 | `pacman -S uv` |
+| curl | `curl` | `curl` | `curl` | `curl` |
 
-# 停止
-sudo systemctl stop entrypoint
+**RHEL/Fedora 的 ffmpeg 来源**：EPEL 与官方仓不提供完整 ffmpeg
+（Fedora 许可政策）；官方 `ffmpeg-free` 编解码受限（缺部分专利编码器）。
+deploy.sh 缺省经 **RPM Fusion free** 安装完整 ffmpeg（video_to_srt 等管线
+需要完整编解码）；离线或拒绝第三方仓时用 `--ffmpeg-source free` 改装
+`ffmpeg-free` 并接受功能受限。
 
-# 重启
-sudo systemctl restart entrypoint
+**Python 版本**：模块 venv 要求 `>=3.10,<3.13`；系统 Python 过新（如 Arch 3.14）
+时 uv 自动下载托管 CPython 至 `runtime/uv-python/`（自包含，见 §6），无需手工干预
+（离线环境预置：`uv python install 3.12`）。
 
-# 查看状态
-sudo systemctl status entrypoint
+---
 
-# 开机自启状态
-systemctl is-enabled entrypoint
-```
+## 5. systemd 服务
 
-> ⚠️ **重启前先停止运行中的模块**：daemon 重启**不会**回收旧的模块子进程，它们会继续运行并占用已分配的端口（18000–19000 段），导致 daemon 重启后模块端口冲突或状态不一致。重启 daemon 前，先通过 WebUI 或 `POST /api/modules/<module-id>/stop` 停止各运行中模块。
-
-### 服务文件说明
-
-`scripts/entrypoint.service` 关键配置：
+deploy.sh 渲染的 unit（`/etc/systemd/system/entrypoint.service`）要点：
 
 ```ini
 [Service]
-Type=simple
-User=bob                              # 运行用户（按需修改）
-WorkingDirectory=/server/EntryPoint   # 工作目录（按需修改）
-ExecStart=/server/EntryPoint/target/release/ep-daemon
+User=<部署目录属主>                      # --user 可覆盖；root 属主会警告
+Environment=EP_ROOT=<部署目录绝对路径>    # daemon 根目录解析的唯一权威来源
+WorkingDirectory=<部署目录>
+ExecStart=<部署目录>/bin/ep-daemon
 Restart=on-failure
-RestartSec=5
-Environment=RUST_LOG=ep_daemon=info,ep_core=info
-Environment=LD_LIBRARY_PATH=/usr/local/cuda/lib64
+TimeoutStopSec=30                        # SIGTERM 优雅回收窗口（逐模块停止+释放端口）
+# 安全加固（不启用 ProtectHome：部署目录可能在 /home 或任意挂载点下）
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=<部署目录>
+PrivateTmp=yes
+UMask=0027
 ```
 
-> ⚠️ 部署到其他机器时，需修改 `User`、`WorkingDirectory`、`ExecStart` 路径。
+**按项目约定 deploy.sh 绝不执行 `systemctl enable`**（开机自启由用户显式决定）：
+
+```bash
+sudo systemctl enable entrypoint     # 需要自启时手动执行
+```
+
+优雅退出语义：`systemctl stop/restart` 发 SIGTERM → daemon 逐个停止运行中的
+模块子进程（进程组级 SIGTERM + 5s 宽限 + SIGKILL 兜底）并释放端口后退出。
+`kill -9` 强杀不走该路径，可能留下孤儿子进程。
 
 ---
 
-## 5. 防火墙与 SELinux 配置
+## 6. 运行时目录（自包含布局）
 
-> 💡 运行 `scripts/install-service.sh` 会**自动**完成下述防火墙与 SELinux 配置（幂等，可重复执行）。以下内容用于手动操作或排障。
+所有运行期数据都在部署目录内：
 
-### 5.1 防火墙（firewalld）
-
-开放 WebUI 端口（默认 9800）：
-
-```bash
-# 永久开放端口
-sudo firewall-cmd --permanent --add-port=9800/tcp
-sudo firewall-cmd --reload
-
-# 验证
-sudo firewall-cmd --list-ports
 ```
-
-如修改了 `config/app.toml` 中的端口，需对应调整防火墙规则。
-
-### 5.2 SELinux
-
-RHEL 默认 SELinux 为 `Enforcing`。daemon 绑定 9800 端口前，需为该端口添加 SELinux 标签，否则在 systemd 受限域下启动可能被拒绝绑定。
-
-```bash
-# 查看当前 SELinux 状态
-getenforce
-
-# 为 9800/tcp 添加 http_port_t 标签（幂等：已存在则用 -m 修改）
-sudo semanage port -a -t http_port_t -p tcp 9800
-# 若提示已存在不同标签，改用：
-# sudo semanage port -m -t http_port_t -p tcp 9800
-
-# 验证
-sudo semanage port -l | grep 9800
-```
-
-若缺少 `semanage` 命令，先安装：
-
-```bash
-sudo dnf install -y policycoreutils-python-utils
-```
-
-**关于服务域**：`entrypoint.service` 未指定 `SELinuxContext=`，systemd 默认以 `unconfined_service_t` 运行——这对需要派生 Python 模块、ffmpeg 等子进程的应用是合适的（完全受限策略会阻断子进程派生）。配合上面的端口标签即可正常工作。
-
-**排障**：若 systemd 启动后仍被 SELinux 拦截，查看拒绝日志并生成策略：
-
-```bash
-sudo ausearch -m avc -ts recent          # 查看最近的 SELinux 拒绝
-sudo journalctl -u entrypoint -n 50      # 查看服务日志
+<EP_ROOT>/
+├── config/app.toml          # 主配置（配置向导合并式写入）
+├── models/                  # 模型权重缓存（下载/上传/导入落盘处）
+├── runtime/
+│   ├── venvs/<module>/      # 模块虚拟环境（uv 创建，跨平台损坏自动重建）
+│   ├── uv-python/           # uv 托管 CPython（系统 Python 不满足约束时自动下载）
+│   ├── .uv-cache/           # uv 包缓存（UV_CACHE_DIR 注入，不污染 ~/.cache）
+│   └── tasks/               # 任务注册表与产物
+└── workspace/
+    ├── uploads/             # v1 推理接口输入文件约定目录（见 §8）
+    └── tasks/<task_id>/     # 任务工作目录与归集产物（files/ 可下载）
 ```
 
 ---
 
-## 6. 访问 WebUI
+## 7. 模型获取（三路径）
 
-浏览器打开：
+1. **在线下载**：WebUI 模块页选择模块变体 → 下载（HuggingFace/ModelScope/URL
+   三源 + 镜像选源，WebSocket 实时进度；`[network]` 代理配置生效）
+2. **浏览器上传**：文件夹多文件 / zip / tar.gz，服务端流式落盘解包
+3. **本地导入**：服务器上已有权重目录直接导入；或直接把权重目录放入
+   `<EP_ROOT>/models/<target_dir>/`（模块发现时按 `is_model_present` 判定就绪）
 
+---
+
+## 8. 输入文件约定（重要）
+
+- **systemd 部署**：unit 带 `PrivateTmp=yes`，daemon **看不到用户的 /tmp**；
+  输入文件必须位于部署目录内（建议 `workspace/uploads/`）。
+- **统一推理 API（`/api/v1/inference/...`）**：`input_path` 强制要求位于
+  `workspace/uploads/` 前缀内（路径安全契约，canonicalize 防穿越）。
+- 管线 `file_input` 节点：路径需 daemon 可读（systemd 下同理限部署目录内）。
+
+---
+
+## 9. 配置参考
+
+主配置 `config/app.toml`（完整字段见 [CONFIG_REFERENCE.md](CONFIG_REFERENCE.md)）：
+
+```toml
+[server]
+host = "127.0.0.1"     # 局域网访问改 0.0.0.0（配合防火墙放行与 allow_public 评估）
+port = 9800
+allow_public = false   # false=IP 过滤仅放行私有/回环地址；公网暴露前务必设置 [api] token
+
+[api]
+# token = "<openssl rand -hex 32>"   # 公网/对外暴露时强烈建议配置
 ```
-http://<服务器IP>:9800
+
+部署期配置向导覆盖最常用项；其余（compute 策略、端口范围、下载并发等）
+直接编辑文件后 `./deploy.sh stop && ./deploy.sh start` 生效。
+
+---
+
+## 10. 防火墙与 SELinux
+
+- **firewalld**（活动）：`firewall-cmd --permanent --add-port=<port>/tcp && firewall-cmd --reload`
+- **ufw**：`ufw allow <port>/tcp`
+- host 为回环地址时无需放行（deploy.sh 自动跳过并说明）
+- **SELinux**（rpm 族 Enforcing）：`semanage port -a -t http_port_t -p tcp <port>`
+  （缺 semanage 时装 `policycoreutils-python-utils`）；服务域保持
+  `unconfined_service_t`（模块需派生 python/ffmpeg 子进程，不加 SELinuxContext）
+
+---
+
+## 11. 升级与卸载
+
+- **升级**：新 ZIP 解压覆盖后重跑 `./deploy.sh install`——`bin/webui/modules`
+  覆盖更新，`config/models/runtime/workspace` 保留（服务在跑会先优雅停止）
+- **软卸载**：`./deploy.sh uninstall`（停服务 + 删 unit，数据全保留）
+- **彻底删除**：`./deploy.sh uninstall --purge`（二次确认删整个部署目录）
+
+---
+
+## 12. 排障
+
+```bash
+./deploy.sh check              # 只读诊断（依赖/端口/权限/unit 一致性）
+./deploy.sh logs -f            # 实时日志（= journalctl -u entrypoint -f）
+./deploy.sh status             # 服务状态 + 健康探测
 ```
 
-首次访问即可看到仪表盘，包含设备状态、模块列表等。逐页使用方法见
-[WEBUI_GUIDE.md](WEBUI_GUIDE.md)。
+常见问题：
 
-### WebUI 主要能力
-
-| 功能 | 说明 |
+| 症状 | 处理 |
 |---|---|
-| 模型上传 | 从浏览器直接上传本地模型：支持选择整个文件夹（逐文件上传）或单个压缩包（`.zip` / `.tar.gz` / `.tgz`，服务端解包），带真实上传进度 |
-| 模型下载 | 支持 HuggingFace / ModelScope（及 URL 直链）多下载源，可在下载时选择来源；模块声明了 `[[models.mirrors]]` 备选源时，主源失败可切换镜像重试 |
-| 代理配置 | 「设置 → 网络与代理」页可配置 `[network]` 节的 http_proxy / https_proxy / no_proxy，保存即落盘 |
-| 管线在线执行 | 在浏览器中提交管线任务、跟踪各节点执行状态，无需命令行 |
-| 任务中心 | 查看历史任务与状态，下载各节点产物（如字幕、音频、JSON 结果） |
+| 启动失败 `EP_ROOT` 解析异常 | 确认 unit 的 `Environment=EP_ROOT=` 指向部署目录（deploy.sh check 会核对） |
+| 模块 venv 准备慢/失败 | 首次 torch 系依赖需下载 GB 级 wheel（已放宽 uv 超时到 300s）；失败会自动拆除半壳 venv，重试即可 |
+| 推理报 input 不在 uploads | 输入文件移入 `workspace/uploads/`（§8） |
+| systemd 下读不到输入文件 | PrivateTmp 隔离所致，输入放部署目录内（§8） |
+| 端口被占 | `deploy.sh check` 报端口状态；改 `[server] port` 或释放占用 |
 
 ---
 
-## 7. 日志查看
+## 13. 开发者：从源码构建
 
-EntryPoint 通过 systemd journal 输出日志：
-
-```bash
-# 实时跟踪日志
-journalctl -u entrypoint -f
-
-# 查看最近 100 行
-journalctl -u entrypoint -n 100
-
-# 查看今天的日志
-journalctl -u entrypoint --since today
-
-# 按时间范围查看
-journalctl -u entrypoint --since "2026-07-29 10:00" --until "2026-07-29 12:00"
-```
-
-### 日志级别
-
-通过 `RUST_LOG` 环境变量控制（在 service 文件中配置）：
-
-| 级别 | 说明 |
-|---|---|
-| `error` | 仅错误 |
-| `warn` | 警告 + 错误 |
-| `info` | 常规信息（默认） |
-| `debug` | 调试信息 |
-| `trace` | 详细追踪 |
-
-示例：临时提高日志级别运行：
+前置：Rust 1.97+、Node.js 20+、uv、ffmpeg（安装方式见 README「开发环境搭建」）。
 
 ```bash
-sudo systemctl stop entrypoint
-sudo RUST_LOG=debug /server/EntryPoint/target/release/ep-daemon
+./build.sh server              # clippy + 全量测试 + release 构建 + 打包（全门禁）
+./build.sh server --skip-test --skip-clippy   # 快速出包
+./build.sh server -d debian-12               # 指定目标发行版（glibc 兼容性检查 + 依赖包名适配）
 ```
 
----
-
-## 8. 故障排除
-
-### 服务启动失败
-
-```bash
-# 查看详细错误
-journalctl -u entrypoint -n 50 --no-pager
-
-# 手动运行测试
-cd /server/EntryPoint
-./target/release/ep-daemon
-```
-
-常见原因：
-- **端口被占用**：`ss -tlnp | grep 9800`，修改配置或停止占用进程
-- **权限不足**：确认运行用户对工作目录有读写权限
-- **CUDA 库缺失**：确认 `LD_LIBRARY_PATH` 包含 CUDA 库路径
-
-### GPU 未检测到
-
-```bash
-# 检查 NVIDIA 驱动
-nvidia-smi
-
-# 确认 CUDA 库路径
-ls /usr/local/cuda/lib64/libcudart.so*
-```
-
-- 无 GPU 时系统自动回退 CPU 模式，不影响基本功能
-- 确认 service 文件中 `Environment=LD_LIBRARY_PATH=/usr/local/cuda/lib64` 路径正确
-
-### WebUI 无法访问
-
-1. 确认服务运行中：`systemctl status entrypoint`
-2. 确认端口监听：`ss -tlnp | grep 9800`
-3. 确认防火墙：`sudo firewall-cmd --list-ports`
-4. 确认 IP 过滤：默认仅允许局域网 IP，公网访问需设置 `allow_public = true`
-5. 浏览器直接访问 `http://localhost:9800`（服务器本机测试）
-
-### 模块启动失败
-
-```bash
-# 检查 uv 是否可用
-which uv && uv --version
-
-# 检查 Python
-python3 --version
-
-# 手动测试模块环境
-cd /server/EntryPoint
-uv venv runtime/venvs/<module-id>/
-```
-
-### 首次模型下载超时
-
-全新安装首次下载模型前会自动准备模块的 Python 虚拟环境，耗时取决于依赖规模（含 torch 的模块约 15–20 分钟），可能超过常见 HTTP 客户端超时。建议将客户端超时设为 ≥20 分钟，或超时后直接重试——venv 已存在时下载会立即开始。
-
-### 构建失败
-
-- **Rust 编译错误**：确认 `rustup update` 到最新 stable
-- **npm 错误**：删除 `node_modules` 和 `package-lock.json` 后重新 `npm install`
-- **磁盘空间**：release 构建需要约 2GB 临时空间
-
----
-
-## 9. 更新部署
-
-```bash
-cd /server/EntryPoint
-
-# 拉取最新代码
-git pull
-
-# 重新构建服务器包
-./build.sh server
-
-# 解压 tar.gz 后运行 install.sh 完成安装（或直接用源码树安装）
-
-# 重启前先停止运行中的模块（daemon 重启不会回收旧的模块子进程，
-# 孤儿子进程会继续占用 18000–19000 段端口）：
-#   WebUI 中逐个停止，或 POST /api/modules/<module-id>/stop
-
-sudo systemctl restart entrypoint
-
-# 确认启动成功
-journalctl -u entrypoint -f
-```
-
----
-
-## 10. 安全建议
-
-1. **默认局域网模式**：`allow_public = false` 时仅允许私有 IP 访问，适合内网部署
-2. **公网部署**：建议前置 Nginx/Caddy 反向代理 + HTTPS，再设置 `allow_public = true`
-3. **最小权限**：service 文件使用非 root 用户运行
-4. **防火墙**：仅开放必要端口（9800 + 模块端口范围 18000-19000 按需；
-   模块 adapter 经平台注入的 `EP_HOST` 仅绑本机回环，该端口段无需对外放行）
-5. **模型目录权限**：模型缓存目录设置为运行用户所有
-
----
-
-## 11. Windows 部署
-
-Windows 以 **server zip 包**形态分发（`build.ps1 server` 产出，或直接使用已发布
-zip），无安装器：解压即用，WebUI 为唯一 UI。
-
-### 11.1 前置要求
-
-| 项目 | 要求 | 说明 |
-|---|---|---|
-| 系统 | Windows 10/11 x64 | 包内已附带 VC 运行库 DLL（无需另装 VC++ Redistributable） |
-| Python | 3.10–3.12 | 模块 venv 准备需要；需在 PATH 中可用 |
-| uv | 最新 | Python 依赖安装 |
-| ffmpeg | 5.x+ | 系统 PATH 或应用根目录 `runtime\bin`；缺失时含 ffmpeg 节点的管线（如 video_to_srt）会失败 |
-| CUDA | 可选 | 无 NVIDIA GPU/驱动时自动回退 CPU |
-
-### 11.2 解压与启动
-
-1. 解压 zip 到目标目录（如 `D:\EntryPoint`），包内布局：
-
-   ```
-   EntryPoint/
-   ├── bin\ep-daemon.exe      ← 主程序
-   ├── bin\ep-pack.exe        ← 整合包 CLI
-   ├── config\                ← 配置与自带管线
-   ├── modules\               ← 自带模块
-   ├── webui\                 ← WebUI 静态资源
-   ├── workspace\
-   └── start-daemon.bat       ← 启动脚本
-   ```
-
-2. 双击 `start-daemon.bat`：拉起 ep-daemon，随后自动打开默认浏览器访问
-   `http://127.0.0.1:9800`。
-3. 无人值守/远程场景：`start-daemon.bat --no-browser` 跳过自动开浏览器。
-
-### 11.3 开机自启（可选）
-
-如需登录后自动启动，可用任务计划程序（以下命令需管理员 PowerShell，
-路径按实际安装位置修改）：
-
-```powershell
-schtasks /Create /SC ONLOGON /TN "EntryPoint Daemon" `
-  /TR "D:\EntryPoint\start-daemon.bat --no-browser"
-schtasks /Run /TN "EntryPoint Daemon"   # 立即试跑一次
-```
-
-> 此为**可选**方案；不需要开机自启时直接双击 `start-daemon.bat` 即可。
-> 删除任务：`schtasks /Delete /TN "EntryPoint Daemon"`。
-
-### 11.4 Windows 防火墙
-
-- **模块子进程**：所有模块 adapter 由平台注入 `EP_HOST=127.0.0.1` 只绑回环
-  （ADAPTER_API.md §1.2），**不会**触发防火墙弹窗，也无需为模块端口段
-  （18000–19000）添加入站规则。
-- **daemon 本身**：取决于 `config/app.toml [server].host`——
-  - 绑 `127.0.0.1`（**包内自带配置缺省值**，仅本机访问）：无需任何入站规则。
-  - 绑 `0.0.0.0` 或局域网地址（手动修改后；代码缺省值亦为 0.0.0.0）：首启会出现
-    Windows 防火墙确认弹窗，需放行 9800/tcp（也可用以下命令预先添加规则）：
-
-    ```powershell
-    netsh advfirewall firewall add rule name="EntryPoint WebUI" `
-      dir=in action=allow protocol=TCP localport=9800
-    ```
-
-    （与 §5.1 Linux firewalld 口径一致；`allow_public = false` 时仍仅限
-    RFC 1918 私有地址访问，见 §3。）
-
-### 11.5 日志与更新
-
-- 日志：daemon 输出在独立控制台窗口（`start-daemon.bat` 拉起），模块日志在
-  WebUI 日志查看器实时查看；关闭控制台窗口即停止服务。
-- 更新：解压新版 zip 覆盖 `bin\` / `webui\` / `modules\`（保留 `config\`、
-  `models\`、`runtime\` 用户数据）；重启前先停止运行中的模块（同 §9 提醒）。
+产物见 §1。源码树开发调试：`cargo run -p ep-daemon`（EP_ROOT 缺省取 cwd）。
