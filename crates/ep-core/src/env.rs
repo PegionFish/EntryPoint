@@ -650,6 +650,10 @@ impl EnvManager {
                 );
             }
         }
+        // uv 默认单请求超时 30s：torch 等 GB 级 wheel 在慢网/抖动链路下
+        // 解压中途超时即整包失败（Linux 真机 E2E 实测 networkx 超时拖垮
+        // deep-filter venv）。放宽到 300s，重试机制不变。
+        uv_env.push(("UV_HTTP_TIMEOUT".to_string(), "300".to_string()));
         uv_env
     }
 
@@ -1418,6 +1422,8 @@ mod tests {
             root.join("runtime").join("uv-python").to_string_lossy()
         );
         assert_eq!(get("HTTP_PROXY").unwrap(), "http://127.0.0.1:7890");
+        // GB 级 wheel 慢网硬化：单请求超时放宽至 300s（默认 30s 易整包失败）
+        assert_eq!(get("UV_HTTP_TIMEOUT").unwrap(), "300");
         // 注入前目录已创建（uv 无需自行建父目录）
         assert!(root.join("runtime").join("uv-python").is_dir());
 
