@@ -123,7 +123,7 @@ pub(crate) fn parse_wmic_name_values(output: &str) -> Vec<String> {
 }
 
 /// 逐行去空白、去空行（PowerShell 单列输出等纯文本列表）
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 pub(crate) fn parse_plain_lines(output: &str) -> Vec<String> {
     output
         .lines()
@@ -201,11 +201,6 @@ pub(crate) fn windows_video_controller_names() -> Vec<String> {
         }
         Vec::new()
     })
-}
-
-#[cfg(not(windows))]
-pub(crate) fn windows_video_controller_names() -> Vec<String> {
-    Vec::new()
 }
 
 /// 全部检测器。注册顺序 = 检测优先级；CUDA 默认优先，CPU 兜底。

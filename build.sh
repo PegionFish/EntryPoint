@@ -153,8 +153,11 @@ detect_distro() {
     if [ -f /etc/os-release ]; then
         local ver=""
         . /etc/os-release 2>/dev/null || true
-        # VERSION_ID 可能带次版本（如 Linux Mint 21.3）：按 . 截断为主版本再匹配知识表
-        ver="${VERSION_ID%%.*}"
+        # VERSION_ID 可能带次版本（如 Linux Mint 21.3）：按 . 截断为主版本再匹配知识表。
+        # 注意：rolling 发行版（如 Arch）os-release 无 VERSION_ID，set -u 下必须
+        # 默认展开为空，否则直接报 "unbound variable" 中断打包。
+        ver="${VERSION_ID:-}"
+        ver="${ver%%.*}"
         if [ -n "$ver" ]; then
             echo "${ID:-unknown}-${ver}"
         else

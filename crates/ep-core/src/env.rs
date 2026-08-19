@@ -427,6 +427,31 @@ impl EnvManager {
         //    created_now：本次新建的 venv 若安装失败须拆除（半壳 venv 只剩
         //    python 解释器，会让仅看 python.exe 存在性的调用方误判就绪）。
         let mut created_now = false;
+        // 跨平台/损坏 venv 自愈：目录存在但解释器缺失（如 Windows 构建的 venv
+        // 在 Linux 使用——只有 Lib/Scripts 无 bin/python；或上次安装失败残留的
+        // 半壳），uv 无法在其上补装（--python 指向不存在的解释器必然失败且
+        // 永远无法重试），删除后走下方重建路径。Windows 上 Scripts/python.exe
+        // 存在，不受影响。
+        if venv_dir.exists() && !venv_python.exists() {
+            warn!(
+                module = module_id,
+                path = %venv_dir.display(),
+                "venv python interpreter missing (cross-platform or incomplete venv), removing for rebuild"
+            );
+            match std::fs::remove_dir_all(&venv_dir) {
+                Ok(()) => {
+                    info!(module = module_id, "removed incomplete venv, rebuilding");
+                }
+                Err(e) => {
+                    warn!(
+                        module = module_id,
+                        path = %venv_dir.display(),
+                        error = %e,
+                        "failed to remove incomplete venv, rebuild will proceed if directory is absent"
+                    );
+                }
+            }
+        }
         if !venv_dir.exists() {
             info!(module = module_id, path = %venv_dir.display(), "creating venv");
             std::fs::create_dir_all(&venv_dir).with_context(|| {

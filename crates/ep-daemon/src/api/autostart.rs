@@ -475,30 +475,49 @@ output_type = "file"
         ))
     }
 
-    /// 在指定端口启动一个最小 HTTP 服务（任意请求一律 200），模拟模块的
-    /// /health 端点，返回任务句柄。
+    /// 为 `module_id` allocate 端口，并在该端口启动一个最小 HTTP 服务
+    ///（任意请求一律 200）模拟模块的 /health 端点，返回 (端口, 任务句柄)。
     ///
     /// 测试序列必须是「先 allocate 端口 → 再在该端口起 mock」：
     /// [`ep_core::port::PortManager::allocate`] 带 OS 层占用探测，mock 先占住
     /// 端口会让 allocate 判其占用而拒绝分配（fake 模块进程虽不监听，
     /// 真实模块会 bind 同端口，探测语义上该端口确实不可用）。
-    async fn spawn_mock_health_server_on(port: u16) -> tokio::task::JoinHandle<()> {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-            .await
-            .unwrap();
-        tokio::spawn(async move {
-            loop {
-                if let Ok((mut stream, _)) = listener.accept().await {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    let _ = stream.read(&mut buf).await;
-                    let response =
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
-                    let _ = stream.write_all(response).await;
-                    let _ = stream.shutdown().await;
+    ///
+    /// allocate 的 OS 探测与 bind 之间存在 TOCTOU 窗口（并行测试的探测、
+    /// 机器上其他进程的瞬态占首都可能抢走刚判空闲的端口，Linux 真机实测
+    /// 触发过 AddrInUse）：bind 失败时释放重分、最多重试 5 次。
+    async fn allocate_and_spawn_mock_health(
+        state: &Arc<AppState>,
+        module_id: &str,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let mut last_err: Option<std::io::Error> = None;
+        for _ in 0..5 {
+            let port = {
+                let mut pm = state.port_manager.write().await;
+                pm.release(module_id); // 重试前清除上一轮分配，强制重新探测
+                pm.allocate(module_id).expect("预分配端口")
+            };
+            match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                Ok(listener) => {
+                    let handle = tokio::spawn(async move {
+                        loop {
+                            if let Ok((mut stream, _)) = listener.accept().await {
+                                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                                let mut buf = [0u8; 1024];
+                                let _ = stream.read(&mut buf).await;
+                                let response =
+                                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+                                let _ = stream.write_all(response).await;
+                                let _ = stream.shutdown().await;
+                            }
+                        }
+                    });
+                    return (port, handle);
                 }
+                Err(e) => last_err = Some(e),
             }
-        })
+        }
+        panic!("allocate→bind 重试 5 次仍失败（端口探测 TOCTOU 竞态）: {last_err:?}")
     }
 
     /// 等待并清理：停止模块进程、abort mock server
@@ -539,15 +558,9 @@ output_type = "file"
             (39201, 39210),
         );
         // 先 allocate（OS 探测在 mock 启动前执行）→ 再在分得的端口起 mock
-        // 模拟 /health（序列约束见 spawn_mock_health_server_on 注释）；
+        // 模拟 /health（序列约束与 TOCTOU 重试见 allocate_and_spawn_mock_health 注释）；
         // ensure 内 allocate 幂等命中已分配端口，不再探测
-        let port = state
-            .port_manager
-            .write()
-            .await
-            .allocate("auto-mod")
-            .expect("预分配端口");
-        let server = spawn_mock_health_server_on(port).await;
+        let (port, server) = allocate_and_spawn_mock_health(&state, "auto-mod").await;
 
         // 前置：无实例（相当于 Stopped）
         assert!(state
@@ -700,14 +713,8 @@ default = true
         std::fs::create_dir_all(&small_dir).unwrap();
         std::fs::write(small_dir.join("model.bin"), b"weights").unwrap();
 
-        // 先 allocate 再起 mock（序列约束见 spawn_mock_health_server_on 注释）
-        let port = state
-            .port_manager
-            .write()
-            .await
-            .allocate("f1-mod")
-            .expect("预分配端口");
-        let server = spawn_mock_health_server_on(port).await;
+        // 先 allocate 再起 mock（序列约束与 TOCTOU 重试见 allocate_and_spawn_mock_health 注释）
+        let (_port, server) = allocate_and_spawn_mock_health(&state, "f1-mod").await;
 
         ensure_module_running_with_timeout(&state, "f1-mod", Duration::from_secs(15))
             .await
@@ -790,14 +797,8 @@ ready_timeout_secs = 30
             vec![module_from_toml(&root, &toml)],
             (39211, 39220),
         );
-        // 先 allocate 再起 mock（序列约束见 spawn_mock_health_server_on 注释）
-        let port = state
-            .port_manager
-            .write()
-            .await
-            .allocate("py-mod")
-            .expect("预分配端口");
-        let server = spawn_mock_health_server_on(port).await;
+        // 先 allocate 再起 mock（序列约束与 TOCTOU 重试见 allocate_and_spawn_mock_health 注释）
+        let (_port, server) = allocate_and_spawn_mock_health(&state, "py-mod").await;
 
         // 预置 venv python（双平台路径），使准备分支被跳过
         let py = if cfg!(target_os = "windows") {
@@ -831,14 +832,8 @@ ready_timeout_secs = 30
             vec![module_from_toml(&root, &toml)],
             (39221, 39230),
         );
-        // 先 allocate 再起 mock（序列约束见 spawn_mock_health_server_on 注释）
-        let port = state
-            .port_manager
-            .write()
-            .await
-            .allocate("retry-mod")
-            .expect("预分配端口");
-        let server = spawn_mock_health_server_on(port).await;
+        // 先 allocate 再起 mock（序列约束与 TOCTOU 重试见 allocate_and_spawn_mock_health 注释）
+        let (_port, server) = allocate_and_spawn_mock_health(&state, "retry-mod").await;
 
         // 先把实例打到 Error（模拟上次启动失败残留）：
         // 拉起→无健康等待至 Error 不可控，直接经 stop 制造 Stopped 再断言等价语义。

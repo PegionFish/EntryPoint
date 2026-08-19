@@ -1,0 +1,2 @@
+# 统一 LF 行尾，防止跨平台工具链（如 Windows 编辑器）批量写入 CRLF
+* text=auto eol=lf
