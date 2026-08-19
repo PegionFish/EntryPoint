@@ -243,49 +243,72 @@ mod tests {
     #[test]
     fn test_release_and_reuse() {
         let _guard = lock_port_tests();
-        let start = find_free_window(1);
-        let mut pm = PortManager::new(start, start + 2);
-        let port = pm.allocate("mod-a").unwrap();
-        assert_eq!(port, start);
+        // find_free_window 释放预约后、allocate 前存在 TOCTOU 窗口：并行
+        // 测试（不持 PORT_TEST_LOCK）可能 bind 走窗口端口，allocate 的
+        // OS 探测会跳过被占端口而落到窗口外。窗口被抢占时重试，最多 3 次。
+        for _attempt in 0..3 {
+            let start = find_free_window(1);
+            let mut pm = PortManager::new(start, start + 2);
+            let port = match pm.allocate("mod-a") {
+                Ok(p) if p == start => p,
+                _ => continue, // 窗口被并行测试抢占，重试
+            };
 
-        pm.release("mod-a");
-        assert_eq!(pm.allocated_count(), 0);
-        assert!(pm.is_available(start));
+            pm.release("mod-a");
+            if pm.allocated_count() != 0 || !pm.is_available(start) {
+                continue;
+            }
 
-        // 释放后端口可被重新分配
-        let port2 = pm.allocate("mod-b").unwrap();
-        assert_eq!(port2, start);
+            // 释放后端口可被重新分配
+            if let Ok(start) = pm.allocate("mod-b") {
+                assert_eq!(port, start);
+                return;
+            }
+        }
+        panic!("port window kept being preempted by parallel tests after 3 attempts");
     }
 
     #[test]
     fn test_range_exhausted() {
         let _guard = lock_port_tests();
-        let start = find_free_window(2);
-        let mut pm = PortManager::new(start, start + 1);
-        pm.allocate("mod-a").unwrap();
-        pm.allocate("mod-b").unwrap();
+        // 同上：窗口被并行测试抢占时 allocate 会落到窗口外，耗尽语义不成立，重试。
+        for _attempt in 0..3 {
+            let start = find_free_window(2);
+            let mut pm = PortManager::new(start, start + 1);
+            if pm.allocate("mod-a").is_err() || pm.allocate("mod-b").is_err() {
+                continue;
+            }
 
-        let result = pm.allocate("mod-c");
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("exhausted"));
+            if let Err(e) = pm.allocate("mod-c") {
+                assert!(e.to_string().contains("exhausted"));
+                return;
+            }
+        }
+        panic!("port window kept being preempted by parallel tests after 3 attempts");
     }
 
     #[test]
     fn test_is_available() {
         let _guard = lock_port_tests();
-        // 窗口须覆盖 start+5：is_available 现在含 OS 探测，候选须确认 OS 空闲
-        let start = find_free_window(6);
-        let mut pm = PortManager::new(start, start + 5);
-        assert!(pm.is_available(start));
-        assert!(pm.is_available(start + 5));
-        // 范围外
-        assert!(!pm.is_available(start - 1));
-        assert!(!pm.is_available(start + 6));
+        // 窗口须覆盖 start+5：is_available 现在含 OS 探测，候选须确认 OS 空闲。
+        // 并行测试抢占窗口端口时探测失败，重试（见 test_release_and_reuse 注释）。
+        for _attempt in 0..3 {
+            let start = find_free_window(6);
+            let mut pm = PortManager::new(start, start + 5);
+            if !pm.is_available(start) || !pm.is_available(start + 5) {
+                continue;
+            }
+            // 范围外
+            assert!(!pm.is_available(start - 1));
+            assert!(!pm.is_available(start + 6));
 
-        pm.allocate("mod-a").unwrap();
-        assert!(!pm.is_available(start));
-        assert!(pm.is_available(start + 1));
+            // 已分配端口不再可用（用实际分配到的端口断言，避免窗口被抢时误判）
+            let got = pm.allocate("mod-a").unwrap();
+            assert!(!pm.is_available(got));
+            assert!(pm.is_available(start + 1));
+            return;
+        }
+        panic!("port window kept being preempted by parallel tests after 3 attempts");
     }
 
     #[test]

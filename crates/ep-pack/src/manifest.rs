@@ -174,6 +174,15 @@ fn check_pipeline_file(file: &str) -> Result<(), String> {
             "'{file}' uses backslash separators; pack-internal paths must use '/'"
         ));
     }
+    // Windows 盘符前缀（如 `C:/...`）：跨平台显式拒绝。Linux/macOS 上
+    // Path 不识别盘符，`C:` 会被当作普通相对目录名而漏放；此处统一拦截，
+    // 与 Windows 上 is_absolute() 的判定保持同语义。
+    let bytes = file.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Err(format!(
+            "'{file}' uses a Windows drive prefix; pack-internal paths must be relative"
+        ));
+    }
     let path = Path::new(file);
     if path.is_absolute() || path.has_root() {
         return Err(format!("'{file}' must be a relative path inside the pack"));

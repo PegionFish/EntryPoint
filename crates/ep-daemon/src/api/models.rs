@@ -2423,12 +2423,27 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
-        assert_eq!(body.0["queued"], false); // 闸门有空位 → 立即启动
-        {
+        // 下载并发闸是全局 static（P2-1，max_concurrent_downloads）：并行
+        // 测试可能占满闸门使本请求排队（queued=true）。排队任务会在空位
+        // 释放后自动启动（Semaphore 公平性），轮询等待其转 downloading，
+        // 保持"取消进行中下载"的测试语义，不依赖闸门空闲。
+        let key = download_key(MODULE_ID, MODEL_ID);
+        if body.0["queued"] == false {
             let map = state.downloads.lock().unwrap();
-            assert_eq!(
-                map.get(&download_key(MODULE_ID, MODEL_ID)).unwrap().state,
-                "downloading"
+            assert_eq!(map.get(&key).unwrap().state, "downloading");
+        } else {
+            let mut became_downloading = false;
+            for _ in 0..100 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let map = state.downloads.lock().unwrap();
+                if map.get(&key).map(|e| e.state.as_str()) == Some("downloading") {
+                    became_downloading = true;
+                    break;
+                }
+            }
+            assert!(
+                became_downloading,
+                "queued download did not start within 5s (gate never freed)"
             );
         }
 
