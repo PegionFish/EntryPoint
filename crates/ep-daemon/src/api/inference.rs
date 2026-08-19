@@ -812,14 +812,17 @@ fn first_artifact_url(
     let has_served = |node_id: &str| -> bool {
         record.served_artifacts.contains_key(node_id) || record.artifacts.contains_key(node_id)
     };
+    // 优先级：output 节点 > 其余节点按序（跳过 input——那是输入文件不是结果，
+    // 直跑 JSON/Text 输出物化在 run 节点）> 兜底任意产物（含 input）
     let picked = if has_served("output") {
         Some("output".to_string())
     } else {
         record
             .node_order
             .iter()
-            .find(|node_id| has_served(node_id))
+            .find(|node_id| *node_id != "input" && has_served(node_id))
             .cloned()
+            .or_else(|| record.node_order.iter().find(|n| has_served(n)).cloned())
     };
     picked.map(|node_id| format!("/api/tasks/{task_id}/artifacts/{node_id}"))
 }
