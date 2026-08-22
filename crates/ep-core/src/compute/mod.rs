@@ -1,12 +1,14 @@
 //! 异构计算设备管理 — Wave 1 A5 Detectors
 //!
-//! 覆盖后端：CUDA / ROCm / OpenVINO（Intel iGPU + NPU）/ DirectML / CPU。
+//! 覆盖后端：CUDA / ROCm / OpenVINO（Intel iGPU + NPU）/ DirectML / Vulkan / CPU。
 //!
 //! 设计要点（PACK_UNIFY_PLAN §7 设计 E）：
-//! - 检测优先级：CUDA 保持默认优先（注册表首位），其后 ROCm / OpenVINO / DirectML，CPU 兜底
+//! - 检测优先级：CUDA 保持默认优先（注册表首位），其后 ROCm / OpenVINO / DirectML /
+//!   Vulkan（备选位，HETERO_DIST_PLAN M4），CPU 兜底
 //! - 所有检测器均为 best-effort：子进程超时 + 畸形输出容错；任何检测失败一律优雅降级为
 //!   空设备列表，绝不 panic
-//! - DirectML 与 CUDA/ROCm/OpenVINO 按适配器名去重（策略详见 directml.rs 模块文档）
+//! - DirectML 与 CUDA/ROCm/OpenVINO 按适配器名去重（策略详见 directml.rs 模块文档）；
+//!   Vulkan 与其之前全部后端按归一化名称去重（详见 vulkan.rs 模块文档）
 
 pub mod cpu;
 pub mod cuda;
@@ -14,12 +16,14 @@ pub mod directml;
 pub mod openvino;
 pub mod rocm;
 pub mod scheduler;
+pub mod vulkan;
 
 pub use cpu::CpuDetector;
 pub use cuda::CudaDetector;
 pub use directml::DirectMlDetector;
 pub use openvino::OpenVinoDetector;
 pub use rocm::RocmDetector;
+pub use vulkan::VulkanDetector;
 
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -203,20 +207,23 @@ pub(crate) fn windows_video_controller_names() -> Vec<String> {
     })
 }
 
-/// 全部检测器。注册顺序 = 检测优先级；CUDA 默认优先，CPU 兜底。
+/// 全部检测器。注册顺序 = 检测优先级；CUDA 默认优先，CPU 兜底，
+/// Vulkan 备选位（DirectML 之后、Cpu 之前）。
 fn all_detectors() -> Vec<Box<dyn DeviceDetector>> {
     vec![
         Box::new(CudaDetector),
         Box::new(RocmDetector),
         Box::new(OpenVinoDetector),
         Box::new(DirectMlDetector),
+        Box::new(VulkanDetector),
         Box::new(CpuDetector),
     ]
 }
 
 /// 检测所有可用计算设备。
 ///
-/// 顺序语义：CUDA → ROCm → OpenVINO → DirectML（对已检出设备去重）→ CPU。
+/// 顺序语义：CUDA → ROCm → OpenVINO → DirectML（对已检出设备去重）
+/// → Vulkan（对已检出设备去重，备选位）→ CPU。
 pub fn detect_all_devices(disabled: &[ComputeBackend]) -> Vec<ComputeDevice> {
     let mut devices: Vec<ComputeDevice> = Vec::new();
 
@@ -226,14 +233,17 @@ pub fn detect_all_devices(disabled: &[ComputeBackend]) -> Vec<ComputeDevice> {
             continue;
         }
         match backend {
-            // DirectML 需要已检出设备作为去重上下文、CPU 固定最后，单独处理
-            ComputeBackend::DirectML | ComputeBackend::Cpu => continue,
+            // DirectML/Vulkan 需要已检出设备作为去重上下文、CPU 固定最后，单独处理
+            ComputeBackend::DirectML | ComputeBackend::Vulkan | ComputeBackend::Cpu => continue,
             _ => devices.extend(detector.detect()),
         }
     }
 
     if !disabled.contains(&ComputeBackend::DirectML) {
         devices.extend(DirectMlDetector.detect_excluding(&devices));
+    }
+    if !disabled.contains(&ComputeBackend::Vulkan) {
+        devices.extend(VulkanDetector.detect_excluding(&devices));
     }
     if !disabled.contains(&ComputeBackend::Cpu) {
         devices.extend(CpuDetector.detect());
@@ -259,9 +269,33 @@ mod tests {
                 ComputeBackend::Rocm,
                 ComputeBackend::OpenVINO,
                 ComputeBackend::DirectML,
-                ComputeBackend::Cpu, // 兜底
+                ComputeBackend::Vulkan, // 备选位（M4）：厂商栈均不可用时兜底
+                ComputeBackend::Cpu,    // 兜底
             ]
         );
+    }
+
+    #[test]
+    fn test_vulkan_backend_serde_and_display() {
+        // M4 词表：serde 小写 "vulkan" 与 Display/FromStr 三向一致
+        assert_eq!(ComputeBackend::Vulkan.to_string(), "vulkan");
+        assert_eq!(
+            serde_json::to_string(&ComputeBackend::Vulkan).unwrap(),
+            "\"vulkan\""
+        );
+        assert_eq!(
+            "vulkan".parse::<ComputeBackend>().unwrap(),
+            ComputeBackend::Vulkan
+        );
+        assert_eq!(
+            serde_json::from_str::<ComputeBackend>("\"vulkan\"").unwrap(),
+            ComputeBackend::Vulkan
+        );
+        // DeviceId 双向：Display 与 index
+        let id = crate::types::DeviceId::Vulkan(2);
+        assert_eq!(id.to_string(), "vulkan:2");
+        assert_eq!(id.backend(), ComputeBackend::Vulkan);
+        assert_eq!(id.index(), Some(2));
     }
 
     #[test]

@@ -978,6 +978,27 @@ disabled_backends = ["directml", "rocm"]
         );
     }
 
+    /// M4：vulkan 词表经 `disabled_backends` 自然兼容（serde 小写 + 回写一致）
+    #[test]
+    fn disabled_backends_vulkan_word_accepted() {
+        let toml_str = r#"
+[compute]
+disabled_backends = ["openvino", "vulkan"]
+"#;
+        let config: AppConfig = toml::from_str(toml_str).expect("parse vulkan word");
+        assert_eq!(
+            config.compute.disabled_backends,
+            vec![ComputeBackend::OpenVINO, ComputeBackend::Vulkan]
+        );
+
+        // 序列化回写保持小写词形（配置落盘形态稳定）
+        let serialized = toml::to_string_pretty(&config).expect("serialize");
+        assert!(
+            serialized.contains("\"vulkan\""),
+            "serialized disabled_backends should contain \"vulkan\":\n{serialized}"
+        );
+    }
+
     #[test]
     fn resolve_paths() {
         let config = AppConfig::default();

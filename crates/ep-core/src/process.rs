@@ -86,11 +86,18 @@ pub fn cuda_lib_path_env(cuda_libs_dir: &Path) -> Option<(String, String)> {
 }
 
 /// 读取 `manifest.compute.env.<backend>` 表（backend = 当前设备后端的小写名，
-/// 如 cuda/rocm/openvino/directml/cpu），将值中 `{device_index}` 替换为实际设备号后
-/// 返回待注入的环境变量（§3.1 compute.env 接线，CUDA_VISIBLE_DEVICES 等多卡隔离立即生效）。
+/// 如 cuda/rocm/openvino/directml/vulkan/cpu），将值中的占位符替换后返回待注入的
+/// 环境变量（§3.1 compute.env 接线，CUDA_VISIBLE_DEVICES 等多卡隔离立即生效）。
+///
+/// 占位符（MODULE_SPEC §2.3 契约注入点）：
+/// - `{device_index}` → 数字设备号；OpenVINO 等字符串索引设备无数字 index，
+///   替换为空串；
+/// - `{device_name}` → OpenVINO 完整设备名（`"NPU.0"` / `"GPU.0"`，即
+///   `DeviceId::OpenVINO` 的内层标识，与 `compute/openvino.rs` 探测器的取值
+///   语义一致），供契约写法 `OPENVINO_DEVICE = "{device_name}"` 消费；
+///   非 OpenVINO 后端替换为空串。
 ///
 /// 防御性读取：表不存在 / 当前 backend 无条目时返回空（接口以现有 `ModuleManifest` 字段为准）。
-/// 注：OpenVINO 等字符串索引设备无数字 index，`{device_index}` 替换为空串。
 pub fn backend_env_vars(manifest: &ModuleManifest, device: &DeviceId) -> Vec<(String, String)> {
     let Some(env_map) = manifest.compute.env.as_ref() else {
         return Vec::new();
@@ -100,9 +107,19 @@ pub fn backend_env_vars(manifest: &ModuleManifest, device: &DeviceId) -> Vec<(St
         return Vec::new();
     };
     let index = device.index().map(|i| i.to_string()).unwrap_or_default();
+    let device_name = match device {
+        DeviceId::OpenVINO(name) => name.clone(),
+        _ => String::new(),
+    };
     table
         .iter()
-        .map(|(k, v)| (k.clone(), v.replace("{device_index}", &index)))
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                v.replace("{device_index}", &index)
+                    .replace("{device_name}", &device_name),
+            )
+        })
         .collect()
 }
 
@@ -854,6 +871,7 @@ mod tests {
                 runtime_type: RuntimeType::Python,
                 python_version: Some(">=3.10".to_string()),
                 requirements: None,
+                requirements_by_backend: Default::default(),
                 entrypoint: Some("adapter.py".to_string()),
                 start_command: start_command.map(|s| s.to_string()),
                 binaries: None,
@@ -1544,6 +1562,106 @@ mod tests {
         )]));
         let vars = backend_env_vars(&manifest3, &DeviceId::OpenVINO("npu0".to_string()));
         assert_eq!(vars, vec![("OV_DEVICE".to_string(), "npu-".to_string())]);
+    }
+
+    // ─── M6 回归：OPENVINO_DEVICE={device_name} 注入链路 ────────────────────
+    //
+    // MODULE_SPEC §2.3 契约写法 `openvino = { OPENVINO_DEVICE = "{device_name}" }`
+    // 要求注入 OpenVINO 完整设备名（"NPU.0"/"GPU.0"）。修复前 backend_env_vars
+    // 只替换 {device_index}，字面量 "{device_name}" 会被原样注入子进程。
+
+    /// openvino 后端：{device_name} 必须替换为探测器的 DeviceId 内层完整设备名
+    #[test]
+    fn test_backend_env_vars_device_name_openvino() {
+        for (inner, expected) in [("NPU.0", "NPU.0"), ("GPU.0", "GPU.0"), ("GPU.1", "GPU.1")] {
+            let mut manifest = test_manifest(None);
+            manifest.compute.env = Some(HashMap::from([(
+                "openvino".to_string(),
+                HashMap::from([(
+                    "OPENVINO_DEVICE".to_string(),
+                    "{device_name}".to_string(),
+                )]),
+            )]));
+
+            let vars =
+                backend_env_vars(&manifest, &DeviceId::OpenVINO(inner.to_string()));
+            assert_eq!(
+                vars,
+                vec![(
+                    "OPENVINO_DEVICE".to_string(),
+                    expected.to_string()
+                )],
+                "device_name 应取 compute/openvino.rs 同语义的完整设备名 {inner}"
+            );
+        }
+    }
+
+    /// {device_name} 与 {device_index} 混用：各自独立替换、互不干扰
+    #[test]
+    fn test_backend_env_vars_device_name_combined_with_index() {
+        let mut manifest = test_manifest(None);
+        manifest.compute.env = Some(HashMap::from([(
+            "openvino".to_string(),
+            HashMap::from([(
+                "OV_COMBINED".to_string(),
+                "idx={device_index};name={device_name}".to_string(),
+            )]),
+        )]));
+
+        let vars = backend_env_vars(&manifest, &DeviceId::OpenVINO("NPU.0".to_string()));
+        assert_eq!(
+            vars,
+            vec![(
+                "OV_COMBINED".to_string(),
+                "idx=;name=NPU.0".to_string()
+            )]
+        );
+    }
+
+    /// 非 OpenVINO 后端：{device_name} 替换为空串（该占位符为 openvino 专属契约）
+    #[test]
+    fn test_backend_env_vars_device_name_empty_for_other_backends() {
+        let mut manifest = test_manifest(None);
+        manifest.compute.env = Some(HashMap::from([
+            (
+                "cuda".to_string(),
+                HashMap::from([(
+                    "CUDA_VISIBLE_DEVICES".to_string(),
+                    "{device_index}".to_string(),
+                )]),
+            ),
+            (
+                "cpu".to_string(),
+                HashMap::from([("OV_STRAY".to_string(), "{device_name}".to_string())]),
+            ),
+        ]));
+
+        assert_eq!(
+            backend_env_vars(&manifest, &DeviceId::Cuda(3)),
+            vec![("CUDA_VISIBLE_DEVICES".to_string(), "3".to_string())]
+        );
+        // cpu 表存在但值为纯 {device_name} → 空串（不残留字面量）
+        assert_eq!(
+            backend_env_vars(&manifest, &DeviceId::Cpu),
+            vec![("OV_STRAY".to_string(), String::new())]
+        );
+    }
+
+    /// vulkan 词表（M4）经 backend_env_vars 的 backend 键路由自然兼容
+    #[test]
+    fn test_backend_env_vars_vulkan_key_routing() {
+        let mut manifest = test_manifest(None);
+        manifest.compute.env = Some(HashMap::from([(
+            "vulkan".to_string(),
+            HashMap::from([("VK_ICD_FILENAMES".to_string(), "/opt/icd.json".to_string())]),
+        )]));
+        assert_eq!(
+            backend_env_vars(&manifest, &DeviceId::Vulkan(0)),
+            vec![(
+                "VK_ICD_FILENAMES".to_string(),
+                "/opt/icd.json".to_string()
+            )]
+        );
     }
 
     // ─── A2 环境注入：build_module_env 公共构建函数（P0-4 前置） ────────────

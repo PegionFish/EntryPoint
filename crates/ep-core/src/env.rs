@@ -15,6 +15,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::PythonConfig;
 use crate::process::apply_no_window;
+use crate::types::ComputeBackend;
 
 // ─── 公共类型 ────────────────────────────────────────────────────────────────
 
@@ -374,9 +375,9 @@ impl EnvManager {
         }
     }
 
-    /// 确保模块的虚拟环境就绪
+    /// 确保模块的虚拟环境就绪（旧单 venv 布局口径，行为不变）
     ///
-    /// 流程：
+    /// 流程（详见 [`Self::ensure_venv_impl`]）：
     /// 1. 构造 uv 子进程环境变量（网络代理 + `UV_CACHE_DIR` + `UV_PYTHON_INSTALL_DIR`，
     ///    §3.1 依赖栈统一 / LNX-03 托管解释器入包）
     /// 2. 检查 `runtime/venvs/<module_id>/` 是否存在
@@ -393,13 +394,56 @@ impl EnvManager {
         python_version: &str,
         requirements: &Path,
     ) -> Result<PathBuf> {
+        let venv_dir = self.venv_dir(module_id);
+        self.ensure_venv_impl(module_id, python_version, requirements, &venv_dir, None)
+    }
+
+    /// 确保模块在指定后端维度的虚拟环境就绪（HETERO_DIST_PLAN M2/M3）。
+    ///
+    /// - 目标目录：`runtime/venvs/<module-id>--<backend>/`（分后端 venv，
+    ///   多后端依赖分歧后每后端一套依赖栈）；
+    /// - `.ep_deps_hash` 哈希输入加入 backend 名：各后端独立判定依赖栈变更，
+    ///   跨后端切换绝不误判"依赖未变"；
+    /// - **旧布局兼容读取**：新目录不存在而旧单 venv（`runtime/venvs/<id>/`）
+    ///   存在且旧口径哈希匹配时，直接复用旧 venv 返回其解释器，避免全量重建；
+    /// - 依赖文件由调用方按当前后端解析（[`crate::module::manifest::RuntimeConfig::
+    ///   resolve_requirements`]，缺省回退 `runtime.requirements`）。
+    pub fn ensure_venv_for_backend(
+        &self,
+        module_id: &str,
+        python_version: &str,
+        requirements: &Path,
+        backend: ComputeBackend,
+    ) -> Result<PathBuf> {
+        let venv_dir = self.venv_dir_for_backend(module_id, backend);
+        if !venv_dir.exists() && self.is_venv_ready(module_id, requirements) {
+            debug!(
+                module = module_id,
+                backend = %backend,
+                "reusing legacy single-venv layout"
+            );
+            return Ok(self.venv_python_path(module_id));
+        }
+        self.ensure_venv_impl(module_id, python_version, requirements, &venv_dir, Some(backend))
+    }
+
+    /// venv 创建 + 依赖安装核心流程（布局参数化：旧单 venv / 分后端共用）。
+    ///
+    /// `backend` 仅参与 `.ep_deps_hash` 哈希输入（None = 旧口径，与历史哈希逐字节兼容）。
+    fn ensure_venv_impl(
+        &self,
+        module_id: &str,
+        python_version: &str,
+        requirements: &Path,
+        venv_dir: &Path,
+        backend: Option<ComputeBackend>,
+    ) -> Result<PathBuf> {
         let uv = self
             .uv_path
             .as_ref()
             .context("uv not found, cannot create venv")?;
 
-        let venv_dir = self.venv_dir(module_id);
-        let venv_python = self.venv_python_path(module_id);
+        let venv_python = self.python_in(venv_dir.to_path_buf());
 
         // 0. uv 子进程环境变量：网络代理 + UV_CACHE_DIR + UV_PYTHON_INSTALL_DIR
         //    （§3.1 / LNX-03）。缓存与托管解释器入应用根 → 与 venv 同盘 →
@@ -421,7 +465,7 @@ impl EnvManager {
                 path = %venv_dir.display(),
                 "venv python interpreter missing (cross-platform or incomplete venv), removing for rebuild"
             );
-            match std::fs::remove_dir_all(&venv_dir) {
+            match std::fs::remove_dir_all(venv_dir) {
                 Ok(()) => {
                     info!(module = module_id, "removed incomplete venv, rebuilding");
                 }
@@ -437,7 +481,7 @@ impl EnvManager {
         }
         if !venv_dir.exists() {
             info!(module = module_id, path = %venv_dir.display(), "creating venv");
-            std::fs::create_dir_all(&venv_dir).with_context(|| {
+            std::fs::create_dir_all(venv_dir).with_context(|| {
                 format!("failed to create venv directory: {}", venv_dir.display())
             })?;
 
@@ -456,7 +500,7 @@ impl EnvManager {
             ) {
                 Ok(output) => output,
                 Err(e) => {
-                    if let Err(rm_err) = std::fs::remove_dir_all(&venv_dir) {
+                    if let Err(rm_err) = std::fs::remove_dir_all(venv_dir) {
                         warn!(
                             module = module_id,
                             path = %venv_dir.display(),
@@ -497,11 +541,12 @@ impl EnvManager {
         }
 
         let current_hash =
-            compute_deps_hash(requirements, constraints_file.as_deref()).with_context(
-                || format!("failed to hash dependency stack: {}", requirements.display()),
-            )?;
+            compute_deps_hash_seeded(requirements, constraints_file.as_deref(), backend)
+                .with_context(|| {
+                    format!("failed to hash dependency stack: {}", requirements.display())
+                })?;
 
-        let hash_file = self.deps_hash_path(module_id);
+        let hash_file = venv_dir.join(DEPS_HASH_FILE_NAME);
         let needs_install = if hash_file.exists() {
             let stored = std::fs::read_to_string(&hash_file).unwrap_or_default();
             stored.trim() != current_hash
@@ -550,7 +595,7 @@ impl EnvManager {
                     // 本次新建的 venv 安装失败 → 拆除半壳，下次从零重来，
                     // 避免残留只有解释器的空 venv 误导就绪判定。
                     if created_now {
-                        if let Err(rm_err) = std::fs::remove_dir_all(&venv_dir) {
+                        if let Err(rm_err) = std::fs::remove_dir_all(venv_dir) {
                             warn!(
                                 module = module_id,
                                 path = %venv_dir.display(),
@@ -671,12 +716,39 @@ impl EnvManager {
         self.constraints_path().filter(|p| p.is_file())
     }
 
-    /// 获取模块 venv 内的 python 可执行文件路径
+    /// 获取模块 venv 内的 python 可执行文件路径（旧单 venv 布局口径）
     ///
     /// - Windows: `runtime/venvs/<id>/Scripts/python.exe`
     /// - Linux/macOS: `runtime/venvs/<id>/bin/python`
     pub fn venv_python_path(&self, module_id: &str) -> PathBuf {
-        let venv_dir = self.venv_dir(module_id);
+        self.python_in(self.venv_dir(module_id))
+    }
+
+    /// 分后端 venv 内的 python 可执行文件路径（M3，旧布局兼容读取）：
+    ///
+    /// 1. 新布局 `runtime/venvs/<id>--<backend>/` 解释器存在 → 返回新布局；
+    /// 2. 否则旧布局 `runtime/venvs/<id>/` 解释器存在 → 兼容返回旧布局
+    ///    （避免全量重建；就绪判定请配合 [`Self::is_venv_ready_for_backend`]）；
+    /// 3. 两者皆无解释器 → 返回新布局口径（前瞻性答案）。
+    pub fn venv_python_path_for_backend(
+        &self,
+        module_id: &str,
+        backend: ComputeBackend,
+    ) -> PathBuf {
+        let per_backend = self.python_in(self.venv_dir_for_backend(module_id, backend));
+        if per_backend.exists() {
+            return per_backend;
+        }
+        let legacy = self.venv_python_path(module_id);
+        if legacy.exists() {
+            legacy
+        } else {
+            per_backend
+        }
+    }
+
+    /// venv 目录内的平台解释器路径（Windows `Scripts/python.exe`，其他 `bin/python`）
+    fn python_in(&self, venv_dir: PathBuf) -> PathBuf {
         if cfg!(windows) {
             venv_dir.join("Scripts").join("python.exe")
         } else {
@@ -684,9 +756,40 @@ impl EnvManager {
         }
     }
 
-    /// 检查模块 venv 是否就绪（存在且依赖哈希匹配）
+    /// 检查模块 venv 是否就绪（存在且依赖哈希匹配；旧单 venv 布局口径）
     pub fn is_venv_ready(&self, module_id: &str, requirements: &Path) -> bool {
-        let venv_python = self.venv_python_path(module_id);
+        self.is_ready_in(&self.venv_dir(module_id), requirements, None)
+    }
+
+    /// 检查模块在指定后端维度的 venv 是否就绪（M3，含旧布局兼容读取）：
+    ///
+    /// 分后端新布局就绪（backend 维度哈希匹配），**或**旧单 venv 按旧口径
+    /// 哈希就绪 → true。
+    pub fn is_venv_ready_for_backend(
+        &self,
+        module_id: &str,
+        requirements: &Path,
+        backend: ComputeBackend,
+    ) -> bool {
+        if self.is_ready_in(
+            &self.venv_dir_for_backend(module_id, backend),
+            requirements,
+            Some(backend),
+        ) {
+            return true;
+        }
+        // 旧布局兼容读取：存在且旧口径哈希匹配则继续用
+        self.is_ready_in(&self.venv_dir(module_id), requirements, None)
+    }
+
+    /// 就绪判定的目录级内核：解释器存在 + （无 requirements 文件 ∨ 哈希匹配）
+    fn is_ready_in(
+        &self,
+        venv_dir: &Path,
+        requirements: &Path,
+        backend: Option<ComputeBackend>,
+    ) -> bool {
+        let venv_python = self.python_in(venv_dir.to_path_buf());
         if !venv_python.exists() {
             return false;
         }
@@ -696,30 +799,41 @@ impl EnvManager {
             return true;
         }
 
-        let hash_file = self.deps_hash_path(module_id);
+        let hash_file = venv_dir.join(DEPS_HASH_FILE_NAME);
         if !hash_file.exists() {
             return false;
         }
 
-        // 与 ensure_venv 保持同一哈希口径（requirements + constraints + link-mode 标记，P2-18）
-        let current_hash =
-            match compute_deps_hash(requirements, self.constraints_file().as_deref()) {
-                Ok(h) => h,
-                Err(_) => return false,
-            };
+        // 与 ensure_venv_impl 保持同一哈希口径（requirements + constraints +
+        // link-mode 标记，P2-18；分后端布局额外加入 backend 名，M3）
+        let current_hash = match compute_deps_hash_seeded(
+            requirements,
+            self.constraints_file().as_deref(),
+            backend,
+        ) {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
 
         let stored = std::fs::read_to_string(&hash_file).unwrap_or_default();
         stored.trim() == current_hash
     }
 
-    /// venv 目录路径: `runtime/venvs/<module_id>/`
+    /// venv 目录路径（旧单 venv 布局）: `runtime/venvs/<module_id>/`
     fn venv_dir(&self, module_id: &str) -> PathBuf {
         self.root.join("runtime").join("venvs").join(module_id)
     }
 
-    /// 依赖哈希文件路径: `runtime/venvs/<module_id>/.ep_deps_hash`
-    fn deps_hash_path(&self, module_id: &str) -> PathBuf {
-        self.venv_dir(module_id).join(".ep_deps_hash")
+    /// 分后端 venv 目录路径（M3）: `runtime/venvs/<module-id>--<backend>/`
+    ///
+    /// 多后端依赖分歧后每模块每后端一个 venv；`--<backend>` 后缀取后端
+    /// 小写名（如 `faster-whisper--cuda`），与 module-id 的合法字符集
+    /// （小写字母/数字/连字符）不冲突。
+    pub fn venv_dir_for_backend(&self, module_id: &str, backend: ComputeBackend) -> PathBuf {
+        self.root
+            .join("runtime")
+            .join("venvs")
+            .join(format!("{module_id}--{backend}"))
     }
 
     /// 获取检测到的 python 路径
@@ -740,7 +854,7 @@ impl EnvManager {
         }
 
         let venv_dir = self.venv_dir(module_id);
-        let hash_file = venv_dir.join(".ep_deps_hash");
+        let hash_file = venv_dir.join(DEPS_HASH_FILE_NAME);
 
         // 无 hash 文件时，检查是否有 requirements 需要安装
         if !hash_file.exists() {
@@ -785,13 +899,16 @@ impl EnvManager {
 /// hardlink：缓存与 venv 同盘时硬链接去重；跨文件系统时 uv 内建自动回退 copy。
 pub const UV_LINK_MODE: &str = "hardlink";
 
+/// 依赖哈希文件名（venv 目录内，旧/新布局通用）
+const DEPS_HASH_FILE_NAME: &str = ".ep_deps_hash";
+
 /// 依赖哈希版本标记（P2-18）：把 link-mode 策略纳入哈希输入。
 ///
 /// 标记或 link-mode 策略变化会使旧 `.ep_deps_hash` 失配，触发全量重装。
 /// 注意：须与 [`UV_LINK_MODE`] 保持一致（`deps_hash_marker_covers_link_mode` 测试把关）。
 const DEPS_HASH_MARKER: &str = "ep-deps-hash:v2,link-mode=hardlink";
 
-/// 计算依赖栈哈希（P2-18 扩展）
+/// 计算依赖栈哈希（P2-18 扩展；旧单 venv 布局口径，不含 backend 名）
 ///
 /// 哈希输入 = requirements.txt 字节 + constraints 文件字节（若提供且存在）+ link-mode 版本标记。
 /// 任一输入变化（requirements 变更 / constraints 变更 / constraints 增删 / 策略标记变化）
@@ -801,6 +918,31 @@ const DEPS_HASH_MARKER: &str = "ep-deps-hash:v2,link-mode=hardlink";
 /// 仅用于检测依赖栈是否变更，不用于安全校验。
 /// 输出格式：`hash:<16位十六进制>`
 pub fn compute_deps_hash(requirements: &Path, constraints: Option<&Path>) -> Result<String> {
+    compute_deps_hash_seeded(requirements, constraints, None)
+}
+
+/// 计算依赖栈哈希——分后端口径（M3）：在 [`compute_deps_hash`] 的输入基础上
+/// 额外混入 backend 名。
+///
+/// 分后端 venv 各自持有 `.ep_deps_hash`，同一模块不同后端的依赖栈互不可替
+/// （cuda 与 rocm 的 wheel 不同的场景下，跨后端复用哈希会误判"依赖未变"）。
+pub fn compute_deps_hash_for_backend(
+    requirements: &Path,
+    constraints: Option<&Path>,
+    backend: ComputeBackend,
+) -> Result<String> {
+    compute_deps_hash_seeded(requirements, constraints, Some(backend))
+}
+
+/// 哈希内核：requirements + constraints? [+ backend 名] + 版本标记。
+///
+/// backend 名插入在 constraints 与版本标记之间——None 时输入流与历史公式
+/// 完全一致，保证既有 `.ep_deps_hash` 逐字节兼容（不触发无谓重装）。
+fn compute_deps_hash_seeded(
+    requirements: &Path,
+    constraints: Option<&Path>,
+    backend: Option<ComputeBackend>,
+) -> Result<String> {
     let mut hasher = DefaultHasher::new();
 
     let req_bytes = std::fs::read(requirements).with_context(|| {
@@ -824,8 +966,12 @@ pub fn compute_deps_hash(requirements: &Path, constraints: Option<&Path>) -> Res
         }
     }
 
-    DEPS_HASH_MARKER.hash(&mut hasher);
+    // M3：分后端布局的哈希输入加入 backend 名（小写 Display 形态）
+    if let Some(b) = backend {
+        b.to_string().hash(&mut hasher);
+    }
 
+    DEPS_HASH_MARKER.hash(&mut hasher);
     let hash_value = hasher.finish();
     Ok(format!("hash:{hash_value:016x}"))
 }
@@ -1177,7 +1323,7 @@ mod tests {
 
         // 2) 写入匹配哈希 → 就绪
         let hash = compute_deps_hash(&req, None).unwrap();
-        std::fs::write(mgr.deps_hash_path(module_id), &hash).unwrap();
+        std::fs::write(mgr.venv_dir(module_id).join(DEPS_HASH_FILE_NAME), &hash).unwrap();
         assert!(mgr.is_venv_ready(module_id, &req));
 
         // 3) requirements 变更 → 哈希失配 → 未就绪
@@ -1464,7 +1610,7 @@ mod tests {
 
         // 写入与安装口径一致的哈希 → 就绪
         let hash = compute_deps_hash(&req, mgr.constraints_file().as_deref()).unwrap();
-        std::fs::write(mgr.deps_hash_path("mod-x"), &hash).unwrap();
+        std::fs::write(mgr.venv_dir("mod-x").join(DEPS_HASH_FILE_NAME), &hash).unwrap();
         assert!(mgr.is_venv_ready("mod-x", &req), "fresh hash should be ready");
 
         // constraints 内容变更 → 需要重装
@@ -1476,7 +1622,7 @@ mod tests {
 
         // 重装完成（重写哈希）→ 就绪；requirements 变更 → 再次需要重装
         let hash2 = compute_deps_hash(&req, mgr.constraints_file().as_deref()).unwrap();
-        std::fs::write(mgr.deps_hash_path("mod-x"), &hash2).unwrap();
+        std::fs::write(mgr.venv_dir("mod-x").join(DEPS_HASH_FILE_NAME), &hash2).unwrap();
         assert!(mgr.is_venv_ready("mod-x", &req));
         std::fs::write(&req, "torch\nnumpy\n").unwrap();
         assert!(
@@ -1676,6 +1822,7 @@ mod tests {
                 runtime_type: RuntimeType::Python,
                 python_version: Some(">=3.10".into()),
                 requirements: None,
+                requirements_by_backend: Default::default(),
                 entrypoint: None,
                 start_command: None,
                 binaries: None,
@@ -1718,6 +1865,7 @@ mod tests {
                 runtime_type: RuntimeType::Python,
                 python_version: Some(">=3.10".into()),
                 requirements: Some("requirements.txt".into()),
+                requirements_by_backend: Default::default(),
                 entrypoint: None,
                 start_command: None,
                 binaries: None,
@@ -1765,6 +1913,311 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert!(result["mod-a"]); // venv 存在，无 requirements → ready
         assert!(!result["mod-b"]); // venv 不存在 → not ready
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── M3：分后端 venv 布局 / 哈希 / 旧布局兼容读取（HETERO_DIST_PLAN）────
+
+    /// 最小 EnvManager 夹具：无 python/uv/网络/缓存/constraints
+    fn per_backend_mgr(root: &std::path::Path) -> EnvManager {
+        EnvManager {
+            root: root.to_path_buf(),
+            python_path: None,
+            uv_path: None,
+            network_env: Vec::new(),
+            uv_cache_dir: String::new(),
+            constraints: String::new(),
+        }
+    }
+
+    /// 分后端目录命名：`runtime/venvs/<module-id>--<backend>/`
+    #[test]
+    fn venv_dir_for_backend_naming() {
+        let root = PathBuf::from("/app");
+        let mgr = per_backend_mgr(&root);
+        assert_eq!(
+            mgr.venv_dir_for_backend("faster-whisper", ComputeBackend::Cuda),
+            root.join("runtime")
+                .join("venvs")
+                .join("faster-whisper--cuda")
+        );
+        assert_eq!(
+            mgr.venv_dir_for_backend("rembg", ComputeBackend::OpenVINO),
+            root.join("runtime").join("venvs").join("rembg--openvino")
+        );
+        // 旧口径不受影响
+        assert_eq!(
+            mgr.venv_dir("rembg"),
+            root.join("runtime").join("venvs").join("rembg")
+        );
+    }
+
+    /// 分后端口径哈希：backend 名参与输入；None 种子与公开旧口径逐字节一致
+    #[test]
+    fn deps_hash_seeded_differs_by_backend_and_matches_legacy_api() {
+        let (dir, req, cons) = deps_hash_fixture("m3seed");
+
+        let legacy = compute_deps_hash(&req, Some(&cons)).unwrap();
+        let cuda = compute_deps_hash_for_backend(&req, Some(&cons), ComputeBackend::Cuda).unwrap();
+        let cuda_again =
+            compute_deps_hash_for_backend(&req, Some(&cons), ComputeBackend::Cuda).unwrap();
+        let rocm = compute_deps_hash_for_backend(&req, Some(&cons), ComputeBackend::Rocm).unwrap();
+
+        assert_eq!(cuda, cuda_again, "同输入必须确定性");
+        assert_ne!(cuda, rocm, "不同后端的依赖栈哈希必须可区分");
+        assert_ne!(cuda, legacy, "分后端口径不得与旧口径碰撞");
+        assert_ne!(rocm, legacy);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 旧布局兼容读取：旧单 venv 存在且旧口径哈希匹配 → 直接复用，
+    /// 不创建 `<id>--<backend>` 新目录，避免全量重建
+    #[test]
+    fn ensure_venv_for_backend_reuses_ready_legacy_venv() {
+        let root = std::env::temp_dir().join(format!("ep_m3_reuse_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let mid = "legacy-mod";
+        // 旧布局：假解释器 + 匹配旧口径哈希的依赖栈
+        let legacy_py = {
+            let venv_dir = root.join("runtime").join("venvs").join(mid);
+            let bin = if cfg!(windows) {
+                venv_dir.join("Scripts")
+            } else {
+                venv_dir.join("bin")
+            };
+            std::fs::create_dir_all(&bin).unwrap();
+            let py_name = if cfg!(windows) { "python.exe" } else { "python" };
+            let py = bin.join(py_name);
+            std::fs::write(&py, b"fake").unwrap();
+            py
+        };
+        let req = root.join("modules").join(mid).join("requirements.txt");
+        std::fs::create_dir_all(req.parent().unwrap()).unwrap();
+        std::fs::write(&req, "fastapi>=0.100.0\n").unwrap();
+
+        let mgr = per_backend_mgr(&root);
+        let hash = compute_deps_hash(&req, None).unwrap();
+        std::fs::write(
+            root.join("runtime")
+                .join("venvs")
+                .join(mid)
+                .join(DEPS_HASH_FILE_NAME),
+            &hash,
+        )
+        .unwrap();
+
+        // uv_path=None：若误入创建分支会立即报错，恰好证明兼容路径命中
+        let py = mgr
+            .ensure_venv_for_backend(mid, ">=3.10", &req, ComputeBackend::Cuda)
+            .expect("legacy-ready venv must be reused without uv");
+        assert_eq!(py, legacy_py, "应返回旧布局解释器");
+        assert!(
+            !mgr.venv_dir_for_backend(mid, ComputeBackend::Cuda).exists(),
+            "复用旧布局时不得新建分后端目录"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 旧布局存在但哈希失配（依赖已变更）→ 不得复用，转而走分后端新目录
+    /// （uv 缺失时在创建入口报错，证明目标不是旧目录）
+    #[test]
+    fn ensure_venv_for_backend_skips_stale_legacy_venv() {
+        let root = std::env::temp_dir().join(format!("ep_m3_stale_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let mid = "stale-mod";
+        let venv_dir = root.join("runtime").join("venvs").join(mid);
+        let bin = if cfg!(windows) {
+            venv_dir.join("Scripts")
+        } else {
+            venv_dir.join("bin")
+        };
+        std::fs::create_dir_all(&bin).unwrap();
+        let py_name = if cfg!(windows) { "python.exe" } else { "python" };
+        std::fs::write(bin.join(py_name), b"fake").unwrap();
+
+        let req = root.join("modules").join(mid).join("requirements.txt");
+        std::fs::create_dir_all(req.parent().unwrap()).unwrap();
+        std::fs::write(&req, "torch\n").unwrap();
+        // 写入与当前依赖栈不匹配的哈希（模拟旧依赖）
+        std::fs::write(
+            venv_dir.join(DEPS_HASH_FILE_NAME),
+            "hash:deadbeefdeadbeef",
+        )
+        .unwrap();
+
+        let mgr = per_backend_mgr(&root);
+        let err = mgr
+            .ensure_venv_for_backend(mid, ">=3.10", &req, ComputeBackend::Cuda)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("uv not found"),
+            "陈旧旧布局不得被复用，应在新建分支因缺 uv 报错: {err}"
+        );
+        assert!(
+            !mgr.venv_dir_for_backend(mid, ComputeBackend::Cuda).exists(),
+            "uv 缺失时不得留下半壳新目录"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 就绪判定：新布局（backend 口径哈希）优先；旧布局按旧口径兜底判定
+    #[test]
+    fn is_venv_ready_for_backend_new_layout_and_legacy_fallback() {
+        let root = std::env::temp_dir().join(format!("ep_m3_ready_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let mid = "ready-mod";
+        let req = root.join("modules").join(mid).join("requirements.txt");
+        std::fs::create_dir_all(req.parent().unwrap()).unwrap();
+        std::fs::write(&req, "ctranslate2\n").unwrap();
+
+        let mgr = per_backend_mgr(&root);
+
+        // 1) 什么都不存在 → false
+        assert!(!mgr.is_venv_ready_for_backend(mid, &req, ComputeBackend::Rocm));
+
+        // 2) 仅旧布局就绪（旧口径哈希）→ true（兼容读取）
+        let legacy_bin = if cfg!(windows) {
+            mgr.venv_dir(mid).join("Scripts")
+        } else {
+            mgr.venv_dir(mid).join("bin")
+        };
+        std::fs::create_dir_all(&legacy_bin).unwrap();
+        let py_name = if cfg!(windows) { "python.exe" } else { "python" };
+        std::fs::write(legacy_bin.join(py_name), b"fake").unwrap();
+        std::fs::write(
+            mgr.venv_dir(mid).join(DEPS_HASH_FILE_NAME),
+            compute_deps_hash(&req, None).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            mgr.is_venv_ready_for_backend(mid, &req, ComputeBackend::Rocm),
+            "旧布局就绪必须在 rocm 维度兼容读取为 true"
+        );
+
+        // 3) 新布局就绪（rocm 口径哈希）→ true；且此时新布局优先于旧布局
+        let new_py = {
+            let bin = if cfg!(windows) {
+                mgr.venv_dir_for_backend(mid, ComputeBackend::Rocm)
+                    .join("Scripts")
+            } else {
+                mgr.venv_dir_for_backend(mid, ComputeBackend::Rocm)
+                    .join("bin")
+            };
+            std::fs::create_dir_all(&bin).unwrap();
+            let py = bin.join(py_name);
+            std::fs::write(&py, b"fake").unwrap();
+            py
+        };
+        std::fs::write(
+            mgr.venv_dir_for_backend(mid, ComputeBackend::Rocm)
+                .join(DEPS_HASH_FILE_NAME),
+            compute_deps_hash_for_backend(&req, None, ComputeBackend::Rocm).unwrap(),
+        )
+        .unwrap();
+        assert!(mgr.is_venv_ready_for_backend(mid, &req, ComputeBackend::Rocm));
+        assert_eq!(
+            mgr.venv_python_path_for_backend(mid, ComputeBackend::Rocm),
+            new_py,
+            "新旧布局同时可用时必须优先新布局"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 新布局哈希校验（隔离场景，无旧布局可兜底）：
+    /// `.ep_deps_hash` 必须为**该 backend 口径**哈希——旧口径或其它 backend
+    /// 的哈希写入新目录时不得通过校验（M3 哈希输入加入 backend 名的意义所在）
+    #[test]
+    fn new_layout_hash_must_be_backend_scoped() {
+        let root = std::env::temp_dir().join(format!("ep_m3_scope_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let mid = "scoped-mod";
+        let req = root.join("modules").join(mid).join("requirements.txt");
+        std::fs::create_dir_all(req.parent().unwrap()).unwrap();
+        std::fs::write(&req, "onnxruntime\n").unwrap();
+
+        let mgr = per_backend_mgr(&root);
+        let py_name = if cfg!(windows) { "python.exe" } else { "python" };
+        let bin = if cfg!(windows) {
+            mgr.venv_dir_for_backend(mid, ComputeBackend::Cuda)
+                .join("Scripts")
+        } else {
+            mgr.venv_dir_for_backend(mid, ComputeBackend::Cuda)
+                .join("bin")
+        };
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join(py_name), b"fake").unwrap();
+
+        // 1) 旧口径哈希 → cuda 维度不认
+        std::fs::write(
+            mgr.venv_dir_for_backend(mid, ComputeBackend::Cuda)
+                .join(DEPS_HASH_FILE_NAME),
+            compute_deps_hash(&req, None).unwrap(),
+        )
+        .unwrap();
+        assert!(!mgr.is_venv_ready_for_backend(mid, &req, ComputeBackend::Cuda));
+
+        // 2) 其它 backend 的口径哈希 → 同样不认
+        std::fs::write(
+            mgr.venv_dir_for_backend(mid, ComputeBackend::Cuda)
+                .join(DEPS_HASH_FILE_NAME),
+            compute_deps_hash_for_backend(&req, None, ComputeBackend::Rocm).unwrap(),
+        )
+        .unwrap();
+        assert!(!mgr.is_venv_ready_for_backend(mid, &req, ComputeBackend::Cuda));
+
+        // 3) 精确匹配的 cuda 口径哈希 → 通过
+        std::fs::write(
+            mgr.venv_dir_for_backend(mid, ComputeBackend::Cuda)
+                .join(DEPS_HASH_FILE_NAME),
+            compute_deps_hash_for_backend(&req, None, ComputeBackend::Cuda).unwrap(),
+        )
+        .unwrap();
+        assert!(mgr.is_venv_ready_for_backend(mid, &req, ComputeBackend::Cuda));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 解释器路径解析顺序：新布局 > 旧布局 > 前瞻性新布局答案
+    #[test]
+    fn venv_python_path_for_backend_resolution_order() {
+        let root = std::env::temp_dir().join(format!("ep_m3_pypath_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let mid = "path-mod";
+        let backend = ComputeBackend::Vulkan;
+        let mgr = per_backend_mgr(&root);
+        let new_layout_py = if cfg!(windows) {
+            mgr.venv_dir_for_backend(mid, backend).join("Scripts").join("python.exe")
+        } else {
+            mgr.venv_dir_for_backend(mid, backend).join("bin").join("python")
+        };
+
+        // 1) 两者皆无 → 返回新布局口径（前瞻性答案）
+        assert_eq!(mgr.venv_python_path_for_backend(mid, backend), new_layout_py);
+
+        // 2) 仅旧布局存在解释器 → 兼容返回旧布局
+        let legacy_py = if cfg!(windows) {
+            mgr.venv_dir(mid).join("Scripts").join("python.exe")
+        } else {
+            mgr.venv_dir(mid).join("bin").join("python")
+        };
+        std::fs::create_dir_all(legacy_py.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_py, b"fake").unwrap();
+        assert_eq!(mgr.venv_python_path_for_backend(mid, backend), legacy_py);
+
+        // 3) 新布局出现解释器 → 新布局优先
+        std::fs::create_dir_all(new_layout_py.parent().unwrap()).unwrap();
+        std::fs::write(&new_layout_py, b"fake").unwrap();
+        assert_eq!(mgr.venv_python_path_for_backend(mid, backend), new_layout_py);
 
         let _ = std::fs::remove_dir_all(&root);
     }

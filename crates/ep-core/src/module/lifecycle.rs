@@ -10,6 +10,7 @@ use tracing::{debug, info};
 use crate::config::AppConfig;
 use crate::env::EnvManager;
 use crate::model::ModelManager;
+use crate::types::ComputeBackend;
 
 use super::discovery::DiscoveredModule;
 
@@ -54,7 +55,22 @@ impl ModuleLifecycle {
     pub fn get_readiness(
         &self,
         module: &DiscoveredModule,
+        config: &AppConfig,
+    ) -> ModuleReadiness {
+        self.get_readiness_for_backend(module, config, None)
+    }
+
+    /// [`Self::get_readiness`] 的后端感知版（HETERO_DIST_PLAN M2/M3）：
+    ///
+    /// - 依赖文件经 `runtime.resolve_requirements(backend)` 选择（per-backend
+    ///   条目优先，缺省回退 `runtime.requirements`）；
+    /// - venv 就绪判定走分后端口径 + 旧单 venv 兼容读取。
+    ///   `backend = None` 保持旧单 venv 语义。
+    pub fn get_readiness_for_backend(
+        &self,
+        module: &DiscoveredModule,
         _config: &AppConfig,
+        backend: Option<ComputeBackend>,
     ) -> ModuleReadiness {
         let manifest = match &module.manifest {
             Some(m) => m,
@@ -63,12 +79,18 @@ impl ModuleLifecycle {
 
         let module_id = &manifest.module.id;
 
-        // 检查环境
-        if manifest.runtime.requirements.is_some() {
-            let req_path = module
-                .path
-                .join(manifest.runtime.requirements.as_deref().unwrap_or("requirements.txt"));
-            if !self.env_manager.is_venv_ready(module_id, &req_path) {
+        // 声明了依赖文件（显式 requirements 或 per-backend 条目）才检查环境
+        let has_requirements = manifest.runtime.requirements.is_some()
+            || !manifest.runtime.requirements_by_backend.is_empty();
+        if has_requirements {
+            let req_path = module.path.join(manifest.runtime.resolve_requirements(backend));
+            let ready = match backend {
+                Some(b) => self
+                    .env_manager
+                    .is_venv_ready_for_backend(module_id, &req_path, b),
+                None => self.env_manager.is_venv_ready(module_id, &req_path),
+            };
+            if !ready {
                 return ModuleReadiness::MissingEnv;
             }
         }
@@ -84,10 +106,24 @@ impl ModuleLifecycle {
     }
 
     /// 编排完整生命周期：discover → validate → check_env → setup_env → check_model → download_model → ready
+    /// （旧单 venv 口径）
     pub async fn prepare_module(
         &mut self,
         module: &DiscoveredModule,
         config: &AppConfig,
+    ) -> Result<ModuleReadiness> {
+        self.prepare_module_for_backend(module, config, None).await
+    }
+
+    /// [`Self::prepare_module`] 的后端感知版（HETERO_DIST_PLAN M2/M3）：
+    ///
+    /// 依赖文件按当前 backend 选择；venv 落位 `runtime/venvs/<id>--<backend>/`
+    /// （旧布局存在且哈希匹配时兼容复用）。`backend = None` 保持旧单 venv 语义。
+    pub async fn prepare_module_for_backend(
+        &mut self,
+        module: &DiscoveredModule,
+        config: &AppConfig,
+        backend: Option<ComputeBackend>,
     ) -> Result<ModuleReadiness> {
         let manifest = match &module.manifest {
             Some(m) => m,
@@ -96,21 +132,36 @@ impl ModuleLifecycle {
 
         let module_id = &manifest.module.id;
 
-        // 1. 检查/准备环境
-        if manifest.runtime.requirements.is_some() {
-            let req_path = module
-                .path
-                .join(manifest.runtime.requirements.as_deref().unwrap_or("requirements.txt"));
+        // 1. 检查/准备环境（声明了依赖文件才需要 venv）
+        let has_requirements = manifest.runtime.requirements.is_some()
+            || !manifest.runtime.requirements_by_backend.is_empty();
+        if has_requirements {
+            let req_path = module.path.join(manifest.runtime.resolve_requirements(backend));
 
-            if !self.env_manager.is_venv_ready(module_id, &req_path) {
+            let ready = match backend {
+                Some(b) => self
+                    .env_manager
+                    .is_venv_ready_for_backend(module_id, &req_path, b),
+                None => self.env_manager.is_venv_ready(module_id, &req_path),
+            };
+            if !ready {
                 info!(module = module_id, "environment not ready, setting up");
                 let python_version = manifest
                     .runtime
                     .python_version
                     .as_deref()
                     .unwrap_or(">=3.10");
-                self.env_manager
-                    .ensure_venv(module_id, python_version, &req_path)?;
+                match backend {
+                    Some(b) => {
+                        info!(module = module_id, backend = %b, "per-backend venv");
+                        self.env_manager
+                            .ensure_venv_for_backend(module_id, python_version, &req_path, b)?;
+                    }
+                    None => {
+                        self.env_manager
+                            .ensure_venv(module_id, python_version, &req_path)?;
+                    }
+                }
             } else {
                 debug!(module = module_id, "environment already ready");
             }
@@ -124,7 +175,10 @@ impl ModuleLifecycle {
                     model = %model.id,
                     "model not present, downloading"
                 );
-                let venv_python = self.env_manager.venv_python_path(module_id);
+                let venv_python = match backend {
+                    Some(b) => self.env_manager.venv_python_path_for_backend(module_id, b),
+                    None => self.env_manager.venv_python_path(module_id),
+                };
                 self.model_manager
                     .execute_download(model, &module.path, &venv_python, config)
                     .await?;
@@ -222,6 +276,7 @@ mod tests {
                 } else {
                     None
                 },
+                requirements_by_backend: Default::default(),
                 entrypoint: Some("adapter.py".to_string()),
                 start_command: None,
                 binaries: None,

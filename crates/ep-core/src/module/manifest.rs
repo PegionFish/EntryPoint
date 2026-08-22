@@ -55,9 +55,38 @@ pub struct RuntimeConfig {
     pub runtime_type: RuntimeType,
     pub python_version: Option<String>,
     pub requirements: Option<String>,
+    /// 后端相关依赖文件（MODULE_SPEC §2.6 schema 冻结，HETERO_DIST_PLAN M2 落地消费）。
+    ///
+    /// key = 计算后端名（与 `[compute].backends` 同一词表），value = 依赖文件路径
+    /// （相对于模块目录，语义同 `runtime.requirements`）。TOML 中 inline table
+    /// 与子表两种写法等价：
+    ///
+    /// ```toml
+    /// [runtime]
+    /// requirements_by_backend = { cuda = "requirements-cuda.txt", rocm = "requirements-rocm.txt", cpu = "requirements.txt" }
+    /// ```
+    ///
+    /// 解析规则见 [`RuntimeConfig::resolve_requirements`]；未声明时为空表。
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub requirements_by_backend: HashMap<ComputeBackend, String>,
     pub entrypoint: Option<String>,
     pub start_command: Option<String>,
     pub binaries: Option<HashMap<String, String>>,
+}
+
+impl RuntimeConfig {
+    /// 按当前后端解析实际使用的依赖文件路径（§2.6 回退语义）。
+    ///
+    /// - `backend` 有对应条目且非空白 → 使用该条目；
+    /// - 否则回退 `runtime.requirements`（缺省 `"requirements.txt"`）。
+    pub fn resolve_requirements(&self, backend: Option<ComputeBackend>) -> &str {
+        let fallback = self.requirements.as_deref().unwrap_or("requirements.txt");
+        backend
+            .and_then(|b| self.requirements_by_backend.get(&b))
+            .map(String::as_str)
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or(fallback)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -852,5 +881,162 @@ type = "http"
         // 变体与模块均未声明 → None（未知）
         assert_eq!(manifest.resolve_vram_estimate("large-v3"), None);
         assert_eq!(manifest.resolve_vram_estimate("medium"), None);
+    }
+
+    // ── requirements_by_backend（§2.6 冻结 schema，HETERO_DIST_PLAN M2）────
+
+    const REQS_BY_BACKEND_TOML: &str = r#"
+[module]
+id = "video-upscale"
+name = "Video Upscale"
+version = "1.0.0"
+description = "d"
+category = "video"
+genre = "sr"
+
+[runtime]
+type = "python"
+python_version = ">=3.10,<3.13"
+requirements = "requirements.txt"
+requirements_by_backend = { cuda = "requirements-cuda.txt", rocm = "requirements-rocm.txt", openvino = "requirements-openvino.txt", directml = "requirements-directml.txt", vulkan = "requirements-vulkan.txt", cpu = "requirements.txt" }
+
+[compute]
+backends = ["cuda", "rocm", "openvino", "vulkan", "cpu"]
+
+[[models]]
+id = "x4"
+name = "X4"
+source = "url"
+url = "https://example.invalid/x4.pth"
+target_dir = "x4"
+
+[interface]
+type = "http"
+"#;
+
+    #[test]
+    fn test_parse_requirements_by_backend_inline_table() {
+        let manifest: ModuleManifest = toml::from_str(REQS_BY_BACKEND_TOML).unwrap();
+        let map = &manifest.runtime.requirements_by_backend;
+        assert_eq!(map.len(), 6, "六个后端词表键都应解析");
+        assert_eq!(
+            map.get(&ComputeBackend::Cuda).map(String::as_str),
+            Some("requirements-cuda.txt")
+        );
+        assert_eq!(
+            map.get(&ComputeBackend::Rocm).map(String::as_str),
+            Some("requirements-rocm.txt")
+        );
+        assert_eq!(
+            map.get(&ComputeBackend::OpenVINO).map(String::as_str),
+            Some("requirements-openvino.txt")
+        );
+        assert_eq!(
+            map.get(&ComputeBackend::DirectML).map(String::as_str),
+            Some("requirements-directml.txt")
+        );
+        assert_eq!(
+            map.get(&ComputeBackend::Vulkan).map(String::as_str),
+            Some("requirements-vulkan.txt")
+        );
+        assert_eq!(
+            map.get(&ComputeBackend::Cpu).map(String::as_str),
+            Some("requirements.txt")
+        );
+        assert!(manifest.validate().is_ok());
+    }
+
+    #[test]
+    fn test_requirements_by_backend_sub_table_form_equivalent() {
+        // 子表写法与 inline table 等价（TOML 语义）
+        let toml_str = REQS_BY_BACKEND_TOML.replace(
+            "requirements_by_backend = { cuda = \"requirements-cuda.txt\", rocm = \"requirements-rocm.txt\", openvino = \"requirements-openvino.txt\", directml = \"requirements-directml.txt\", vulkan = \"requirements-vulkan.txt\", cpu = \"requirements.txt\" }",
+            "[runtime.requirements_by_backend]\ncuda = \"requirements-cuda.txt\"\nrocm = \"requirements-rocm.txt\"",
+        );
+        let manifest: ModuleManifest = toml::from_str(&toml_str).unwrap();
+        assert_eq!(manifest.runtime.requirements_by_backend.len(), 2);
+        assert_eq!(
+            manifest.runtime.resolve_requirements(Some(ComputeBackend::Cuda)),
+            "requirements-cuda.txt"
+        );
+    }
+
+    #[test]
+    fn test_resolve_requirements_hit_fallback_and_default() {
+        let manifest: ModuleManifest = toml::from_str(REQS_BY_BACKEND_TOML).unwrap();
+
+        // 命中：cuda 有专属条目
+        assert_eq!(
+            manifest.runtime.resolve_requirements(Some(ComputeBackend::Cuda)),
+            "requirements-cuda.txt"
+        );
+        // None（后端未知/尚未分配）→ 回退 runtime.requirements
+        assert_eq!(
+            manifest.runtime.resolve_requirements(None),
+            "requirements.txt"
+        );
+
+        // 词表内但无条目的 backend → 回退 runtime.requirements（§2.6 回退语义）
+        let no_vulkan = REQS_BY_BACKEND_TOML.replace(
+            ", vulkan = \"requirements-vulkan.txt\"",
+            "",
+        );
+        let no_vulkan: ModuleManifest = toml::from_str(&no_vulkan).unwrap();
+        assert_eq!(
+            no_vulkan.runtime.resolve_requirements(Some(ComputeBackend::Vulkan)),
+            "requirements.txt"
+        );
+
+        // 完全未声明该字段（旧清单）→ 恒回退 requirements / 默认值
+        let legacy: ModuleManifest = toml::from_str(VALID_TOML).unwrap();
+        assert!(legacy.runtime.requirements_by_backend.is_empty());
+        assert_eq!(
+            legacy.runtime.resolve_requirements(Some(ComputeBackend::Cuda)),
+            "requirements.txt",
+            "旧清单无 per-backend 条目时必须回退 runtime.requirements"
+        );
+        assert_eq!(legacy.runtime.resolve_requirements(None), "requirements.txt");
+
+        // runtime.requirements 也未声明 → 默认 "requirements.txt"
+        let bare: ModuleManifest = toml::from_str(
+            &VALID_TOML.replace("requirements = \"requirements.txt\"\n", ""),
+        )
+        .unwrap();
+        assert_eq!(
+            bare.runtime.resolve_requirements(Some(ComputeBackend::Rocm)),
+            "requirements.txt"
+        );
+    }
+
+    #[test]
+    fn test_resolve_requirements_blank_entry_falls_back() {
+        // 空白条目视为未声明（防御第三方清单手误）
+        let toml_str = REQS_BY_BACKEND_TOML.replace(
+            "cuda = \"requirements-cuda.txt\"",
+            "cuda = \"  \"",
+        );
+        let manifest: ModuleManifest = toml::from_str(&toml_str).unwrap();
+        assert_eq!(
+            manifest.runtime.resolve_requirements(Some(ComputeBackend::Cuda)),
+            "requirements.txt"
+        );
+    }
+
+    #[test]
+    fn test_requirements_by_backend_serialization_roundtrip() {
+        // 整合包导出会序列化 manifest：字段须原样往返，且空表不落盘
+        let manifest: ModuleManifest = toml::from_str(REQS_BY_BACKEND_TOML).unwrap();
+        let serialized = toml::to_string_pretty(&manifest).unwrap();
+        let reparsed: ModuleManifest = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            reparsed.runtime.requirements_by_backend,
+            manifest.runtime.requirements_by_backend
+        );
+        assert!(serialized.contains("requirements_by_backend"));
+
+        // 旧清单（无字段）序列化后不得出现空表键
+        let legacy: ModuleManifest = toml::from_str(VALID_TOML).unwrap();
+        let legacy_ser = toml::to_string_pretty(&legacy).unwrap();
+        assert!(!legacy_ser.contains("requirements_by_backend"));
     }
 }

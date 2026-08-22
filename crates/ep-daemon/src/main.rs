@@ -447,6 +447,10 @@ fn is_timeout_exempt_path(path: &str) -> bool {
     if path == "/api/upload/input" {
         return true;
     }
+    // 模块标准档案导入（§2.3）：含原生二进制的模块包上传可能远超 300s 总时长
+    if path == "/api/modules/import" {
+        return true;
+    }
     // v1 同步推理提交（wait=true）：模型加载 + 长推理可能远超 300s 总时长
     // 上限，任务级超时语义由管线引擎（空闲看门狗/节点硬超时）负责，此处
     // 不叠加；结果查询端点（/api/v1/inference/result/）为快速读，不豁免，
@@ -980,6 +984,7 @@ mod tests {
                 tags: vec![],
             },
             runtime: RuntimeConfig {
+                requirements_by_backend: Default::default(),
                 runtime_type: RuntimeType::Native,
                 python_version: None,
                 requirements: None,
