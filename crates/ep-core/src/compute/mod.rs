@@ -14,6 +14,7 @@ pub mod cpu;
 pub mod cuda;
 pub mod directml;
 pub mod openvino;
+pub mod physical;
 pub mod rocm;
 pub mod scheduler;
 pub mod vulkan;

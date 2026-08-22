@@ -63,6 +63,26 @@ fn run_rocm_smi() -> Option<String> {
     None
 }
 
+/// 卡片字段的版本兼容取值：rocm-smi 新旧版键名大小写不一
+/// （旧 `Card series`/`Card model`，新 `Card Series`/`Device Name`），
+/// 依次尝试多个候选键（忽略大小写），返回首个非空字符串值。
+fn card_field(card: &serde_json::Value, candidates: &[&str]) -> Option<String> {
+    let obj = card.as_object()?;
+    for wanted in candidates {
+        for (key, value) in obj {
+            if key.eq_ignore_ascii_case(wanted) {
+                if let Some(s) = value.as_str() {
+                    let s = s.trim();
+                    if !s.is_empty() {
+                        return Some(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// 解析 rocm-smi JSON 输出。畸形/缺失字段一律降级为 None 或跳过。
 pub(crate) fn parse_rocm_smi_json(output: &str) -> Vec<ComputeDevice> {
     let mut devices: Vec<ComputeDevice> = Vec::new();
@@ -90,12 +110,10 @@ pub(crate) fn parse_rocm_smi_json(output: &str) -> Vec<ComputeDevice> {
     cards.sort_by_key(|(index, _)| *index);
 
     for (index, card) in cards {
-        let name = card
-            .get("Card series")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
+        // 名称兜底链：Card series(/Series) → Device Name → Card model(/Model)
+        // → AMD GPU <index>。真机教训：新版 rocm-smi 只给 `Card Series`
+        // （大写 S），仅认旧键会静默退化为通用名「AMD GPU 0」。
+        let name = card_field(card, &["Card series", "Device Name", "Card model"])
             .unwrap_or_else(|| format!("AMD GPU {index}"));
 
         let total_memory_mb = card
@@ -290,5 +308,32 @@ mod tests {
         let output = r#"{"card0": {"GPU use (%)": "150"}}"#;
         let devices = parse_rocm_smi_json(output);
         assert_eq!(devices[0].utilization, Some(100));
+    }
+
+    /// 真机（ROCm 7.x）实测形态：键名 `Card Series` 大写 S + `Device Name`，
+    /// 旧解析仅认小写 s 键导致静默退化为「AMD GPU 0」
+    #[test]
+    fn test_new_smi_key_casing_still_yields_proper_name() {
+        let output = r#"{"card0": {
+            "Device Name": "AMD Radeon RX 7900 XTX",
+            "Card Series": "AMD Radeon RX 7900 XTX",
+            "Card Model": "0x744c",
+            "GFX Version": "gfx1100"
+        }}"#;
+        let devices = parse_rocm_smi_json(output);
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "AMD Radeon RX 7900 XTX");
+    }
+
+    #[test]
+    fn test_name_fallback_chain_device_name_then_model() {
+        // 无 Card series → Device Name；再无 → Card model；全无 → AMD GPU <n>
+        let output = r#"{
+            "card0": {"Card model": "Radeon RX 7900 Series"},
+            "card1": {}
+        }"#;
+        let devices = parse_rocm_smi_json(output);
+        assert_eq!(devices[0].name, "Radeon RX 7900 Series");
+        assert_eq!(devices[1].name, "AMD GPU 1");
     }
 }
