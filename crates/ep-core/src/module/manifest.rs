@@ -887,8 +887,8 @@ type = "http"
 
     const REQS_BY_BACKEND_TOML: &str = r#"
 [module]
-id = "video-upscale"
-name = "Video Upscale"
+id = "realesr"
+name = "RealESR"
 version = "1.0.0"
 description = "d"
 category = "video"
