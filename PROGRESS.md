@@ -609,6 +609,34 @@ Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平�
 - 🔧 **libcublas 缺失修复**：CT2 静默落 CPU 致全片超 300s 节点窗 → nvidia-cublas-cu12
   wheel 硬链入 runtime/cuda-libs（LD_LIBRARY_PATH 注入链路真机确认）
 
+### 恢复后增量（同日第二轮）
+
+- ✅ **E2 openvino:NPU 平台全链**：single_device 钉 NPU.0 → `rembg--openvino` venv
+  自动构建（M2/M3 消费端落地）→ OPENVINO_DEVICE 注入 → OV EP 激活（无回落）→
+  宇航员图抠图前景 54.4%，与 iGPU 结果**二值差异率 0.0**
+- ✅ **E3 openvino:GPU.0 平台全链**：least_memory 落 GPU.0，同一输入推理完成
+- ✅ **E1 rocm 平台全链**：WS-B 补派交付（CT2 ≥4.7 Release 附 HIP wheels 的两步
+  安装法 + requirements_by_backend 接线）；宿主机补装 rocm-hip-runtime/hiprand/
+  hipblas/libomp 后，7900XTX 上 large-v3 ja 转写与 cuda 基线同文
+- 🔧 **P1-6 缺陷修复（5f915ef）**：daemon select_module_device 走的是不带
+  single_device 名称的兼容入口——`[compute].single_device` 此前静默失效，
+  E2 命中属 compatible[0] 巧合；补传名称后 rocm:0 真机钉位成功
+- 📌 **post-install 钩子缺口**：requirements_by_backend 只能选 pip 文件；
+  CT2-HIP 需"装后覆盖 Release 轮子"，当前以手动执行 setup 脚本覆盖段桥接，
+  平台侧待议 `runtime.post_install_<backend>` 或固定名脚本约定
+- M4 Vulkan 检测器真机上线：/api/devices 新增 vulkan:0 / vulkan:2
+
+### 异构矩阵记分板（G1）
+
+| 实验 | 后端×设备 | 状态 |
+|---|---|---|
+| E1 | rocm × RX 7900 XTX | ✅ 平台全链（ja 转写与 cuda 同文） |
+| E2 | openvino:NPU.0 × Core Ultra NPU | ✅ 抠图一致（diff=0.0） |
+| E3 | openvino:GPU.0 × Arrow Lake iGPU | ✅ 前景 54.4% |
+| E4 | cuda × RTX 5090 D | ✅ 全片 401 段 / 99.5% 时间轴命中 |
+| E5 | 调度矩阵 | ✅ 单元+集成绿；真机 single/least_memory 双策略实测 |
+| E6-E8 | SR/VFI 三运行时 | ⏳ 待 ncnn 引擎二进制落地（fetch-engine.sh 已备） |
+
 ### 待办（恢复工作时的接续点）
 
 1. daemon 新二进制重启未完成（暂停时中断）——重启后 E2 走平台全链：
