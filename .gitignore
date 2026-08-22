@@ -53,3 +53,7 @@ __pycache__/
 
 # 第三方 AI 工具本地目录
 .codewhale/
+
+# 本地测试媒体（真机 E2E 用，不入库）
+*.mkv
+*.ass
