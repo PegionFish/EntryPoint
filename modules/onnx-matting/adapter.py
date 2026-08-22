@@ -226,13 +226,17 @@ def _error(status_code: int, error_code: str, message: str, detail: Optional[str
 
 @app.get("/health")
 async def health():
+    # 服务级存活语义（对齐 ADAPTER_API 与 rembg 惯例）：进程+FastAPI 可服务即 200。
+    # 会话为懒加载（首次推理才建），模型就绪细节经 body.ready / /info 暴露；
+    # 若在此返回 503"loading"，daemon 健康门禁（等 2xx）与懒加载互等死锁。
     ready = bool(_sessions)
     return JSONResponse(
         content={
-            "status": "ok" if ready else "loading",
+            "status": "ok",
+            "ready": ready,
             "model": next(iter(_sessions), None),
         },
-        status_code=200 if ready else 503,
+        status_code=200,
     )
 
 

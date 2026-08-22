@@ -14,6 +14,7 @@ transformers>=4.57.0
 # torch 与 config/constraints.txt【torch 全家桶】对齐：锁 2.11.0 使 uv 在 cu130
 # 索引命中同族 +cu130 wheel。本模块无音频依赖，不需 torchaudio。
 torch==2.11.0
+torchvision==0.26.0
 
 # 官方 main.py 以 device_map="auto" 加载（依赖 accelerate）
 accelerate>=1.0.0

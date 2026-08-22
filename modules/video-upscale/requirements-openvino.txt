@@ -1,3 +1,10 @@
+# === 基础依赖（自动并入，M2 单文件语义：每后端文件必须自足）===
+# adapter 基础依赖（所有后端共享；视频处理走系统 ffmpeg）
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+python-multipart>=0.0.6
+
+# === 后端专属 ===
 # OpenVINO(ORT-OV) 路线依赖（openvino 后端）——M2 消费前手动安装
 # Intel 维护的 ORT 发行版，含 OpenVINOExecutionProvider（标准 onnxruntime wheel 不含）
 onnxruntime-openvino>=1.17

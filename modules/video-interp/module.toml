@@ -43,6 +43,7 @@ cpu = { TORCH_DEVICE = "cpu" }
 cuda = "requirements-torch.txt"
 rocm = "requirements-torch.txt"
 openvino = "requirements-openvino.txt"
+# vulkan 走 ncnn subprocess，无 python 侧专属依赖 → 回退基础 requirements.txt（§2.6 三级回退）
 
 # ---- 权重变体：ncnn param+bin（主变体，MIT；vulkan 兜底路线）----
 # 上游无独立模型包资产：nihui release 各版本均为「二进制+全部模型」整包 zip。
