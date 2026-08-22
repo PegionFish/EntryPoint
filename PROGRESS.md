@@ -637,6 +637,37 @@ Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平�
 | E5 | 调度矩阵 | ✅ 单元+集成绿；真机 single/least_memory 双策略实测 |
 | E6-E8 | SR/VFI 三运行时 | ⏳ 待 ncnn 引擎二进制落地（fetch-engine.sh 已备） |
 
+### 收官增量（同日第三轮——TODO List 清零）
+
+- ✅ **E8 平台全链**：video-upscale x4（320x240→1280x960）与 video-interp 2x
+  （30帧@15fps→60帧@30fps）经 single_device=vulkan:0 钉位完成；ncnn 子进程
+  分派 + `video-{upscale,interp}--vulkan` venv 自动构建（M2 词表扩 vulkan 后
+  首个真实消费方）
+- ✅ **新模块真机冒烟全过**：onnx-matting（BiRefNet cuda 软边抠图，前景53.4%）、
+  qwen3-asr（0.6B ja 转写与 whisper 基线同文）、firered-ocr（"Hello OCR 2026"）
+- ✅ **W3 分发闭环**：export(内附 SHA256SUMS.txt+头部哈希)→删除→import 回装
+  目录一致→运行正常；同版重导入 409 拒绝；手动解压 modules/ 自动纳管
+- ✅ **post-install 钩子机制**（4a4012a）：ensure_venv 安装后执行
+  scripts/post-install.sh（VIRTUAL_ENV+EP_BACKEND 注入、失败 fail-fast 且哈希
+  不落盘）；faster-whisper rocm 覆盖段改造为首用例
+- 🔧 冒烟暴露并修复：video 变体依赖未叠基础栈（M2 单文件语义违反）、
+  onnx-matting /health 503 与健康门禁互等死锁、firered-ocr 缺 torchvision、
+  uv 缓存 sox sdist 条目损坏、ep-pack notes 词表测试随 M4 过时（23916cd2）
+- ✅ 最终门禁：workspace **1230/1230** tests + clippy 全仓零警告
+
+### 异构矩阵终版（G1 全绿）
+
+| 实验 | 后端×设备 | 状态 |
+|---|---|---|
+| E1 | rocm × RX 7900 XTX | ✅ 平台全链 |
+| E2 | openvino:NPU.0 | ✅ diff=0.0 |
+| E3 | openvino:GPU.0 (iGPU) | ✅ |
+| E4 | cuda × RTX 5090 D | ✅ 全片 99.5% |
+| E5 | 调度矩阵 | ✅ |
+| E6 | 引擎落地 | ✅ ncnn 二进制+公版模型入位 |
+| E7 | OV ONNX SR | ⏸ 无权威 ONNX 直链（memo §1.2），501 诚实占位 |
+| E8 | vulkan 兜底 × 三卡 | ✅ upscale+interp 平台链 |
+
 ### 待办（恢复工作时的接续点）
 
 1. daemon 新二进制重启未完成（暂停时中断）——重启后 E2 走平台全链：
