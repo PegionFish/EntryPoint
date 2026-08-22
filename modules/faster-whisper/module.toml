@@ -14,6 +14,10 @@ tags = ["speech", "recognition", "multilingual", "timestamps"]
 type = "python"
 python_version = ">=3.10,<3.13"
 requirements = "requirements.txt"
+# M2/M3 接线：按当前后端选依赖文件；cpu 无条目 → 回退 requirements.txt（CPU 兜底口径）。
+# rocm 侧 ctranslate2 的占位 pin + HIP 轮子覆盖两步法见 requirements-rocm.txt 头注与
+# scripts/hetero/whisper-rocm/README.md
+requirements_by_backend = { rocm = "requirements-rocm.txt", cuda = "requirements-cuda.txt" }
 entrypoint = "adapter.py"
 start_command = "{venv_python} {MODULE_DIR}/{entrypoint}"
 
@@ -25,6 +29,11 @@ min_vram_mb = 2048
 
 [compute.env]
 cuda = { CUDA_VISIBLE_DEVICES = "{device_index}" }
+# HSA_OVERRIDE_GFX_VERSION 说明（2026-08-22 调研，证据见 scripts/hetero/whisper-rocm/README.md §3）：
+# gfx1100（RX 7900 XTX / RDNA3）无需设置——CTranslate2 官方 ROCm wheel（≥v4.7.1，pin v4.8.1）
+# 已把 gfx1100 编译为内置 GPU 内核。仅未收录架构才需 override（如 RDNA2 gfx1032 → "10.3.0"，
+# 且另需 CT2_CUDA_ALLOCATOR=cub_caching）。TOML inline table 内不支持注释，故说明置于键上方；
+# rocm 注入保持最小集。
 rocm = { HIP_VISIBLE_DEVICES = "{device_index}" }
 
 [[models]]

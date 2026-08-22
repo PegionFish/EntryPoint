@@ -1,0 +1,19 @@
+# requirements-rocm.txt — rocm 后端依赖（M2/M3：venv = runtime/venvs/faster-whisper--rocm）
+#
+# 基础依赖与 requirements.txt（CPU 兜底口径）对齐；唯一分歧是 ctranslate2 的获取方式：
+# PyPI 官方 ctranslate2 wheel 只含 CUDA 后端（无 HIP），AMD ROCm wheel 由上游在 GitHub
+# Releases 以 zip 打包分发、无 --extra-index 可用，pip 也无法直接引用 zip 内轮子。
+# 因此采用两步安装法：
+#   1) 本文件先装 PyPI ctranslate2==4.8.1（CUDA 构建占位）——保证依赖可解析 + M3 deps hash 稳定；
+#   2) scripts/hetero/whisper-rocm/setup-rocm.sh 从 Release v4.8.1 解出对应 cpXX 轮子，
+#      以 --force-reinstall 同版本覆盖为 HIP 构建。
+# 调研结论与证据：scripts/hetero/whisper-rocm/README.md
+# 注意：HIP wheel 加载还需宿主机 ROCm 库（/opt/rocm/lib/libamdhip64.so 与
+# /opt/rocm/lib/llvm/lib/libomp.so）；本机 2026-08-22 实测缺这两样，E1 前需先补装。
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+python-multipart>=0.0.6
+faster-whisper>=1.0.0
+
+# 占位 pin：必须与 setup-rocm.sh 内 CT2_ROCM_VERSION 一致（同版本覆盖安装）
+ctranslate2==4.8.1

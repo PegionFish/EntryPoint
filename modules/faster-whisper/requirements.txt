@@ -1,3 +1,9 @@
+# requirements.txt — CPU 兜底口径（backend=cpu 时经 MODULE_SPEC §2.6 回退语义使用本文件）
+# - 现状本无 cu130 extra-index，维持默认 PyPI 源：ctranslate2 默认 wheel 虽为 CUDA 12 构建，
+#   但其 GPU 运行库为懒加载，CPU 兜底机器无需 NVIDIA 驱动即可安装与运行（device="cpu" 正常），
+#   故不拆分、不引入额外索引。
+# - 注意：本文件内容变化（含本次加注释）会改变旧布局 .ep_deps_hash 输入，
+#   触发既有单 venv（runtime/venvs/faster-whisper/）重建一次。
 fastapi>=0.100.0
 uvicorn[standard]>=0.23.0
 python-multipart>=0.0.6

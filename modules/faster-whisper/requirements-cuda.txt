@@ -1,0 +1,7 @@
+# requirements-cuda.txt — cuda 后端依赖（M2/M3 拆分时自原 requirements.txt 原样迁移）
+# 内容与 CPU 兜底口径一致：PyPI ctranslate2 默认 manylinux wheel 即 CUDA 12 构建，
+# 无需 extra-index；GPU 运行库懒加载，纯 CPU 环境装它也不受影响。
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+python-multipart>=0.0.6
+faster-whisper>=1.0.0
