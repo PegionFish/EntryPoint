@@ -14,6 +14,12 @@ function backendTone(backend: string): string {
   return 'bg-muted text-muted-foreground'
 }
 
+/** 卡片展示的栈列表：后端契约保证非空；旧响应缺 stacks 时退化为单主栈 */
+function deviceStacks(device: DeviceResponse): string[] {
+  if (device.stacks && device.stacks.length > 0) return device.stacks
+  return [device.backend]
+}
+
 /** 后端 → 图标（GPU 闪电、CPU 芯片） */
 function BackendIcon({
   backend,
@@ -102,12 +108,26 @@ export function DeviceCard({ device }: DeviceCardProps) {
             {device.id}
           </p>
         </div>
-        <Badge
-          variant="outline"
-          className={cn('shrink-0 font-mono uppercase tracking-wide', tone)}
+        {/* 支持栈徽章组：一台物理设备可被多栈覆盖（如 rocm+vulkan），
+            全量展示避免同卡重复条目；主栈（id 前缀）排在首位 */}
+        <div
+          className="flex shrink-0 flex-wrap items-center justify-end gap-1"
+          title={deviceStacks(device).join(' / ')}
         >
-          {device.backend}
-        </Badge>
+          {deviceStacks(device).map((s) => (
+            <Badge
+              key={s}
+              variant="outline"
+              className={cn(
+                'font-mono uppercase tracking-wide',
+                s === device.backend ? backendTone(s) : 'bg-muted/60 text-muted-foreground',
+                deviceStacks(device).length > 2 && 'px-1.5 text-[10px]',
+              )}
+            >
+              {s}
+            </Badge>
+          ))}
+        </div>
       </CardHeader>
 
       <CardContent className="space-y-4 px-5 py-4">

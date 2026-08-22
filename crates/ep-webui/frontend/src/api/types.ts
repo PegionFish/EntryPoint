@@ -1,8 +1,11 @@
 // ===== Devices =====
 export interface DeviceResponse {
   id: string
+  /** 主后端（组内最高优先级栈），调度身份 */
   backend: string
   name: string
+  /** 覆盖该物理设备的全部计算栈（如 7900 XTX → ['rocm','vulkan']） */
+  stacks: string[]
   total_memory_mb: number | null
   used_memory_mb: number | null
   utilization: number | null

@@ -1017,8 +1017,18 @@ export function ModuleBindingEditor({ model, device, variants, devices, onChange
   const deviceValue = device && device.trim() ? device : 'auto'
   const deviceIds = devices.map((d) => d.id)
   const deviceKnown = deviceValue === 'auto' || deviceIds.includes(deviceValue)
-  // 未知设备仍列入选项（软约束：展示 + 警告，不回写清空）
-  const deviceOptions = deviceKnown ? deviceIds : [...deviceIds, deviceValue]
+  // 未知设备仍列入选项（软约束：展示 + 警告，不回写清空）。
+  // 选项展示「设备名 + 支持栈」：物理归并后条目即物理卡，名称比裸 id 更可读
+  const deviceOptions: { value: string; label?: string; stacks?: string[] }[] = [
+    ...devices.map((d) => ({
+      value: d.id,
+      label: d.name !== d.id ? d.name : undefined,
+      stacks: d.stacks?.length ? d.stacks : undefined,
+    })),
+  ]
+  if (!deviceKnown) {
+    deviceOptions.unshift({ value: deviceValue })
+  }
 
   return (
     <div className="space-y-3">
@@ -1063,8 +1073,16 @@ export function ModuleBindingEditor({ model, device, variants, devices, onChange
               {tc('pipeline.module.deviceAuto', { defaultValue: 'auto（调度器自动分配）' })}
             </SelectItem>
             {deviceOptions.map((d) => (
-              <SelectItem key={d} value={d} className="text-xs">
-                <span className="font-mono">{d}</span>
+              <SelectItem key={d.value} value={d.value} className="text-xs">
+                <span className="flex items-baseline gap-2">
+                  <span className="font-mono">{d.value}</span>
+                  {d.label && <span className="truncate text-muted-foreground">{d.label}</span>}
+                  {d.stacks && d.stacks.length > 1 && (
+                    <span className="ml-auto font-mono text-[10px] uppercase text-muted-foreground/70">
+                      {d.stacks.join('+')}
+                    </span>
+                  )}
+                </span>
               </SelectItem>
             ))}
           </SelectContent>

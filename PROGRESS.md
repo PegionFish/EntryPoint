@@ -668,6 +668,22 @@ Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平�
 | E7 | OV ONNX SR | ⏸ 无权威 ONNX 直链（memo §1.2），501 诚实占位 |
 | E8 | vulkan 兜底 × 三卡 | ✅ upscale+interp 平台链 |
 
+### 追加（同日第四轮——仪表板设备归并）
+
+- 🔧 **ROCm 键名漂移修复**：新版 rocm-smi 输出 `Card Series`/`Device Name`
+  （大写 S），旧解析仅认 `Card series` → 静默退化通用名「AMD GPU 0」；
+  现按忽略大小写多候选键解析（Card series→Device Name→Card model→兜底）
+- ✨ **跨栈物理设备归并**（ep-core::compute::physical，纯函数）：同一物理卡
+  的多栈视图折叠为一条目——匹配规则保守优先：Cpu/NPU 不参与、厂商类别须
+  一致、核心名（剥圆括号尾注；方括号是 OpenVINO 家族锚点仅去字符）
+  词集互含或 `AMD GPU <n>` 兜底名厂商级通配；每组每后端至多吸收一成员
+  （双卡同型防误并）。调度器消费的 state.devices 保持逐栈条目不变，
+  仅 /api/devices 显示层折叠并新增 `stacks` 字段（如 ["rocm","vulkan"]）；
+  展示名取括号剥离后词数最多者（专有名优先于通用名）
+- ✨ 前端 DeviceCard 渲染栈徽章组（主栈高亮）、管线节点设备下拉升级为
+  「id + 设备名 + 多栈提示」
+- 真机效果：7 条目 → 5 条目，7900 XTX 与 iGPU 各归一处且栈覆盖一目了然
+
 ### 待办（恢复工作时的接续点）
 
 1. daemon 新二进制重启未完成（暂停时中断）——重启后 E2 走平台全链：

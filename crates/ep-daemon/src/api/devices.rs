@@ -17,28 +17,48 @@ pub fn router() -> Router<Arc<AppState>> {
 }
 
 /// Serializable view of a compute device returned by the API.
+///
+/// 一个条目 = 一台**物理设备**：`id`/`backend`/指标取组内主成员（最高优先级
+/// 后端），`stacks` 列出该物理卡被哪些计算栈覆盖（如 7900 XTX →
+/// `["rocm","vulkan"]`）。跨栈归并逻辑见 `ep_core::compute::physical`。
 #[derive(Debug, Serialize)]
 pub(crate) struct DeviceResponse {
     id: String,
     backend: String,
     name: String,
+    stacks: Vec<String>,
     total_memory_mb: Option<u32>,
     used_memory_mb: Option<u32>,
     utilization: Option<u8>,
     temperature: Option<u8>,
 }
 
-impl From<&ComputeDevice> for DeviceResponse {
-    fn from(d: &ComputeDevice) -> Self {
+impl DeviceResponse {
+    /// 单设备视图（无跨栈别名时退化为自身单栈）
+    fn from_device(d: &ComputeDevice) -> Self {
         Self {
             id: d.id.to_string(),
             backend: d.backend.to_string(),
             name: d.name.clone(),
+            stacks: vec![d.backend.to_string()],
             total_memory_mb: d.total_memory_mb,
             used_memory_mb: d.used_memory_mb,
             utilization: d.utilization,
             temperature: d.temperature,
         }
+    }
+
+    /// 物理归并视图：身份/指标取主成员，名字取最具描述性成员，栈列表为全成员并集
+    fn from_group(all: &[ComputeDevice], group: &ep_core::compute::physical::PhysicalGroup) -> Self {
+        let primary = &all[group.primary];
+        let mut resp = Self::from_device(primary);
+        resp.name = ep_core::compute::physical::display_name(all, group).to_string();
+        resp.stacks = group
+            .members
+            .iter()
+            .map(|&m| all[m].backend.to_string())
+            .collect();
+        resp
     }
 }
 
@@ -46,7 +66,13 @@ pub async fn list_devices(
     State(state): State<Arc<AppState>>,
 ) -> Json<Vec<DeviceResponse>> {
     let devices = state.devices.read().await;
-    let resp: Vec<DeviceResponse> = devices.iter().map(DeviceResponse::from).collect();
+    // 显示层物理归并：同一物理适配器的多栈视图折叠为单条目；
+    // 调度器消费的 state.devices 保持逐栈条目不变
+    let groups = ep_core::compute::physical::group_physical_devices(&devices);
+    let resp: Vec<DeviceResponse> = groups
+        .iter()
+        .map(|g| DeviceResponse::from_group(&devices, g))
+        .collect();
     Json(resp)
 }
 
@@ -124,6 +150,7 @@ mod tests {
         assert_eq!(arr[0]["id"], "cuda:0");
         assert_eq!(arr[0]["backend"], "cuda");
         assert_eq!(arr[0]["name"], "Test GPU");
+        assert_eq!(arr[0]["stacks"], serde_json::json!(["cuda"]));
         assert_eq!(arr[0]["total_memory_mb"], 24576);
         assert_eq!(arr[0]["used_memory_mb"], 1024);
         assert_eq!(arr[0]["utilization"], 42);
@@ -142,5 +169,45 @@ mod tests {
     async fn list_devices_empty_returns_empty_array() {
         let body = get_devices(devices_state(vec![])).await;
         assert_eq!(body, serde_json::json!([]));
+    }
+
+    // 物理归并：同一物理卡的多栈视图（rocm + vulkan）折叠为单条目，
+    // 主身份取最高优先级后端，stacks 列全量覆盖栈，名字取最具描述性者。
+    #[tokio::test]
+    async fn list_devices_merges_cross_stack_views_of_one_gpu() {
+        let devices = vec![
+            ComputeDevice {
+                id: DeviceId::Rocm(0),
+                backend: ComputeBackend::Rocm,
+                name: "AMD GPU 0".into(), // rocm-smi 兜底名（旧版键名缺失）
+                total_memory_mb: Some(24563),
+                used_memory_mb: Some(536),
+                utilization: Some(23),
+                temperature: Some(41),
+            },
+            ComputeDevice {
+                id: DeviceId::Vulkan(2),
+                backend: ComputeBackend::Vulkan,
+                name: "AMD Radeon RX 7900 XTX (RADV NAVI31)".into(),
+                total_memory_mb: None,
+                used_memory_mb: None,
+                utilization: None,
+                temperature: None,
+            },
+        ];
+        let body = get_devices(devices_state(devices)).await;
+        let arr = body.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "两条目归并为一个物理设备");
+        assert_eq!(arr[0]["id"], "rocm:0", "主成员 = 最高优先级后端");
+        assert_eq!(arr[0]["backend"], "rocm");
+        assert_eq!(arr[0]["stacks"], serde_json::json!(["rocm", "vulkan"]));
+        assert_eq!(
+            arr[0]["name"],
+            "AMD Radeon RX 7900 XTX (RADV NAVI31)",
+            "展示名修复：不再显示通用名 AMD GPU 0"
+        );
+        // 指标仍来自带数据源的主成员（rocm-smi）
+        assert_eq!(arr[0]["total_memory_mb"], 24563);
+        assert_eq!(arr[0]["utilization"], 23);
     }
 }
