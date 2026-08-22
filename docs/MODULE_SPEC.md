@@ -322,6 +322,24 @@ requirements_by_backend = { cuda = "requirements-cuda.txt", rocm = "requirements
 | value | 依赖文件路径（相对于模块目录），语义同 `runtime.requirements` |
 | 回退 | 当前后端无对应条目 → 使用 `runtime.requirements`（默认 `requirements.txt`） |
 
+**post-install 钩子**（v1.3-draft，HETERO_DIST_PLAN 契约缺口补全）：
+模块目录内可选提供固定名脚本 `scripts/post-install.sh`，供"pip 安装完成后还需
+后处理"的依赖场景使用——典型如 CTranslate2-ROCm 的两步安装法：先装 PyPI 占位
+pin，再以官方 Release 的 HIP 轮子同版本覆盖（真实用例：
+`modules/faster-whisper/scripts/post-install.sh`，改造自
+`scripts/hetero/whisper-rocm/setup-rocm.sh` 的覆盖段）。
+
+| 约束 | 说明 |
+|---|---|
+| 触发时机 | `uv pip install` 实际执行后、`.ep_deps_hash` 落盘前；依赖未变的重入不触发 |
+| 环境变量 | 注入 `VIRTUAL_ENV=<venv 目录>`、`EP_BACKEND=<backend 小写名>`（旧单 venv 口径为空串）；继承宿主其余环境 |
+| 缺失行为 | 脚本不存在 → 静默跳过 |
+| 失败行为 | 非零退出/超时 → 整体 `ensure_venv` 报错且哈希不落盘：半成品依赖栈不得被哈希锁定（fail-fast，下次进入自动重装并重跑钩子） |
+| 执行方式 | Unix 经 `bash` 解释执行（不要求可执行位）；Windows 以同名 `.cmd`/`.bat` 存在性探测执行（落地待定稿） |
+
+钩子成功才算环境就绪：哈希落盘即代表"依赖安装 + 后处理"完整完成，
+故钩子自身须幂等可重入。
+
 **venv 命名演进方向**（与 requirements_by_backend 配套，W1 随 M3 一并落地）：
 多后端依赖分歧后，venv 目录将从现状 `runtime/venvs/<module-id>/` 演进为
 `runtime/venvs/<module>--<backend>/`（每模块每后端一个 venv）。现有单 venv
