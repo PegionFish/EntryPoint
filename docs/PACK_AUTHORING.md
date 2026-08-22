@@ -255,3 +255,41 @@ ep-pack build my-kit -o my-kit-1.0.0.epzip   # 4. 出包（CHECKSUMS 自动生�
 - [ ] `[compute].backends` 反映真实支持面，`notes` 写清额外依赖
 - [ ] `ep-pack validate` 全绿后再 `build`
 - [ ] 发布附言：依赖模块清单、权重许可、适配提示
+
+---
+
+## 10. 模块的标准压缩包分发（v1.3-draft 增补）
+
+> 本节面向**模块作者**（分发 `modules/<id>/` 目录），与上文整合包（`.epzip`）是
+> 两条独立通道。设计依据：HETERO_DIST_PLAN §2.2（分发载体）与 §2.3（平台导入/
+> 导出 API）。
+
+**不存在 `.epmod` 式自定义格式。** 历史上的 `.epmod` 提案已撤销（HETERO_DIST_PLAN
+v2 变更）：模块分发一律采用**标准压缩档案**——`modules/<module-id>/` 目录本身就是
+分发单元，打成 zip 或 tar.gz 即为发布物；任何"根部含一个 `module.toml`"的标准
+压缩包都可被平台导入。不引入专有扩展名、专有清单或专用工具链。
+（`.epzip` 整合包为已交付的历史功能，维持现状、不扩散，见 §1–§9。）
+
+发布物清单：
+
+```
+<module-id>-<version>.zip        ← 内容即 modules/<module-id>/ 目录本身
+<module-id>-<version>.tar.gz     ← 同内容第二格式，按平台习惯二选一亦可
+SHA256SUMS.txt                   ← 全部发布物的 sha256 清单（sha256sum -c 可验）
+```
+
+- 包内布局 = MODULE_SPEC §1 模块目录结构，`module.toml` 位于包根（或唯一一级目录下）；
+- 完整性交给用户侧工具链：发布侧出 SHA256SUMS.txt，用户自行校验；
+- 权重一律不随包（HETERO_DIST_PLAN §2.4 三级策略）；Tier B/C 模型在 module.toml
+  的 `[distribution]` 中声明 `license_note` / `guide_url`（MODULE_SPEC §2.2）。
+
+用户获取路径（三选一，HETERO_DIST_PLAN §2.1）：
+
+| 路径 | 说明 |
+|---|---|
+| a. WebUI 导入页上传 | 上传压缩包 → 服务端安全解包校验后落位 |
+| b. 下载 + URL/上传导入 | 自行从 GitHub Releases 等渠道下载压缩包，经 WebUI/API 上传或 `import-url` 直链导入 |
+| c. 完全手动解压 | 解压到 `modules/<id>/` → 刷新识别（poweruser 首选，一等公民路径） |
+
+托管建议：GitHub Release 挂上述三个文件即可；EntryPoint 不运营商店/注册表，
+发现与传播由作者自选渠道负责。

@@ -127,27 +127,32 @@ SHA256SUMS.txt                      ← 全部发布物的 sha256 清单（标�
 | **Tier B 引导下载** | 许可允许分发但需署名/限定用途，或有更稳的官方源 | WebUI 模型页正常展示下载按钮 + 许可提示 | `[[models]]` + 新字段 `[models].license_note` |
 | **Tier C 手动指引** | 不可再分发 / 注册制下载 / 专有 | 模块卡片显示"手动安装指引"，用户自行放置目录后点"扫描导入"（本地导入路径已有） | `[[models]] guide_url` 或 README 章节 + `/info` 返回指引文本 |
 
-### 2.5 许可证合规矩阵（初始判定，WS-G 代理逐项核实）
+### 2.5 许可证合规矩阵（WS-G 逐项核实，2026-08-22 回填完毕——零"待核"残留）
+
+> 2026-08-22 WS-G 回填：原「待核」条目全部落定，每行附一句话依据与指向
+> [reports/license-matrix.md](../reports/license-matrix.md) 对应锚点的证据卡。
+> 两处初稿判断被一手证据推翻：CAIN 原仓（2021-10 起）与 DAIN（2019-03 起）实际均带 MIT
+> LICENSE；SRMD 由"C 疑似研究限制"从严修正为"排除（仓库零许可文本＝权利保留）"。
 
 | 模型族 | 上游许可 | 初判层级 | 备注 |
 |---|---|---|---|
 | U²-Net (u2net) | Apache-2.0 | A | xuebinqin |
-| ISNet (isnet-general-use) | 待核 | B→A? | DIS 仓库代码与权重许可需分别核 |
+| ISNet (isnet-general-use) | 代码 Apache-2.0（已核）；权重未逐字授权 | **B** | DIS Term of Use 仅明示覆盖代码/评测指标；isnet-general-use.pth 经官方网盘外链分发 → 引导下载不捆绑（[证据卡](../reports/license-matrix.md#isnet-dis)） |
 | BiRefNet | MIT | A | ZhengPeng7 |
-| GFPGAN 1.4 | 待核 | B | Apache/BSD 需核权重条款 |
-| RMBG-1.4 (briaai) | 非商业 | C | 仅个人/研究场景引导 |
-| Qwen3-ASR / ForcedAligner | Apache-2.0（Qwen 系惯例） | A | 以仓库 LICENSE 核实为准 |
-| FireRed-OCR | Apache-2.0（待核） | A | FireRedTeam |
+| GFPGAN 1.4 | Apache-2.0（腾讯声明式，SPDX NOASSERTION） | **A**（上调） | LICENSE 头部逐字："GFPGAN is licensed under the Apache License Version 2.0 except for the third-party components listed below"；GFPGANv1/v1.3/v1.4.pth 为同仓库 GitHub Release 资产、无附加限制 → 可捆绑，随包保留许可文本与第三方清单（[证据卡](../reports/license-matrix.md#gfpgan)） |
+| RMBG-1.4 (briaai) | bria-rmbg-1.4 定制许可（条款原文已核） | **C** | 模型卡逐字确认："Creative Commons license for non-commercial use"+"Commercial use is subject to a commercial agreement with BRIA"；HF gated → 仅个人/研究场景手动指引（[证据卡](../reports/license-matrix.md#rmbg-14)） |
+| Qwen3-ASR / ForcedAligner | Apache-2.0（已核：HF 卡片标注 + GitHub 同许可） | **A** | ASR-0.6B/1.7B 与 ForcedAligner-0.6B 三仓卡片均 `License: apache-2.0`、无 gated；双源 HF/ModelScope（[证据卡](../reports/license-matrix.md#qwen3-asr)） |
+| FireRed-OCR | Apache-2.0（已核） | **A** | GitHub LICENSE.txt = Apache-2.0 全文，且 HF 卡片逐字明示 "The code and the weights of FireRed-OCR are licensed under Apache 2.0."（[证据卡](../reports/license-matrix.md#firered-ocr)） |
 | Whisper CT2 权重（Systran） | MIT | A | 已在用 |
 | **waifu2x** cunet/upconv noise0-3 | MIT | A | nagadomi；包内命名与上游一致 |
 | **Real-CUGAN** se/pro/nose up2x-denoise0-3x | MIT | A | bilibili/ailab；公版 |
 | **Real-ESRGAN 官方系** x4plus / x4plus-anime / animevideov3 x2-x4 / general-x4v3(+wdn) / animevideo-xsx2/xsx4 | BSD-3-Clause | A | xinntao；仅取官方名，排除 -W2xEX 自训 |
-| **RIFE v2→v4.26 全系（含 lite/large）** | **MIT（已核实）** | A | Practical-RIFE 声明"链接内容同项目 MIT"；DeepWiki 复核"所有 RIFE 模型 MIT，可自由再分发" |
-| IFRNet S/L GoPro/Vimeo90K | 待核 | B | FengyangPang/IFRNet 许可核实中 |
-| CAIN | 待核 | B | 原仓库历史无明确许可，nihui 移植版注明模型归原作者 |
-| DAIN | 待核 | C | baowenbo/DAIN 历史无 LICENSE 文件，风险高 |
-| RealSR DF2K | 待核 | B | jixiaozhong/Real-SR 许可核实中 |
-| SRMD x2/x3/x4 (+nf) | 待核 | C | 疑似研究用途限制 |
+| **RIFE v2→v4.26 全系（含 lite/large）** | **MIT（已核实）** | A | README 逐字声明 "The content of these links is under the same MIT license as this project."；LICENSE 原文链接见[证据卡](../reports/license-matrix.md#practical-rife) |
+| IFRNet S/L GoPro/Vimeo90K | MIT（代码已核）；权重未逐字授权 | **B** | 官方仓实为 ltkong218/IFRNet（任务书所写 FengyangPang 地址已 404），LICENSE=MIT (c)2022 Lingtong Kong；权重 Dropbox 外链无逐字声明 → 引导下载或 nihui 移植版兜底（[证据卡](../reports/license-matrix.md#ifrnet)） |
+| CAIN | MIT（2021-10 起在库，已核原文与提交日期） | **B** | 推翻初稿"历史无明确许可"：LICENSE (c)2021 Myungsub Choi 自 2021-10-06 即入库；torch 权重 Dropbox 外链 → 引导下载；nihui/cain-ncnn-vulkan 为 MIT 且 Release 自带转换模型 → ncnn 变体可直接再分发（[证据卡](../reports/license-matrix.md#cain)） |
+| DAIN | MIT（2019-03 起在库，已核原文与提交日期） | **B** | 推翻初稿"历史无 LICENSE 文件"：LICENSE (c)2019 Wenbo Bao 自 2019-03-22 即入库；权重 best.pth 在作者校园服务器外链 → 引导下载不捆绑，需备地址失效降级文案（[证据卡](../reports/license-matrix.md#dain)） |
+| RealSR DF2K | Apache-2.0（腾讯声明式，已核双许可文件） | **B** | jixiaozhong/Real-SR 已 301 迁移至 Tencent/Real-SR；LICENSE_RealSR=Apache-2.0+BasicSR 清单；权重 DF2K/DPED/DF2K-JPEG 均 GDrive 外链 → 引导官方源或 nihui realsr-ncnn-vulkan（[证据卡](../reports/license-matrix.md#realsr)） |
+| SRMD x2/x3/x4 (+nf) | 无任何 LICENSE（已核仓库根目录与 API 元数据） | **排除** | 从严修正初判"疑似研究限制"：cszn/SRMD 零许可文本＝默认权利保留；KAIR 的 MIT 仅覆盖工具箱代码不构成权重授权；SR 槽位已由公版全覆盖 → 不采纳、不引导（[证据卡](../reports/license-matrix.md#srmd)） |
 | W2xEX 作者自训系列（Omni-* / Photo-* / Anime-HQ / Universal-Fast / AnimeVideo-Mini 等） | 不明（作者自训产物） | **排除** | 包内 HTMLs/EsrganModelIntro 文档自证为作者训练；不采纳、不引导下载 |
 
 > 规则：凡"待核"条目，在核实完成前一律按更高限制层级对待；核实结论回写本表并附证据链接。
@@ -166,9 +171,9 @@ SHA256SUMS.txt                      ← 全部发布物的 sha256 清单（标�
 | `rembg`（增强） | 现有模块 | ONNX Runtime | cpu, **openvino**(新) | A（u2net）/B(isnet) | P0 |
 | `onnx-matting`(新) | FaceFusion 包 ONNX 提炼（birefnet_general/portrait） | ONNX Runtime 多 EP | cpu, cuda, openvino, (directml) | A（BiRefNet MIT） | P1 |
 | `qwen3-asr`(新) | Qwen3ASR/qwen-asr-0.6B/1.7B + ForcedAligner | torch + qwen_asr | cuda, cpu（rocm 观察） | A | P1 |
-| `firered-ocr`(新) | FireRed-OCR | torch transformers | cuda, cpu | A（待核） | P2 |
+| `firered-ocr`(新) | FireRed-OCR（Qwen3-VL-2B 微调） | torch transformers | cuda, cpu | A（Apache-2.0 已核，权重同许可） | P2 |
 | `video-upscale`(新，核心) | 公版 Real-ESRGAN / waifu2x / Real-CUGAN | **torch(cuda/rocm) 主 + OV-ONNX(intel) + ncnn-vulkan 兜底** | cuda, rocm, openvino, vulkan(备选), cpu | A（BSD-3/MIT） | **P0** |
-| `video-interp`(新，核心) | 公版 RIFE 全系（MIT 已核实）/ IFRNet | 同上分层策略 | cuda, rocm, openvino, vulkan(备选), cpu | A（RIFE）/ B（IFRNet 待核） | **P0** |
+| `video-interp`(新，核心) | 公版 RIFE 全系（MIT 已核实）/ IFRNet | 同上分层策略 | cuda, rocm, openvino, vulkan(备选), cpu | A（RIFE）/ B（IFRNet，MIT 代码+权重外链 Dropbox） | **P0** |
 
 > 视频超分与插帧为核心需求。运行时分层策略（用户定案）：**厂商栈优先**——
 > CUDA/ROCm 走官方 torch 权重（xinntao .pth、RIFE .pkl，各自原生推理路径），
@@ -189,7 +194,7 @@ SHA256SUMS.txt                      ← 全部发布物的 sha256 清单（标�
 | 照片/通用 SR | realesrgan-x4plus(-anime)、realesr-general-x4v3(+wdn) | xinntao (BSD-3) |
 | **视频 SR（核心）** | RealESRGANv2-animevideo-xsx2/xsx4、realesr-animevideov3-x2/x3/x4 | xinntao (BSD-3) |
 | **插帧 VFI（核心）** | RIFE v2→v4.26 全系含 lite/large（contextnet/flownet/fusionnet 命名与 nihui 发布一致） | hzwer Practical-RIFE (**MIT 已核实**) |
-| 备选 VFI | IFRNet S/L GoPro/Vimeo90K | FengyangPang (待核) |
+| 备选 VFI | IFRNet S/L GoPro/Vimeo90K | ltkong218/IFRNet（MIT；权重 Dropbox 外链→Tier B） |
 
 **❌ 作者自训排除（-W2xEX / -W4xEX 后缀，包内文档自证为作者训练产物）：**
 Omni-MiniV2 / Omni-Smallv2 / Omni-TurboV1.5 / Universal-FastV2-W2xEX、

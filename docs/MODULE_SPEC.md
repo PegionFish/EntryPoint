@@ -1,6 +1,12 @@
 # 模块接入规范 (Module Specification)
 
-> 版本：1.2 | 适用于 EntryPoint v0.x
+> 版本：1.3-draft | 适用于 EntryPoint v0.x
+>
+> v1.3-draft 变更（W1 WS-G 契约增补；**未实现冻结**——字段与词表先行定义，
+> 消费逻辑随 W1 各实现流落地）：§2.2 新增可选节 `[distribution]`
+> （`license_note` / `guide_url`，Tier B/C 权重展示用）；§2.3 `backends` 词表
+> 新增 `vulkan` 备选后端；§2.6 `requirements_by_backend` 状态由"本期不实现"
+> 更新为"W1 落地消费（HETERO_DIST_PLAN M2/M3）"，schema 冻结描述不变。
 >
 > v1.2 变更（PACK_UNIFY_PLAN §4.3/§7）：`[[models]]` 新增 `qualified_id` 与
 > 变体级 `vram_estimate_mb`（§2.4）；`[runtime] requirements_by_backend` schema
@@ -100,6 +106,26 @@ modules/<module-id>/
 | `{input}` | CLI 输入文件路径（type=native, interface=cli） | `.../workspace/task-1/input.wav` |
 | `{output}` | CLI 输出文件路径（type=native, interface=cli） | `.../workspace/task-1/output.wav` |
 
+#### `[distribution]` — 分发与许可元数据（可选，v1.3-draft 新增，未实现冻结）
+
+Tier B/C 权重的展示用元数据（分级定义见 HETERO_DIST_PLAN §2.4 三级策略）：
+平台仅在模块卡片 / 模型详情页渲染这两个字段，**不做任何逻辑校验**；
+Tier A 权重无需声明本节。
+
+```toml
+[distribution]
+license_note = "ISNet 权重由 DIS 项目经官方渠道分发，代码 Apache-2.0；权重许可以仓库 Term of Use 为准"
+guide_url = "https://github.com/xuebinqin/DIS#7-term-of-use"
+```
+
+| 字段 | 类型 | 必须 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `license_note` | string | ❌ | — | 一句话许可提示（展示用）。Tier B：随下载按钮显示的许可说明；Tier C：手动安装前提说明 |
+| `guide_url` | string | ❌ | — | 手动获取指引链接。指向上游模型发布页/条款页；模块 README 亦应包含等价指引章节 |
+
+> 合规纪律：模块压缩包内永不携带 Tier B/C 权重（HETERO_DIST_PLAN §2.4）；逐模型族
+> 的核实结论与证据见 reports/license-matrix.md。
+
 #### `[runtime.binaries]` — 原生二进制路径（type=native 时必须）
 
 按 `<os>-<arch>` 为 key：
@@ -130,6 +156,7 @@ linux-aarch64 = "bin/linux-aarch64/deep-filter"
 | `rocm` | AMD GPU | `HIP_VISIBLE_DEVICES={device_index}` |
 | `openvino` | Intel CPU/GPU/NPU | `OPENVINO_DEVICE={device_name}` |
 | `directml` | Windows 通用 GPU | 由 ONNX Runtime 管理 |
+| `vulkan` | 备选通用 GPU 后端（v1.3-draft 新增）：厂商栈（cuda/rocm/openvino）均不可用时的兜底路径，典型载体为 ncnn-vulkan 类引擎；由调度器经 `vulkaninfo` 探测检出，优先级置于 openvino 之后、cpu 之前（HETERO_DIST_PLAN M4） | 无标准注入（Vulkan 设备由模块自行枚举） |
 | `cpu` | 纯 CPU（始终可用） | 无 |
 
 #### `[compute.env]` — 自定义环境变量覆盖（可选）
@@ -275,12 +302,12 @@ vad_filter = { type = "boolean", default = true, description = "启用 VAD 过�
 | `boolean` | — | 布尔 |
 | `select` | `options` (string[]) | 下拉选择 |
 
-### 2.6 `[runtime] requirements_by_backend` — 后端相关依赖（schema 冻结，本期不实现）
+### 2.6 `[runtime] requirements_by_backend` — 后端相关依赖（schema 冻结；W1 落地消费）
 
-> **状态**：PACK_UNIFY_PLAN §7/§4.6 决策——本字段**本次只冻结 schema，不实现**。
-> 清单解析对其保持宽容（出现时忽略不报错）；消费逻辑（按当前后端选择依赖文件、
-> 与 backend 维度的依赖哈希联动）留待后续版本。依赖层现状：venv 按平台重建，
-> 整合包以 `[compute].notes` 给出后端依赖提示。
+> **状态**：PACK_UNIFY_PLAN §7/§4.6 决策的 **schema 冻结描述保持不变**；
+> `requirements_by_backend` 由"本期不实现"调整为 **W1 落地消费**——按当前后端
+> 选择依赖文件、与 backend 维度的依赖哈希联动，见 HETERO_DIST_PLAN M2/M3。
+> 依赖层现状补充：整合包以 `[compute].notes` 给出后端依赖提示。
 
 schema 形状（冻结）：
 
@@ -291,14 +318,14 @@ requirements_by_backend = { cuda = "requirements-cuda.txt", rocm = "requirements
 
 | 约束 | 说明 |
 |---|---|
-| key | 计算后端名（`cuda` / `rocm` / `openvino` / `directml` / `cpu`），与 `[compute].backends` 同一词表 |
+| key | 计算后端名（`cuda` / `rocm` / `openvino` / `directml` / `vulkan` / `cpu`），与 `[compute].backends` 同一词表（§2.3，含 v1.3-draft 新增的 vulkan） |
 | value | 依赖文件路径（相对于模块目录），语义同 `runtime.requirements` |
 | 回退 | 当前后端无对应条目 → 使用 `runtime.requirements`（默认 `requirements.txt`） |
 
-**venv 命名演进方向**（与 requirements_by_backend 配套，本期同样不实现）：
+**venv 命名演进方向**（与 requirements_by_backend 配套，W1 随 M3 一并落地）：
 多后端依赖分歧后，venv 目录将从现状 `runtime/venvs/<module-id>/` 演进为
 `runtime/venvs/<module>--<backend>/`（每模块每后端一个 venv）。现有单 venv
-布局与 `.ep_deps_hash` / `ep.lock` 语义保持不变，迁移由未来版本处理。
+布局与 `.ep_deps_hash` / `ep.lock` 语义保持不变，旧单 venv 兼容读取。
 
 ---
 
