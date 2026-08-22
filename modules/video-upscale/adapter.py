@@ -135,9 +135,10 @@ def _probe_video(path: Path) -> dict:
 def _extract_frames(video: Path, frames_dir: Path) -> int:
     """无损抽帧为 %08d.png，返回总帧数。"""
     frames_dir.mkdir(parents=True, exist_ok=True)
+    # ffmpeg>=7 移除 -vsync，改用 -fps_mode passthrough（等价 vsync=0）
     _run([
         "ffmpeg", "-hide_banner", "-y", "-i", str(video),
-        "-vsync", "0", "-start_number", "0",
+        "-fps_mode", "passthrough", "-start_number", "0",
         str(frames_dir / "%08d.png"),
     ], timeout=None)
     count = len(list(frames_dir.glob("*.png")))

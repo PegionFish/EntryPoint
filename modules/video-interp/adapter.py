@@ -132,9 +132,10 @@ def _probe_video(path: Path) -> dict:
 
 def _extract_frames(video: Path, frames_dir: Path) -> int:
     frames_dir.mkdir(parents=True, exist_ok=True)
+    # ffmpeg>=7 移除 -vsync，改用 -fps_mode passthrough（等价 vsync=0）
     _run([
         "ffmpeg", "-hide_banner", "-y", "-i", str(video),
-        "-vsync", "0", "-start_number", "0",
+        "-fps_mode", "passthrough", "-start_number", "0",
         str(frames_dir / "%08d.png"),
     ])
     count = len(list(frames_dir.glob("*.png")))
@@ -208,7 +209,12 @@ def resolve_ncnn_engine() -> Path:
 # ---------------------------------------------------------------------------
 def interp_frames_ncnn(frames_in: Path, model_dir: Path, model_name: str,
                        passes: int) -> tuple[int, Path]:
-    """执行 passes 轮 2x 插帧；返回 (最终帧数, 最终帧目录)。"""
+    """执行 passes 轮 2x 插帧；返回 (最终帧数, 最终帧目录)。
+
+    契约修正（E8 前直连冒烟实测，2026-08-22）：manifest 钉定的 20221029 版引擎
+    目录模式已原生输出完整 2N 序列（原帧+中间帧交错、%08d 从 1 起），不再输出
+    N-1 中间帧——直接采用引擎产物作为该轮结果，移除本地交错重组。
+    """
     engine = resolve_ncnn_engine()
     ncnn_model = find_ncnn_model_dir(model_dir, model_name)
     if ncnn_model is None:
@@ -220,29 +226,23 @@ def interp_frames_ncnn(frames_in: Path, model_dir: Path, model_name: str,
     current, cur_count = frames_in, len(list(frames_in.glob("*.png")))
     work_root = current.parent
     for step in range(passes):
-        mid_dir = work_root / f"mids_{step}"
         out_dir = work_root / f"pass_{step + 1}"
-        mid_dir.mkdir(parents=True, exist_ok=True)
-        cmd = [str(engine), "-i", str(current), "-o", str(mid_dir),
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cmd = [str(engine), "-i", str(current), "-o", str(out_dir),
                "-m", str(ncnn_model)]
         logger.info("ncnn exec (pass %d/%d): %s", step + 1, passes, " ".join(cmd))
         _run(cmd)
 
-        mids = sorted(mid_dir.glob("*.png"))
-        if len(mids) != max(cur_count - 1, 0):
+        produced = len(list(out_dir.glob("*.png")))
+        expected = cur_count * 2
+        if produced != expected:
             raise RuntimeError(
-                f"engine produced {len(mids)} intermediate frames, expected {cur_count - 1}"
+                f"rife engine directory mode produced {produced} frames, "
+                f"expected {expected}; the pinned 20221029 build emits the full "
+                "doubled sequence (older builds emitting only N-1 intermediates "
+                "are not supported by this adapter)"
             )
-        # 原帧/中间帧交错：out[2i]=orig[i], out[2i+1]=mid[i]
-        out_dir.mkdir(parents=True, exist_ok=True)
-        origs = sorted(current.glob("*.png"))
-        idx = 0
-        for i, orig in enumerate(origs):
-            shutil.copy(orig, out_dir / f"{idx:08d}.png")
-            if i < len(mids):
-                shutil.copy(mids[i], out_dir / f"{idx + 1:08d}.png")
-            idx += 2
-        current, cur_count = out_dir, idx
+        current, cur_count = out_dir, produced
 
     return cur_count, current
 
@@ -371,7 +371,9 @@ def run_interpolate(input_path: Path, out_path: Path, params: dict) -> dict:
 
     model_id = str(params.get("model") or EP_MODEL_ID or "rife-v4.6-ncnn")
     model_dir, how = resolve_model_dir(model_id)
-    model_name = str(params.get("model_name") or "")
+    # 默认取 manifest 默认变体 rife-v4.6 的模型子目录（params.model_name 可覆盖）；
+    # 留空会让 find_ncnn_model_dir 按字典序误选 rife-HD
+    model_name = str(params.get("model_name") or "rife-v4.6")
 
     work_root = Path(tempfile.mkdtemp(prefix="ep-vint-", dir=EP_WORKSPACE or None))
     frames_in = work_root / "frames_in"
