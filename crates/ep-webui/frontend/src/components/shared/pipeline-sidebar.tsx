@@ -4,7 +4,7 @@ import { CircleAlert, GripVertical, RefreshCw, Search, Wrench, X } from 'lucide-
 import { useTranslation } from 'react-i18next'
 import { api } from '@/api/client'
 import type { CapabilityDecl, ModuleResponse } from '@/api/types'
-import { statusMeta } from '@/lib/constants'
+import { categoryLabel, statusMeta } from '@/lib/constants'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -144,22 +144,28 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
     [query, i18n.language],
   )
 
-  /** 模块面板：按模型家族一模块一项，平铺不按功能类别归堆——
-   *  类别聚合会把 realesr/animevideo/rife 等不同家族压进同一「视频」标题，
-   *  掩盖模块 = 模型家族的平台约定（用户编排心智按家族而非按类别） */
-  const familyModules = useMemo(() => {
+  /** 模块面板按功能类别分组展示（编排检索心智：按「做什么」找）；
+   *  组内条目仍是模块 = 模型家族（realesr/animevideo/rife 各自独立，
+   *  不存在同类别下多家族合并为一个模块的情况） */
+  const groupedModules = useMemo(() => {
     if (!modules) return null
-    return modules
-      .filter(
-        (m) =>
-          !query ||
-          m.name.toLowerCase().includes(query) ||
-          m.id.toLowerCase().includes(query) ||
-          m.description.toLowerCase().includes(query) ||
-          capabilityNames(m).some((name) => name.toLowerCase().includes(query)),
-      )
-      .sort((a, b) => a.id.localeCompare(b.id))
-  }, [modules, query])
+    const matched = modules.filter(
+      (m) =>
+        !query ||
+        m.name.toLowerCase().includes(query) ||
+        m.id.toLowerCase().includes(query) ||
+        m.description.toLowerCase().includes(query) ||
+        categoryLabel(m.category).toLowerCase().includes(query) ||
+        capabilityNames(m).some((name) => name.toLowerCase().includes(query)),
+    )
+    const groups = new Map<string, ModuleResponse[]>()
+    for (const m of matched) {
+      const list = groups.get(m.category) ?? []
+      list.push(m)
+      groups.set(m.category, list)
+    }
+    return [...groups.entries()]
+  }, [modules, query, i18n.language])
 
   // §6.7：external_api 不进 palette —— LLM 接入统一走 llm builtin 项
   return (
@@ -250,7 +256,7 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
             </div>
           )}
 
-          {familyModules && familyModules.length === 0 && (
+          {groupedModules && groupedModules.length === 0 && (
             <div className="flex flex-col items-center gap-1.5 px-3 py-5 text-center">
               <Wrench className="h-4 w-4 text-muted-foreground" />
               <p className="text-xs text-muted-foreground">
@@ -261,41 +267,50 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
             </div>
           )}
 
-          {familyModules?.map((m) => {
-            const visual = categoryVisual(m.category)
-            const Icon = visual.icon
-            const st = statusMeta(m.status)
-            // P0-1：能力裸名随载荷传递，节点创建完全数据驱动
-            const caps = capabilityNames(m)
-            const subtitle =
-              caps.length > 0
-                ? `${m.id} · ${caps.join(' / ')}`
-                : `${m.id} · ${t('pipelineSidebar.noCapabilities', { defaultValue: '未声明能力' })}`
-            return (
-              <PaletteItem
-                key={m.id}
-                icon={<Icon className="h-4 w-4" />}
-                title={m.name}
-                subtitle={subtitle}
-                accent={visual.accent}
-                trailing={
-                  <span
-                    title={t('pipelineSidebar.moduleStatusTitle', { status: st.label })}
-                    className={cn('h-1.5 w-1.5 shrink-0 rounded-full', st.dot)}
-                  />
-                }
-                payload={{
-                  nodeType: 'module',
-                  moduleId: m.id,
-                  moduleName: m.name,
-                  moduleVersion: m.version,
-                  category: m.category,
-                  capabilities: m.capabilities ?? [],
-                }}
-                onAdd={onAdd}
-              />
-            )
-          })}
+          {groupedModules?.map(([category, list]) => (
+            <div key={category} className="mb-1">
+              <p className="px-2 pb-1 pt-2 text-[11px] font-medium text-muted-foreground">
+                {categoryLabel(category)}
+              </p>
+              <div className="space-y-0.5">
+                {list.map((m) => {
+                  const visual = categoryVisual(m.category)
+                  const Icon = visual.icon
+                  const st = statusMeta(m.status)
+                  // P0-1：能力裸名随载荷传递，节点创建完全数据驱动
+                  const caps = capabilityNames(m)
+                  const subtitle =
+                    caps.length > 0
+                      ? `${m.id} · ${caps.join(' / ')}`
+                      : `${m.id} · ${t('pipelineSidebar.noCapabilities', { defaultValue: '未声明能力' })}`
+                  return (
+                    <PaletteItem
+                      key={m.id}
+                      icon={<Icon className="h-4 w-4" />}
+                      title={m.name}
+                      subtitle={subtitle}
+                      accent={visual.accent}
+                      trailing={
+                        <span
+                          title={t('pipelineSidebar.moduleStatusTitle', { status: st.label })}
+                          className={cn('h-1.5 w-1.5 shrink-0 rounded-full', st.dot)}
+                        />
+                      }
+                      payload={{
+                        nodeType: 'module',
+                        moduleId: m.id,
+                        moduleName: m.name,
+                        moduleVersion: m.version,
+                        category: m.category,
+                        capabilities: m.capabilities ?? [],
+                      }}
+                      onAdd={onAdd}
+                    />
+                  )
+                })}
+              </div>
+            </div>
+          ))}
         </div>
       </ScrollArea>
 
