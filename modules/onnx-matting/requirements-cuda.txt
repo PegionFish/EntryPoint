@@ -1,0 +1,12 @@
+# onnx-matting — cuda 后端依赖（M2 requirements_by_backend 消费点）
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+python-multipart>=0.0.6
+Pillow>=10.0.0
+numpy>=2.0,<3.0
+# onnxruntime-gpu 与官方 onnxruntime 同包名互斥：本文件用 gpu 发行版整体替换，
+# 不与 requirements.txt 混装同一 venv（M3 分后端 venv <module>--<cuda>）。
+# 版本策略与基础栈同区间 >=1.23.2,<2.0.0。
+# 主机前置：CUDA 12.x + cuDNN 9 系统库（ORT 1.23+ 对应版本要求），wheel 本身
+# 不携带 CUDA 运行库；EP_BACKEND=cuda 时 adapter 注入 CUDAExecutionProvider(device_id)。
+onnxruntime-gpu>=1.23.2,<2.0.0

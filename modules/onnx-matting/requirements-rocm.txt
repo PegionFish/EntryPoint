@@ -1,0 +1,13 @@
+# onnx-matting — rocm 后端依赖（M2 requirements_by_backend 消费点）
+# 状态：实验性（HETERO_DIST_PLAN §5 失败处置条款：未经真机验证的路线保留声明
+# 但标注 experimental；E1 先以 faster-whisper 验证 ROCm 栈，本模块随后跟进）。
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+python-multipart>=0.0.6
+Pillow>=10.0.0
+numpy>=2.0,<3.0
+# AMD 发布的 ORT-ROCm wheel（PyPI 发行版 onnxruntime-rocm，仅 linux；
+# 区间与 rembg[rocm] extra 一致 >=1.22.0,<2.0.0）。与官方 onnxruntime 同包名
+# 互斥，整体替换、不混装。主机前置：ROCm/HIP 运行库（/opt/rocm）。
+# EP_BACKEND=rocm 时 adapter 注入 ROCMExecutionProvider(device_id)。
+onnxruntime-rocm>=1.22.0,<2.0.0 ; sys_platform == "linux"

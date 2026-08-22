@@ -1,8 +1,8 @@
 [module]
 id = "rembg"
 name = "RemBG 智能去背景"
-version = "2.0.50"
-description = "基于 U2-Net/ISNet 的 AI 图像背景移除"
+version = "2.1.0"
+description = "基于 U2-Net/ISNet/BiRefNet 的 AI 图像背景移除（ONNX Runtime 多 EP）"
 category = "image"
 genre = "rembg"
 authors = ["EntryPoint Community"]
@@ -16,16 +16,27 @@ python_version = ">=3.10,<3.13"
 requirements = "requirements.txt"
 entrypoint = "adapter.py"
 start_command = "{venv_python} {MODULE_DIR}/{entrypoint}"
+# M2：openvino 后端换装 onnxruntime-openvino（与官方 onnxruntime 同包命名空间、
+# 互斥不可共存，故不能与基础 requirements.txt 的 rembg[cpu] 栈同 venv）。
+# 其余后端无对应条目时按规范回退 runtime.requirements（cpu 基础栈）。
+requirements_by_backend = { openvino = "requirements-openvino.txt" }
 
-# 诚实声明：requirements.txt 安装 rembg[cpu]（onnxruntime CPU-only），
-# 实际推理只走 CPU。此前 backends 含 cuda 导致设备账本记 GPU、实际跑 CPU。
-# GPU 化途径（未来工作）见 modules/rembg/README.md：
-# rembg[gpu] + onnxruntime CUDAExecutionProvider。
+# 后端诚实声明（2026-08-22，W1/WS-C）：
+# - openvino：经 onnxruntime-openvino 的 OpenVINOExecutionProvider 执行，
+#   设备由 OPENVINO_DEVICE={device_name} 注入（E2=NPU.0 /dev/accel0、
+#   E3=GPU.0 Arrow Lake iGPU 实验载体）；u2net/isnet ONNX 直接吃 EP，模型不变。
+# - cpu：rembg[cpu] 基础栈兜底，始终可用。
+# - cuda：本期不做——ORT 各发行 wheel 共享 `onnxruntime` 包名、单 venv 互斥；
+#   待 M3 分后端 venv 全量铺开后再评估 onnxruntime-gpu 路线，未验证不声明。
+# default_backend 暂取 cpu；E2/E3 真机验证通过后可上调 openvino。
 [compute]
-backends = ["cpu"]
+backends = ["openvino", "cpu"]
 default_backend = "cpu"
-vram_estimate_mb = 0
-min_vram_mb = 0
+vram_estimate_mb = 512
+min_vram_mb = 256
+
+[compute.env]
+openvino = { OPENVINO_DEVICE = "{device_name}" }
 
 [[models]]
 id = "u2net"
@@ -34,6 +45,7 @@ source = "url"
 url = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net.onnx"
 target_dir = "rembg-u2net"
 size_estimate_mb = 176
+vram_estimate_mb = 512
 default = true
 
 [[models]]
@@ -43,6 +55,7 @@ source = "url"
 url = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/isnet-general-use.onnx"
 target_dir = "rembg-isnet"
 size_estimate_mb = 176
+vram_estimate_mb = 512
 
 [[models]]
 id = "birefnet-general"
@@ -51,6 +64,7 @@ source = "url"
 url = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/BiRefNet-general-epoch_244.onnx"
 target_dir = "rembg-birefnet"
 size_estimate_mb = 880
+vram_estimate_mb = 2048
 
 [interface]
 type = "http"

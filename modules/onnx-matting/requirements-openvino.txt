@@ -1,0 +1,13 @@
+# onnx-matting — openvino 后端依赖（M2 requirements_by_backend 消费点）
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+python-multipart>=0.0.6
+Pillow>=10.0.0
+numpy>=2.0,<3.0
+# Intel 发布的 ORT-OV 整合 wheel（内置 OpenVINO EP + CPU EP），与官方 onnxruntime
+# 同包名互斥，整体替换、不混装。版本策略与基础栈同区间 >=1.23.2,<2.0.0：
+# 解析得最新 1.24.1（对应 ORT 1.24.1 + OpenVINO 2025.4.1），cp310–cp313 wheel，
+# 覆盖 runtime.python_version >=3.10,<3.13。
+# 设备选择：adapter 读 OPENVINO_DEVICE 注入 provider option 键 device_type
+# （GPU.0 / NPU.0 / CPU / AUTO:...），键值域见 ort_ep.py docstring。
+onnxruntime-openvino>=1.23.2,<2.0.0

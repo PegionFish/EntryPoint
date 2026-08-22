@@ -1,0 +1,10 @@
+# onnx-matting — 基础依赖（cpu 后端；其余后端见 requirements-{cuda,rocm,openvino}.txt）
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+python-multipart>=0.0.6
+Pillow>=10.0.0
+numpy>=2.0,<3.0
+# 官方 CPU 版 onnxruntime；区间与 rembg 基础栈对齐（rembg[cpu] extra 同为 >=1.23.2,<2）。
+# 注意：onnxruntime / onnxruntime-gpu / onnxruntime-openvino 共享 `onnxruntime`
+# 包命名空间、单 venv 互斥——后端切换依赖 M3 分后端 venv，不要混装。
+onnxruntime>=1.23.2,<2.0.0

@@ -1,6 +1,9 @@
 """
 RemBG 智能去背景 — EntryPoint adapter
 基于 rembg 库的 HTTP 服务，提供图像背景移除能力。
+ONNX Runtime 多 EP（W1/WS-C）：EP_BACKEND ∈ {cuda, rocm, openvino, cpu}，
+providers 列表恒以 CPU 兜底收尾；openvino 时读 OPENVINO_DEVICE 注入
+provider option 键 device_type（键名依据见 ort_ep.py docstring）。
 """
 
 from __future__ import annotations
@@ -12,11 +15,13 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import uvicorn
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse
+
+from ort_ep import ProviderSpec, provider_names, resolve_providers_from_env
 
 # ---------------------------------------------------------------------------
 # 环境变量
@@ -39,6 +44,8 @@ EP_MODEL_DIR: str = os.getenv("EP_MODEL_DIR", "")
 # 覆盖为非激活变体时 rembg 在激活目录找不到权重会静默联网下载。据
 # EP_MODELS_ROOT 按下方映射解析变体子目录，命中本地权重则直接用。
 EP_MODELS_ROOT: str = os.getenv("EP_MODELS_ROOT", "")
+# 计算后端（MODULE_SPEC §4）：cuda/rocm/openvino/cpu；决定 ORT providers 分派
+EP_BACKEND: str = os.getenv("EP_BACKEND", "cpu")
 
 # 与 module.toml [[models]] 的 id → target_dir 约定对齐（rembg 会话名即 model id，
 # 权重文件名为 <model id>.onnx，见 rembg sessions 各 download_models 实现）。
@@ -109,15 +116,38 @@ logging.basicConfig(
 logger = logging.getLogger("rembg-adapter")
 
 # ---------------------------------------------------------------------------
+# ORT providers 分派（EP_BACKEND → provider 列表，恒以 CPU 兜底收尾）
+# ---------------------------------------------------------------------------
+PROVIDERS: List[ProviderSpec] = resolve_providers_from_env()
+
+
+def _sess_opts():
+    """openvino 后端按 OV EP 官方建议关闭 ORT 图优化（图优化交给 OpenVINO）；
+    其余后端用 rembg 默认 SessionOptions。ORT 不可用时返回 None 走默认。"""
+    if EP_BACKEND.strip().lower() != "openvino":
+        return None
+    try:
+        import onnxruntime as ort
+
+        opts = ort.SessionOptions()
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        return opts
+    except Exception as exc:  # pragma: no cover - 防御：缺 wheel 时仍可启动
+        logger.warning("SessionOptions unavailable, using rembg defaults: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # 全局状态
 # ---------------------------------------------------------------------------
 _session = None
 _session_model: Optional[str] = None
 _ready = False
+_effective_providers: List[str] = []
 
 app = FastAPI(
     title="RemBG Adapter",
-    version="2.0.50",
+    version="2.1.0",
     description="EntryPoint rembg 图像去背景模块",
 )
 
@@ -130,8 +160,11 @@ def _load_session(model_name: str):
 
     加载前先解析本地权重目录并将 U2NET_HOME 指向它（缺陷 #4）：
     缺失时抛 ModelLocalMissingError，绝不让 rembg 静默联网下载。
+    providers 由 EP_BACKEND/OPENVINO_DEVICE 解析后注入 rembg 的
+    new_session(providers=...)（rembg BaseSession 将该列表原样转发给
+    ort.InferenceSession，元组 (name, options) 形态受支持）。
     """
-    global _session, _session_model, _ready
+    global _session, _session_model, _ready, _effective_providers
     if _session is not None and _session_model == model_name:
         return _session
 
@@ -141,10 +174,27 @@ def _load_session(model_name: str):
     try:
         from rembg import new_session
 
-        _session = new_session(model_name)
+        try:
+            _session = new_session(model_name, sess_opts=_sess_opts(), providers=PROVIDERS)
+        except TypeError:
+            # 旧版 rembg 不识别 providers/sess_opts kwarg：无法钉住设备，
+            # EP 会按安装的 onnxruntime 发行版自动选择——大声警告而非静默。
+            logger.warning(
+                "rembg build ignores providers=%s / sess_opts; "
+                "falling back to auto EP selection (device pinning unavailable)",
+                provider_names(PROVIDERS),
+            )
+            _session = new_session(model_name)
         _session_model = model_name
         _ready = True
-        logger.info("Session loaded in %.1fs", time.time() - t0)
+        inner = getattr(_session, "inner_session", None)
+        _effective_providers = list(inner.get_providers()) if inner else []
+        logger.info(
+            "Session loaded in %.1fs (requested providers=%s, active=%s)",
+            time.time() - t0,
+            provider_names(PROVIDERS),
+            _effective_providers,
+        )
     except Exception as exc:
         _ready = False
         logger.exception("Failed to load session: %s", exc)
@@ -184,12 +234,16 @@ async def health():
 async def info():
     return {
         "module": "rembg",
-        "version": "2.0.50",
+        "version": "2.1.0",
         "model": _session_model,
         "ready": _ready,
         "capabilities": ["remove_bg"],
-        # 与 module.toml [compute].backends 保持一致：rembg[cpu] 栈仅 CPU
-        "backends": ["cpu"],
+        # 与 module.toml [compute].backends 保持一致
+        "backends": ["openvino", "cpu"],
+        # EP_BACKEND 分派结果与 session 实际激活的 EP（E2/E3 验证观测点）
+        "ep_backend": EP_BACKEND,
+        "requested_providers": provider_names(PROVIDERS),
+        "providers": _effective_providers,
     }
 
 
@@ -400,10 +454,12 @@ async def predict_remove_bg(
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     logger.info(
-        "Starting rembg adapter on %s:%d (model=%s, workspace=%s)",
+        "Starting rembg adapter on %s:%d (model=%s, backend=%s, providers=%s, workspace=%s)",
         EP_HOST,
         EP_PORT,
         EP_MODEL_NAME,
+        EP_BACKEND,
+        provider_names(PROVIDERS),
         EP_WORKSPACE,
     )
     uvicorn.run(

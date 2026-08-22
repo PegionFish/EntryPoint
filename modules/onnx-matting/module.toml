@@ -1,0 +1,74 @@
+[module]
+id = "onnx-matting"
+name = "ONNX Matting 图像抠图"
+version = "0.1.0"
+description = "基于 BiRefNet ONNX 权重的通用/人像 alpha 抠图（ONNX Runtime 多 EP）"
+category = "image"
+genre = "matting"
+authors = ["EntryPoint Community"]
+license = "MIT"
+homepage = "https://github.com/ZhengPeng7/BiRefNet"
+tags = ["matting", "background-removal", "segmentation", "image", "birefnet"]
+
+[runtime]
+type = "python"
+python_version = ">=3.10,<3.13"
+requirements = "requirements.txt"
+entrypoint = "adapter.py"
+start_command = "{venv_python} {MODULE_DIR}/{entrypoint}"
+# M2：ORT 各发行 wheel 共享 `onnxruntime` 包名、单 venv 互斥——cuda/rocm/openvino
+# 各自的 ORT 发行版经独立依赖文件安装（M3 分后端 venv <module>--<backend>）；
+# cpu 无对应条目，按规范回退 runtime.requirements。
+requirements_by_backend = { cuda = "requirements-cuda.txt", rocm = "requirements-rocm.txt", openvino = "requirements-openvino.txt" }
+
+[compute]
+# ONNX 直跑多 EP：同一 BiRefNet ONNX 权重按 EP_BACKEND 分派执行，
+# providers 恒以 CPU 兜底收尾（adapter 内 ort_ep.resolve_providers）。
+# rocm 走 PyPI onnxruntime-rocm（AMD 发布），未经本机验证前视为实验性。
+backends = ["cuda", "rocm", "openvino", "cpu"]
+default_backend = "cuda"
+vram_estimate_mb = 1000
+min_vram_mb = 512
+
+[compute.env]
+cuda = { CUDA_VISIBLE_DEVICES = "{device_index}" }
+rocm = { HIP_VISIBLE_DEVICES = "{device_index}" }
+openvino = { OPENVINO_DEVICE = "{device_name}" }
+
+# 权重来源说明（W1/WS-C 调研结论）：ZhengPeng7 的 HF 仓库现只发布 torch/safetensors
+# 权重，无官方 ONNX 文件可直链；故按任务书回退方案声明 source=huggingface 作为
+# 上游出处（BiRefNet=MIT Tier A，reports/license-matrix.md 已核）。运行时实际消费
+# 的 ONNX 文件名约定与获取路线见 modules/onnx-matting/README.md「权重获取」。
+[[models]]
+id = "birefnet-general"
+name = "BiRefNet General (通用抠图)"
+source = "huggingface"
+repo_id = "ZhengPeng7/BiRefNet"
+target_dir = "onnx-matting-birefnet-general"
+size_estimate_mb = 930
+vram_estimate_mb = 1000
+default = true
+
+[[models]]
+id = "birefnet-portrait"
+name = "BiRefNet Portrait (人像抠图)"
+source = "huggingface"
+repo_id = "ZhengPeng7/BiRefNet-portrait"
+target_dir = "onnx-matting-birefnet-portrait"
+size_estimate_mb = 930
+vram_estimate_mb = 972
+
+[interface]
+type = "http"
+health_endpoint = "/health"
+ready_timeout_secs = 180
+
+[[interface.capabilities]]
+name = "matte"
+description = "图像 alpha 抠图，输出透明 PNG（保留原分辨率，边缘精细）"
+input_type = "image"
+output_type = "image"
+max_file_size_mb = 100
+
+[interface.capabilities.params]
+model = { type = "string", default = "", description = "变体覆盖（birefnet-general/birefnet-portrait）；缺省用激活变体" }
