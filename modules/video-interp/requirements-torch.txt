@@ -1,0 +1,12 @@
+# torch 路线依赖（cuda / rocm 后端）——M2 requirements_by_backend 消费落地前需手动安装
+#
+# 注意（如实记录）：
+# - CUDA wheel：pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# - ROCm wheel（RX 7900 XTX gfx1100，E6 载体）：
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.4
+# - torch 分支还需 Practical-RIFE 推理模块（rife_ifnet.py / rife_warplayer.py，MIT）
+#   vendor 入库后方可运行（W2 补齐），当前该分支返回 501 EXPERIMENTAL。
+torch>=2.4
+torchvision
+numpy>=1.24
+opencv-python-headless>=4.8

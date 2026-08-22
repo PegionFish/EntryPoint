@@ -1,0 +1,111 @@
+[module]
+id = "video-interp"
+name = "Video Interp 视频插帧"
+version = "0.1.0"
+description = "视频插帧（VFI）：RIFE 公版权重（MIT 全系已核实），torch(CUDA/ROCm) 主路线 + OpenVINO ONNX(Intel) + ncnn-vulkan 兜底"
+category = "video"
+genre = "interp"
+authors = ["EntryPoint Community"]
+license = "MIT"
+homepage = "https://github.com/nihui/rife-ncnn-vulkan"
+tags = ["video", "interpolation", "vfi", "rife", "experimental"]
+
+[runtime]
+type = "python"
+python_version = ">=3.10,<3.13"
+requirements = "requirements.txt"
+entrypoint = "adapter.py"
+start_command = "{venv_python} {MODULE_DIR}/{entrypoint}"
+
+# ncnn 兜底引擎二进制相对路径（vulkan 后端消费）。
+# 上游官方 release 获取与放置步骤见 README「引擎二进制放置」；
+# 禁用 Waifu2x-Extension-GUI 的 _W2xEX 重编译版（计划 §3.2）。
+# 注：type=python 模块复用 [runtime.binaries] 键位词表，adapter 自行解析。
+[runtime.binaries]
+linux-x86_64 = "bin/linux-x86_64/rife-ncnn-vulkan"
+windows-x86_64 = "bin/windows-x86_64/rife-ncnn-vulkan.exe"
+
+[compute]
+backends = ["cuda", "rocm", "openvino", "vulkan", "cpu"]
+default_backend = "cuda"
+vram_estimate_mb = 2048
+min_vram_mb = 1024
+notes = "EXPERIMENTAL：E6/E7/E8 载体，三运行时分层——cuda/rocm/cpu=torch(flownet.pkl，需 vendor Practical-RIFE 推理模块后可用)，openvino=ORT-OV(.onnx 无权威源，占位)，vulkan=ncnn 引擎子进程(需按 README 放置 bin/)；RIFE pkl 官方渠道为 Google Drive/百度网盘（直链不稳），manifest 采用 HF 社区镜像(Bash2X/RIFE-Models，MIT 同源)，镜像化建议见 reports/ws-f-engine-choice.md §5"
+
+[compute.env]
+cuda = { CUDA_VISIBLE_DEVICES = "{device_index}" }
+rocm = { HIP_VISIBLE_DEVICES = "{device_index}", TORCH_DEVICE = "cuda" }
+openvino = { OPENVINO_DEVICE = "{device_name}" }
+cpu = { TORCH_DEVICE = "cpu" }
+
+# schema 冻结待消费（MODULE_SPEC §2.6）
+[runtime.requirements_by_backend]
+cuda = "requirements-torch.txt"
+rocm = "requirements-torch.txt"
+openvino = "requirements-openvino.txt"
+
+# ---- 权重变体：ncnn param+bin（主变体，MIT；vulkan 兜底路线）----
+# 上游无独立模型包资产：nihui release 各版本均为「二进制+全部模型」整包 zip。
+# url 指 Linux(NAS 首选) 整包；Windows 用户改取 -windows.zip（README 有直链）。
+# 平台 URL 下载不自动解压 zip——下载后手动解压或走浏览器上传导入。
+
+[[models]]
+id = "rife-v4.6-ncnn"
+name = "RIFE v4.6 (ncnn/vulkan 兜底·主变体)"
+source = "url"
+url = "https://github.com/nihui/rife-ncnn-vulkan/releases/download/20221029/rife-ncnn-vulkan-20221029-ubuntu.zip"
+target_dir = "video-interp-rife-ncnn"
+size_estimate_mb = 411
+default = true
+qualified_id = "hzwer.rife.v46-ncnn"
+
+# 同一上游包内另含 rife-anime / rife-UHD / rife-HD / rife-v2~v4 等历代模型目录，
+# 可经 params.model_name 选择，无需重复下载（README 说明）。
+
+# ---- 权重变体：torch flownet.pkl（MIT；E6 rocm 实验载体）----
+# 渠道限制（如实记录）：官方渠道 = Google Drive/百度网盘（hzwer/Practical-RIFE README，
+# GDrive 有每日配额、反爬致直链不稳定）；下方 url 为 HuggingFace 社区镜像
+# （Bash2X/RIFE-Models，声明 MIT、未修改原文件）。镜像化建议见决策备忘录 §5。
+
+[[models]]
+id = "rife-v4.26-pkl"
+name = "RIFE v4.26 (torch·实验)"
+source = "url"
+url = "https://huggingface.co/Bash2X/RIFE-Models/resolve/main/RIFE_v4.26.zip"
+target_dir = "video-interp-rife-v426-pkl"
+size_estimate_mb = 45
+qualified_id = "hzwer.rife.v426-pkl"
+
+[[models]]
+id = "rife-v4.25-lite-pkl"
+name = "RIFE v4.25 lite (torch·实验·低算力)"
+source = "url"
+url = "https://huggingface.co/Bash2X/RIFE-Models/resolve/main/RIFE_v4.25.lite.zip"
+target_dir = "video-interp-rife-v425lite-pkl"
+size_estimate_mb = 22
+
+# ---- 占位待补：OpenVINO ONNX 变体 ----
+# 上游无官方 ONNX；社区转换（yuvraj108c/rife-onnx、TensorStack/RIFE 等）无权威许可
+# 标注，暂不出直链声明（调研见 reports/ws-f-engine-choice.md §1.2）。
+# 待自转/选定可分发 ONNX 后回填：
+# [[models]]
+# id = "rife-v4-onnx"
+# source = "url"
+# url = "<待回填>"
+# target_dir = "video-interp-rife-onnx"
+
+[interface]
+type = "http"
+health_endpoint = "/health"
+ready_timeout_secs = 60
+
+[[interface.capabilities]]
+name = "interpolate"
+description = "视频插帧（抽帧→RIFE 中间帧合成→交错重组→回封 mp4，音频流 copy）"
+input_type = "video"
+output_type = "video"
+max_file_size_mb = 4096
+
+[interface.capabilities.params]
+multiplier = { type = "integer", default = 2, min = 2, max = 8, description = "帧率倍增倍数（target_fps>0 时被其推导覆盖）" }
+target_fps = { type = "integer", default = 0, min = 0, max = 240, description = "目标帧率（0=跟随源帧率×multiplier；>0 时按源帧率推导实际倍数）" }
