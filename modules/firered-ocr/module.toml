@@ -1,0 +1,70 @@
+# modules/firered-ocr/module.toml
+#
+# FireRed-OCR：小红书 FireRedTeam 端到端文档解析 OCR（VLM 生成结构化 Markdown）。
+# 上游核实（2026-08-22）：HuggingFace FireRedTeam/FireRed-OCR，基于 Qwen3-VL-2B-Instruct，
+# safetensors BF16 参数 2,127,532,032（≈2.13B），权重文件合计 ≈4058 MiB；
+# 代码与权重均 Apache-2.0（HF LICENSE.txt + GitHub Apache License 2.0）。
+# 注意：实际为 2B 级 VLM 而非 8B 级——显存估算按 2B BF16 权重 ~4.1 GB +
+# 视觉塔激活/KV cache/CUDA 上下文 ≈ 6 GB 计。
+
+[module]
+id = "firered-ocr"
+name = "FireRed-OCR 文档识别"
+version = "0.1.0"
+description = "基于 Qwen3-VL-2B 的端到端文档解析 OCR，图片转结构化 Markdown"
+category = "ocr"
+genre = "firered"
+authors = ["EntryPoint Community"]
+license = "Apache-2.0"
+homepage = "https://github.com/FireRedTeam/FireRed-OCR"
+tags = ["ocr", "document-parsing", "markdown", "vlm", "qwen3-vl"]
+
+[runtime]
+type = "python"
+python_version = ">=3.10,<3.13"
+requirements = "requirements.txt"
+entrypoint = "adapter.py"
+start_command = "{venv_python} {MODULE_DIR}/{entrypoint}"
+
+[compute]
+backends = ["cuda", "cpu"]
+default_backend = "cuda"
+# 2B VLM @BF16：权重 ~4.1 GB + 激活/KV/驱动上下文；CPU 回退时同值为内存参考
+vram_estimate_mb = 6144
+min_vram_mb = 4096
+
+[compute.env]
+cuda = { CUDA_VISIBLE_DEVICES = "{device_index}" }
+
+[[models]]
+id = "fire-red-ocr"
+name = "FireRed-OCR-2B (默认)"
+source = "huggingface"
+repo_id = "FireRedTeam/FireRed-OCR"
+target_dir = "firered-ocr-2b"
+size_estimate_mb = 4060
+default = true
+vram_estimate_mb = 6144
+
+# ModelScope 官方同步镜像（GitHub README 提供 ModelScope 入口，
+# modelscope.cn/models/FireRedTeam/FireRed-OCR 已核实存在）
+[[models.mirrors]]
+source = "modelscope"
+repo_id = "FireRedTeam/FireRed-OCR"
+
+[interface]
+type = "http"
+health_endpoint = "/health"
+ready_timeout_secs = 240
+
+[[interface.capabilities]]
+name = "recognize"
+description = "文档图片转 Markdown（模型输出纯文本 Markdown，无坐标框/置信度）"
+input_type = "image"
+output_type = "json"
+max_file_size_mb = 50
+
+[interface.capabilities.params]
+languages = { type = "string", default = "", description = "可选语言提示，逗号分隔（如 zh,en）；留空不注入语言提示。适配器亦接受 JSON 列表" }
+max_new_tokens = { type = "integer", default = 8192, min = 64, max = 32768, description = "生成 token 上限（官方默认 8192）" }
+output_format = { type = "select", options = ["json", "text", "md"], default = "json", description = "text/md 配合执行器注入的 output_path 输出文件产物（MODULE_SPEC §5）" }

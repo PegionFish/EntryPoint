@@ -1,0 +1,25 @@
+# torch cu130 wheel 索引（RTX 5090 D / Blackwell sm_120 需 cu128+ 构建）。
+# 机制依据：config/constraints.txt 头部【wheel 索引提示】a) requirements 内联。
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+python-multipart>=0.0.6
+
+# FireRed-OCR 官方推理路径（官方 main.py / GitHub Quick Start）：
+# transformers Qwen3VLForConditionalGeneration + AutoProcessor；
+# Qwen3-VL 架构支持自 transformers 4.57 起。
+transformers>=4.57.0
+
+# torch 与 config/constraints.txt【torch 全家桶】对齐：锁 2.11.0 使 uv 在 cu130
+# 索引命中同族 +cu130 wheel。本模块无音频依赖，不需 torchaudio。
+torch==2.11.0
+
+# 官方 main.py 以 device_map="auto" 加载（依赖 accelerate）
+accelerate>=1.0.0
+
+# 官方 main.py 图像输入处理（PIL.Image）
+Pillow>=10.0.0
+
+# 官方 main.py 另含 gradio（WebUI）与 pdf2image（PDF 转图，需系统 Poppler），
+# 本适配器仅封装图片 OCR 推理路径，均未纳入；PDF 场景由管线先行转图。
