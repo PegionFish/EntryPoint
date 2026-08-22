@@ -1,0 +1,4 @@
+# adapter 基础依赖（所有后端共享；视频处理走系统 ffmpeg）
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+python-multipart>=0.0.6

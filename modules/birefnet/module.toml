@@ -1,6 +1,6 @@
 [module]
-id = "onnx-matting"
-name = "ONNX Matting 图像抠图"
+id = "birefnet"
+name = "BiRefNet 图像抠图"
 version = "0.1.0"
 description = "基于 BiRefNet ONNX 权重的通用/人像 alpha 抠图（ONNX Runtime 多 EP）"
 category = "image"
@@ -38,13 +38,13 @@ openvino = { OPENVINO_DEVICE = "{device_name}" }
 # 权重来源说明（W1/WS-C 调研结论）：ZhengPeng7 的 HF 仓库现只发布 torch/safetensors
 # 权重，无官方 ONNX 文件可直链；故按任务书回退方案声明 source=huggingface 作为
 # 上游出处（BiRefNet=MIT Tier A，reports/license-matrix.md 已核）。运行时实际消费
-# 的 ONNX 文件名约定与获取路线见 modules/onnx-matting/README.md「权重获取」。
+# 的 ONNX 文件名约定与获取路线见 modules/birefnet/README.md「权重获取」。
 [[models]]
 id = "birefnet-general"
 name = "BiRefNet General (通用抠图)"
 source = "huggingface"
 repo_id = "ZhengPeng7/BiRefNet"
-target_dir = "onnx-matting-birefnet-general"
+target_dir = "birefnet-general"
 size_estimate_mb = 930
 vram_estimate_mb = 1000
 default = true
@@ -54,7 +54,7 @@ id = "birefnet-portrait"
 name = "BiRefNet Portrait (人像抠图)"
 source = "huggingface"
 repo_id = "ZhengPeng7/BiRefNet-portrait"
-target_dir = "onnx-matting-birefnet-portrait"
+target_dir = "birefnet-portrait"
 size_estimate_mb = 930
 vram_estimate_mb = 972
 

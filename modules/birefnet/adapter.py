@@ -1,5 +1,5 @@
 """
-ONNX Matting 图像抠图 — EntryPoint adapter
+BiRefNet 图像抠图 — EntryPoint adapter（模块按模型家族正名，原 onnx-matting）
 基于 BiRefNet ONNX 权重（ZhengPeng7，MIT）的 HTTP 服务，提供通用/人像 alpha 抠图。
 ONNX Runtime 多 EP：EP_BACKEND ∈ {cuda, rocm, openvino, cpu}，providers 恒以 CPU
 兜底收尾；openvino 时读 OPENVINO_DEVICE 注入 provider option 键 device_type。
@@ -44,8 +44,8 @@ EP_MODELS_ROOT: str = os.getenv("EP_MODELS_ROOT", "")
 
 # 与 module.toml [[models]] 的 target_dir 约定对齐
 MODEL_TARGET_DIRS: Dict[str, str] = {
-    "birefnet-general": "onnx-matting-birefnet-general",
-    "birefnet-portrait": "onnx-matting-birefnet-portrait",
+    "birefnet-general": "birefnet-general",
+    "birefnet-portrait": "birefnet-portrait",
 }
 
 # BiRefNet 输入规格（官方 repo config：input size 1024x1024）
@@ -63,7 +63,7 @@ class ModelLocalMissingError(RuntimeError):
 def resolve_local_model_file(model_name: str) -> Optional[Path]:
     """解析 model_name 的本地 ONNX 文件路径。
 
-    命名约定：<target_dir>/<model_name>.onnx（如 onnx-matting-birefnet-general/
+    命名约定：<target_dir>/<model_name>.onnx（如 birefnet-general/
     birefnet-general.onnx）；目录内无约定名但恰有一个 *.onnx 时按手动放置宽容接受。
     """
     candidates: List[Path] = []
@@ -84,9 +84,9 @@ def resolve_local_model_file(model_name: str) -> Optional[Path]:
 
 logging.basicConfig(
     level=getattr(logging, EP_LOG_LEVEL.upper(), logging.INFO),
-    format="%(asctime)s [onnx-matting-adapter] %(levelname)s %(message)s",
+    format="%(asctime)s [birefnet-adapter] %(levelname)s %(message)s",
 )
-logger = logging.getLogger("onnx-matting-adapter")
+logger = logging.getLogger("birefnet-adapter")
 
 PROVIDERS: List[ProviderSpec] = resolve_providers_from_env()
 
@@ -110,7 +110,7 @@ _sessions: Dict[str, object] = {}
 _effective_providers: List[str] = []
 
 app = FastAPI(
-    title="ONNX Matting Adapter",
+    title="EntryPoint birefnet adapter",
     version="0.1.0",
     description="EntryPoint BiRefNet 图像抠图模块",
 )
@@ -126,7 +126,7 @@ def _get_session(model_name: str):
     model_path = resolve_local_model_file(model_name)
     if model_path is None or not model_path.is_file():
         target = MODEL_TARGET_DIRS.get(
-            model_name, f"onnx-matting-{model_name}"
+            model_name, f"birefnet-{model_name}"
         )
         expected_dir = (
             Path(EP_MODELS_ROOT) / target
@@ -243,7 +243,7 @@ async def health():
 @app.get("/info")
 async def info():
     return {
-        "module": "onnx-matting",
+        "module": "birefnet",
         "version": "0.1.0",
         "model": next(iter(_sessions), None),
         "ready": bool(_sessions),
@@ -404,7 +404,7 @@ async def predict_matte(
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     logger.info(
-        "Starting onnx-matting adapter on %s:%d (model=%s, backend=%s, providers=%s, workspace=%s)",
+        "Starting birefnet adapter on %s:%d (model=%s, backend=%s, providers=%s, workspace=%s)",
         EP_HOST,
         EP_PORT,
         EP_MODEL_NAME,

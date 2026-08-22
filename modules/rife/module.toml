@@ -1,6 +1,6 @@
 [module]
-id = "video-interp"
-name = "Video Interp 视频插帧"
+id = "rife"
+name = "RIFE 视频插帧"
 version = "0.1.0"
 description = "视频插帧（VFI）：RIFE 公版权重（MIT 全系已核实），torch(CUDA/ROCm) 主路线 + OpenVINO ONNX(Intel) + ncnn-vulkan 兜底"
 category = "video"
@@ -8,7 +8,7 @@ genre = "interp"
 authors = ["EntryPoint Community"]
 license = "MIT"
 homepage = "https://github.com/nihui/rife-ncnn-vulkan"
-tags = ["video", "interpolation", "vfi", "rife", "experimental"]
+tags = ["video", "interpolation", "vfi", "rife", "family-renamed", "experimental"]
 
 [runtime]
 type = "python"
@@ -55,7 +55,7 @@ id = "rife-v4.6-ncnn"
 name = "RIFE v4.6 (ncnn/vulkan 兜底·主变体)"
 source = "url"
 url = "https://github.com/nihui/rife-ncnn-vulkan/releases/download/20221029/rife-ncnn-vulkan-20221029-ubuntu.zip"
-target_dir = "video-interp-rife-ncnn"
+target_dir = "rife-v46-ncnn"
 size_estimate_mb = 411
 default = true
 qualified_id = "hzwer.rife.v46-ncnn"
@@ -73,7 +73,7 @@ id = "rife-v4.26-pkl"
 name = "RIFE v4.26 (torch·实验)"
 source = "url"
 url = "https://huggingface.co/Bash2X/RIFE-Models/resolve/main/RIFE_v4.26.zip"
-target_dir = "video-interp-rife-v426-pkl"
+target_dir = "rife-v426-pkl"
 size_estimate_mb = 45
 qualified_id = "hzwer.rife.v426-pkl"
 
@@ -82,7 +82,7 @@ id = "rife-v4.25-lite-pkl"
 name = "RIFE v4.25 lite (torch·实验·低算力)"
 source = "url"
 url = "https://huggingface.co/Bash2X/RIFE-Models/resolve/main/RIFE_v4.25.lite.zip"
-target_dir = "video-interp-rife-v425lite-pkl"
+target_dir = "rife-v425lite-pkl"
 size_estimate_mb = 22
 
 # ---- 占位待补：OpenVINO ONNX 变体 ----
@@ -93,7 +93,7 @@ size_estimate_mb = 22
 # id = "rife-v4-onnx"
 # source = "url"
 # url = "<待回填>"
-# target_dir = "video-interp-rife-onnx"
+# target_dir = "rife-v4-onnx"
 
 [interface]
 type = "http"

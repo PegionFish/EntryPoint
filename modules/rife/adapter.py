@@ -1,4 +1,4 @@
-"""adapter.py — EntryPoint video-interp 模块适配器（W1 脚手架，实验 E6/E7/E8 载体）
+"""adapter.py — EntryPoint rife 模块适配器（W1 脚手架，实验 E6/E7/E8 载体）
 
 视频插帧统一 REST 服务：ffmpeg 抽帧 → 按 EP_BACKEND 分派 RIFE 引擎生成中间帧 →
 原帧/中间帧交错重组 → 按新帧率回封 mp4（音频流 copy）。
@@ -47,7 +47,7 @@ EP_MODEL_ID = os.getenv("EP_MODEL_ID", "")
 EP_BACKEND = os.getenv("EP_BACKEND", "cuda").strip().lower()
 EP_DEVICE = os.getenv("EP_DEVICE", "cuda:0")
 EP_DEVICE_INDEX = os.getenv("EP_DEVICE_INDEX", "0")
-EP_MODULE_ID = os.getenv("EP_MODULE_ID", "video-interp")
+EP_MODULE_ID = os.getenv("EP_MODULE_ID", "rife")
 EP_LOG_LEVEL = os.getenv("EP_LOG_LEVEL", "INFO")
 
 MODULE_DIR = Path(os.getenv("EP_MODULE_DIR", Path(__file__).resolve().parent))
@@ -61,9 +61,9 @@ NCNN_BINARY_NAMES = {
     "linux-x86_64": "rife-ncnn-vulkan",
 }
 MODEL_TARGET_DIRS = {
-    "rife-v4.6-ncnn": "video-interp-rife-ncnn",
-    "rife-v4.26-pkl": "video-interp-rife-v426-pkl",
-    "rife-v4.25-lite-pkl": "video-interp-rife-v425lite-pkl",
+    "rife-v4.6-ncnn": "rife-v46-ncnn",
+    "rife-v4.26-pkl": "rife-v426-pkl",
+    "rife-v4.25-lite-pkl": "rife-v425lite-pkl",
 }
 # nihui 整包内可选模型目录（params.model_name 选择，无需重复下载）
 NCNN_MODEL_SUBDIRS = ["rife-v4.6", "rife-v4", "rife-anime", "rife-UHD", "rife-HD",
@@ -71,9 +71,9 @@ NCNN_MODEL_SUBDIRS = ["rife-v4.6", "rife-v4", "rife-anime", "rife-UHD", "rife-HD
 
 logging.basicConfig(
     level=getattr(logging, EP_LOG_LEVEL.upper(), logging.INFO),
-    format="%(asctime)s [video-interp] %(levelname)s %(message)s",
+    format="%(asctime)s [rife] %(levelname)s %(message)s",
 )
-logger = logging.getLogger("video-interp")
+logger = logging.getLogger("rife")
 
 app = FastAPI(title="EntryPoint video-interp adapter", version="0.1.0")
 

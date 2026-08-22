@@ -1,4 +1,4 @@
-# video-upscale — 视频超分模块（W1 脚手架，实验性）
+# realesr — 视频超分模块（W1 脚手架，实验性）
 
 Real-ESRGAN 官方系公版权重（BSD-3-Clause）的视频超分辨率模块。
 三运行时分层（HETERO_DIST_PLAN §3.1，厂商栈优先，ncnn-vulkan 仅兜底）：
@@ -45,7 +45,7 @@ bash scripts/fetch-engine.sh windows
 
 ```bash
 export EP_MODULE_DIR=$PWD EP_PORT=8920 EP_BACKEND=vulkan \
-       EP_MODEL_DIR=/path/to/models/video-upscale-realesr-animevideov3-x4-ncnn \
+       EP_MODEL_DIR=/path/to/models/realesr-realesr-animevideov3-x4-ncnn \
        EP_WORKSPACE=/tmp/ep-ws
 python adapter.py &
 curl http://127.0.0.1:8920/health

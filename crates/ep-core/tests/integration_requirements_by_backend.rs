@@ -17,7 +17,7 @@ use ep_core::types::ComputeBackend;
 /// 含冻结 schema 字段的完整清单（inline table 形态，MODULE_SPEC §2.6）
 const MANIFEST_TOML: &str = r#"
 [module]
-id = "video-upscale"
+id = "realesr"
 name = "Video Upscale"
 version = "0.1.0"
 description = "M2/M3 integration fixture"
@@ -54,7 +54,7 @@ fn unique_root(tag: &str) -> PathBuf {
 }
 
 fn write_module_dir(root: &Path, toml_src: &str) -> PathBuf {
-    let module_dir = root.join("modules").join("video-upscale");
+    let module_dir = root.join("modules").join("realesr");
     fs::create_dir_all(&module_dir).unwrap();
     fs::write(module_dir.join("module.toml"), toml_src).unwrap();
     // 三份依赖文件内容互不相同（哈希可区分）
@@ -158,16 +158,16 @@ fn per_backend_venv_layout_naming() {
     let env_mgr = EnvManager::new(&root, &PythonConfig::default());
 
     assert_eq!(
-        env_mgr.venv_dir_for_backend("video-upscale", ComputeBackend::Cuda),
+        env_mgr.venv_dir_for_backend("realesr", ComputeBackend::Cuda),
         root.join("runtime")
             .join("venvs")
-            .join("video-upscale--cuda")
+            .join("realesr--cuda")
     );
     assert_eq!(
-        env_mgr.venv_python_path_for_backend("video-upscale", ComputeBackend::Rocm),
+        env_mgr.venv_python_path_for_backend("realesr", ComputeBackend::Rocm),
         root.join("runtime")
             .join("venvs")
-            .join("video-upscale--rocm")
+            .join("realesr--rocm")
             .join(if cfg!(windows) {
                 "Scripts/python.exe"
             } else {
@@ -189,7 +189,7 @@ fn legacy_ready_venv_is_reused_across_backends() {
     let env_mgr = EnvManager::new(&root, &PythonConfig::default());
 
     // 伪造就绪的旧单 venv：假解释器 + 旧口径匹配哈希
-    let mid = "video-upscale";
+    let mid = "realesr";
     let legacy_py = fake_python(&root.join("runtime").join("venvs").join(mid));
     let cuda_req = module_dir.join("requirements-cuda.txt");
     let rocm_req = module_dir.join("requirements-rocm.txt");
@@ -262,7 +262,7 @@ fn stale_legacy_venv_is_not_ready_in_backend_dimension() {
     let module_dir = write_module_dir(&root, MANIFEST_TOML);
 
     let env_mgr = EnvManager::new(&root, &PythonConfig::default());
-    let mid = "video-upscale";
+    let mid = "realesr";
 
     // 陈旧旧布局：假解释器 + 与当前依赖栈不匹配的哈希
     fake_python(&root.join("runtime").join("venvs").join(mid));
@@ -303,7 +303,7 @@ fn new_layout_readiness_requires_backend_scoped_hash() {
     let module_dir = write_module_dir(&root, MANIFEST_TOML);
 
     let env_mgr = EnvManager::new(&root, &PythonConfig::default());
-    let mid = "video-upscale";
+    let mid = "realesr";
     let cuda_req = module_dir.join("requirements-cuda.txt");
 
     // 新布局：仅解释器，无哈希 → 未就绪

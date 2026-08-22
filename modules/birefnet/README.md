@@ -49,8 +49,8 @@ curl -X POST http://127.0.0.1:8901/predict/matte -F "file=@photo.jpg"
 
 | 变体 id | target_dir | 约定权重文件名 | 显存估算 |
 |---|---|---|---|
-| `birefnet-general` | `onnx-matting-birefnet-general` | `birefnet-general.onnx` | ~1000 MB |
-| `birefnet-portrait` | `onnx-matting-birefnet-portrait` | `birefnet-portrait.onnx` | ~972 MB |
+| `birefnet-general` | `birefnet-birefnet-general` | `birefnet-general.onnx` | ~1000 MB |
+| `birefnet-portrait` | `birefnet-birefnet-portrait` | `birefnet-portrait.onnx` | ~972 MB |
 
 查找顺序：`EP_MODELS_ROOT/<target_dir>/` → `EP_MODEL_DIR/`；目录内无约定名但
 恰有一个 `*.onnx` 时按手动放置宽容接受。

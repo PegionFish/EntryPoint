@@ -1,4 +1,4 @@
-"""adapter.py — EntryPoint video-upscale 模块适配器（W1 脚手架，实验 E6/E7/E8 载体）
+"""adapter.py — EntryPoint realesr 模块适配器（W1 脚手架，实验 E6/E7/E8 载体）
 
 视频超分统一 REST 服务：ffmpeg 抽帧 → 按 EP_BACKEND 分派推理引擎 → 回封 mp4。
 
@@ -41,7 +41,7 @@ EP_MODEL_ID = os.getenv("EP_MODEL_ID", "")
 EP_BACKEND = os.getenv("EP_BACKEND", "cuda").strip().lower()
 EP_DEVICE = os.getenv("EP_DEVICE", "cuda:0")
 EP_DEVICE_INDEX = os.getenv("EP_DEVICE_INDEX", "0")
-EP_MODULE_ID = os.getenv("EP_MODULE_ID", "video-upscale")
+EP_MODULE_ID = os.getenv("EP_MODULE_ID", "realesr")
 EP_LOG_LEVEL = os.getenv("EP_LOG_LEVEL", "INFO")
 
 MODULE_DIR = Path(os.getenv("EP_MODULE_DIR", Path(__file__).resolve().parent))
@@ -57,20 +57,18 @@ NCNN_BINARY_NAMES = {
 }
 # [[models]] id → target_dir（与 module.toml 保持一致；params.model 变体覆盖解析用）
 MODEL_TARGET_DIRS = {
-    "realesr-animevideov3-pth": "video-upscale-realesr-animevideov3-x4-pth",
-    "realesrgan-x4plus-pth": "video-upscale-realesrgan-x4plus-pth",
-    "animevideo-xsx2-pth": "video-upscale-animevideo-xsx2-pth",
-    "animevideo-xsx4-pth": "video-upscale-animevideo-xsx4-pth",
-    "realesrgan-animevideov3-x4-ncnn": "video-upscale-realesr-animevideov3-x4-ncnn",
+    "realesr-animevideov3-pth": "realesr-animevideov3-x4-pth",
+    "realesrgan-x4plus-pth": "realesrgan-x4plus-pth",
+    "realesrgan-animevideov3-x4-ncnn": "realesr-animevideov3-x4-ncnn",
 }
 
 logging.basicConfig(
     level=getattr(logging, EP_LOG_LEVEL.upper(), logging.INFO),
-    format="%(asctime)s [video-upscale] %(levelname)s %(message)s",
+    format="%(asctime)s [realesr] %(levelname)s %(message)s",
 )
-logger = logging.getLogger("video-upscale")
+logger = logging.getLogger("realesr")
 
-app = FastAPI(title="EntryPoint video-upscale adapter", version="0.1.0")
+app = FastAPI(title="EntryPoint realesr adapter", version="0.1.0")
 
 
 class ExperimentalError(RuntimeError):
@@ -261,6 +259,13 @@ def upscale_frames_torch(frames_in: Path, frames_out: Path, weight: Path,
             "requirements_by_backend consumption"
         ) from exc
     try:
+        # basicsr 1.4.2 引用的 functional_tensor 在 torchvision>=0.17 已移除，
+        # 以别名 shim 兜底（post-install 钩子的导入自检同款逻辑）
+        import sys as _sys, types as _types
+        import torchvision.transforms.functional as _tvf
+        _shim = _types.ModuleType("torchvision.transforms.functional_tensor")
+        _shim.rgb_to_grayscale = _tvf.rgb_to_grayscale
+        _sys.modules.setdefault("torchvision.transforms.functional_tensor", _shim)
         from basicsr.archs.rrdbnet_arch import RRDBNet
         from realesrgan import RealESRGANer
     except ImportError as exc:
@@ -271,11 +276,21 @@ def upscale_frames_torch(frames_in: Path, frames_out: Path, weight: Path,
 
     device = "cpu" if EP_BACKEND == "cpu" else "cuda"
     model_name = weight.stem.lower()
+    # 架构预设按权重文件名判定（官方 release 实证：键集+形状全匹配）：
+    #   realesr-animevideov3 → SRVGG num_conv=16, upscale=4
+    #   v2 xsx2              → SRVGG num_conv=16, upscale=2
+    #   v2 xsx4              → SRVGG num_conv=32, upscale=4
+    #   x4plus(_anime)       → RRDBNet（23/6 blocks）
+    def _srvgg_preset(stem: str) -> tuple[int, int]:
+        if "xsx4" in stem or "animevideov3" in stem:
+            return 32 if "xsx4" in stem else 16, 4
+        return 16, 2  # xsx2
+
     if "animevideov3" in model_name or "xsx" in model_name:
         # compact SRVGGNetCompact 架构（animevideov3 / v2 xs 系列）
         from realesrgan.archs.srvgg_arch import SRVGGNetCompact
-        netscale = scale if "xsx2" not in model_name else 2
-        net = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=32,
+        num_conv, netscale = _srvgg_preset(model_name)
+        net = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=num_conv,
                               upscale=netscale, act_type="prelu")
     elif "x4plus_anime" in model_name:
         net = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=6,
@@ -528,6 +543,6 @@ async def predict_upscale(
 
 
 if __name__ == "__main__":
-    logger.info("starting video-upscale adapter on %s:%d (backend=%s)",
+    logger.info("starting realesr adapter on %s:%d (backend=%s)",
                 EP_HOST, EP_PORT, EP_BACKEND)
     uvicorn.run(app, host=EP_HOST, port=EP_PORT, log_level=EP_LOG_LEVEL.lower())

@@ -1,4 +1,4 @@
-# video-interp — 视频插帧模块（W1 脚手架，实验性）
+# rife — 视频插帧模块（W1 脚手架，实验性）
 
 RIFE 公版权重（**MIT 全系已核实**，HETERO_DIST_PLAN §2.5）视频插帧模块。
 三运行时分层（厂商栈优先，ncnn-vulkan 仅兜底）：
@@ -46,7 +46,7 @@ adapter 负责：抽帧 → 引擎逐 pass 2x → 原帧/中间帧交错重组 �
 
 ```bash
 export EP_MODULE_DIR=$PWD EP_PORT=8921 EP_BACKEND=vulkan \
-       EP_MODEL_DIR=/path/to/models/video-interp-rife-ncnn EP_WORKSPACE=/tmp/ep-ws
+       EP_MODEL_DIR=/path/to/models/rife-rife-ncnn EP_WORKSPACE=/tmp/ep-ws
 python adapter.py &
 curl http://127.0.0.1:8921/health
 curl -X POST http://127.0.0.1:8921/predict/interpolate -H 'Content-Type: application/json' \

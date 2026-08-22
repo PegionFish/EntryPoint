@@ -1,14 +1,14 @@
 [module]
-id = "video-upscale"
-name = "Video Upscale 视频超分"
+id = "realesr"
+name = "RealESR 视频超分"
 version = "0.1.0"
-description = "视频超分辨率：Real-ESRGAN 官方系公版权重，torch(CUDA/ROCm) 主路线 + OpenVINO ONNX(Intel) + ncnn-vulkan 兜底"
+description = "视频超分（RealESR/RealESRGAN 主线家族）：realesr-animevideov3 轻量与 x4plus 通用公版权重，torch(CUDA/ROCm) 主路线 + OpenVINO ONNX(Intel) + ncnn-vulkan 兜底。同功能域的 RealESRGANv2-animevideo 系另立 animevideo 模块（按模型家族拆分）"
 category = "video"
 genre = "upscale"
 authors = ["EntryPoint Community"]
 license = "BSD-3-Clause"
 homepage = "https://github.com/xinntao/Real-ESRGAN"
-tags = ["video", "upscale", "super-resolution", "realesrgan", "experimental"]
+tags = ["video", "upscale", "super-resolution", "realesr", "realesrgan", "experimental"]
 
 [runtime]
 type = "python"
@@ -48,12 +48,16 @@ openvino = "requirements-openvino.txt"
 
 # ---- 权重变体：torch .pth（BSD-3 官方公版，xinntao GitHub release 直链）----
 
+# ---- 权重变体：torch .pth（BSD-3 官方公版，xinntao GitHub release 直链）----
+# 家族拆分说明（模块 = 模型家族）：RealESRGANv2-animevideo-* 两款迁往
+# modules/animevideo 独立模块；本模块只保留 realesr 主线与 x4plus 通用系。
+
 [[models]]
 id = "realesr-animevideov3-pth"
 name = "RealESRGAN animevideov3 x4 (视频轻量·默认·pth)"
 source = "url"
 url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth"
-target_dir = "video-upscale-realesr-animevideov3-x4-pth"
+target_dir = "realesr-animevideov3-x4-pth"
 size_estimate_mb = 3
 default = true
 qualified_id = "xinntao.realesrgan.realesr-animevideov3-x4"
@@ -63,27 +67,11 @@ id = "realesrgan-x4plus-pth"
 name = "RealESRGAN x4plus (通用照片级·pth)"
 source = "url"
 url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
-target_dir = "video-upscale-realesrgan-x4plus-pth"
+target_dir = "realesrgan-x4plus-pth"
 size_estimate_mb = 64
 qualified_id = "xinntao.realesrgan.x4plus"
 
-[[models]]
-id = "animevideo-xsx2-pth"
-name = "RealESRGANv2 animevideo xsx2 (动漫视频·pth)"
-source = "url"
-url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.3.0/RealESRGANv2-animevideo-xsx2.pth"
-target_dir = "video-upscale-animevideo-xsx2-pth"
-size_estimate_mb = 3
-qualified_id = "xinntao.realesrgan.animevideo-xsx2"
-
-[[models]]
-id = "animevideo-xsx4-pth"
-name = "RealESRGANv2 animevideo xsx4 (动漫视频 4x·pth)"
-source = "url"
-url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.3.0/RealESRGANv2-animevideo-xsx4.pth"
-target_dir = "video-upscale-animevideo-xsx4-pth"
-size_estimate_mb = 3
-qualified_id = "xinntao.realesrgan.animevideo-xsx4"
+# （RealESRGANv2-animevideo-xsx2 / xsx4 已迁往 modules/animevideo）
 
 # ---- 权重变体：ncnn param+bin（vulkan 兜底）----
 # 上游无独立模型包资产：模型捆绑在引擎 portable 包内（binaries+models 一体）。
@@ -95,7 +83,7 @@ id = "realesrgan-animevideov3-x4-ncnn"
 name = "RealESRGAN animevideov3 x4 (ncnn/vulkan 兜底)"
 source = "url"
 url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip"
-target_dir = "video-upscale-realesr-animevideov3-x4-ncnn"
+target_dir = "realesr-animevideov3-x4-ncnn"
 size_estimate_mb = 45
 qualified_id = "xinntao.realesrgan.animevideov3-x4-ncnn"
 
@@ -110,7 +98,7 @@ qualified_id = "xinntao.realesrgan.animevideov3-x4-ncnn"
 # name = "RealESRGAN x4plus (ONNX/OpenVINO)"
 # source = "url"
 # url = "<待回填：自转 dynamic-shape onnx 的发布直链>"
-# target_dir = "video-upscale-realesrgan-x4plus-onnx"
+# target_dir = "realesrgan-x4plus-onnx"
 # size_estimate_mb = 68
 
 [interface]

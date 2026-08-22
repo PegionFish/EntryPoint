@@ -684,6 +684,26 @@ Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平�
   「id + 设备名 + 多栈提示」
 - 真机效果：7 条目 → 5 条目，7900 XTX 与 iGPU 各归一处且栈覆盖一目了然
 
+### 追加（同日第五轮——模块按模型家族重组）
+
+- ✨ **家族正名**：video-upscale→`realesr`、video-interp→`rife`、
+  onnx-matting→`birefnet`；video-upscale 按家族拆为 `realesr`
+  （主线+x4plus+ncnn 兜底）与 `animevideo`（v2 xsx2/xsx4，torch-only）
+  两模块——平台约定「一个模块 = 一个模型家族」；rembg 为多家族工具名惯例
+  保留。模型目录/激活变体键/Rust fixture 同步迁移
+- 🎨 管线编排模块面板弃用 category 归堆（此前超分+插帧同压「视频」标题下），
+  改为平铺家族列表（id 字母序），检索照常
+- 🔧 **torch 路线首通三雷排爆**：① basicsr==1.4.2 setup.py 硬依赖已从 PyPI
+  移除的 tb-nightly → requirements-torch 剔除两包，改由 post-install 钩子
+  --no-deps 安装 basicsr/realesrgan + 补最小运行时依赖（scipy/lmdb/tqdm/
+  addict/future/pyyaml/requests）；② torchvision>=0.17 移除
+  functional_tensor → adapter 内别名 shim；③ SRVGG 架构映射错配 →
+  `_srvgg_preset` 按文件名实证预设（v3=16/4、xsx2=16/2、xsx4=32/4）
+- ✅ 真机冒烟：realesr torch(cuda) 全片 320x240→1280x960 首发、
+  animevideo xsx2 torch 路线通过、rife vulkan 链重命名后回归
+  （30帧@15fps→60帧@30fps）；workspace 1241 tests + clippy 零警告 +
+  webui build/lint 过
+
 ### 待办（恢复工作时的接续点）
 
 1. daemon 新二进制重启未完成（暂停时中断）——重启后 E2 走平台全链：

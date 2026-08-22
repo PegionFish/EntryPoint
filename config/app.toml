@@ -53,4 +53,4 @@ staging_dir = ".pack-staging"
 enabled = true
 
 [active_models]
-video-upscale = "realesrgan-animevideov3-x4-ncnn"
+realesr = "realesrgan-animevideov3-x4-ncnn"

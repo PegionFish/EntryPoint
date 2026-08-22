@@ -1,0 +1,19 @@
+# torch 路线依赖（cuda / rocm 后端）——M2 requirements_by_backend 消费
+# 注意：basicsr==1.4.2 与 realesrgan==0.3.0 不在此列（其 setup.py 硬依赖已从
+# PyPI 移除的 tb-nightly，常规解析必败），由 scripts/post-install.sh 以
+# --no-deps 两步安装并补齐最小运行时依赖。
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+python-multipart>=0.0.6
+
+torch>=2.4
+torchvision
+numpy>=1.24
+opencv-python-headless>=4.8
+scipy>=1.10
+lmdb>=1.4
+tqdm>=4.66
+addict
+future
+pyyaml
+requests

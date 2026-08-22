@@ -1,0 +1,74 @@
+[module]
+id = "animevideo"
+name = "AnimeVideo 视频超分"
+version = "0.1.0"
+description = "视频超分（RealESRGANv2-animevideo 家族）：xsx2/xsx4 动漫视频公版权重，torch(CUDA/ROCm/CPU) 路线。与 RealESR 主线按模型家族拆分为独立模块；pth 官方无 ncnn 转换发布，故不声明 vulkan 兜底"
+category = "video"
+genre = "upscale"
+authors = ["EntryPoint Community"]
+license = "BSD-3-Clause"
+homepage = "https://github.com/xinntao/Real-ESRGAN"
+tags = ["video", "upscale", "super-resolution", "animevideo", "experimental"]
+
+[runtime]
+type = "python"
+python_version = ">=3.10,<3.13"
+requirements = "requirements.txt"
+entrypoint = "adapter.py"
+start_command = "{venv_python} {MODULE_DIR}/{entrypoint}"
+
+[compute]
+# torch-only：官方无 animevideo 系 ncnn/ONNX 权重发布（决策备忘录 ws-f §1.2），
+# 不声明 vulkan/openvino 后端做诚实占位
+backends = ["cuda", "rocm", "cpu"]
+default_backend = "cuda"
+vram_estimate_mb = 2048
+min_vram_mb = 1024
+notes = "EXPERIMENTAL：家族拆分模块——cuda/rocm/cpu=torch(.pth) 单路线；权重为 RealESRGANv2-animevideo 官方 release（BSD-3）。torch 依赖见 requirements-torch.txt（M2 requirements_by_backend 消费）"
+
+[compute.env]
+cuda = { CUDA_VISIBLE_DEVICES = "{device_index}" }
+rocm = { HIP_VISIBLE_DEVICES = "{device_index}", TORCH_DEVICE = "cuda" }
+cpu = { TORCH_DEVICE = "cpu" }
+
+[runtime.requirements_by_backend]
+cuda = "requirements-torch.txt"
+rocm = "requirements-torch.txt"
+
+# ---- 权重变体：torch .pth（BSD-3 官方公版，xinntao GitHub release 直链）----
+# 自 modules/video-upscale 拆出（家族正名：模块 = 模型家族）
+
+[[models]]
+id = "animevideo-xsx2-pth"
+name = "RealESRGANv2 animevideo xsx2 (动漫视频 2x·默认·pth)"
+source = "url"
+url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.3.0/RealESRGANv2-animevideo-xsx2.pth"
+target_dir = "animevideo-xsx2-pth"
+size_estimate_mb = 3
+default = true
+qualified_id = "xinntao.realesrgan.animevideo-xsx2"
+
+[[models]]
+id = "animevideo-xsx4-pth"
+name = "RealESRGANv2 animevideo xsx4 (动漫视频 4x·pth)"
+source = "url"
+url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.3.0/RealESRGANv2-animevideo-xsx4.pth"
+target_dir = "animevideo-xsx4-pth"
+size_estimate_mb = 3
+qualified_id = "xinntao.realesrgan.animevideo-xsx4"
+
+[interface]
+type = "http"
+health_endpoint = "/health"
+ready_timeout_secs = 60
+
+[[interface.capabilities]]
+name = "upscale"
+description = "视频超分辨率放大（抽帧→逐帧 SR→回封 mp4，音频流 copy）"
+input_type = "video"
+output_type = "video"
+max_file_size_mb = 4096
+
+[interface.capabilities.params]
+scale_factor = { type = "integer", default = 4, min = 2, max = 4, description = "放大倍率（xsx2 模型取 2、xsx4 取 4；与所选变体不一致时以变体原生倍率为准）" }
+tile_size = { type = "integer", default = 256, min = 0, max = 1024, description = "推理 tile 边长（0=自动；显存不足时调小）" }
