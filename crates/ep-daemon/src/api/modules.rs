@@ -243,10 +243,15 @@ pub async fn start_module(
         }
     }
 
-    // 3.5 venv 就绪门禁（任务 #10）：手动启动此前完全不做 venv 准备，与自动拉起
-    //     （autostart.rs）路径不一致；现统一走共享助手（is_venv_ready 哈希门禁，
-    //     修复"半壳 venv"误判；未就绪才 ensure_venv）。非 Python 运行时 no-op。
-    if let Err(detail) = super::ensure_module_venv_ready(&state, &id, &manifest).await {
+    // 3.5 venv 就绪门禁（任务 #10 + HETERO_DIST_PLAN M2/M3 接线）：手动启动此前
+    //     完全不做 venv 准备，与自动拉起（autostart.rs）路径不一致；现统一走共享
+    //     助手（is_venv_ready 哈希门禁，修复"半壳 venv"误判；未就绪才 ensure_venv）。
+    //     设备选择前移至此处：分后端 venv 依赖本次分配设备所属 backend
+    //     （依赖文件 requirements_by_backend 解析 + <module>--<backend> 目录）。
+    let device = super::select_module_device(&state, &manifest).await;
+    if let Err(detail) =
+        super::ensure_module_venv_ready(&state, &id, &manifest, Some(device.backend())).await
+    {
         warn!(module_id = %id, error = %detail, "venv prep failed before start");
         return err_response(
             &state,
@@ -274,9 +279,7 @@ pub async fn start_module(
         }
     };
 
-    // 5. 选择设备（D-4 调度器接线）：经 ep-core 共享选择核心统一分配，
-    //    语义见 [`super::select_module_device`]（无兼容设备时 Cpu 兜底）
-    let device = super::select_module_device(&state, &manifest).await;
+    // 5. 设备已选择（见 3.5 前移说明，D-4 调度器接线语义不变）
 
     // 6. 构建环境变量（缺陷 #4 残余修复）：统一委托 ep-core 公共构建函数
     //    （手动启动/自动拉起/独立模式/桌面端同一真源），注入 MODELS_ROOT

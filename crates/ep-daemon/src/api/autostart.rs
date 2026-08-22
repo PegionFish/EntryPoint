@@ -203,10 +203,12 @@ async fn start_via_existing_path(
         }
     }
 
-    // 2. venv 就绪门禁（P0-5 教训 + 任务 #10）：与手动启动（modules.rs）同源
-    //    的共享助手——is_venv_ready 哈希门禁修复"半壳 venv"（只有解释器、
-    //    未装依赖）误判就绪；未就绪才准备。仅 Python 运行时实际生效。
-    super::ensure_module_venv_ready(state, module_id, manifest)
+    // 2. venv 就绪门禁（P0-5 教训 + 任务 #10 + HETERO_DIST_PLAN M2/M3 接线）：
+    //    与手动启动（modules.rs）同源的共享助手——is_venv_ready 哈希门禁修复
+    //    "半壳 venv"（只有解释器、未装依赖）误判就绪；未就绪才准备。仅 Python
+    //    运行时实际生效。设备选择前移：分后端 venv 依赖本次分配 backend。
+    let device = super::select_module_device(state, manifest).await;
+    super::ensure_module_venv_ready(state, module_id, manifest, Some(device.backend()))
         .await
         .map_err(AutoStartError::VenvPrepFailed)?;
 
@@ -218,9 +220,7 @@ async fn start_via_existing_path(
         })?
     };
 
-    // 4. 选择设备（D-4 调度器接线，与 modules.rs 同源）：经 ep-core 共享选择
-    //    核心统一分配，语义见 [`super::select_module_device`]（无兼容设备时 Cpu 兜底）
-    let device = super::select_module_device(state, manifest).await;
+    // 4. 设备已选择（见步骤 2 前移说明，D-4 调度器接线语义不变）
 
     // 5. 构建环境变量（缺陷 #4 残余修复）：与手动启动（modules.rs）同走
     //    [`super::module_start_env_vars`] 统一委托 ep-core build_module_env，

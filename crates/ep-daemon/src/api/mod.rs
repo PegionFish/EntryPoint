@@ -173,10 +173,17 @@ pub(crate) fn module_venv_python_path(
 /// 就绪的问题；未就绪才调 `ensure_venv` 准备。非 Python 运行时直接返回
 /// 常规路径（no-op）。成功返回 venv python 路径；失败返回英文技术细节，
 /// 调用方经 i18n 键 `apiModels.venvPrepFailed` 生成用户文案。
+///
+/// HETERO_DIST_PLAN M2/M3 接线：`backend` 为本次分配设备所属后端（启动路径）
+/// 或 manifest default_backend（下载/导入路径）。Some 时走分后端口径——
+/// 依赖文件经 [`RuntimeConfig::resolve_requirements`] 按 backend 选择、venv 目录
+/// `<module>--<backend>`、哈希混入 backend 名，均含旧布局兼容读取；
+/// None 保持旧单 venv 口径（哈希逐字节兼容）。
 pub(crate) async fn ensure_module_venv_ready(
     state: &Arc<AppState>,
     module_id: &str,
     manifest: &ep_core::module::manifest::ModuleManifest,
+    backend: Option<ep_core::types::ComputeBackend>,
 ) -> Result<std::path::PathBuf, String> {
     use ep_core::module::manifest::RuntimeType;
     use tracing::info;
@@ -197,16 +204,26 @@ pub(crate) async fn ensure_module_venv_ready(
         .python_version
         .clone()
         .unwrap_or_else(|| ">=3.10".into());
-    let req_rel = manifest
-        .runtime
-        .requirements
-        .clone()
-        .unwrap_or_else(|| "requirements.txt".to_string());
+    // M2：依赖文件按后端解析（requirements_by_backend 条目 → runtime.requirements
+    // → "requirements.txt" 三级回退），None 即旧口径
+    let req_rel = manifest.runtime.resolve_requirements(backend).to_string();
 
     let prep = tokio::task::spawn_blocking(move || {
         let env_mgr =
             ep_core::env::EnvManager::new(&root, &python_cfg).with_network(&network_cfg);
         let req_path = root.join("modules").join(&mid).join(&req_rel);
+        if let Some(b) = backend {
+            if env_mgr.is_venv_ready_for_backend(&mid, &req_path, b) {
+                return Ok(env_mgr.venv_python_path_for_backend(&mid, b));
+            }
+            info!(
+                module_id = %mid,
+                backend = %b,
+                requirements = %req_rel,
+                "backend venv not ready (missing or deps hash mismatch), preparing Python environment"
+            );
+            return env_mgr.ensure_venv_for_backend(&mid, &py_ver, &req_path, b);
+        }
         if env_mgr.is_venv_ready(&mid, &req_path) {
             return Ok(env_mgr.venv_python_path(&mid));
         }
@@ -488,7 +505,7 @@ type = "http"
         let root = unique_venv_root("native");
         let state = state_at(root.clone());
         let mf = manifest_with_backends("native-mod", &[ep_core::types::ComputeBackend::Cpu]);
-        let path = ensure_module_venv_ready(&state, "native-mod", &mf)
+        let path = ensure_module_venv_ready(&state, "native-mod", &mf, None)
             .await
             .expect("非 Python 运行时应直接返回");
         assert_eq!(path, module_venv_python_path(&root, "native-mod"));
@@ -517,7 +534,7 @@ type = "http"
         )
         .unwrap();
 
-        let path = ensure_module_venv_ready(&state, "ready-mod", &mf)
+        let path = ensure_module_venv_ready(&state, "ready-mod", &mf, None)
             .await
             .expect("哈希匹配的 venv 应判就绪");
         assert_eq!(path, py);
@@ -540,7 +557,7 @@ type = "http"
         std::fs::create_dir_all(req.parent().unwrap()).unwrap();
         std::fs::write(&req, "ep-halfshell-nonexistent-pkg==1.0\n").unwrap();
 
-        let err = ensure_module_venv_ready(&state, "half-mod", &mf)
+        let err = ensure_module_venv_ready(&state, "half-mod", &mf, None)
             .await
             .expect_err("半壳 venv 必须触发准备并失败");
         assert!(!err.is_empty(), "失败必须携带技术细节");
