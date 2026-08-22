@@ -386,8 +386,10 @@ impl EnvManager {
     /// 5. 对比 `.ep_deps_hash`
     /// 6. 不一致 → `uv pip install -r <req> --python <venv_python> --link-mode hardlink [-c <constraints>]`
     ///    （constraints 仅当配置非空且文件存在时追加，文件不存在静默跳过）
-    /// 7. 写入新哈希
-    /// 8. 返回 venv 内 python 路径
+    /// 7. 执行模块目录内可选的 post-install 钩子（`scripts/post-install.sh`，
+    ///    仅本次实际安装时；失败则整体报错且哈希不落盘，MODULE_SPEC §2.6）
+    /// 8. 写入新哈希
+    /// 9. 返回 venv 内 python 路径
     pub fn ensure_venv(
         &self,
         module_id: &str,
@@ -616,7 +618,14 @@ impl EnvManager {
             };
             debug!(module = module_id, output = %output, "dependencies installed");
 
-            // 4. 写入新哈希
+            // 4. post-install 钩子（HETERO_DIST_PLAN 契约缺口：CTranslate2-ROCm 等
+            //    "pip 装完还要覆盖特殊轮子"的后处理场景，MODULE_SPEC §2.6）。
+            //    挂在写哈希之前执行——`.ep_deps_hash` 一旦落盘即代表"依赖安装 +
+            //    后处理"完整就绪；钩子失败在此 fail-fast，半成品依赖栈绝不会
+            //    被哈希锁定（下次进入必然重装并重跑钩子）。脚本缺失静默跳过。
+            self.run_post_install_hook(module_id, venv_dir, backend)?;
+
+            // 5. 写入新哈希
             if let Some(parent) = hash_file.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
@@ -629,6 +638,67 @@ impl EnvManager {
         }
 
         Ok(venv_python)
+    }
+
+    /// 执行模块目录内的可选 post-install 钩子（HETERO_DIST_PLAN 契约缺口，
+    /// MODULE_SPEC §2.6 v1.3-draft）。
+    ///
+    /// - 固定名：Unix 为 `<root>/modules/<module_id>/scripts/post-install.sh`，
+    ///   经 `bash` 解释执行（不要求可执行位，免疫 git filemode 差异）；
+    /// - 注入环境变量：`VIRTUAL_ENV=<venv 目录>`、`EP_BACKEND=<backend 小写名>`
+    ///   （旧单 venv 口径 None → 空串，经 [`run_command_with_env`] 的非空值过滤即不下发）；
+    /// - 脚本不存在 → 静默跳过（绝大多数模块无后处理需求）；
+    /// - 脚本失败（非零退出/超时/无法 spawn）→ 错误上抛（含 stderr），由调用方
+    ///   在写哈希之前中止——半成品依赖栈（如 HIP 轮子未覆盖的占位安装）不得被
+    ///   `.ep_deps_hash` 锁定；
+    /// - Windows 分支本期留白（设计约定仅实现 Unix）：后续以同名 `.cmd`/`.bat`
+    ///   存在性探测执行之。
+    ///
+    /// 触发时机：仅在本次实际执行了依赖安装时调用（依赖未变的重入不触发），
+    /// 钩子本身须幂等可重入（真实用例见 `modules/faster-whisper/scripts/post-install.sh`）。
+    fn run_post_install_hook(
+        &self,
+        module_id: &str,
+        venv_dir: &Path,
+        backend: Option<ComputeBackend>,
+    ) -> Result<()> {
+        let hook_scripts_dir = self.root.join("modules").join(module_id).join("scripts");
+
+        // 平台分支（cfg! 双臂均参与类型检查，无死代码告警）：
+        if cfg!(windows) {
+            // Windows 留白（本期范围外）：应探测 post-install.cmd / post-install.bat，
+            // 存在时经 cmd /C 执行并注入同等环境变量；两者皆缺 → 静默跳过。
+            let _ = (&hook_scripts_dir, venv_dir, backend);
+            Ok(())
+        } else {
+            let hook = hook_scripts_dir.join("post-install.sh");
+            if !hook.is_file() {
+                debug!(module = module_id, "no post-install hook, skipping");
+                return Ok(());
+            }
+            info!(
+                module = module_id,
+                hook = %hook.display(),
+                backend = %backend.map(|b| b.to_string()).unwrap_or_default(),
+                "running post-install hook"
+            );
+            let extra_env = vec![
+                (
+                    "VIRTUAL_ENV".to_string(),
+                    venv_dir.to_string_lossy().into_owned(),
+                ),
+                // 旧口径（None）→ 空串；run_command_with_env 对空值不注入
+                (
+                    "EP_BACKEND".to_string(),
+                    backend.map(|b| b.to_string()).unwrap_or_default(),
+                ),
+            ];
+            let hook_str = hook.to_string_lossy().into_owned();
+            run_command_with_env("bash", &[hook_str.as_str()], &extra_env).with_context(|| {
+                format!("post-install hook failed for module '{module_id}': {}", hook.display())
+            })?;
+            Ok(())
+        }
     }
 
     /// uv 缓存目录绝对路径（配置为空 → None，即不注入 `UV_CACHE_DIR`）。
