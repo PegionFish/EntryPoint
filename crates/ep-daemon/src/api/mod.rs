@@ -87,21 +87,26 @@ pub(crate) async fn select_module_device(
     state: &AppState,
     manifest: &ep_core::module::manifest::ModuleManifest,
 ) -> ep_core::types::DeviceId {
-    let (vram_mb, strategy, allow_overcommit, disabled) = {
+    let (vram_mb, strategy, allow_overcommit, disabled, single_device) = {
         let config = state.config.read().await;
         (
             ep_core::compute::scheduler::module_vram_request(&config, manifest),
             ep_core::compute::scheduler::scheduling_strategy_for(&config),
             config.compute.allow_overcommit,
             config.compute.disabled_backends.clone(),
+            // P1-6 接线补全：Single 策略的设备名必须传入，否则回退 [0]
+            // （此前走兼容入口导致 `[compute].single_device` 静默失效，
+            // E2 的 NPU 命中属 compatible[0] 巧合——见 HETERO_DIST_PLAN）
+            ep_core::compute::scheduler::single_device_name(&config),
         )
     };
     let devices = state.devices.read().await;
-    ep_core::compute::scheduler::select_device_for_module(
+    ep_core::compute::scheduler::select_device_for_module_with_single_device(
         &devices,
         manifest,
         vram_mb,
         strategy,
+        single_device.as_deref(),
         allow_overcommit,
         &disabled,
     )
