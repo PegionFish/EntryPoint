@@ -661,7 +661,7 @@ async fn download_model(
     // 化解全新安装"下载需要 venv、启动又需要模型"的死锁。
     // 模块未被发现时保留旧语义：venv 存在 → 继续用既有解释器；否则 → 404。
     let venv_python = match find_module_manifest(&state, &module_id).await {
-        Some(mf) => match super::ensure_module_venv_ready(&state, &module_id, &mf).await {
+        Some(mf) => match super::ensure_module_venv_ready(&state, &module_id, &mf, mf.compute.default_backend).await {
             Ok(path) => path,
             Err(detail) => {
                 return err_response(

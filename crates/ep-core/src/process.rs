@@ -133,6 +133,36 @@ pub fn venv_python_path(root: &Path, module_id: &str) -> PathBuf {
     }
 }
 
+/// 模块 venv Python 解释器路径（分后端口径，HETERO_DIST_PLAN M3）：
+///
+/// 1. 新布局 `runtime/venvs/<id>--<backend>/` 解释器存在 → 返回；
+/// 2. 否则旧布局 `runtime/venvs/<id>/` 存在 → 兼容返回（避免无谓重建）；
+/// 3. 皆无 → 返回新布局口径（前瞻性答案，与 EnvManager 同语义）。
+pub fn venv_python_path_for_backend(
+    root: &Path,
+    module_id: &str,
+    backend: crate::types::ComputeBackend,
+) -> PathBuf {
+    let base = root.join("runtime").join("venvs");
+    let python_in = |dir: PathBuf| {
+        if cfg!(windows) {
+            dir.join("Scripts").join("python.exe")
+        } else {
+            dir.join("bin").join("python")
+        }
+    };
+    let per_backend = python_in(base.join(format!("{module_id}--{backend}")));
+    if per_backend.exists() {
+        return per_backend;
+    }
+    let legacy = python_in(base.join(module_id));
+    if legacy.exists() {
+        legacy
+    } else {
+        per_backend
+    }
+}
+
 /// 为短命令/探测进程附加 Windows `CREATE_NO_WINDOW` 创建标志。
 ///
 /// 桌面 GUI（无控制台）拉起 python/uv/ffmpeg 探测时：
@@ -281,8 +311,10 @@ fn prepare_template_vars(
 
     // M1: 注入平台自适应的 venv python 路径
     // 模块 TOML 可用 {venv_python} 替代硬编码的 bin/python（P0-3 ②：键名与占位符对齐）
+    // M3：按本次分配设备所属后端解析分后端 venv（旧布局兼容回退）
     if let Some(root) = vars.get("ROOT").or_else(|| vars.get("root")).cloned() {
-        let python = venv_python_path(Path::new(&root), module_id);
+        let python =
+            venv_python_path_for_backend(Path::new(&root), module_id, device.backend());
         vars.insert("venv_python".to_string(), python.to_string_lossy().to_string());
     }
 

@@ -1486,7 +1486,7 @@ async fn start_one_pending_download(
 
     // 2. venv 就绪门禁（任务 #10：与 models.rs / modules.rs / autostart.rs 同源
     //    的共享助手，哈希门禁修复"半壳 venv"误判；失败仅告警并跳过本次下载）
-    let venv_python = match super::ensure_module_venv_ready(&state, &req.module_id, &manifest)
+    let venv_python = match super::ensure_module_venv_ready(&state, &req.module_id, &manifest, manifest.compute.default_backend)
         .await
     {
         Ok(path) => path,
