@@ -1,0 +1,102 @@
+[module]
+id = "qwen3-asr"
+name = "Qwen3-ASR 语音识别"
+version = "1.0.0"
+description = "基于 Qwen3 的多语言语音识别与 ForcedAligner 词级时间戳对齐（transcribe + align）"
+category = "asr"
+genre = "qwen-asr"
+authors = ["EntryPoint Community"]
+license = "Apache-2.0"
+homepage = "https://github.com/QwenLM/Qwen3-ASR"
+tags = ["speech", "recognition", "multilingual", "timestamps", "alignment", "context-biasing"]
+
+[runtime]
+type = "python"
+python_version = ">=3.10,<3.13"
+requirements = "requirements.txt"
+entrypoint = "adapter.py"
+start_command = "{venv_python} {MODULE_DIR}/{entrypoint}"
+
+[compute]
+backends = ["cuda", "cpu"]
+default_backend = "cuda"
+# 默认变体 qwen3-asr-0.6b：bf16 权重约 1.8 GB + audio encoder/激活开销
+vram_estimate_mb = 2560
+min_vram_mb = 2048
+
+[compute.env]
+cuda = { CUDA_VISIBLE_DEVICES = "{device_index}" }
+
+# repo_id 经 reports/license-matrix.md #qwen3-asr 核实（2026-08-22）：
+# Qwen 官方 org，三仓卡片均 License: apache-2.0、无 gated → Tier A；
+# ModelScope 同名仓库为官方模型卡给出的双源下载路径，声明为镜像。
+[[models]]
+id = "qwen3-asr-0.6b"
+name = "Qwen3-ASR 0.6B (默认)"
+source = "huggingface"
+repo_id = "Qwen/Qwen3-ASR-0.6B"
+target_dir = "qwen3-asr-0.6b"
+revision = "main"
+size_estimate_mb = 1850
+default = true
+vram_estimate_mb = 2560
+
+[[models.mirrors]]
+source = "modelscope"
+repo_id = "Qwen/Qwen3-ASR-0.6B"
+
+[[models]]
+id = "qwen3-asr-1.7b"
+name = "Qwen3-ASR 1.7B (高精度)"
+source = "huggingface"
+repo_id = "Qwen/Qwen3-ASR-1.7B"
+target_dir = "qwen3-asr-1.7b"
+revision = "main"
+size_estimate_mb = 4550
+vram_estimate_mb = 5632
+
+[[models.mirrors]]
+source = "modelscope"
+repo_id = "Qwen/Qwen3-ASR-1.7B"
+
+[[models]]
+id = "qwen3-forced-aligner-0.6b"
+name = "Qwen3-ForcedAligner 0.6B (词级时间戳)"
+source = "huggingface"
+repo_id = "Qwen/Qwen3-ForcedAligner-0.6B"
+target_dir = "qwen3-forced-aligner-0.6b"
+revision = "main"
+size_estimate_mb = 1850
+vram_estimate_mb = 2560
+
+[[models.mirrors]]
+source = "modelscope"
+repo_id = "Qwen/Qwen3-ForcedAligner-0.6B"
+
+[interface]
+type = "http"
+health_endpoint = "/health"
+ready_timeout_secs = 120
+
+[[interface.capabilities]]
+name = "transcribe"
+description = "语音转文字；timestamps=true 且本地存在 Aligner 权重时输出词级时间戳与句级 segments"
+input_type = "audio"
+output_type = "json"
+max_file_size_mb = 2048
+
+[interface.capabilities.params]
+language = { type = "string", default = "auto", description = "语言名（如 Chinese/English，兼容 ISO 代码 zh/en）或 auto 自动检测" }
+context = { type = "string", default = "", description = "上下文提示文本（热词/专名/领域描述，提升识别偏置）" }
+timestamps = { type = "boolean", default = true, description = "输出 segments 与 words 词级时间戳（需本地 Aligner 权重，缺失时自动降级为纯文本）" }
+
+[[interface.capabilities]]
+name = "align"
+description = "强制对齐：给定音频与参考文本，输出逐词时间戳 [{word,start,end}]"
+input_type = "audio"
+output_type = "json"
+max_file_size_mb = 2048
+
+[interface.capabilities.params]
+text = { type = "string", default = "", description = "参考文本（必填；JSON 调用也可置于 body.input_text）" }
+language = { type = "string", default = "", description = "语言名或 ISO 代码（必填；align 不支持 auto 自动检测）" }

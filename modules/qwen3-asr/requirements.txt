@@ -1,0 +1,21 @@
+# torch cu130 wheel 索引（RTX 5090 D / Blackwell sm_120 需 cu128+ 构建）。
+# 机制依据：config/constraints.txt 头部【wheel 索引提示】a) requirements 内联。
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+python-multipart>=0.0.6
+# Qwen3-ASR 官方推理库（模型卡指定 pip install -U qwen-asr），
+# 提供 Qwen3ASRModel（transcribe）与 Qwen3ForcedAligner（align）。
+# 其 0.0.6 内部硬 pin transformers==4.57.6 / accelerate==1.12.0，
+# 与下方下限相容收敛；gradio/flask 为其传递依赖，无需在此重复声明。
+qwen-asr>=0.0.6
+# qwen-asr 0.0.6 解析落点即 transformers 4.57.6 / accelerate 1.12.0，
+# 显式声明下限仅为文档化意图。
+transformers>=4.57.6
+accelerate>=1.12.0
+# torch 与 config/constraints.txt 对齐：锁 2.11.0 使 uv 在 cu130 索引命中
+# 同族 +cu130 wheel（选型依据见 constraints.txt【torch 全家桶】；
+# qwen-asr 走 librosa/soundfile 读音频，无需 torchaudio）。
+torch==2.11.0
+soundfile>=0.12.0
