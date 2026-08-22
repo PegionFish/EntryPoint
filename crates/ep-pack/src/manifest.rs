@@ -535,7 +535,8 @@ mode = "bundle"
 
     #[test]
     fn notes_reject_unknown_backend_key() {
-        let bad = EXAMPLE_TOML.replace("rocm = ", "vulkan = ");
+        // M4 后词表含 vulkan（合法键），改用真正不存在的后端名验证拒绝
+        let bad = EXAMPLE_TOML.replace("rocm = ", "warp9 = ");
         assert!(toml::from_str::<PackManifest>(&bad).is_err());
     }
 
