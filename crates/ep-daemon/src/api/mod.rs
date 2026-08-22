@@ -7,6 +7,7 @@ pub mod health;
 pub mod inference;
 pub mod models;
 pub mod modules;
+pub mod module_import;
 pub mod packs;
 pub mod pipelines;
 pub mod tasks;
@@ -35,6 +36,7 @@ pub fn api_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .merge(devices::router())
         .merge(modules::router())
         // 模块标准档案导入/导出（HETERO_DIST_PLAN §2.2/§2.3，WS-A-api）
+        .merge(module_import::router())
         .merge(config::router())
         .merge(pipelines::router())
         .merge(execute::router())

@@ -33,7 +33,7 @@ import {
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
-import { api, uploadModelWithProgress } from '@/api/client'
+import { api, uploadModelWithProgress, uploadModuleArchive } from '@/api/client'
 import type {
   CapabilityDecl,
   CapabilityParamSchema,
@@ -2484,6 +2484,159 @@ function ExportModuleDialog({
   )
 }
 
+// ─── 模块标准档案导入对话框（HETERO_DIST_PLAN §2.3，WS-A-api）───────────────
+
+/**
+ * 上传模块标准压缩档案（zip / tar.gz）导入为模块。
+ *
+ * 与「整合包导入」（ImportModuleDialog，.epzip 全链路）不同：本入口走
+ * POST /api/modules/import 同步链——安全解包校验（禁 zip-slip / 符号链接 /
+ * 大小写冲突 / 超限）→ module.toml 校验 → semver 版本门禁（仅允许升级，
+ * 降级/同版 409）→ 落位 modules/<id>/。成功 toast 回显模块摘要。
+ */
+function ModuleArchiveImportDialog({
+  open,
+  onClose,
+  onImported,
+}: {
+  open: boolean
+  onClose: () => void
+  /** 导入落位后刷新模块/模型列表 */
+  onImported: () => void
+}) {
+  const { t } = useTranslation('modules')
+  const [pickedFile, setPickedFile] = useState<File | null>(null)
+  const [submitting, setSubmitting] = useState(false)
+  const [percent, setPercent] = useState(0)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
+
+  useEffect(() => {
+    if (!open) {
+      setPickedFile(null)
+      setSubmitting(false)
+      setPercent(0)
+    }
+  }, [open])
+
+  async function submit() {
+    if (!pickedFile || submitting) return
+    setSubmitting(true)
+    setPercent(0)
+    try {
+      const resp = await uploadModuleArchive(pickedFile, (p) => setPercent(p.percent))
+      const m = resp.module
+      toast.success(
+        resp.status === 'upgraded'
+          ? t('moduleArchive.importUpgraded', {
+              defaultValue: '模块已升级到 {{version}}',
+              version: m.version,
+            })
+          : t('moduleArchive.importSucceeded', { defaultValue: '模块导入成功' }),
+        { description: `${m.name} · ${m.id}` },
+      )
+      onImported()
+      onClose()
+    } catch (e) {
+      toast.error(
+        t('moduleArchive.importFailed', { defaultValue: '模块导入失败' }),
+        { description: errMsg(e) },
+      )
+    } finally {
+      setSubmitting(false)
+      setPercent(0)
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={(v) => (v ? undefined : onClose())}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <FileArchive className="size-4 text-primary" />
+            {t('moduleArchive.title', { defaultValue: '导入模块压缩包' })}
+          </DialogTitle>
+          <DialogDescription>
+            {t('moduleArchive.description', {
+              defaultValue:
+                '上传含 module.toml 的 zip / tar.gz 标准档案（根部或唯一一级目录下）；同名模块仅允许升级，降级与同版将被拒绝',
+            })}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-3">
+          {pickedFile ? (
+            <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-muted/20 px-3 py-2.5">
+              <div className="flex min-w-0 items-center gap-2">
+                <FileArchive className="size-4 shrink-0 text-muted-foreground" />
+                <span className="truncate text-sm">{pickedFile.name}</span>
+                <span className="shrink-0 font-mono text-xs text-muted-foreground">
+                  {formatBytes(pickedFile.size)}
+                </span>
+              </div>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                disabled={submitting}
+                onClick={() => setPickedFile(null)}
+                aria-label={t('common:action.close')}
+              >
+                <X className="size-3.5" />
+              </Button>
+            </div>
+          ) : (
+            <Button
+              variant="outline"
+              className="w-full border-dashed"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={submitting}
+            >
+              <FileArchive className="size-4" />
+              {t('moduleArchive.pickFile', {
+                defaultValue: '选择 .zip / .tar.gz / .tgz 文件',
+              })}
+            </Button>
+          )}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".zip,.tar.gz,.tgz"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0]
+              if (file) setPickedFile(file)
+              e.target.value = ''
+            }}
+          />
+
+          {submitting && (
+            <div className="space-y-1">
+              <div className="flex justify-between font-mono text-[11px] text-muted-foreground">
+                <span>{t('moduleArchive.uploading', { defaultValue: '正在上传' })}</span>
+                <span>{Math.floor(percent)}%</span>
+              </div>
+              <Progress value={percent} className="h-1.5" />
+            </div>
+          )}
+        </div>
+
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose} disabled={submitting}>
+            {t('common:action.cancel')}
+          </Button>
+          <Button disabled={!pickedFile || submitting} onClick={() => void submit()}>
+            {submitting ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : (
+              <Upload className="size-4" />
+            )}
+            {t('moduleArchive.submit', { defaultValue: '上传并导入' })}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 // ─── 模型级上传 / 本地路径导入对话框（MODULE_SPEC §6.3）──────────────
 
 /**
@@ -2745,6 +2898,8 @@ export function ModulesPage() {
   const [stopTarget, setStopTarget] = useState<ModuleResponse | null>(null)
   const [importOpen, setImportOpen] = useState(false)
   const [exportOpen, setExportOpen] = useState(false)
+  /** 模块标准档案导入对话框（zip/tar.gz → /api/modules/import） */
+  const [archiveImportOpen, setArchiveImportOpen] = useState(false)
   /** 整合包抽屉（W2：settings.packs 与导入/导出入口归拢） */
   const [packsOpen, setPacksOpen] = useState(false)
   /** 整合包列表重拉信号（导入/卸载落位后自增） */
@@ -3426,6 +3581,14 @@ export function ModulesPage() {
       })}
       actions={
         <>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setArchiveImportOpen(true)}
+          >
+            <FileArchive className="size-3.5" />
+            {t('toolbar.importArchive', { defaultValue: '导入模块' })}
+          </Button>
           <Button variant="outline" size="sm" onClick={() => setPacksOpen(true)}>
             <Package className="size-3.5" />
             {t('toolbar.packs', { defaultValue: '整合包' })}
@@ -3618,6 +3781,13 @@ export function ModulesPage() {
         onClose={() => setExportOpen(false)}
         models={models}
         io={packIo}
+      />
+
+      {/* ── 模块标准档案导入（HETERO_DIST_PLAN §2.3）── */}
+      <ModuleArchiveImportDialog
+        open={archiveImportOpen}
+        onClose={() => setArchiveImportOpen(false)}
+        onImported={() => void refreshAll()}
       />
 
       {/* ── 模型级上传 / 本地路径导入（§6.3）── */}

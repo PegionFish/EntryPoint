@@ -547,3 +547,30 @@ export interface ModelVariantResponse {
   /** 需重启模块生效 */
   needs_restart?: boolean
 }
+
+// ===== 模块标准档案导入 / 导出（HETERO_DIST_PLAN §2.2/§2.3，WS-A-api）=====
+
+/** POST /api/modules/import 响应中的模块摘要（manifest 回显） */
+export interface ModuleImportSummaryModule {
+  id: string
+  name: string
+  version: string
+  description: string
+  category: string
+  genre: string
+  license?: string | null
+  backends: string[]
+  /** 落位路径（modules/<id>/） */
+  path: string
+}
+
+/** POST /api/modules/import 成功响应：manifest 摘要 + 包 sha256 */
+export interface ModuleImportSummary {
+  /** imported = 首次落位 | upgraded = 覆盖升级（semver 更高） */
+  status: 'imported' | 'upgraded'
+  /** 上传归档的 sha256（小写 hex），供来源核对 */
+  sha256: string
+  file_count: number
+  total_bytes: number
+  module: ModuleImportSummaryModule
+}
