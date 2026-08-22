@@ -14,6 +14,7 @@ import type {
   ModelVariantRequest,
   ModelVariantResponse,
   ModuleActionResult,
+  ModuleImportSummary,
   ModuleLogsResponse,
   ModuleResponse,
   ModuleStatusResponse,
@@ -112,6 +113,46 @@ export function uploadModelWithProgress(
           typeof msg === 'string' && msg.trim() ? msg : `HTTP ${xhr.status}`,
         ),
       )
+    })
+    xhr.addEventListener('error', () => reject(new Error('network error')))
+    xhr.send(form)
+  })
+}
+
+/**
+ * 模块标准档案导入上传（HETERO_DIST_PLAN §2.3 POST /api/modules/import）。
+ * XHR 真实进度（同 uploadModelWithProgress 模式）；错误形状与 apiFetch
+ * 一致：抛出 `API <status>: <body>`，body 含 {"error","code"}。
+ */
+export function uploadModuleArchive(
+  file: File,
+  onProgress?: (p: { loaded: number; total: number; percent: number }) => void,
+): Promise<ModuleImportSummary> {
+  const form = new FormData()
+  form.append('file', file)
+  return new Promise<ModuleImportSummary>((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', '/api/modules/import')
+    xhr.upload.addEventListener('progress', (e) => {
+      if (!onProgress || !e.lengthComputable) return
+      onProgress({
+        loaded: e.loaded,
+        total: e.total,
+        percent: e.total > 0 ? Math.min(100, (e.loaded / e.total) * 100) : 0,
+      })
+    })
+    xhr.addEventListener('load', () => {
+      let body: unknown = null
+      try {
+        body = JSON.parse(xhr.responseText)
+      } catch {
+        // 非 JSON 响应
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(body as ModuleImportSummary)
+        return
+      }
+      reject(new Error(`API ${xhr.status}: ${xhr.responseText}`))
     })
     xhr.addEventListener('error', () => reject(new Error('network error')))
     xhr.send(form)
