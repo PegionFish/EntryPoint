@@ -574,3 +574,49 @@ Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平�
 - 最终门禁：clippy 零警告 + 1150/1150 测试通过
 - DEPLOYMENT.md 全量重写（ZIP 自包含模型）、README Linux 章节更新
 - 最终 ZIP 产物验证与统一 push（见 git log）
+
+---
+
+## Wave 6 异构计算落地 + 模块独立分发（2026-08-22，进行中）
+
+方案：`docs/HETERO_DIST_PLAN.md` v5（W0 契约冻结 `b6ab553`）。
+子代理舰队 8 流并行（A-core/A-api/B/C/D/E/F/G），本节为执行快照。
+
+### 已交付（全部已 commit，未 push）
+
+| 流 | 内容 | 提交 |
+|---|---|---|
+| WS-A-core | M2 requirements_by_backend 消费 / M3 分后端 venv `<module>--<backend>`（旧布局兼容）/ M4 Vulkan 检测器（注册序 DirectML 后 CPU 前）/ M6 OPENVINO_DEVICE `{device_name}` 注入修复 | `c9555c0` |
+| WS-A-api | POST /api/modules/import（zip/tar.gz 安全解包+semver 升级门禁+导入即纳管）/ GET export（内附 SHA256SUMS.txt）/ WebUI 导入对话框；ep-daemon 309+302 tests 全绿 clippy 零警告 | `47ff466` |
+| WS-B | **未派出**（两轮 spawn 被截断）——rocm 依赖准备 + faster-whisper requirements_by_backend 接线，待补 | — |
+| WS-C | rembg 多后端化（ORT provider 按 EP_BACKEND 分派 + requirements_by_backend(openvino)）/ onnx-matting 新模块（BiRefNet 双变体）/ ort_ep NPU 设备名归一化 | `bbe8de0` |
+| WS-D | qwen3-asr 新模块：PyPI qwen-asr 0.0.6；transcribe+align 双能力（Aligner 复用 ASR 实例零重复显存）；三模型双源声明 | `c1edf18` |
+| WS-E | firered-ocr 新模块（实为 Qwen3-VL-2B 微调 ~2.1B，Apache-2.0 已核） | `b3a96cb` |
+| WS-F | video-upscale / video-interp 三运行时分层脚手架（torch 懒守卫/ORT-OV/ncnn subprocess，未实现分支 501）+ 引擎决策备忘录 | `8152c3c` |
+| WS-G | 许可证矩阵零"待核"回填（GFPGAN 升 A、CAIN/DAIN 实有 MIT、SRMD 零许可判排除）+ MODULE_SPEC v1.3-draft（[distribution] 字段/vulkan 词表行）+ PACK_AUTHORING §10 标准压缩包分发 | `f18a79e` |
+
+### 真机验证进展
+
+- ✅ **E4 cuda 全片基线**：《Sound Euphonium 3》EP01（24'56"，日文主音轨）large-v3
+  转写 401 段，与 CHS.ass 参考字幕时间轴命中率 **99.5%**（368/370 正文段 ±1.5s）
+- ✅ **E3 冒烟**：Arrow Lake iGPU `GPU.0` OV EP 激活，Conv 计算与基准一致
+- ✅ **NPU 驱动排障链**（E2 前置）：驱动更新后设备节点迁移 `/dev/accel0`→`/dev/accel/accel0`
+  （新 UAPI）；bob 加入 render 组 + setfacl 即时授权；OV 2025.4.1 单 NPU 枚举裸名
+  `NPU`（`NPU.0` 索引被拒）→ ort_ep 归一化补丁 + 单测更新；裸 NPU 会话激活且真实
+  Conv 输出与基准一致
+- ✅ **uv 硬链接缓存实证**：Windows venv 移入 runtime/venvs.win64.bak 后，
+  faster-whisper Linux venv 秒级重建（ct2 4.8.1）
+- 🔧 **libcublas 缺失修复**：CT2 静默落 CPU 致全片超 300s 节点窗 → nvidia-cublas-cu12
+  wheel 硬链入 runtime/cuda-libs（LD_LIBRARY_PATH 注入链路真机确认）
+
+### 待办（恢复工作时的接续点）
+
+1. daemon 新二进制重启未完成（暂停时中断）——重启后 E2 走平台全链：
+   start rembg → `venvs/rembg--openvino` 自动构建（M2 消费）→ u2net 推理核验 providers=NPU
+2. E1/E6/E7/E8 实验；WS-B 补派
+3. W2 集成清单：daemon 四条 venv 准备路径切分后端 API、`{venv_python}` 占位符
+   分后端口径、apiModules.* i18n 键、全局 constraints 对 onnxruntime-* 发行名豁免、
+   deps 扫描 `<id>--<backend>` 目录展示后缀
+4. 契约反馈积压：多输入能力声明形态（align audio+text）、params array 类型、
+   EP_BACKEND 未知值 fail-loud 入规范、ncnn 多文件权重/zip 自动解压支持、
+   导入大小上限取值统一（模块包 1GiB vs 整合包 64GiB）
