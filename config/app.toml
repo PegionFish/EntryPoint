@@ -14,6 +14,8 @@ strategy = "least_memory"
 disabled_backends = []
 refresh_interval_secs = 5
 allow_overcommit = false
+single_device = "vulkan:0"
+cuda_libs_dir = "runtime/cuda-libs"
 
 [ports]
 range_start = 18000
@@ -24,16 +26,18 @@ cache_dir = "models"
 hf_endpoint = "https://huggingface.co"
 default_source = "huggingface"
 max_concurrent_downloads = 2
-# 本地模型缓存搜索路径（按优先级排序），用于发现用户已有的模型文件
 cache_paths = []
 
 [python]
 path = "python"
 uv_path = "uv"
+uv_cache_dir = "runtime/.uv-cache"
+constraints = "config/constraints.txt"
 
 [pipeline]
 max_parallel = 2
 default_timeout_secs = 300
+default_node_timeout_secs = 0
 keep_workspace = false
 workspace_dir = "workspace"
 
@@ -42,10 +46,11 @@ http_proxy = ""
 https_proxy = ""
 no_proxy = "localhost,127.0.0.1"
 
-# 统一推理 API（/api/v1/*）：默认不设 token（内网可信场景直通）。
-# 对外/公网暴露前建议配置：token = "<随机长字符串>"
-# 配置后 v1 端点要求 Authorization: Bearer <token> 或 X-API-Key: <token>。
-# 详见 docs/INFERENCE_API.md。
+[packs]
+staging_dir = ".pack-staging"
+
 [api]
 enabled = true
-# token = ""
+
+[active_models]
+video-upscale = "realesrgan-animevideov3-x4-ncnn"
