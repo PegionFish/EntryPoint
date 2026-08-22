@@ -865,6 +865,7 @@ type = "http"
                 entrypoint: None,
                 start_command: start_command.map(str::to_string),
                 binaries: None,
+                requirements_by_backend: Default::default(),
             },
             compute: ManifestComputeConfig {
                 backends: vec![ComputeBackend::Cpu],

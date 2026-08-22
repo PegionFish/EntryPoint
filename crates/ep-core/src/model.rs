@@ -3196,6 +3196,7 @@ mod tests {
                 runtime_type: RuntimeType::Python,
                 python_version: Some(">=3.10".to_string()),
                 requirements: None,
+                requirements_by_backend: Default::default(),
                 entrypoint: None,
                 start_command: None,
                 binaries: None,

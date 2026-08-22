@@ -20,6 +20,8 @@ pub enum ComputeBackend {
     OpenVINO,
     /// Windows 通用 GPU 加速 (DirectML)
     DirectML,
+    /// Vulkan 通用 GPU 加速（备选后端：厂商栈均不可用时的兜底，HETERO_DIST_PLAN M4）
+    Vulkan,
     /// 纯 CPU（始终可用）
     Cpu,
 }
@@ -31,6 +33,7 @@ impl fmt::Display for ComputeBackend {
             Self::Rocm => write!(f, "rocm"),
             Self::OpenVINO => write!(f, "openvino"),
             Self::DirectML => write!(f, "directml"),
+            Self::Vulkan => write!(f, "vulkan"),
             Self::Cpu => write!(f, "cpu"),
         }
     }
@@ -44,6 +47,7 @@ impl std::str::FromStr for ComputeBackend {
             "rocm" => Ok(Self::Rocm),
             "openvino" => Ok(Self::OpenVINO),
             "directml" => Ok(Self::DirectML),
+            "vulkan" => Ok(Self::Vulkan),
             "cpu" => Ok(Self::Cpu),
             _ => Err(format!("unknown compute backend: {s}")),
         }
@@ -57,6 +61,8 @@ pub enum DeviceId {
     Rocm(u32),
     OpenVINO(String),
     DirectML(u32),
+    /// Vulkan 物理设备（序号为归一化名称去重后的连续编号）
+    Vulkan(u32),
     Cpu,
 }
 
@@ -67,6 +73,7 @@ impl fmt::Display for DeviceId {
             Self::Rocm(i) => write!(f, "rocm:{i}"),
             Self::OpenVINO(s) => write!(f, "openvino:{s}"),
             Self::DirectML(i) => write!(f, "directml:{i}"),
+            Self::Vulkan(i) => write!(f, "vulkan:{i}"),
             Self::Cpu => write!(f, "cpu"),
         }
     }
@@ -79,13 +86,14 @@ impl DeviceId {
             Self::Rocm(_) => ComputeBackend::Rocm,
             Self::OpenVINO(_) => ComputeBackend::OpenVINO,
             Self::DirectML(_) => ComputeBackend::DirectML,
+            Self::Vulkan(_) => ComputeBackend::Vulkan,
             Self::Cpu => ComputeBackend::Cpu,
         }
     }
 
     pub fn index(&self) -> Option<u32> {
         match self {
-            Self::Cuda(i) | Self::Rocm(i) | Self::DirectML(i) => Some(*i),
+            Self::Cuda(i) | Self::Rocm(i) | Self::DirectML(i) | Self::Vulkan(i) => Some(*i),
             _ => None,
         }
     }

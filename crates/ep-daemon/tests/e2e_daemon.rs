@@ -1910,6 +1910,7 @@ mod e2e_harness_teardown {
                 tags: vec![],
             },
             runtime: RuntimeConfig {
+                requirements_by_backend: Default::default(),
                 runtime_type: RuntimeType::Native,
                 python_version: None,
                 requirements: None,

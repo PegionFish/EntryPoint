@@ -1489,6 +1489,7 @@ mod tests {
                 tags: vec![],
             },
             runtime: RuntimeConfig {
+                requirements_by_backend: Default::default(),
                 runtime_type: RuntimeType::Python,
                 python_version: Some(">=3.10".into()),
                 requirements: None,
