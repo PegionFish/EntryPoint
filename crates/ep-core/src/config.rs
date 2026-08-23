@@ -351,6 +351,10 @@ pub struct PipelineConfig {
     /// （tmpfs 耗尽会触发交换或分配失败，宁可慢不可拖垮全机）
     #[serde(default = "default_staging_floor_mb")]
     pub staging_floor_mb: u64,
+    /// 暂存预算上限（MB；0 = 自动取 tmpfs 容量 25%，下限 256MB）：
+    /// 单机内存受限时的核心保护——预算内才接纳 RAM 落位
+    #[serde(default)]
+    pub staging_max_ram_mb: u64,
     /// tmpfs 根覆盖（缺省 /dev/shm/ep-staging；Windows 恒走盘上回退）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staging_root: Option<String>,
@@ -363,6 +367,7 @@ fn default_staging_floor_mb() -> u64 {
     2048
 }
 
+
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
@@ -373,9 +378,30 @@ impl Default for PipelineConfig {
             workspace_dir: default_workspace_dir(),
             staging_mode: default_staging_mode(),
             staging_floor_mb: default_staging_floor_mb(),
+            staging_max_ram_mb: 0,
             staging_root: None,
         }
     }
+}
+
+/// 模块生命周期配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModulesConfig {
+    /// 空闲自动释放（秒）：运行中模块持续无任务触达超过该时长即自动停止，
+    /// 释放模型内存/显存与功耗；下次任务经既有拉起路径按需重载。
+    /// 0 = 停用（7×24 常驻）。缺省 1800（30 分钟）。
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+}
+
+impl Default for ModulesConfig {
+    fn default() -> Self {
+        Self { idle_timeout_secs: default_idle_timeout_secs() }
+    }
+}
+
+fn default_idle_timeout_secs() -> u64 {
+    1800
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -491,6 +517,9 @@ pub struct AppConfig {
     /// 整合包配置（§8.3）
     #[serde(default)]
     pub packs: PacksConfig,
+    /// 模块生命周期（按需加载 + 空闲自动释放）
+    #[serde(default)]
+    pub modules: ModulesConfig,
     /// 统一推理 API（`/api/v1/*`）配置：可选 token 鉴权
     #[serde(default)]
     pub api: ApiConfig,
@@ -1315,9 +1344,16 @@ workspace_dir = "workspace"
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // 半写现场：合法序列化内容的前半截（截断在表名中间）
+        // 半写现场：在最后一个表头中间截断（确定性落点，保证非法 TOML；
+        // 简单按比例截断会随字段增删漂移到合法边界）
         let full = toml::to_string_pretty(&AppConfig::default()).unwrap();
-        let half = &full[..full.len() / 2];
+        let header_pos = full
+            .rmatch_indices("\n[")
+            .next()
+            .map(|(i, _)| i)
+            .expect("serialized config contains tables");
+        // 切进表头名内部（保留 "\n[表名首字符"）——残缺表头必解析失败
+        let half = &full[..(header_pos + 3).min(full.len())];
         std::fs::write(dir.join(CONFIG_FILE_NAME), half).unwrap();
 
         // 必须返回 Err（错误上下文含文件名），绝不 panic

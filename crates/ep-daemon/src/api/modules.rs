@@ -295,14 +295,25 @@ pub async fn start_module(
         .start_module(&id, &manifest, device, port, env_vars)
         .await
     {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(json!({
-                "status": "starting",
-                "module_id": id,
-                "port": port
-            })),
-        ),
+        Ok(()) => {
+            // 空闲自动释放时间基准：手动启动即视为活跃起点
+            {
+                let now = chrono::Utc::now().timestamp();
+                state
+                    .module_activity
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(id.clone(), now);
+            }
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "starting",
+                    "module_id": id,
+                    "port": port
+                })),
+            )
+        }
         Err(e) => {
             warn!(module_id = %id, error = %e, "failed to start module");
             // 启动失败：释放端口

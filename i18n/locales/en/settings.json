@@ -101,5 +101,9 @@
   "advanced.addEntry": "Add mapping",
   "advanced.moduleIdPlaceholder": "Module ID",
   "advanced.modelIdPlaceholder": "Model ID",
-  "pipeline.keepWorkspaceNote": "Experimental: post-task workspace cleanup is not implemented yet; this toggle has no effect"
+  "pipeline.keepWorkspaceNote": "Experimental: post-task workspace cleanup is not implemented yet; this toggle has no effect",
+  "modulesLifecycle.title": "Module Lifecycle",
+  "modulesLifecycle.description": "Models load on demand and unload after idle to save memory/VRAM and power; they reload automatically on the next task.",
+  "modulesLifecycle.idleTimeout": "Idle auto-unload (seconds)",
+  "modulesLifecycle.idleTimeoutDescription": "Running modules idle beyond this duration are stopped automatically; 0 disables (always-on). Default 1800 (30 minutes)."
 }

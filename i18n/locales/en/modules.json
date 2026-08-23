@@ -101,5 +101,8 @@
   "modelDelete.failed": "Model deletion failed",
   "modelDelete.confirmTitle": "Delete model \"{{name}}\"?",
   "modelDelete.confirmDescription": "This removes the model files and local cache of module \"{{module}}\" ({{id}}). This cannot be undone.",
-  "modelFilter.all": "All"
+  "modelFilter.all": "All",
+  "detail.releaseNow": "Release now",
+  "toast.released": "Module unloaded and resources freed; it will reload on the next task",
+  "toast.releaseFailed": "Failed to release"
 }

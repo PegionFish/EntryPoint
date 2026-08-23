@@ -21,6 +21,7 @@ use ep_core::deps::DepReport;
 use ep_core::module::discovery::discover_modules;
 use ep_core::port::PortManager;
 use ep_core::process::ProcessManager;
+use tracing::info;
 use ep_core::types::ServiceStatus;
 
 use crate::state::AppState;
@@ -349,6 +350,80 @@ async fn run_server(root: PathBuf, cfg: AppConfig) -> anyhow::Result<()> {
                     Err(e) => {
                         tracing::warn!(error = %e, "device refresh task failed");
                     }
+                }
+            }
+        });
+    }
+
+    // 10.5 Spawn 模块空闲回收任务（按需加载 + 定期释放）：周期巡检运行中
+    //      模块，持续无任务触达超过 [modules].idle_timeout_secs 即自动停止，
+    //      释放模型内存/显存与功耗；下次任务经既有拉起路径按需重载。
+    //      超时实时读取——运行期经 PUT /api/config 改动即时生效（0=停用）。
+    //      活跃守卫：被排队/运行中任务引用的模块一律豁免（TaskRecord.module_ids）。
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let timeout_secs = {
+                    let cfg = state.config.read().await;
+                    cfg.modules.idle_timeout_secs
+                };
+                if timeout_secs == 0 {
+                    continue;
+                }
+                let now = chrono::Utc::now().timestamp();
+
+                // 候选：status=Running 的实例，基准 = max(started_at, 最近触达)
+                let running: Vec<(String, i64)> = {
+                    let pm = state.process_manager.read().await;
+                    pm.list_running()
+                        .into_iter()
+                        .map(|i| {
+                            (
+                                i.module_id.clone(),
+                                i.started_at.map(|t| t.timestamp()).unwrap_or(0),
+                            )
+                        })
+                        .collect()
+                };
+                if running.is_empty() {
+                    continue;
+                }
+                let baselines: Vec<(String, i64)> = {
+                    let activity =
+                        state.module_activity.lock().unwrap_or_else(|p| p.into_inner());
+                    running
+                        .iter()
+                        .map(|(id, started)| (id.clone(), *activity.get(id).unwrap_or(started)))
+                        .collect()
+                };
+
+                let victims =
+                    ep_core::module::lifecycle::idle_release_candidates(baselines, timeout_secs, now);
+                if victims.is_empty() {
+                    continue;
+                }
+                // 活跃守卫：排队/运行中任务引用的模块不释放
+                let busy: std::collections::HashSet<String> =
+                    crate::api::execute::execution::active_task_module_ids();
+
+                for id in victims {
+                    if busy.contains(&id) {
+                        tracing::debug!(module_id = %id, "idle 回收跳过：存在活跃任务引用");
+                        continue;
+                    }
+                    info!(module_id = %id, timeout_secs, "模块空闲超时，自动释放（下次任务按需重载）");
+                    let mut pm = state.process_manager.write().await;
+                    if let Err(e) = pm.stop_module(&id).await {
+                        tracing::warn!(module_id = %id, error = %e, "idle 自动释放失败");
+                        continue;
+                    }
+                    drop(pm);
+                    state.port_manager.write().await.release(&id);
                 }
             }
         });

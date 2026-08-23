@@ -111,6 +111,18 @@ pub use ep_core::task_registry::{NodeRecord, TaskRecord, TaskState};
 
 static REGISTRY: OnceLock<Mutex<TaskRegistry>> = OnceLock::new();
 
+/// 空闲回收器守卫：当前排队/运行中任务引用的全部模块 id
+/// （仅 main.rs 二进制消费；e2e 测试独立编译本文件时不可达 → 豁免 dead_code）
+#[allow(dead_code)]
+pub fn active_task_module_ids() -> std::collections::HashSet<String> {
+    let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+    reg.all()
+        .into_iter()
+        .filter(|r| r.is_active())
+        .flat_map(|r| r.module_ids)
+        .collect()
+}
+
 fn registry() -> &'static Mutex<TaskRegistry> {
     REGISTRY.get_or_init(|| Mutex::new(TaskRegistry::new()))
 }
@@ -587,6 +599,23 @@ pub async fn submit_pipeline_full(
     let staged = state.staging.read().await.alloc_task(&task_id);
     let staging_dir = staged.path.clone();
 
+    // 空闲自动释放：任务关联模块即刻视为活跃（回收器据此豁免）
+    let task_module_ids: Vec<String> = pipeline
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.kind {
+            NodeKind::Module { module_id, .. } => Some(module_id.clone()),
+            _ => None,
+        })
+        .collect();
+    {
+        let now = chrono::Utc::now().timestamp();
+        let mut act = state.module_activity.lock().unwrap_or_else(|p| p.into_inner());
+        for id in &task_module_ids {
+            act.insert(id.clone(), now);
+        }
+    }
+
     let pipeline_id = pipeline.id.clone();
     // §6.8：管线级并发上限（TOML `[pipeline] max_instances`，缺省跟随全局）
     let max_instances = resolve_max_instances(&state.root, &pipeline_id);
@@ -619,6 +648,7 @@ pub async fn submit_pipeline_full(
         served_artifacts: HashMap::new(),
         work_dir: task_dir.clone(),
         staging_dir: Some(staging_dir.to_string_lossy().to_string()),
+        module_ids: task_module_ids,
     };
     registry()
         .lock()
@@ -917,6 +947,7 @@ fn start_task(
         let task_id_bg = task_id.clone();
         let cancel_flag = extras_bg.cancel.clone();
         let activity_ms = extras_bg.last_activity_ms.clone();
+        let module_activity_state = state_bg.module_activity.clone();
         // 暂存目录随任务记录传递（submit 时分配；终态由收尾路径清算）
         let staging_dir = registry()
             .lock()
@@ -935,6 +966,7 @@ fn start_task(
                 activity_ms,
                 default_node_timeout,
                 staging_dir,
+                module_activity_state,
             )
         })
         .await;
@@ -1075,6 +1107,8 @@ async fn finalize_task(
             // 使产物都落在 ServeDir 根内可下载
             if matches!(cause, TerminalCause::Engine(_)) {
                 let task_dir = record.work_dir.clone();
+                let staging_root =
+                    record.staging_dir.as_ref().map(std::path::PathBuf::from);
                 let artifacts = record.artifacts.clone();
                 for (node_id, src) in artifacts {
                     if !src.is_file() {
@@ -1092,7 +1126,17 @@ async fn finalize_task(
                         || std::fs::hard_link(&src, &dest).is_ok()
                         || std::fs::copy(&src, &dest).is_ok()
                     {
-                        record.served_artifacts.insert(node_id.clone(), dest);
+                        record.served_artifacts.insert(node_id.clone(), dest.clone());
+                        // 暂存区产物：源随终态清算即删（tmpfs 生命周期），
+                        // 记录路径改写为持久 files/ 副本，保证事后仍可定位；
+                        // 盘上产物保持原路径不动——惰性归集（懒链接重建）
+                        // 依赖原始源存在，语义不变。
+                        let in_staging = staging_root
+                            .as_ref()
+                            .is_some_and(|r| src.starts_with(r));
+                        if in_staging {
+                            record.artifacts.insert(node_id, dest);
+                        }
                     } else {
                         warn!(task_id, node_id = %node_id, "artifact collection failed; node artifact will not be downloadable");
                     }
@@ -1124,6 +1168,25 @@ async fn finalize_task(
     // 占用的是全机共享内存，必须即刻归还（与 keep_workspace 解耦：该开关
     // 仅管盘上工作目录的调试现场）。失败仅告警，不阻塞终态上报。
     state.staging.read().await.free_task(task_id).ok();
+
+    // 空闲自动释放：任务终态刷新关联模块活跃时刻（空闲时钟自此重起）。
+    // finalize_task 无 pipeline 上下文 → 从注册表记录的 module_ids 取。
+    {
+        let now = chrono::Utc::now().timestamp();
+        let ids: Vec<String> = registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(task_id)
+            .map(|r| r.module_ids.clone())
+            .unwrap_or_default();
+        let mut act = state
+            .module_activity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for mid in ids {
+            act.insert(mid, now);
+        }
+    }
 
     // 清理运行时标志
     extras()
@@ -1311,6 +1374,7 @@ async fn wait_until_terminal(state: &Arc<AppState>, task_id: &str) -> TaskRecord
                     served_artifacts: HashMap::new(),
                     work_dir: PathBuf::new(),
                     staging_dir: None,
+                    module_ids: Vec::new(),
                 });
             }
         }
@@ -1634,6 +1698,7 @@ fn run_task(
     activity_ms: Arc<AtomicU64>,
     default_node_timeout: Option<Duration>,
     staging_dir: Option<PathBuf>,
+    module_activity: Arc<std::sync::Mutex<HashMap<String, i64>>>,
 ) -> (anyhow::Result<()>, Option<TaskDetail>) {
     #[cfg(test)]
     run_test_hook(&task_id);
@@ -1643,6 +1708,17 @@ fn run_task(
     let mut runner = PipelineRunnerImpl::new(task_dir.clone());
     runner.staging_dir = staging_dir;
     runner.set_module_ports(module_ports);
+
+    // 节点级模块活跃触点：长任务期间持续刷新，空闲回收器不会误杀在跑模块。
+    // 节点开始/完成各刷一次（单超长节点也有起点基准）。
+    let node_module_of: HashMap<String, String> = pipeline
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.kind {
+            NodeKind::Module { module_id, .. } => Some((n.id.clone(), module_id.clone())),
+            _ => None,
+        })
+        .collect();
     runner.set_cancel_flag(cancel_flag);
     runner.set_default_node_timeout(default_node_timeout);
 
@@ -1652,6 +1728,8 @@ fn run_task(
         let pid = pipeline_id.clone();
         let tid = task_id.clone();
         let act = activity_ms.clone();
+        let node_module_of = node_module_of.clone();
+        let module_activity = module_activity.clone();
         runner.on_node_start = Some(Arc::new(move |node_id| {
             act.store(now_epoch_ms(), Ordering::SeqCst);
             let _ = tx.send(ProgressMessage {
@@ -1661,6 +1739,13 @@ fn run_task(
                 status: "running".to_string(),
             });
             set_node_state(&tid, node_id, "running", None);
+            if let Some(mid) = node_module_of.get(node_id) {
+                let now = chrono::Utc::now().timestamp();
+                module_activity
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(mid.clone(), now);
+            }
         }));
     }
     // 回调：节点完成 → completed + 记录产物
@@ -1670,8 +1755,17 @@ fn run_task(
         let tid = task_id.clone();
         let act = activity_ms.clone();
         let tdir = task_dir.clone();
+        let node_module_complete = node_module_of.clone();
+        let module_activity_complete = module_activity.clone();
         runner.on_node_complete = Some(Arc::new(move |node_id, artifact| {
             act.store(now_epoch_ms(), Ordering::SeqCst);
+            if let Some(mid) = node_module_complete.get(node_id) {
+                let now = chrono::Utc::now().timestamp();
+                module_activity_complete
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(mid.clone(), now);
+            }
             let _ = tx.send(ProgressMessage {
                 pipeline_id: pid.clone(),
                 task_id: tid.clone(),
@@ -2210,6 +2304,7 @@ to = ["output", "input"]
             served_artifacts: HashMap::new(),
             work_dir: PathBuf::new(),
             staging_dir: None,
+            module_ids: Vec::new(),
         };
         registry()
             .lock()
@@ -3303,6 +3398,7 @@ output_type = "json"
             served_artifacts: HashMap::new(),
             work_dir: PathBuf::new(),
             staging_dir: None,
+            module_ids: Vec::new(),
         }
     }
 
@@ -3342,6 +3438,7 @@ output_type = "json"
             served_artifacts: HashMap::new(),
             work_dir: PathBuf::new(),
             staging_dir: None,
+            module_ids: Vec::new(),
         };
         registry()
             .lock()

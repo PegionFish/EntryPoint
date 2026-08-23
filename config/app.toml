@@ -54,3 +54,8 @@ enabled = true
 
 [active_models]
 realesr = "realesrgan-animevideov3-x4-ncnn"
+
+[modules]
+# 空闲自动释放（秒）：运行中模块无任务触达超过该时长即停止，释放内存/显存；
+# 下次任务按需重载。0 = 常驻停用。
+idle_timeout_secs = 1800

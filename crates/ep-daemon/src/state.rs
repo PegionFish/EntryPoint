@@ -127,6 +127,9 @@ pub struct AppState {
     /// 管线中间产物暂存管理器（RAM 优先，任务终态清算 + 启动清扫；
     /// ep-core::staging）。Arc 内层不可变，配置读取时按需重建整体。
     pub staging: Arc<RwLock<Arc<ep_core::staging::StagingManager>>>,
+    /// 模块最近活跃时刻（epoch 秒）：空闲自动释放的时间基准。
+    /// 触点 = 模块启动 / 任务提交 / 节点开始与完成回调 / 任务终态。
+    pub module_activity: Arc<std::sync::Mutex<HashMap<String, i64>>>,
     pub config: Arc<RwLock<AppConfig>>,
     pub devices: Arc<RwLock<Vec<ComputeDevice>>>,
     pub modules: Arc<RwLock<Vec<DiscoveredModule>>>,
@@ -180,12 +183,14 @@ impl AppState {
             config.pipeline.staging_root.as_deref(),
             &root.join("runtime"),
             config.pipeline.staging_floor_mb,
+            config.pipeline.staging_max_ram_mb,
         );
         staging.sweep_orphans();
 
         Self {
             root,
             staging: Arc::new(RwLock::new(Arc::new(staging))),
+            module_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             config: Arc::new(RwLock::new(config)),
             devices: Arc::new(RwLock::new(devices)),
             modules: Arc::new(RwLock::new(modules)),

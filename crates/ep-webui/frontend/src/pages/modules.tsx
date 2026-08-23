@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   ChevronDown,
+  Unplug,
   CircleCheck,
   CircleX,
   Copy,
@@ -1038,14 +1039,26 @@ function ModuleDetailSheet({
       case 'starting':
       case 'preparing':
         return (
-          <Button
-            variant="destructive"
-            size="sm"
-            onClick={() => onStop(module)}
-          >
-            <Square />
-            {t('common:action.stop')}
-          </Button>
+          <>
+            <Button
+              variant="ghost"
+              size="sm"
+              title={t('detail.releaseNow')}
+              onClick={() => onStop(module)}
+              className="text-muted-foreground hover:text-foreground"
+            >
+              <Unplug />
+              {t('detail.releaseNow')}
+            </Button>
+            <Button
+              variant="destructive"
+              size="sm"
+              onClick={() => onStop(module)}
+            >
+              <Square />
+              {t('common:action.stop')}
+            </Button>
+          </>
         )
       case 'error':
         return (
