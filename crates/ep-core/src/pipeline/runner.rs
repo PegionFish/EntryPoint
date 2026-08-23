@@ -115,21 +115,6 @@ async fn wait_for_cancel_flag(flag: Arc<std::sync::atomic::AtomicBool>) {
     }
 }
 
-/// 在飞节点的中断原因（缺陷 #5：硬超时 / 协作取消均走 abort 路径）
-enum NodeInterrupt {
-    /// 节点级 wall-clock 硬超时触发
-    Timeout(u64),
-    /// 协作取消标志置位
-    Cancelled,
-}
-
-/// 单节点执行竞速结果：自然完成 / 硬超时中断 / 取消中断
-enum NodeRunOutcome {
-    Done(anyhow::Result<Artifact>),
-    TimedOut(u64),
-    Cancelled,
-}
-
 impl PipelineRunnerImpl {
     pub fn new(work_dir: PathBuf) -> Self {
         Self {
@@ -276,42 +261,66 @@ impl PipelineRunnerImpl {
 
             task.execute_layer(layer);
 
-            for node_id in layer {
-                // 跳过非 Running 状态的节点（可能已被标记为 Skipped）
-                if !matches!(task.node_state(node_id), Some(NodeState::Running)) {
-                    continue;
-                }
+            // ── 层内并行执行（fail-fast）───────────────────────────────────
+            // 同层节点互不依赖（拓扑分层保证），并行驱动以支撑扇出/扇入
+            // 管线（如 视频拆段 → 多路处理 → 合并）。首个失败/取消即中止
+            // 其余在飞兄弟（abort），语义对齐旧串行行为的「失败即停层」。
+            // 共享 PipelineTask 不跨线程可变：各在飞任务只读上游状态，
+            // 成败标记由本驱动循环按完成序统一落账。
+            let runnable: Vec<&String> = layer
+                .iter()
+                .filter(|id| matches!(task.node_state(id), Some(NodeState::Running)))
+                .collect();
 
-                // 取消检查点（P0-6/B3）：节点边界检查协作取消标志，
-                // 置位 → 任务终结为 Cancelled（下一节点不再启动；若标志在
-                // 节点在飞期间置位，由下方取消监视器中断在飞执行 — 缺陷 #5）
-                if self
+            // 批前取消检查点：置位 → 整层不启动，任务终结 Cancelled
+            if !runnable.is_empty()
+                && self
                     .cancel_flag
                     .as_ref()
                     .is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst))
-                {
-                    let err_msg = "task cancelled".to_string();
+            {
+                let ids: Vec<String> = runnable.iter().map(|s| (*s).clone()).collect();
+                for node_id in &ids {
                     if let Some(ref cb) = self.on_node_error {
-                        cb(node_id, &err_msg);
+                        cb(node_id, "task cancelled");
                     }
-                    task.mark_failed_with_pipeline(node_id, err_msg, false, pipeline);
-                    // P0：同层剩余 Running 兄弟一并置 Skipped，避免任务永久 Running
-                    task.skip_layer_remaining(layer);
-                    task.status = TaskStatus::Cancelled;
-                    self.finish_task(task);
-                    return Err(anyhow::anyhow!("pipeline execution cancelled"));
                 }
+                // 旧串行契约：边界首个可运行节点记 failed(cancelled)，
+                // 其下游（含后续层）由 mark_failed_with_pipeline 罧 Skipped
+                if let Some(first) = runnable.first() {
+                    task.mark_failed_with_pipeline(
+                        first,
+                        "task cancelled".to_string(),
+                        false,
+                        pipeline,
+                    );
+                }
+                task.skip_layer_remaining(layer);
+                task.status = TaskStatus::Cancelled;
+                self.finish_task(task);
+                return Err(anyhow::anyhow!("pipeline execution cancelled"));
+            }
 
-                // 回调：节点开始
+            #[derive(Debug)]
+            enum NodeOutcome {
+                Done(String, anyhow::Result<Artifact>),
+                TimedOut(String, u64),
+            }
+
+            let mut set: tokio::task::JoinSet<NodeOutcome> = tokio::task::JoinSet::new();
+            for node_id in &runnable {
+                let node_id = (*node_id).clone();
+                let node = match pipeline.nodes.iter().find(|n| n.id == node_id) {
+                    Some(n) => n.clone(),
+                    None => {
+                        return Err(anyhow::anyhow!("node '{node_id}' not found in pipeline"))
+                    }
+                };
+
+                // 回调：节点开始（并发期开始事件交错到达，如实反映并行）
                 if let Some(ref cb) = self.on_node_start {
-                    cb(node_id);
+                    cb(&node_id);
                 }
-
-                let node = pipeline
-                    .nodes
-                    .iter()
-                    .find(|n| &n.id == node_id)
-                    .ok_or_else(|| anyhow::anyhow!("node '{node_id}' not found in pipeline"))?;
 
                 // Wall-clock 超时包裹（P0-6/B3）：节点 `timeout_secs` 优先，
                 // 缺省用 `default_node_timeout`；覆盖 ffmpeg 子进程等非 HTTP
@@ -322,133 +331,177 @@ impl PipelineRunnerImpl {
                     .or_else(|| self.default_node_timeout.map(|d| d.as_secs()))
                     .filter(|&secs| secs > 0);
 
-                // ── 可中断执行（缺陷 #5）────────────────────────────────────
-                // execute_node 派生为独立 tokio 任务，与「硬超时 / 取消标志」
-                // 竞速：超时或取消赢得竞争时 abort() 执行任务——在飞的模块
-                // HTTP 请求（/predict/*）future 被丢弃、连接立即断开（模块侧
-                // 尽快收到断开）；ffmpeg 子进程经 kill_on_drop 一并终止。
-                // 不再「标记失败而任请求挂到自然结束」。
-                let node_owned = node.clone();
+                let node_owned = node;
                 let pipeline_owned = pipeline.clone();
                 let task_owned = task.clone();
                 let work_dir_owned = work_dir.to_path_buf();
                 let ports_owned = self.module_ports.clone();
                 let staging_owned = self.staging_dir.clone();
-                let mut exec_handle = tokio::spawn(async move {
-                    execute_node(
-                        &node_owned,
-                        &pipeline_owned,
-                        &task_owned,
-                        &work_dir_owned,
-                        &ports_owned,
-                        staging_owned.as_deref(),
-                    )
-                    .await
-                });
-
-                // 中断竞速：硬超时与取消标志任一先到即中断在飞节点；
-                // 两者皆未配置时为永不就绪分支，等价于只等执行完成。
-                let timeout_owned = timeout_secs;
                 let flag_owned = self.cancel_flag.clone();
-                let interrupt = async move {
-                    let timeout_branch = async move {
-                        match timeout_owned {
-                            Some(secs) => {
-                                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-                                NodeInterrupt::Timeout(secs)
+
+                set.spawn(async move {
+                    // 可中断执行（缺陷 #5）：execute_node 与「硬超时/取消」竞速，
+                    // 中断方胜出时 abort 在飞 future——模块 HTTP 连接立即断开、
+                    // ffmpeg 子进程经 kill_on_drop 一并终止。
+                    let mut exec_handle = tokio::spawn(async move {
+                        execute_node(
+                            &node_owned,
+                            &pipeline_owned,
+                            &task_owned,
+                            &work_dir_owned,
+                            &ports_owned,
+                            staging_owned.as_deref(),
+                        )
+                        .await
+                    });
+
+                    let interrupt = async move {
+                        let timeout_branch = async move {
+                            match timeout_secs {
+                                Some(secs) => {
+                                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                                    true // TimedOut
+                                }
+                                None => std::future::pending::<bool>().await,
                             }
-                            None => std::future::pending::<NodeInterrupt>().await,
+                        };
+                        let cancel_branch = async move {
+                            match flag_owned {
+                                Some(flag) => {
+                                    wait_for_cancel_flag(flag).await;
+                                    false // Cancelled
+                                }
+                                None => std::future::pending::<bool>().await,
+                            }
+                        };
+                        tokio::select! {
+                            timed_out = timeout_branch => timed_out,
+                            _ = cancel_branch => false,
                         }
                     };
-                    let cancel_branch = async move {
-                        match flag_owned {
-                            Some(flag) => {
-                                wait_for_cancel_flag(flag).await;
-                                NodeInterrupt::Cancelled
-                            }
-                            None => std::future::pending::<NodeInterrupt>().await,
-                        }
-                    };
+
                     tokio::select! {
-                        i = timeout_branch => i,
-                        i = cancel_branch => i,
-                    }
-                };
-
-                let outcome = tokio::select! {
-                    res = &mut exec_handle => {
-                        // 任务自然完成（或 join 异常）→ 走既有成败处理
-                        NodeRunOutcome::Done(match res {
-                            Ok(inner) => inner,
-                            Err(join_err) => Err(anyhow::anyhow!(
-                                "node '{node_id}' execution task aborted: {join_err}"
-                            )),
-                        })
-                    }
-                    i = interrupt => {
-                        exec_handle.abort();
-                        match i {
-                            NodeInterrupt::Timeout(secs) => NodeRunOutcome::TimedOut(secs),
-                            NodeInterrupt::Cancelled => NodeRunOutcome::Cancelled,
+                        res = &mut exec_handle => NodeOutcome::Done(
+                            node_id.clone(),
+                            match res {
+                                Ok(inner) => inner,
+                                Err(join_err) => Err(anyhow::anyhow!(
+                                    "node '{node_id}' execution task aborted: {join_err}"
+                                )),
+                            },
+                        ),
+                        timed_out = interrupt => {
+                            exec_handle.abort();
+                            if timed_out {
+                                NodeOutcome::TimedOut(node_id, timeout_secs.unwrap_or(0))
+                            } else {
+                                // 取消路径复用 Done(Err) 通道，文案与既有契约一致
+                                NodeOutcome::Done(
+                                    node_id.clone(),
+                                    Err(anyhow::anyhow!(
+                                        "task cancelled (in-flight node aborted)"
+                                    )),
+                                )
+                            }
                         }
                     }
-                };
+                });
+            }
 
-                let exec_result = match outcome {
-                    NodeRunOutcome::Done(result) => result,
-                    NodeRunOutcome::TimedOut(secs) => Err(anyhow::anyhow!(
-                        "node '{node_id}' timed out after {secs}s (in-flight call aborted)"
-                    )),
-                    NodeRunOutcome::Cancelled => {
-                        // 与节点边界取消同语义：节点判 failed、任务终结
-                        // Cancelled。行为边界：模块侧推理线程为同步 CPU/GPU
-                        // 密集执行，客户端断开后可能仍在收尾，worker 短暂
-                        // 占用属预期；平台侧不再等待/重试该请求。
-                        tracing::info!(
-                            node_id,
-                            "task cancelled: in-flight node aborted (module HTTP connection closed); \
-                             module-side inference may still finish its current request \
-                             (brief worker occupation is expected)"
-                        );
-                        let err_msg = "task cancelled (in-flight node aborted)".to_string();
-                        if let Some(ref cb) = self.on_node_error {
-                            cb(node_id, &err_msg);
-                        }
-                        task.mark_failed_with_pipeline(node_id, err_msg, false, pipeline);
-                        // P0：同层剩余 Running 兄弟一并置 Skipped，避免任务永久 Running
-                        task.skip_layer_remaining(layer);
-                        task.status = TaskStatus::Cancelled;
-                        self.finish_task(task);
-                        return Err(anyhow::anyhow!("pipeline execution cancelled"));
+            let mut layer_failure: Option<(String, String, bool)> = None;
+            let mut cancelled_in_flight = false;
+            while let Some(joined) = set.join_next().await {
+                let outcome = match joined {
+                    Ok(o) => o,
+                    Err(join_err) => {
+                        // spawn 任务 panic：按失败计（不应发生；防御性兜底）
+                        layer_failure = Some((
+                            "<unknown>".to_string(),
+                            format!("node task panicked: {join_err}"),
+                            false,
+                        ));
+                        set.abort_all();
+                        continue;
                     }
                 };
-
-                match exec_result {
-                    Ok(artifact) => {
-                        // 回调：节点完成
-                        if let Some(ref cb) = self.on_node_complete {
-                            cb(node_id, &artifact);
-                        }
-                        task.mark_completed(node_id, artifact);
-                    }
-                    Err(e) => {
-                        let err_msg = e.to_string();
-                        // 从 ModuleCallError 提取可重试标志（B7 契约：保留 downcast）
-                        let retryable = e
-                            .downcast_ref::<ModuleCallError>()
-                            .map(|mce| mce.retryable)
+                match outcome {
+                    NodeOutcome::Done(node_id, result) => {
+                        // 取消中断与自然失败共用 Err 通道：先探测取消语义
+                        let is_cancel = result
+                            .as_ref()
+                            .err()
+                            .map(|e| e.to_string().contains("task cancelled"))
                             .unwrap_or(false);
-                        // 回调：节点错误
-                        if let Some(ref cb) = self.on_node_error {
-                            cb(node_id, &err_msg);
+                        if is_cancel {
+                            tracing::info!(
+                                node_id = %node_id,
+                                "task cancelled: in-flight node aborted (module HTTP connection closed); \
+                                 module-side inference may still finish its current request \
+                                 (brief worker occupation is expected)"
+                            );
+                            let err_msg = "task cancelled (in-flight node aborted)".to_string();
+                            if let Some(ref cb) = self.on_node_error {
+                                cb(&node_id, &err_msg);
+                            }
+                            task.mark_failed_with_pipeline(&node_id, err_msg, false, pipeline);
+                            cancelled_in_flight = true;
+                            set.abort_all();
+                            continue;
                         }
-                        task.mark_failed_with_pipeline(node_id, err_msg, retryable, pipeline);
-                        // P0：同层剩余 Running 兄弟一并置 Skipped；check_completion
-                        // 随之在全部节点终结时置 Failed，任务终态正确传播
-                        task.skip_layer_remaining(layer);
-                        break; // 停止当前层的执行
+                        match result {
+                            Ok(artifact) => {
+                                if let Some(ref cb) = self.on_node_complete {
+                                    cb(&node_id, &artifact);
+                                }
+                                task.mark_completed(&node_id, artifact);
+                            }
+                            Err(e) => {
+                                let err_msg = e.to_string();
+                                let retryable = e
+                                    .downcast_ref::<ModuleCallError>()
+                                    .map(|mce| mce.retryable)
+                                    .unwrap_or(false);
+                                if let Some(ref cb) = self.on_node_error {
+                                    cb(&node_id, &err_msg);
+                                }
+                                task.mark_failed_with_pipeline(
+                                    &node_id,
+                                    err_msg,
+                                    retryable,
+                                    pipeline,
+                                );
+                                layer_failure =
+                                    Some((node_id, "".to_string(), retryable));
+                                set.abort_all();
+                            }
+                        }
+                    }
+                    NodeOutcome::TimedOut(node_id, secs) => {
+                        let err_msg = format!(
+                            "node '{node_id}' timed out after {secs}s (in-flight call aborted)"
+                        );
+                        if let Some(ref cb) = self.on_node_error {
+                            cb(&node_id, &err_msg);
+                        }
+                        task.mark_failed_with_pipeline(&node_id, err_msg, false, pipeline);
+                        layer_failure = Some((node_id, "".to_string(), false));
+                        set.abort_all();
                     }
                 }
+            }
+
+            if cancelled_in_flight {
+                // P0：同层剩余 Running 兄弟一并置 Skipped，避免任务永久 Running
+                task.skip_layer_remaining(layer);
+                task.status = TaskStatus::Cancelled;
+                self.finish_task(task);
+                return Err(anyhow::anyhow!("pipeline execution cancelled"));
+            }
+            if let Some((_, _, _)) = layer_failure {
+                // P0：同层剩余 Running 兄弟一并置 Skipped；check_completion
+                // 随之在全部节点终结时置 Failed，任务终态正确传播
+                task.skip_layer_remaining(layer);
+                break; // 停止后续层（fail-fast）
             }
         }
 

@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use axum::{
     Router,
+    response::IntoResponse,
     extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     routing::{delete, get, post, put},
@@ -66,6 +67,12 @@ fn pipelines_dir(state: &AppState) -> PathBuf {
 
 /// 扫描目录下所有 *.toml 并加载为 spec；损坏文件跳过并 warn。
 /// 按文件名排序，保证列表顺序稳定。
+/// 调度兜底扫描（execution.rs 消费）：公开只读包装
+#[allow(dead_code)] // e2e 独立编译豁免
+pub fn scan_specs_pub(dir: &Path) -> Vec<(PathBuf, PipelineSpec)> {
+    scan_specs(dir)
+}
+
 fn scan_specs(dir: &Path) -> Vec<(PathBuf, PipelineSpec)> {
     let mut result = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -103,6 +110,11 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/pipelines/{id}", put(update_pipeline))
         .route("/pipelines/{id}", delete(delete_pipeline))
         .route("/pipelines/{id}/status", get(pipeline_status))
+        // JSON 导入/导出/分享（管线描述符自包含文件即分享载体）
+        .route("/pipelines/{id}/export", get(export_pipeline))
+        .route("/pipelines/import", post(import_pipeline))
+        // 定时调度（cron）：注册/查看/删除；触发由 daemon 巡检循环驱动
+        .route("/pipelines/{id}/schedule", put(put_schedule).get(get_schedule).delete(delete_schedule))
         // §6.8 管线级任务视图（P1-5：替代坏掉的 {id}/status 的运维面）
         .route("/pipelines/{id}/tasks", get(pipeline_tasks))
         // §6.3 VRAM 预算（编辑器实时计算，S2 前端形状，仲裁 #3）
@@ -153,8 +165,238 @@ async fn get_pipeline(
     }
 }
 
-/// PUT /api/pipelines/:id — 保存 spec（body 为完整 spec JSON）
+// ─── 定时调度（cron）────────────────────────────────────────────────────
+
+fn schedules_path(state: &AppState) -> PathBuf {
+    crate::schedule::default_registry_path(&state.root)
+}
+
+/// PUT /api/pipelines/:id/schedule — 注册/更新定时计划。
+/// body: `{ "cron": "0 3 * * *", "enabled": true,
+///          "inputs": {...}?, "params": {...}? }`
+async fn put_schedule(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    body: String,
+) -> (StatusCode, Json<Value>) {
+    let body: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    let cron_str = match body.get("cron").and_then(|v| v.as_str()) {
+        Some(c) => c.to_string(),
+        None => {
+            return err_response(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "apiPipelines.schedule.cronRequired",
+                &[],
+            )
+            .await
+        }
+    };
+    if let Err(e) = ep_core::cron::CronExpr::parse(&cron_str) {
+        return err_response(
+            &state,
+            StatusCode::BAD_REQUEST,
+            "apiPipelines.schedule.cronInvalid",
+            &[("detail", e.to_string())],
+        )
+        .await;
+    }
+    let pdir = pipelines_dir(&state);
+    if !pdir.join(format!("{}.toml", id.replace('-', "_"))).exists()
+        && find_spec_file(&pdir, &id).is_none()
+    {
+        return err_response(
+            &state,
+            StatusCode::NOT_FOUND,
+            "apiPipelines.pipelines.notFound",
+            &[],
+        )
+        .await;
+    }
+
+    let path = schedules_path(&state);
+    let mut registry = crate::schedule::ScheduleRegistry::load(&path);
+    let prev = registry.entries.get(&id).cloned();
+    let entry = crate::schedule::ScheduleEntry {
+        cron: cron_str,
+        enabled: body.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+        inputs: body.get("inputs").cloned().unwrap_or_else(|| {
+            prev.as_ref().map(|p| p.inputs.clone()).unwrap_or(Value::Null)
+        }),
+        params: body.get("params").cloned().unwrap_or_else(|| {
+            prev.as_ref().map(|p| p.params.clone()).unwrap_or(Value::Null)
+        }),
+        last_checked: chrono::Utc::now().timestamp(),
+        last_task_id: prev.and_then(|p| p.last_task_id),
+    };
+    registry.entries.insert(id.clone(), entry);
+    if let Err(e) = registry.save(&path) {
+        return err_response(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "apiPipelines.schedule.saveFailed",
+            &[("detail", e.to_string())],
+        )
+        .await;
+    }
+    (StatusCode::OK, Json(json!({ "ok": true, "id": id })))
+}
+
+/// GET /api/pipelines/:id/schedule — 查看定时计划（未配置 → 404）
+async fn get_schedule(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> (StatusCode, Json<Value>) {
+    let registry = crate::schedule::ScheduleRegistry::load(&schedules_path(&state));
+    match registry.entries.get(&id) {
+        Some(e) => (StatusCode::OK, Json(json!({ "id": id, "schedule": e }))),
+        None => err_response(
+            &state,
+            StatusCode::NOT_FOUND,
+            "apiPipelines.schedule.notSet",
+            &[],
+        )
+        .await,
+    }
+}
+
+/// DELETE /api/pipelines/:id/schedule — 取消定时计划（幂等）
+async fn delete_schedule(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> (StatusCode, Json<Value>) {
+    let path = schedules_path(&state);
+    let mut registry = crate::schedule::ScheduleRegistry::load(&path);
+    registry.entries.remove(&id);
+    let ok = registry.save(&path).is_ok();
+    (StatusCode::OK, Json(json!({ "ok": ok })))
+}
+
+/// GET /api/pipelines/:id/export — 导出管线为自包含 JSON 描述符。
 ///
+/// 形状（分享契约 v1）：
+/// ```json
+/// { "format": "entrypoint-pipeline/v1", "exported_at": "<iso8601>",
+///   "spec": <PipelineSpec> }
+/// ```
+/// 该文件即为分享载体——接收方经 POST /api/pipelines/import 一键导入。
+async fn export_pipeline(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> axum::response::Response {
+    let dir = pipelines_dir(&state);
+    let Some((_, spec)) = find_spec_file(&dir, &id) else {
+        let (code, body) =
+            err_response(&state, StatusCode::NOT_FOUND, "apiPipelines.pipelines.notFound", &[])
+                .await;
+        return (code, body).into_response();
+    };
+    let body = json!({
+        "format": "entrypoint-pipeline/v1",
+        "exported_at": chrono::Utc::now().to_rfc3339(),
+        "spec": serde_json::to_value(&spec).unwrap_or(serde_json::Value::Null),
+    });
+    let mut resp = (StatusCode::OK, Json(body)).into_response();
+    resp.headers_mut().insert(
+        axum::http::header::CONTENT_DISPOSITION,
+        axum::http::HeaderValue::from_str(&format!(
+            "attachment; filename=\"{id}.pipeline.json\""
+        ))
+        .unwrap_or(axum::http::HeaderValue::from_static("attachment")),
+    );
+    resp
+}
+
+/// POST /api/pipelines/import — 导入分享的管线 JSON。
+///
+/// 接受两种形状：完整导出信封（含 format/spec 字段）或裸 PipelineSpec。
+/// id 冲突时按 `-imported<N>` 后缀去重；导入前以执行层视角全量校验。
+async fn import_pipeline(
+    State(state): State<Arc<AppState>>,
+    body: String,
+) -> (StatusCode, Json<Value>) {
+    let raw: Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return err_response(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "apiPipelines.pipelines.specNotJson",
+                &[("detail", e.to_string())],
+            )
+            .await
+        }
+    };
+    let spec_value = if raw.get("format").and_then(|v| v.as_str()) == Some("entrypoint-pipeline/v1") {
+        raw.get("spec").cloned().unwrap_or(Value::Null)
+    } else {
+        raw
+    };
+    let mut spec: PipelineSpec = match serde_json::from_value(spec_value) {
+        Ok(s) => s,
+        Err(e) => {
+            return err_response(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "apiPipelines.pipelines.specMalformed",
+                &[("detail", e.to_string())],
+            )
+            .await
+        }
+    };
+
+    // id 归一 + 去重：非法/缺失 → 由 name 派生；仍冲突 → -imported2/-imported3…
+    if !is_valid_pipeline_id(&spec.pipeline.id) {
+        let slug: String = spec
+            .pipeline
+            .name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c.to_ascii_lowercase() } else { '-' })
+            .collect();
+        let slug = slug.trim_matches('-').to_string();
+        spec.pipeline.id = if is_valid_pipeline_id(&slug) { slug } else { format!("imported-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S")) };
+    }
+    let dir = pipelines_dir(&state);
+    let existing: std::collections::HashSet<String> =
+        scan_specs(&dir).into_iter().map(|(_, sp)| sp.pipeline.id).collect();
+    let mut final_id = spec.pipeline.id.clone();
+    let mut n = 2;
+    while existing.contains(&final_id) {
+        final_id = format!("{}-imported{n}", spec.pipeline.id);
+        n += 1;
+    }
+    spec.pipeline.id = final_id.clone();
+
+    // 执行层视角完整校验（与 PUT 同一真源）
+    if let Err(e) = pipeline_bridge::spec_to_pipeline(&spec) {
+        return err_response(
+            &state,
+            StatusCode::BAD_REQUEST,
+            "apiPipelines.specInvalid",
+            &[("detail", e.to_string())],
+        )
+        .await;
+    }
+
+    let target = dir.join(format!("{}.toml", final_id.replace('-', "_")));
+    match pipeline_bridge::save_spec(&spec, &target) {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(json!({ "ok": true, "id": final_id, "name": spec.pipeline.name })),
+        ),
+        Err(e) => err_response(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "apiPipelines.pipelines.saveFailed",
+            &[("detail", e.to_string())],
+        )
+        .await,
+    }
+}
+
+/// PUT /api/pipelines/:id — 保存 spec（body 为完整 spec JSON）
+/// 以 String 提取 body 自行解析，保证解析失败时返回本地化 JSON 错误。
+/// PUT /api/pipelines/:id — 保存 spec（body 为完整 spec JSON）
 /// 以 String 提取 body 自行解析，保证解析失败时返回本地化 JSON 错误。
 async fn update_pipeline(
     State(state): State<Arc<AppState>>,

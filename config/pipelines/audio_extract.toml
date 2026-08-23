@@ -16,7 +16,7 @@ builtin = "ffmpeg"
 label = "FFmpeg 提取"
 
 [nodes.params]
-args = ["-i", "{input}", "-vn", "-acodec", "copy", "{output}"]
+args = ["-i", "{input}", "-vn", "-acodec", "aac", "-b:a", "192k", "{output}"]
 output_extension = "m4a"
 
 [[nodes]]

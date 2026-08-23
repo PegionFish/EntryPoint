@@ -1,0 +1,58 @@
+[pipeline]
+id = "fanout-demo"
+name = "扇出扇入演示"
+description = "一路输入→双分支ffmpeg处理→定向占位符合并"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+label = "输入"
+
+[[nodes]]
+id = "rot"
+kind = "builtin"
+builtin = "ffmpeg"
+label = "反色"
+params = { args = ["-i", "{input}", "-vf", "negate", "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-an", "{output}"], output_extension = "mp4" }
+
+[[nodes]]
+id = "mirror"
+kind = "builtin"
+builtin = "ffmpeg"
+label = "水平镜像+慢速编码"
+params = { args = ["-i", "{input}", "-vf", "hflip", "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-an", "{output}"], output_extension = "mp4" }
+
+[[nodes]]
+id = "merge"
+kind = "builtin"
+builtin = "ffmpeg"
+label = "并排合并"
+params = { args = ["-i", "{input.rot}", "-i", "{input.mirror}", "-filter_complex", "[0:v][1:v]hstack=inputs=2[v]", "-map", "[v]", "-c:v", "libx264", "-preset", "ultrafast", "{output}"], output_extension = "mp4" }
+
+[[nodes]]
+id = "output"
+kind = "builtin"
+builtin = "file_output"
+label = "输出"
+params = { extension = "mp4" }
+
+[[edges]]
+from = ["input", "output"]
+to = ["rot", "input"]
+
+[[edges]]
+from = ["input", "output"]
+to = ["mirror", "input"]
+
+[[edges]]
+from = ["rot", "output"]
+to = ["merge", "input"]
+
+[[edges]]
+from = ["mirror", "output"]
+to = ["merge", "input"]
+
+[[edges]]
+from = ["merge", "output"]
+to = ["output", "input"]
