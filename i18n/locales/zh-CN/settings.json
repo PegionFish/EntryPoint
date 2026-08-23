@@ -101,5 +101,9 @@
   "advanced.addEntry": "新增映射",
   "advanced.moduleIdPlaceholder": "模块 ID",
   "advanced.modelIdPlaceholder": "模型 ID",
-  "pipeline.keepWorkspaceNote": "实验性预留：任务结束后的工作区清理尚未实现，本开关当前不影响行为"
+  "pipeline.keepWorkspaceNote": "实验性预留：任务结束后的工作区清理尚未实现，本开关当前不影响行为",
+  "modulesLifecycle.title": "模块生命周期",
+  "modulesLifecycle.description": "模型按需加载、空闲自动释放，控制内存/显存占用与功耗；下次任务自动重载。",
+  "modulesLifecycle.idleTimeout": "空闲自动释放（秒）",
+  "modulesLifecycle.idleTimeoutDescription": "运行中模块持续无任务触达超过该时长即自动停止并释放资源；0 = 停用（常驻）。缺省 1800（30 分钟）。"
 }

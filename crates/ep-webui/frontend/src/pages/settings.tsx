@@ -19,6 +19,7 @@ import {
   Settings2,
   SlidersHorizontal,
   TerminalSquare,
+  Timer,
   TriangleAlert,
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
@@ -962,6 +963,27 @@ export function SettingsPage() {
                 patchSection('pipeline', { keep_workspace: v })
               }
             />
+          </Section>
+
+          {/* ── 模块生命周期（按需加载 + 空闲自动释放）── */}
+          <Section
+            icon={Timer}
+            title={t('modulesLifecycle.title')}
+            description={t('modulesLifecycle.description')}
+          >
+            <Field
+              label={t('modulesLifecycle.idleTimeout')}
+              description={t('modulesLifecycle.idleTimeoutDescription')}
+            >
+              <NumberField
+                value={config.modules?.idle_timeout_secs ?? 1800}
+                onValueChange={(v) =>
+                  patchSection('modules', { idle_timeout_secs: v })
+                }
+                min={0}
+                max={604800}
+              />
+            </Field>
           </Section>
 
           {/* ── 高级（§8.3 active_models 单槽位）── */}

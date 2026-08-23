@@ -101,5 +101,8 @@
   "modelDelete.failed": "模型删除失败",
   "modelDelete.confirmTitle": "删除模型「{{name}}」？",
   "modelDelete.confirmDescription": "将删除模块「{{module}}」的模型文件与本机缓存（{{id}}），不可恢复",
-  "modelFilter.all": "全部"
+  "modelFilter.all": "全部",
+  "detail.releaseNow": "立即释放",
+  "toast.released": "模块已卸载，资源已释放；下次任务将自动重载",
+  "toast.releaseFailed": "释放失败"
 }

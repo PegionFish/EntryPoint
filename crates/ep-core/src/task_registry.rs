@@ -128,6 +128,10 @@ pub struct TaskRecord {
     /// 帧序列落位根；任务终态清算。旧落盘 JSON 无此字段 → default None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staging_dir: Option<String>,
+    /// 任务关联模块 id 集：空闲自动释放的活跃守卫依据——回收器绝不停止
+    /// 被排队/运行中任务引用的模块。旧 JSON 缺省为空。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub module_ids: Vec<String>,
 }
 
 impl TaskRecord {
@@ -356,6 +360,7 @@ mod tests {
             served_artifacts: HashMap::new(),
             work_dir: PathBuf::from(format!("/tmp/tasks/{id}")),
             staging_dir: None,
+            module_ids: Vec::new(),
         }
     }
 

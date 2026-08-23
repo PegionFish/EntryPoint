@@ -540,3 +540,64 @@ mod tests {
         cleanup(&root);
     }
 }
+
+
+// ── 模块空闲自动释放（按需加载 + 定期卸载）────────────────────────────────
+
+/// 空闲释放决策（纯函数，fixture 可测）。
+///
+/// 平台约定：模块进程 = 模型驻留单元。任务触达（提交/节点回调/终态）会刷新
+/// 活跃时间戳；持续无触达超过 `timeout_secs` 的运行中模块应被停止以释放
+/// 内存/显存与功耗，下次任务经既有拉起路径按需重载。
+///
+/// - `timeout_secs == 0` → 停用语义，恒返回空
+/// - `last_active_epoch_secs <= 0` → 未知基准（如升级前的常驻老进程），保守跳过
+pub fn idle_release_candidates<I, S>(
+    candidates: I,
+    timeout_secs: u64,
+    now_epoch_secs: i64,
+) -> Vec<String>
+where
+    I: IntoIterator<Item = (S, i64)>,
+    S: AsRef<str>,
+{
+    if timeout_secs == 0 {
+        return Vec::new();
+    }
+    candidates
+        .into_iter()
+        .filter(|(_, last_active)| *last_active > 0)
+        .filter(|(_, last_active)| now_epoch_secs - last_active >= timeout_secs as i64)
+        .map(|(id, _)| id.as_ref().to_string())
+        .collect()
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::idle_release_candidates;
+
+    #[test]
+    fn zero_timeout_disables() {
+        let out = idle_release_candidates([("a", 100)], 0, 10_000);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn unknown_baseline_is_skipped_conservatively() {
+        let out = idle_release_candidates([("legacy", 0), ("neg", -5)], 60, 10_000);
+        assert!(out.is_empty(), "无可靠基准的常驻进程不得误杀");
+    }
+
+    #[test]
+    fn expired_and_fresh_split() {
+        // a: 空闲 120s ≥ 60s 超时 → 释放；b: 刚触达 → 保留
+        let out = idle_release_candidates([("a", 9_880), ("b", 9_995)], 60, 10_000);
+        assert_eq!(out, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn boundary_exact_timeout_counts_as_idle() {
+        let out = idle_release_candidates([("a", 9_940)], 60, 10_000);
+        assert_eq!(out.len(), 1);
+    }
+}
