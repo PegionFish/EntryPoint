@@ -1635,6 +1635,7 @@ to = ["output", "input"]
             &[Artifact::Text("hello world".into())],
             &work_dir,
             &single_port_map("faster-whisper", &server),
+            None,
         )
         .await
         .expect("module JSON call should succeed");
@@ -1673,6 +1674,7 @@ to = ["output", "input"]
             &[Artifact::Json(serde_json::json!({"text": "hi"}))],
             &work_dir,
             &single_port_map("m1", &server),
+            None,
         )
         .await
         .unwrap();
@@ -1696,6 +1698,7 @@ to = ["output", "input"]
             &[],
             &work_dir,
             &single_port_map("m1", &server),
+            None,
         )
         .await
         .unwrap();
@@ -1712,6 +1715,7 @@ to = ["output", "input"]
             &[],
             &work_dir,
             &single_port_map("m1", &server),
+            None,
         )
         .await
         .unwrap();
@@ -1750,6 +1754,7 @@ to = ["output", "input"]
             &[Artifact::File(input_file)],
             &work_dir,
             &single_port_map("faster-whisper", &server),
+            None,
         )
         .await
         .expect("multipart module call should succeed");
@@ -1820,6 +1825,7 @@ to = ["output", "input"]
             &[Artifact::File(input_file)],
             &work_dir,
             &single_port_map("m1", &server),
+            None,
         )
         .await
         .expect("large multipart upload should succeed");
@@ -1860,6 +1866,7 @@ to = ["output", "input"]
             &[Artifact::Text("hi".into())],
             &work_dir,
             &single_port_map("m1", &server),
+            None,
         )
         .await
         .unwrap();
@@ -1884,6 +1891,7 @@ to = ["output", "input"]
             &[Artifact::Text("hi".into())],
             &work_dir,
             &single_port_map("m1", &server),
+            None,
         )
         .await
         .unwrap();
@@ -1913,6 +1921,7 @@ to = ["output", "input"]
             &[Artifact::Text("hi".into())],
             std::path::Path::new("."),
             &single_port_map("m1", &server),
+            None,
         )
         .await
         .unwrap_err();
@@ -1943,6 +1952,7 @@ to = ["output", "input"]
             &[Artifact::Text("hi".into())],
             std::path::Path::new("."),
             &single_port_map("m1", &server),
+            None,
         )
         .await
         .unwrap_err();
@@ -1971,6 +1981,7 @@ to = ["output", "input"]
             &[],
             std::path::Path::new("."),
             &single_port_map("m1", &server),
+            None,
         )
         .await
         .unwrap_err();
@@ -1999,6 +2010,7 @@ to = ["output", "input"]
             &[],
             std::path::Path::new("."),
             &single_port_map("m1", &server),
+            None,
         )
         .await
         .unwrap_err();
@@ -2027,7 +2039,7 @@ to = ["output", "input"]
         let mut module_ports = HashMap::new();
         module_ports.insert("m1".to_string(), closed_port);
 
-        let err = execute_module_node(&node, &[], std::path::Path::new("."), &module_ports)
+        let err = execute_module_node(&node, &[], std::path::Path::new("."), &module_ports, None)
             .await
             .unwrap_err();
         let mce = err.downcast_ref::<ModuleCallError>().expect("ModuleCallError");
@@ -2052,6 +2064,7 @@ to = ["output", "input"]
             &[Artifact::Text("hi".into())],
             std::path::Path::new("."),
             &single_port_map("m1", &server),
+            None,
         )
         .await
         .unwrap_err();
@@ -2071,7 +2084,7 @@ to = ["output", "input"]
     async fn test_module_node_port_resolution_registry_params_and_missing() {
         // 1) 无注册表条目且 params 无 port → 本地即失败，不可重试
         let node = module_node_with("ghost", "cap", serde_json::json!({}));
-        let err = execute_module_node(&node, &[], std::path::Path::new("."), &HashMap::new())
+        let err = execute_module_node(&node, &[], std::path::Path::new("."), &HashMap::new(), None)
             .await
             .unwrap_err();
         let mce = err.downcast_ref::<ModuleCallError>().expect("ModuleCallError");
@@ -2093,7 +2106,7 @@ to = ["output", "input"]
             "cap",
             serde_json::json!({ "port": mock_server_port(&server) }),
         );
-        let artifact = execute_module_node(&node, &[], std::path::Path::new("."), &HashMap::new())
+        let artifact = execute_module_node(&node, &[], std::path::Path::new("."), &HashMap::new(), None)
             .await
             .unwrap();
         assert_eq!(artifact, Artifact::Text("via params port".into()));
@@ -2120,6 +2133,7 @@ to = ["output", "input"]
             &[],
             std::path::Path::new("."),
             &single_port_map("m1", &registry_server),
+            None,
         )
         .await
         .unwrap();
@@ -2176,6 +2190,7 @@ pub(crate) async fn execute_node(
     task: &PipelineTask,
     work_dir: &Path,
     module_ports: &HashMap<String, u16>,
+    staging: Option<&Path>,
 ) -> anyhow::Result<Artifact> {
     let upstream = collect_upstream_artifacts(&node.id, pipeline, task);
 
@@ -2183,7 +2198,9 @@ pub(crate) async fn execute_node(
         NodeKind::Builtin { builtin } => {
             execute_builtin_node(builtin, node, &upstream, work_dir).await
         }
-        NodeKind::Module { .. } => execute_module_node(node, &upstream, work_dir, module_ports).await,
+        NodeKind::Module { .. } => {
+            execute_module_node(node, &upstream, work_dir, module_ports, staging).await
+        }
         // 遗留 `kind = "external_api" | "llm"` 节点：统一走 llm 执行路径（§6.7）。
         // kind 级 endpoint/api_key_env 作为 base_url/api_key_env 的来源之一，
         // 与 params 中的同名字段合并（kind 级非空值优先）。
@@ -2638,6 +2655,7 @@ async fn execute_module_node(
     upstream: &[Artifact],
     work_dir: &Path,
     module_ports: &HashMap<String, u16>,
+    staging: Option<&Path>,
 ) -> anyhow::Result<Artifact> {
     let (module_id, capability) = match &node.kind {
         NodeKind::Module {
@@ -2718,7 +2736,7 @@ async fn execute_module_node(
             "executing module HTTP call"
         );
 
-        match send_module_request(&client, &url, &module_id, node, upstream, has_file_input, work_dir).await {
+        match send_module_request(&client, &url, &module_id, node, upstream, has_file_input, work_dir, staging).await {
             Ok(artifact) => return Ok(artifact),
             Err(e) => {
                 let mce: ModuleCallError = match e.downcast_ref::<ModuleCallError>() {
@@ -2759,6 +2777,7 @@ async fn execute_module_node(
 }
 
 /// 发送单次模块 HTTP 请求并解析响应
+#[allow(clippy::too_many_arguments)]
 async fn send_module_request(
     client: &reqwest::Client,
     url: &str,
@@ -2767,11 +2786,16 @@ async fn send_module_request(
     upstream: &[Artifact],
     has_file_input: bool,
     work_dir: &Path,
+    staging_dir: Option<&Path>,
 ) -> anyhow::Result<Artifact> {
     // ── output_format 声明 → 注入 output_path（模块可据此产出文件产物） ──
     // 约定：节点 params 含 output_format（如 "srt"/"txt"，非 "json"）时，
-    // 执行器在 params 中补充 output_path=<work_dir>/<node_id>_output.<fmt>，
+    // 执行器在 params 中补充 output_path=<落位根>/<node_id>_output.<fmt>，
     // 模块按该路径写出文件并返回 output_type="file" + result=路径。
+    // 落位根：staging（RAM 暂存，ep-core::staging）优先，无暂存时回退
+    // work_dir（既有行为）。staging 同时以 params.staging_dir 透传给模块，
+    // 作为帧序列等大体量中间数据的建议落点（adapter 自主选择是否消费）。
+    let output_base = staging_dir.unwrap_or(work_dir);
     let output_format = node
         .params
         .get("output_format")
@@ -2779,9 +2803,7 @@ async fn send_module_request(
         .map(str::trim)
         .filter(|f| !f.is_empty() && *f != "json");
     let mut params_value = node.params.clone();
-    if let Some(fmt) = output_format {
-        let safe: String = fmt.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-        let out_path = work_dir.join(format!("{}_output.{safe}", node.id));
+    {
         let obj = match params_value.as_object_mut() {
             Some(o) => o,
             None => {
@@ -2789,10 +2811,20 @@ async fn send_module_request(
                 params_value.as_object_mut().expect("just set")
             }
         };
-        obj.insert(
-            "output_path".to_string(),
-            serde_json::Value::String(out_path.to_string_lossy().to_string()),
-        );
+        if let Some(staging) = staging_dir {
+            obj.insert(
+                "staging_dir".to_string(),
+                serde_json::Value::String(staging.to_string_lossy().to_string()),
+            );
+        }
+        if let Some(fmt) = output_format {
+            let safe: String = fmt.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+            let out_path = output_base.join(format!("{}_output.{safe}", node.id));
+            obj.insert(
+                "output_path".to_string(),
+                serde_json::Value::String(out_path.to_string_lossy().to_string()),
+            );
+        }
     }
 
     let resp = if has_file_input {

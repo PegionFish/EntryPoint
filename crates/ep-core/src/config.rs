@@ -342,6 +342,25 @@ pub struct PipelineConfig {
     pub keep_workspace: bool,
     #[serde(default = "default_workspace_dir")]
     pub workspace_dir: String,
+    /// 中间产物暂存模式（管线级 RAM 盘生命周期管理，ep-core::staging）：
+    /// "auto"（缺省，Linux 探测 tmpfs 可用则驻留内存否则落盘）/ "tmpfs"
+    /// （强制尝试）/ "disk"（禁用内存驻留）
+    #[serde(default = "default_staging_mode")]
+    pub staging_mode: String,
+    /// tmpfs 准入水位（MB）：可用空间低于该值时新任务暂存目录落盘回退
+    /// （tmpfs 耗尽会触发交换或分配失败，宁可慢不可拖垮全机）
+    #[serde(default = "default_staging_floor_mb")]
+    pub staging_floor_mb: u64,
+    /// tmpfs 根覆盖（缺省 /dev/shm/ep-staging；Windows 恒走盘上回退）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staging_root: Option<String>,
+}
+
+fn default_staging_mode() -> String {
+    "auto".to_string()
+}
+fn default_staging_floor_mb() -> u64 {
+    2048
 }
 
 impl Default for PipelineConfig {
@@ -352,6 +371,9 @@ impl Default for PipelineConfig {
             default_node_timeout_secs: 0,
             keep_workspace: true,
             workspace_dir: default_workspace_dir(),
+            staging_mode: default_staging_mode(),
+            staging_floor_mb: default_staging_floor_mb(),
+            staging_root: None,
         }
     }
 }
