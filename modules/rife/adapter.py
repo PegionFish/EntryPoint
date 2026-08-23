@@ -375,7 +375,11 @@ def run_interpolate(input_path: Path, out_path: Path, params: dict) -> dict:
     # 留空会让 find_ncnn_model_dir 按字典序误选 rife-HD
     model_name = str(params.get("model_name") or "rife-v4.6")
 
-    work_root = Path(tempfile.mkdtemp(prefix="ep-vint-", dir=EP_WORKSPACE or None))
+    # 帧序列落位：params.staging_dir（平台 RAM 暂存区，ep-core::staging 注入）
+    # 优先，缺省回退 workspace（第三方直连/旧平台兼容语义不变）
+    staging_root = (params.get("staging_dir") or "").strip() if isinstance(params, dict) else ""
+    work_base = staging_root or (EP_WORKSPACE or None)
+    work_root = Path(tempfile.mkdtemp(prefix="ep-vint-", dir=work_base))
     frames_in = work_root / "frames_in"
     try:
         n_src = _extract_frames(input_path, frames_in)

@@ -74,6 +74,9 @@ pub struct PipelineRunnerImpl {
     work_dir: PathBuf,
     /// 模块端口注册表：module_id → port
     module_ports: HashMap<String, u16>,
+    /// 任务暂存目录（RAM 优先，ep-core::staging）：Some 时模块节点的
+    /// output_path/staging_dir 注入指向此处，中间产物驻留内存
+    pub staging_dir: Option<PathBuf>,
     /// 节点开始执行时回调
     #[allow(clippy::type_complexity)]
     pub on_node_start: Option<Arc<dyn Fn(&str) + Send + Sync>>,
@@ -134,6 +137,7 @@ impl PipelineRunnerImpl {
             tasks: HashMap::new(),
             work_dir,
             module_ports: HashMap::new(),
+            staging_dir: None,
             on_node_start: None,
             on_node_complete: None,
             on_node_error: None,
@@ -329,6 +333,7 @@ impl PipelineRunnerImpl {
                 let task_owned = task.clone();
                 let work_dir_owned = work_dir.to_path_buf();
                 let ports_owned = self.module_ports.clone();
+                let staging_owned = self.staging_dir.clone();
                 let mut exec_handle = tokio::spawn(async move {
                     execute_node(
                         &node_owned,
@@ -336,6 +341,7 @@ impl PipelineRunnerImpl {
                         &task_owned,
                         &work_dir_owned,
                         &ports_owned,
+                        staging_owned.as_deref(),
                     )
                     .await
                 });
@@ -481,6 +487,7 @@ impl PipelineRunner for PipelineRunnerImpl {
                 let default_node_timeout = self.default_node_timeout;
 
                 let mut temp_runner = PipelineRunnerImpl {
+                    staging_dir: self.staging_dir.clone(),
                     task: None,
                     tasks: HashMap::new(),
                     work_dir: work_dir_path.clone(),

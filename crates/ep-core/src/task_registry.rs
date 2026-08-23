@@ -124,6 +124,10 @@ pub struct TaskRecord {
     pub served_artifacts: HashMap<String, PathBuf>,
     /// 任务工作目录（{workspace}/tasks/{task_id}）
     pub work_dir: PathBuf,
+    /// 任务暂存目录（RAM 优先，ep-core::staging）：节点中间产物与 adapter
+    /// 帧序列落位根；任务终态清算。旧落盘 JSON 无此字段 → default None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staging_dir: Option<String>,
 }
 
 impl TaskRecord {
@@ -351,6 +355,7 @@ mod tests {
             artifacts: HashMap::new(),
             served_artifacts: HashMap::new(),
             work_dir: PathBuf::from(format!("/tmp/tasks/{id}")),
+            staging_dir: None,
         }
     }
 

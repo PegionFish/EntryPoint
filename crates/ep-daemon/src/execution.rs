@@ -582,6 +582,11 @@ pub async fn submit_pipeline_full(
         ))
     })?;
 
+    // 管线暂存区分配（RAM 优先，ep-core::staging）：节点中间产物与 adapter
+    // 帧序列的落位根；任务终态由 run_task 收尾路径统一清算
+    let staged = state.staging.read().await.alloc_task(&task_id);
+    let staging_dir = staged.path.clone();
+
     let pipeline_id = pipeline.id.clone();
     // §6.8：管线级并发上限（TOML `[pipeline] max_instances`，缺省跟随全局）
     let max_instances = resolve_max_instances(&state.root, &pipeline_id);
@@ -613,6 +618,7 @@ pub async fn submit_pipeline_full(
         artifacts: HashMap::new(),
         served_artifacts: HashMap::new(),
         work_dir: task_dir.clone(),
+        staging_dir: Some(staging_dir.to_string_lossy().to_string()),
     };
     registry()
         .lock()
@@ -911,6 +917,13 @@ fn start_task(
         let task_id_bg = task_id.clone();
         let cancel_flag = extras_bg.cancel.clone();
         let activity_ms = extras_bg.last_activity_ms.clone();
+        // 暂存目录随任务记录传递（submit 时分配；终态由收尾路径清算）
+        let staging_dir = registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&task_id)
+            .and_then(|r| r.staging_dir.clone())
+            .map(PathBuf::from);
         let joined = tokio::task::spawn_blocking(move || {
             run_task(
                 task_id_bg,
@@ -921,6 +934,7 @@ fn start_task(
                 cancel_flag,
                 activity_ms,
                 default_node_timeout,
+                staging_dir,
             )
         })
         .await;
@@ -1104,6 +1118,12 @@ async fn finalize_task(
             }
         }
     }
+
+    // staging 清算（终态统一出口，无条件执行）：易失区的定位就是「随任务
+    // 生灭」——归集完成后帧序列/节点中间产物不再有存在价值，而 tmpfs 驻留
+    // 占用的是全机共享内存，必须即刻归还（与 keep_workspace 解耦：该开关
+    // 仅管盘上工作目录的调试现场）。失败仅告警，不阻塞终态上报。
+    state.staging.read().await.free_task(task_id).ok();
 
     // 清理运行时标志
     extras()
@@ -1290,6 +1310,7 @@ async fn wait_until_terminal(state: &Arc<AppState>, task_id: &str) -> TaskRecord
                     artifacts: HashMap::new(),
                     served_artifacts: HashMap::new(),
                     work_dir: PathBuf::new(),
+                    staging_dir: None,
                 });
             }
         }
@@ -1612,6 +1633,7 @@ fn run_task(
     cancel_flag: Arc<AtomicBool>,
     activity_ms: Arc<AtomicU64>,
     default_node_timeout: Option<Duration>,
+    staging_dir: Option<PathBuf>,
 ) -> (anyhow::Result<()>, Option<TaskDetail>) {
     #[cfg(test)]
     run_test_hook(&task_id);
@@ -1619,6 +1641,7 @@ fn run_task(
     let pipeline_id = pipeline.id.clone();
 
     let mut runner = PipelineRunnerImpl::new(task_dir.clone());
+    runner.staging_dir = staging_dir;
     runner.set_module_ports(module_ports);
     runner.set_cancel_flag(cancel_flag);
     runner.set_default_node_timeout(default_node_timeout);
@@ -2186,6 +2209,7 @@ to = ["output", "input"]
             artifacts: HashMap::new(),
             served_artifacts: HashMap::new(),
             work_dir: PathBuf::new(),
+            staging_dir: None,
         };
         registry()
             .lock()
@@ -3278,6 +3302,7 @@ output_type = "json"
             artifacts: HashMap::new(),
             served_artifacts: HashMap::new(),
             work_dir: PathBuf::new(),
+            staging_dir: None,
         }
     }
 
@@ -3316,6 +3341,7 @@ output_type = "json"
             artifacts: HashMap::new(),
             served_artifacts: HashMap::new(),
             work_dir: PathBuf::new(),
+            staging_dir: None,
         };
         registry()
             .lock()

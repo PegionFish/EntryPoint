@@ -704,6 +704,24 @@ Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平�
   （30帧@15fps→60帧@30fps）；workspace 1241 tests + clippy 零警告 +
   webui build/lint 过
 
+### 追加（同日第六轮——管线暂存层，系统级 RAM 盘生命周期）
+
+- ✨ **ep-core::staging**：任务级暂存管理器——双区布局
+  `runtime/staging|/dev/shm/ep-staging/<task_id>/`（易失，RAM 优先）×
+  `workspace/tasks/<id>/files/`(持久产物)；准入水位线（staging_floor_mb，
+  缺省 2048MB）不足即落盘回退，tmpfs 探测经 /proc/self/mounts 判型；
+  启动全量清扫孤儿；statvfs 可注入探针（7 单测覆盖落位/幂等/清扫/穿越）
+- 🔌 执行器接线：send_module_request 注入 `output_path` 与
+  `params.staging_dir` 指向暂存区（无 staging 时行为不变，既有测试零改动
+  语义）；TaskRecord.staging_dir 随记录流转，终态**无条件**清算易失区
+  （tmpfs 是全机共享内存，与 keep_workspace 解耦——该开关仅管盘上现场）
+- 🐍 消费端：realesr/animevideo/rife 帧序列 mkdtemp 落位改读
+  params.staging_dir（缺省回退 workspace，第三方直连兼容不变）
+- 配置：[pipeline] 新增 staging_mode(auto/tmpfs/disk)/staging_floor_mb/
+  staging_root 三键（serde 缺省即 auto，存量配置零迁移）
+- ✅ 真机实证：帧序列驻留 /dev/shm、终态归零清算、输出尺寸正确；
+  workspace **1248 tests** 全过 + clippy 零警告
+
 ### 待办（恢复工作时的接续点）
 
 1. daemon 新二进制重启未完成（暂停时中断）——重启后 E2 走平台全链：

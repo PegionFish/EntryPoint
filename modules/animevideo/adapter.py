@@ -389,7 +389,11 @@ def run_upscale(input_path: Path, out_path: Path, params: dict) -> dict:
     tile = int(params.get("tile_size") or (0 if preset == "fast" else 256))
     fp32 = preset == "quality"
 
-    work_root = Path(tempfile.mkdtemp(prefix="ep-vups-", dir=EP_WORKSPACE or None))
+    # 帧序列落位：params.staging_dir（平台 RAM 暂存区，ep-core::staging 注入）
+    # 优先，缺省回退 workspace（第三方直连/旧平台兼容语义不变）
+    staging_root = (params.get("staging_dir") or "").strip() if isinstance(params, dict) else ""
+    work_base = staging_root or (EP_WORKSPACE or None)
+    work_root = Path(tempfile.mkdtemp(prefix="ep-vups-", dir=work_base))
     frames_in = work_root / "frames_in"
     try:
         n_frames = _extract_frames(input_path, frames_in)

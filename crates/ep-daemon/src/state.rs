@@ -124,6 +124,9 @@ pub struct DownloadEntry {
 pub struct AppState {
     /// 项目根目录（绝对路径），所有相对路径的基准
     pub root: PathBuf,
+    /// 管线中间产物暂存管理器（RAM 优先，任务终态清算 + 启动清扫；
+    /// ep-core::staging）。Arc 内层不可变，配置读取时按需重建整体。
+    pub staging: Arc<RwLock<Arc<ep_core::staging::StagingManager>>>,
     pub config: Arc<RwLock<AppConfig>>,
     pub devices: Arc<RwLock<Vec<ComputeDevice>>>,
     pub modules: Arc<RwLock<Vec<DiscoveredModule>>>,
@@ -170,8 +173,19 @@ impl AppState {
         // daemon 重启后 GET /api/tasks 立即可见历史任务。
         crate::api::execute::execution::bind_persistence(&root);
 
+        // 管线中间产物暂存管理器（RAM 优先）：按启动时配置快照构建；
+        // 启动期无活跃任务，暂存根下的一切皆为上次进程遗留 → 全量清扫
+        let staging = ep_core::staging::StagingManager::new(
+            ep_core::staging::StagingMode::parse(&config.pipeline.staging_mode),
+            config.pipeline.staging_root.as_deref(),
+            &root.join("runtime"),
+            config.pipeline.staging_floor_mb,
+        );
+        staging.sweep_orphans();
+
         Self {
             root,
+            staging: Arc::new(RwLock::new(Arc::new(staging))),
             config: Arc::new(RwLock::new(config)),
             devices: Arc::new(RwLock::new(devices)),
             modules: Arc::new(RwLock::new(modules)),
