@@ -43,6 +43,8 @@ mod ws;
 // reload 接线，P2-1），纳入以保持与 main.rs 模块树对齐
 #[path = "../src/logging.rs"]
 mod logging;
+#[path = "../src/schedule.rs"]
+mod schedule;
 
 // ─── 公共 harness ────────────────────────────────────────────────────────────
 

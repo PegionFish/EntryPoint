@@ -1,5 +1,6 @@
 mod api;
 mod logging;
+mod schedule;
 mod state;
 mod updates;
 mod ws;
@@ -21,7 +22,7 @@ use ep_core::deps::DepReport;
 use ep_core::module::discovery::discover_modules;
 use ep_core::port::PortManager;
 use ep_core::process::ProcessManager;
-use tracing::info;
+use tracing::{info, warn};
 use ep_core::types::ServiceStatus;
 
 use crate::state::AppState;
@@ -425,6 +426,76 @@ async fn run_server(root: PathBuf, cfg: AppConfig) -> anyhow::Result<()> {
                     drop(pm);
                     state.port_manager.write().await.release(&id);
                 }
+            }
+        });
+    }
+
+    // 10.6 Spawn 管线定时调度巡检（cron）：每 30s 对 runtime/schedules.json
+    //      求触发窗口；命中即按存储的 inputs/params 模板提交执行。
+    //      last_checked 水位线持久化——重启不补跑错过的窗口，也不双跑。
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let path = schedule::default_registry_path(&state.root);
+                let registry = schedule::ScheduleRegistry::load(&path);
+                if registry.entries.is_empty() {
+                    continue;
+                }
+                let now = chrono::Utc::now().timestamp();
+                // 活跃管线集：闸门在跑/排队的任务所属管线
+                let active: std::collections::HashSet<String> = {
+                    let reg = crate::api::execute::execution::task_registry_all();
+                    reg.into_iter()
+                        .filter(|r| r.is_active())
+                        .map(|r| r.pipeline_id)
+                        .collect()
+                };
+                let (due, next) = schedule::collect_due(&registry, now, &active);
+                if due.is_empty() {
+                    if next.entries.len() == registry.entries.len()
+                        && next
+                            .entries
+                            .iter()
+                            .all(|(k, v)| registry.entries.get(k).map(|o| o.last_checked == v.last_checked).unwrap_or(false))
+                    {
+                        continue; // 无状态变化不落盘
+                    }
+                    if let Err(e) = next.save(&path) {
+                        tracing::warn!(error = %e, "schedules.json 保存失败");
+                    }
+                    continue;
+                }
+                for trigger in &due {
+                    info!(pipeline_id = %trigger.pipeline_id, cron = %trigger.entry.cron, "schedule 触发管线执行");
+                    let inputs: std::collections::HashMap<String, serde_json::Value> =
+                        serde_json::from_value(trigger.entry.inputs.clone()).unwrap_or_default();
+                    match crate::api::execute::execution::submit_pipeline_for_schedule(
+                        &state,
+                        &trigger.pipeline_id,
+                        inputs,
+                        trigger.entry.params.clone(),
+                    ).await {
+                        Ok(task_id) => {
+                            tracing::info!(%task_id, pipeline_id = %trigger.pipeline_id, "schedule 任务已提交");
+                            let mut reg2 = schedule::ScheduleRegistry::load(&path);
+                            if let Some(e) = reg2.entries.get_mut(&trigger.pipeline_id) {
+                                e.last_task_id = Some(task_id);
+                                e.last_checked = now;
+                            }
+                            let _ = reg2.save(&path);
+                        }
+                        Err(e) => {
+                            warn!(pipeline_id = %trigger.pipeline_id, error = %e, "schedule 触发提交失败");
+                        }
+                    }
+                }
+                // 兜底持久化最终水位线
+                let _ = next.save(&path);
             }
         });
     }

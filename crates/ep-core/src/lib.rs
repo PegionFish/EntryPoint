@@ -28,5 +28,8 @@ pub mod deps_install;
 // 管线中间产物暂存（任务级 RAM 盘生命周期管理）
 pub mod staging;
 
+// 极简 cron 解析（管线定时执行）
+pub mod cron;
+
 // Wave S 骨架（§4.3 全限定模型 ID，签名冻结，实现由 Wave 1 A3 填入）
 pub mod model_id;

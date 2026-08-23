@@ -741,6 +741,31 @@ Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平�
 - ✅ 真机实证：45s 超时下 realesr 自动释放→VRAM 归还→再提交按需重载完成；
   workspace **1254 tests** 全过 + clippy 零警告
 
+### 追加（同日第八轮——管线 JSON 分享 / cron 定时 / 层内并行与多上游扇入）
+
+- ✨ **层内真并行**（runner 重构）：拓扑分层内节点 JoinSet 并发驱动，
+  fail-fast（首个失败/取消 abort 其余在飞兄弟，语义对齐旧串行「失败即停层」；
+  取消边界契约保持——首节点 failed(cancelled)、下游 Skipped）。
+  共享 PipelineTask 不跨线程可变：在飞只读上游、成败按完成序统一落账
+- ✨ **ffmpeg 多上游定向占位符** `{input.<node_id>}`：扇入合并场景定向引用
+  各上游产物（`{input}` 首文件语义向后兼容）；collect_upstream_artifacts
+  增带源变体；纯函数单测覆盖命中/未命中/未闭合
+- ✨ **管线 JSON 导入/导出/分享**：GET /pipelines/{id}/export 输出自包含
+  信封（format=entrypoint-pipeline/v1+spec，Content-Disposition 附件名）；
+  POST /pipelines/import 接受信封或裸 spec，id 冲突自动 `-importedN`
+  去重，导入前执行层全量校验——导出文件即分享载体
+- ✨ **cron 定时调度**：零依赖五段解析器（ep-core::cron：*/n、范围、列表、
+  vixie 日周 OR 语义、7=周日，6 单测）；runtime/schedules.json 独立注册表
+  （与编辑器回写隔离）；PUT/GET/DELETE /pipelines/{id}/schedule；
+  巡检循环 30s 求触发窗口，last_checked 水位线持久化（重启不补跑不双跑，
+  停用期间推进水位防补喷）；活跃管线豁免 + 提交模板 inputs/params
+- 🔧 内置 audio-extract 修 FLAC→m4a 不兼容（copy→aac 192k）
+- ✅ **真机实证三连**：① 导出→导入→去重闭环；② cron `* * * * *` 每分钟
+  准点触发→修参后全片提取完成→DELETE 注销；③ 扇出/扇入演示管线
+  （negate∥hflip→hstack）640x240 全绿 + 并行度实锤：单分支 3.25s vs
+  双分支并行+合并 3.46s（串行应 ~6.5s）
+- 门禁：workspace **1271 tests** 全过 + clippy 零警告 + webui build 过
+
 ### 待办（恢复工作时的接续点）
 
 1. daemon 新二进制重启未完成（暂停时中断）——重启后 E2 走平台全链：

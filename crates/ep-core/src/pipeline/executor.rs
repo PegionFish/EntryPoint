@@ -513,7 +513,7 @@ to = ["save", "input"]
         let output = PathBuf::from("/tmp/work/extract_output.m4a");
 
         let (replaced, output_substituted) =
-            substitute_ffmpeg_placeholders(&args, "extract", Some(&input), &output).unwrap();
+            substitute_ffmpeg_placeholders(&args, "extract", Some(&input), None, &output).unwrap();
 
         assert_eq!(
             replaced,
@@ -547,7 +547,7 @@ to = ["save", "input"]
         .collect();
 
         let (replaced, output_substituted) =
-            substitute_ffmpeg_placeholders(&args, "encode", None, Path::new("/tmp/o")).unwrap();
+            substitute_ffmpeg_placeholders(&args, "encode", None, None, Path::new("/tmp/o")).unwrap();
 
         assert_eq!(replaced, args);
         assert!(
@@ -561,7 +561,7 @@ to = ["save", "input"]
         let args = vec!["-i".to_string(), "{input}".to_string(), "{output}".to_string()];
 
         let err =
-            substitute_ffmpeg_placeholders(&args, "extract-audio", None, Path::new("/tmp/o"))
+            substitute_ffmpeg_placeholders(&args, "extract-audio", None, None, Path::new("/tmp/o"))
                 .expect_err("must error when {input} is present without an upstream file");
         let msg = err.to_string();
 
@@ -584,6 +584,7 @@ to = ["save", "input"]
             &args,
             "n",
             Some(Path::new("a.mp4")),
+            None,
             Path::new("o.wav"),
         )
         .unwrap();
@@ -648,7 +649,7 @@ to = ["save", "input"]
         );
 
         let artifact =
-            execute_builtin_ffmpeg(&node, &[Artifact::File(input_file)], &work_dir)
+            execute_builtin_ffmpeg(&node, &[Artifact::File(input_file)], &[], &work_dir)
                 .await
                 .expect("ffmpeg should succeed after placeholder substitution");
 
@@ -688,7 +689,7 @@ to = ["save", "input"]
         );
 
         let artifact =
-            execute_builtin_ffmpeg(&node, &[Artifact::File(input_file)], &work_dir)
+            execute_builtin_ffmpeg(&node, &[Artifact::File(input_file)], &[], &work_dir)
                 .await
                 .expect("legacy behavior without placeholders should be unchanged");
 
@@ -721,7 +722,7 @@ to = ["save", "input"]
             }),
         );
 
-        let err = execute_builtin_ffmpeg(&node, &[], &work_dir)
+        let err = execute_builtin_ffmpeg(&node, &[], &[], &work_dir)
             .await
             .expect_err("ffmpeg 成功但无产物时应报错");
         assert!(
@@ -805,7 +806,7 @@ to = ["save", "input"]
             }),
         );
 
-        let err = execute_builtin_ffmpeg(&node, &[], &work_dir)
+        let err = execute_builtin_ffmpeg(&node, &[], &[], &work_dir)
             .await
             .expect_err("must fail without upstream input");
         let msg = err.to_string();
@@ -955,7 +956,7 @@ to = ["output", "input"]
             }),
         );
 
-        let artifact = execute_builtin_ffmpeg(&node, &[Artifact::File(input_file)], &work_dir)
+        let artifact = execute_builtin_ffmpeg(&node, &[Artifact::File(input_file)], &[], &work_dir)
             .await
             .expect("string args should be split and executed like array args");
         let Artifact::File(output) = artifact else {
@@ -2146,6 +2147,36 @@ to = ["output", "input"]
     }
 }
 
+    #[test]
+    fn test_substitute_placeholders_directed_multi_input() {
+        // 扇入合并：{input.<node>} 定向引用各自上游产物
+        let mut map = std::collections::HashMap::new();
+        map.insert("video".to_string(), PathBuf::from("/tmp/v.mp4"));
+        map.insert("audio".to_string(), PathBuf::from("/tmp/a.wav"));
+        let args = vec![
+            "-i".to_string(),
+            "{input.video}".to_string(),
+            "-i".to_string(),
+            "{input.audio}".to_string(),
+            "-c".to_string(),
+            "copy".to_string(),
+            "{output}".to_string(),
+        ];
+        let (out, out_sub) =
+            substitute_ffmpeg_placeholders(&args, "merge", None, Some(&map), Path::new("/tmp/o.mp4"))
+                .unwrap();
+        assert!(out_sub);
+        assert_eq!(out[1], "/tmp/v.mp4");
+        assert_eq!(out[3], "/tmp/a.wav");
+        assert!(!out.iter().any(|a| a.contains("{input")));
+
+        // 未命中上游 → 显式报错
+        let bad = vec!["{input.nope}".to_string()];
+        assert!(substitute_ffmpeg_placeholders(&bad, "m", None, Some(&map), Path::new("/x")).is_err());
+        // 无映射上下文同样报错
+        assert!(substitute_ffmpeg_placeholders(&bad, "m", None, None, Path::new("/x")).is_err());
+    }
+
 // ─── 节点执行辅助函数 ────────────────────────────────────────────────────────
 
 /// 收集指定节点的所有上游产物（按边在 pipeline.edges 中的出现顺序）
@@ -2154,13 +2185,26 @@ pub(crate) fn collect_upstream_artifacts(
     pipeline: &Pipeline,
     task: &PipelineTask,
 ) -> Vec<Artifact> {
+    collect_upstream_artifacts_with_nodes(node_id, pipeline, task)
+        .into_iter()
+        .map(|(_, a)| a)
+        .collect()
+}
+
+/// 同 [`collect_upstream_artifacts`]，但保留产物所属的上游节点 id——
+/// ffmpeg 多上游占位符 `{input.<node_id>}` 的解析依据（扇入合并场景）。
+pub(crate) fn collect_upstream_artifacts_with_nodes(
+    node_id: &str,
+    pipeline: &Pipeline,
+    task: &PipelineTask,
+) -> Vec<(String, Artifact)> {
     pipeline
         .edges
         .iter()
         .filter(|e| e.to.0 == node_id)
         .filter_map(|e| {
             if let Some(NodeState::Completed { artifact: Some(a) }) = task.node_state(&e.from.0) {
-                Some(a.clone())
+                Some((e.from.0.clone(), a.clone()))
             } else {
                 None
             }
@@ -2196,7 +2240,7 @@ pub(crate) async fn execute_node(
 
     match &node.kind {
         NodeKind::Builtin { builtin } => {
-            execute_builtin_node(builtin, node, &upstream, work_dir).await
+            execute_builtin_node(builtin, node, pipeline, task, &upstream, work_dir).await
         }
         NodeKind::Module { .. } => {
             execute_module_node(node, &upstream, work_dir, module_ports, staging).await
@@ -2218,13 +2262,18 @@ pub(crate) async fn execute_node(
 async fn execute_builtin_node(
     builtin: &str,
     node: &PipelineNode,
+    pipeline: &Pipeline,
+    task: &PipelineTask,
     upstream: &[Artifact],
     work_dir: &Path,
 ) -> anyhow::Result<Artifact> {
     match builtin {
         "file_input" => execute_builtin_file_input(node, work_dir).await,
         "file_output" => execute_builtin_file_output(node, upstream, work_dir).await,
-        "ffmpeg" => execute_builtin_ffmpeg(node, upstream, work_dir).await,
+        "ffmpeg" => {
+            let with_nodes = collect_upstream_artifacts_with_nodes(&node.id, pipeline, task);
+            execute_builtin_ffmpeg(node, upstream, &with_nodes, work_dir).await
+        }
         // §6.7 LLM builtin：规范名 `llm`；`external_api` 保留为别名，
         // 两名执行完全等价（builtin 形状无 kind 级字段，参数全部来自 params）
         "llm" | "external_api" => execute_llm_node(node, upstream, None, None).await,
@@ -2375,10 +2424,16 @@ pub(crate) const INPUT_PLACEHOLDER: &str = "{input}";
 /// args 占位符：本节点输出文件路径
 pub(crate) const OUTPUT_PLACEHOLDER: &str = "{output}";
 
-/// 替换 ffmpeg 节点 args 中的 `{input}` / `{output}` 占位符（纯函数，可单测）。
+/// 定向上游占位符前缀：`{input.<node_id>}` 引用指定上游节点的文件产物
+pub(crate) const INPUT_BY_NODE_PREFIX: &str = "{input.";
+
+/// 替换 ffmpeg 节点 args 中的 `{input}` / `{input.<node_id>}` / `{output}`
+/// 占位符（纯函数，可单测）。
 ///
 /// 规则：
-/// - `{input}`  → 上游输入文件路径；args 含 `{input}` 但无可用上游文件时返回中文错误
+/// - `{input}`  → 首个上游文件路径；无可用上游文件时报错（向后兼容单入形状）
+/// - `{input.<node_id>}` → 该上游节点的文件产物；扇入合并场景的定向引用，
+///   未命中（节点不存在/产物非文件）时显式报错
 /// - `{output}` → 本节点解析出的输出文件路径
 ///
 /// 返回 `(替换后的 args, {output} 是否被替换过)`。
@@ -2387,6 +2442,7 @@ pub(crate) fn substitute_ffmpeg_placeholders(
     args: &[String],
     node_id: &str,
     input_file: Option<&Path>,
+    input_by_node: Option<&std::collections::HashMap<String, PathBuf>>,
     output_path: &Path,
 ) -> anyhow::Result<(Vec<String>, bool)> {
     let mut result = Vec::with_capacity(args.len());
@@ -2394,6 +2450,33 @@ pub(crate) fn substitute_ffmpeg_placeholders(
 
     for arg in args {
         let mut replaced = arg.clone();
+
+        // 定向引用先行匹配（{input. 开头），避免被 {input} 规则误吃
+        if replaced.contains(INPUT_BY_NODE_PREFIX) {
+            let mut resolved = String::new();
+            let mut rest = replaced.as_str();
+            while let Some(idx) = rest.find(INPUT_BY_NODE_PREFIX) {
+                resolved.push_str(&rest[..idx]);
+                let after = &rest[idx + INPUT_BY_NODE_PREFIX.len()..];
+                let Some(close_rel) = after.find('}') else {
+                    return Err(anyhow::anyhow!(
+                        "ffmpeg node '{node_id}' has an unterminated {{input.<node>}} placeholder in args"
+                    ));
+                };
+                let up_node = &after[..close_rel];
+                let path = input_by_node
+                    .and_then(|m| m.get(up_node))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "ffmpeg node '{node_id}' references {{{{input.{up_node}}}}} but that                              upstream node has no file artifact; connect it and ensure it succeeded"
+                        )
+                    })?;
+                resolved.push_str(&path.to_string_lossy());
+                rest = &after[close_rel + 1..];
+            }
+            resolved.push_str(rest);
+            replaced = resolved;
+        }
 
         if replaced.contains(INPUT_PLACEHOLDER) {
             let input = input_file.ok_or_else(|| {
@@ -2518,6 +2601,7 @@ pub(crate) fn split_shell_words(input: &str) -> Vec<String> {
 async fn execute_builtin_ffmpeg(
     node: &PipelineNode,
     upstream: &[Artifact],
+    upstream_nodes: &[(String, Artifact)],
     work_dir: &Path,
 ) -> anyhow::Result<Artifact> {
     // args 契约形状为**数组**；若收到字符串（P0-2 前端历史形状），按 shell
@@ -2550,10 +2634,23 @@ async fn execute_builtin_ffmpeg(
         Artifact::File(p) => Some(p.clone()),
         _ => None,
     });
+    // 上游节点 id → 文件路径映射 —— `{input.<node_id>}` 定向引用（扇入合并）
+    let mut input_by_node: std::collections::HashMap<String, PathBuf> =
+        std::collections::HashMap::new();
+    for (up_id, a) in upstream_nodes {
+        if let Artifact::File(p) = a {
+            input_by_node.insert(up_id.clone(), p.clone());
+        }
+    }
 
-    // 替换 {input} / {output} 占位符
-    let (args, output_substituted) =
-        substitute_ffmpeg_placeholders(&args_vec, &node.id, input_file.as_deref(), &output_path)?;
+    // 替换 {input} / {input.<node>} / {output} 占位符
+    let (args, output_substituted) = substitute_ffmpeg_placeholders(
+        &args_vec,
+        &node.id,
+        input_file.as_deref(),
+        Some(&input_by_node),
+        &output_path,
+    )?;
 
     let ffmpeg_bin = resolve_ffmpeg_path();
     let mut cmd = tokio::process::Command::new(&ffmpeg_bin);

@@ -123,6 +123,67 @@ pub fn active_task_module_ids() -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// 定时调度触发入口：按管线 id 从磁盘加载 spec → 提交执行。
+/// inputs/params 来自 schedule 条目模板；管线缺失或校验失败即报错
+/// （调度错误进日志与 last_task_id 缺省，不影响巡检循环存活）。
+#[allow(dead_code)] // e2e 测试独立编译本文件时无 main 循环消费方
+pub async fn submit_pipeline_for_schedule(
+    state: &Arc<AppState>,
+    pipeline_id: &str,
+    inputs: std::collections::HashMap<String, serde_json::Value>,
+    params: serde_json::Value,
+) -> Result<String, String> {
+    let dir = state.root.join("config").join("pipelines");
+    let spec = crate::api::pipelines::pipeline_bridge::load_spec(&dir.join(format!(
+        "{}.toml",
+        pipeline_id.replace('-', "_")
+    )))
+    .or_else(|_| {
+        // 兜底：扫描匹配（文件名规范外历史文件）
+        let mut found = None;
+        for (path, sp) in crate::api::pipelines::scan_specs_pub(&dir) {
+            if sp.pipeline.id == pipeline_id {
+                found = Some(crate::api::pipelines::pipeline_bridge::load_spec(&path));
+                break;
+            }
+        }
+        found.unwrap_or_else(|| {
+            Err(anyhow::anyhow!("pipeline '{pipeline_id}' not found"))
+        })
+    })
+    .map_err(|e| e.to_string())?;
+    let mut pipeline = crate::api::pipelines::pipeline_bridge::spec_to_pipeline(&spec)
+        .map_err(|e| e.to_string())?;
+    if !params.is_null() {
+        if let Some(obj) = params.as_object() {
+            for (node_id, patch) in obj {
+                if let Some(node) = pipeline.nodes.iter_mut().find(|n| &n.id == node_id) {
+                    if let (Some(base), Some(patch_obj)) =
+                        (node.params.as_object_mut(), patch.as_object())
+                    {
+                        for (k, v) in patch_obj {
+                            base.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    submit_pipeline_full(state, pipeline, Some(inputs), SubmitOptions::default())
+        .await
+        .map(|o| o.task_id)
+        .map_err(|e| e.to_string())
+}
+
+/// 调度巡检消费：注册表全量快照
+#[allow(dead_code)]
+pub fn task_registry_all() -> Vec<ep_core::task_registry::TaskRecord> {
+    registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .all()
+}
+
 fn registry() -> &'static Mutex<TaskRegistry> {
     REGISTRY.get_or_init(|| Mutex::new(TaskRegistry::new()))
 }
