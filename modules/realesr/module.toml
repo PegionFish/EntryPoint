@@ -87,19 +87,19 @@ target_dir = "realesr-animevideov3-x4-ncnn"
 size_estimate_mb = 45
 qualified_id = "xinntao.realesrgan.animevideov3-x4-ncnn"
 
-# ---- 占位待补：OpenVINO ONNX 变体 ----
-# 上游不发官方 ONNX（决策备忘录 reports/ws-f-engine-choice.md §1.2）：
-# 计划按 Intel doc 816445 自转 dynamic-shape ONNX(opset12) 并核验 PSNR 后回填直链。
-# 候选（未采纳原因如实记录）：
-#   - huggingface.co/bukuroo/RealESRGAN-ONNX（BSD-3，但输入固定 128x128）
-#   - Qualcomm AI Hub qualcomm/Real-ESRGAN-x4plus（固定 128x128，许可标注 other）
-# [[models]]
-# id = "realesrgan-x4plus-onnx"
-# name = "RealESRGAN x4plus (ONNX/OpenVINO)"
-# source = "url"
-# url = "<待回填：自转 dynamic-shape onnx 的发布直链>"
-# target_dir = "realesrgan-x4plus-onnx"
-# size_estimate_mb = 68
+# ---- OpenVINO ONNX 变体（E7 已落地：自建导出）----
+# 上游不发官方 ONNX（决策备忘录 §1.2）；社区件输入固定 128px 不可用。
+# 按裁决自建：scripts/export_onnx.py 从同源 pth 导出 dynamic-shape ONNX
+# （opset17/18，N/H/W 动轴），经 PSNR 对拍核验后作为 openvino 后端权威权重。
+# source=local_import：不随 URL 分发，获取方式见 README「ONNX 权重获取」
+# （自行运行导出脚本或平台本地导入）。许可随源权重 BSD-3-Clause。
+[[models]]
+id = "realesr-animevideov3-onnx"
+name = "RealESR animevideov3 x4 (ONNX/OpenVINO·自建)"
+source = "local_import"
+target_dir = "realesr-animevideov3-onnx"
+size_estimate_mb = 1
+qualified_id = "xinntao.realesrgan.animevideov3-x4-onnx"
 
 [interface]
 type = "http"

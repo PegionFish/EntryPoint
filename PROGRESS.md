@@ -777,6 +777,22 @@ Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平�
   导出附件名 fanout-demo.pipeline.json；演示样例管线 fanout-demo 入库
 - 门禁：workspace **1271 tests** 全过 + clippy 零警告 + tsc/build 过
 
+### 追加（同日第十轮——E7 落地：自建 ONNX 导出点亮 OpenVINO 路线）
+
+- ✨ **E7 完成**：scripts/export_onnx.py 自建 RealESR dynamic-shape ONNX
+  （SRVGG 架构预设复用，strict 加载同源 pth；N/H/W 动轴 opset17/18），
+  manifest 新增 local_import 来源类型（模型层全链适配：resolve/校验/
+  下载脚本 no-op/更新检查哨兵/打包引用声明）
+- 🔧 OV-GPU 动态模型 OCL 限制绕行：ORT-OV EP 对动态输入报
+  clEnqueueMapBuffer(-30) 且 ORT 无法加载 OV IR → adapter 改为 GPU 场景
+  用 openvino runtime 按首帧尺寸 reshape 字符串 PartialShape 后内存直连
+  编译（列表形式在部分驱动抛 to_shape 异常，实证差异记录在案）；CPU 兜底
+  维持 ORT 会话；post-install 钩子按后端分派（torch 家族才装 basicsr 链）
+- ✅ **真机验证**：iGPU(Arrow Lake) 全片 upscale completed（1280x960×30帧）；
+  数值对拍 torch-CUDA：首帧 PSNR **47.58dB**、灰度相关 0.9999——异构双栈
+  输出一致。至此 G1 记分板 E7 由诚实占位转绿，异构矩阵七项全过
+- 门禁：workspace tests 全过 + clippy 零警告
+
 ### 待办（恢复工作时的接续点）
 
 1. daemon 新二进制重启未完成（暂停时中断）——重启后 E2 走平台全链：

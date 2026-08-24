@@ -4,8 +4,9 @@
 
 运行时分层（HETERO_DIST_PLAN §3.1，厂商栈优先）：
   cuda / rocm / cpu : torch + 官方 .pth（懒导入守卫；栈未装时返回 501 EXPERIMENTAL）
-  openvino          : onnxruntime OpenVINO EP（ORT-OV）；ONNX 变体占位待补，
-                      权重落位前恒返回 501 EXPERIMENTAL
+  openvino          : onnxruntime OpenVINO EP（ORT-OV）；E7 已落地——
+                      权重 = scripts/export_onnx.py 自建 dynamic-shape ONNX，
+                      缺权重时按契约返回 501 EXPERIMENTAL
   vulkan            : nihui/xinntao 上游 ncnn 引擎子进程（bin/<os>-<arch>/ 由用户放置）
 
 产物协议：MODULE_SPEC §5 —— output_type="file"，result=输出绝对路径；
@@ -60,6 +61,7 @@ MODEL_TARGET_DIRS = {
     "realesr-animevideov3-pth": "realesr-animevideov3-x4-pth",
     "realesrgan-x4plus-pth": "realesrgan-x4plus-pth",
     "realesrgan-animevideov3-x4-ncnn": "realesr-animevideov3-x4-ncnn",
+    "realesr-animevideov3-onnx": "realesr-animevideov3-onnx",
 }
 
 logging.basicConfig(
@@ -318,12 +320,10 @@ def upscale_frames_torch(frames_in: Path, frames_out: Path, weight: Path,
 # ---------------------------------------------------------------------------
 def upscale_frames_openvino(frames_in: Path, frames_out: Path, weight: Path,
                             tile: int) -> None:
-    """ORT-OV 路径：OpenVINOExecutionProvider 优先，CPUExecutionProvider 兜底。
-
-    权重侧：manifest 的 ONNX 变体占位待补（见 module.toml 注释块与决策备忘录
-    §1.2），因此当前任何请求都会在 find_weight_file 阶段命中 501 占位提示；
-    待 dynamic-shape ONNX 回填后此分支即为可用实现（E7 载体）。
-    """
+    """ORT-OV 路径：OpenVINOExecutionProvider 优先（OPENVINO_DEVICE 指定
+    设备类型），CPUExecutionProvider 兜底。权重为自建 dynamic-shape ONNX
+    （scripts/export_onnx.py，E7）；预处理与 torch RealESRGANer 同口径：
+    BGR→RGB /255 CHW fp32，输出 RGB→BGR 回写。"""
     try:
         import numpy as np
         import onnxruntime as ort
@@ -335,19 +335,60 @@ def upscale_frames_openvino(frames_in: Path, frames_out: Path, weight: Path,
 
     providers: list = []
     avail = ort.get_available_providers()
+    use_gpu = False
+    dev = os.getenv("OPENVINO_DEVICE", "GPU")
     if "OpenVINOExecutionProvider" in avail:
-        dev = os.getenv("OPENVINO_DEVICE", "GPU")
         providers.append(("OpenVINOExecutionProvider", {"device_type": dev.split(".")[0]}))
+        use_gpu = not dev.upper().startswith("CPU")
     if "CPUExecutionProvider" in avail:
         providers.append("CPUExecutionProvider")
-    session = ort.InferenceSession(str(weight), providers=providers or None)
-    input_name = session.get_inputs()[0].name
 
-    def infer(img_bgr):
-        blob = cv2.dnn.blobFromImage(img_bgr, 1.0 / 255.0, swapRB=True)  # NCHW fp32 RGB
-        out = session.run(None, {input_name: blob})[0]
-        out = np.clip(out[0].transpose(1, 2, 0) * 255.0, 0, 255).astype("uint8")
-        return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+    def _make_infer():
+        """构造 infer(img_bgr)->img_bgr。
+
+        GPU + 动态 shape 模型：ORT 的 OV EP 在部分 iGPU 驱动上对动态输入报
+        clEnqueueMapBuffer(-30)，且 ORT 无法加载 OV IR——故该组合直接用
+        openvino runtime 按首帧尺寸 reshape 后内存编译（E7 排障实证）；
+        其余组合维持 ORT 会话。"""
+        if use_gpu:
+            try:
+                import openvino as ov
+
+                core = ov.Core()
+                model = core.read_model(str(weight))
+                if not model.inputs[0].partial_shape.is_static:
+                    import cv2 as _cv2p
+
+                    probe = _cv2p.imread(str(min(frames_in.glob("*.png"))), _cv2p.IMREAD_COLOR)
+                    h0, w0 = probe.shape[:2]
+                    model.reshape(f"[1,3,{h0},{w0}]")
+                    logger.info("OV-GPU 按首帧尺寸 reshape: %dx%d", w0, h0)
+                compiled = core.compile_model(model, dev.split(".")[0])
+                in_node = compiled.input(0)
+
+                def infer_ov(img_bgr):
+                    blob = cv2.dnn.blobFromImage(img_bgr, 1.0 / 255.0, swapRB=True)
+                    out = compiled({in_node: blob})[compiled.output(0)]
+                    out = np.clip(out[0].transpose(1, 2, 0) * 255.0, 0, 255).astype("uint8")
+                    return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+
+                logger.info("openvino 直连路线就绪 (device=%s)", dev)
+                return infer_ov
+            except Exception as exc:  # noqa: BLE001 —— 回退 ORT（含 CPU 兜底）
+                logger.warning("openvino 直连不可用，回退 ORT 会话: %s", exc)
+
+        session = ort.InferenceSession(str(weight), providers=providers or None)
+        input_name = session.get_inputs()[0].name
+
+        def infer_ort(img_bgr):
+            blob = cv2.dnn.blobFromImage(img_bgr, 1.0 / 255.0, swapRB=True)
+            out = session.run(None, {input_name: blob})[0]
+            out = np.clip(out[0].transpose(1, 2, 0) * 255.0, 0, 255).astype("uint8")
+            return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+
+        return infer_ort
+
+    infer = _make_infer()
 
     frames_out.mkdir(parents=True, exist_ok=True)
     for img_path in sorted(frames_in.glob("*.png")):

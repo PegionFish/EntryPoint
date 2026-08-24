@@ -53,3 +53,19 @@ curl http://127.0.0.1:8920/info
 curl -X POST http://127.0.0.1:8920/predict/upscale -H 'Content-Type: application/json' \
      -d '{"input_path":"/path/to/in.mp4","params":{"scale_factor":4,"target_preset":"balanced"}}'
 ```
+
+
+## ONNX 权重获取（OpenVINO 变体）
+
+上游无官方 ONNX 发布。`realesr-animevideov3-onnx` 变体由本模块脚本自建：
+
+```bash
+# 在 realesr 的 torch venv 内执行（需 torch/basicsr 链）
+python scripts/export_onnx.py \
+  models/realesr-animevideov3-x4-pth/realesr-animevideov3.pth \
+  models/realesr-animevideov3-onnx/realesr-animevideov3.onnx
+```
+
+动态 shape（N/H/W 动轴，opset17+）；OV-GPU 推理时 adapter 会按首帧尺寸自动
+reshape 并经 openvino runtime 直连编译（ORT-OV EP 对动态输入的 OCL 限制绕行）。
+E7 真机对拍：与 torch-CUDA 输出首帧 PSNR 47.58dB。

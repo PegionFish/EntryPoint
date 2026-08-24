@@ -27,6 +27,16 @@ VENV_PY="${VIRTUAL_ENV:-}/bin/python"
 
 UV_BIN="${UV_BIN:-uv}"
 
+# 后端守卫：basicsr/realesrgan 仅服务 torch 家族路线（cuda/rocm/cpu）。
+# openvino 走 ORT-OV（无需 torch 栈），vulkan 走 ncnn 子进程——均直接跳过。
+case "${EP_BACKEND:-}" in
+  cuda|rocm|cpu) ;;
+  *)
+    log "backend '${EP_BACKEND:-<empty>}' 不需要 torch 权重链，跳过"
+    exit 0
+    ;;
+esac
+
 log "--no-deps 安装 basicsr==1.4.2 / realesrgan==0.3.0 ..."
 "$UV_BIN" pip install -p "$VENV_PY" --no-deps \
     "basicsr==1.4.2" "realesrgan==0.3.0" \

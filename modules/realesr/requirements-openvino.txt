@@ -10,3 +10,5 @@ python-multipart>=0.0.6
 onnxruntime-openvino>=1.17
 opencv-python-headless>=4.8
 numpy>=1.24
+# OV-GPU 动态模型内存编译（E7）：ORT-OV EP 之外直连 runtime 的依赖
+openvino>=2024.0
