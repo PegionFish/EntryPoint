@@ -1957,6 +1957,88 @@ interface SaveAsDialogProps {
   onConfirm: (name: string, id: string) => Promise<boolean>
 }
 
+/** 定时调度对话框：cron 表达式 + 启用开关；保存/移除走 /schedule API */
+function ScheduleDialog({
+  open,
+  onOpenChange,
+  pipelineId,
+  form,
+  onFormChange,
+  current,
+  onSave,
+  onRemove,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  pipelineId: string | null
+  form: { cron: string; enabled: boolean }
+  onFormChange: (next: { cron: string; enabled: boolean }) => void
+  current: { cron: string; enabled: boolean; last_task_id?: string | null } | null
+  onSave: () => void
+  onRemove: () => void
+}) {
+  const { t } = useTranslation('pipeline')
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>
+            {t('schedule.title', { defaultValue: '定时调度' })}
+            {pipelineId ? (
+              <span className="ml-2 font-mono text-xs text-muted-foreground">{pipelineId}</span>
+            ) : null}
+          </DialogTitle>
+          <DialogDescription>
+            {t('schedule.description', {
+              defaultValue:
+                '按五段 cron（本地时区）周期自动执行本管线；留空任务输入时使用保存的模板。',
+            })}
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-4 py-2">
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium">
+              {t('schedule.cron', { defaultValue: 'cron 表达式' })}
+            </label>
+            <Input
+              value={form.cron}
+              onChange={(e) =>
+                onFormChange({ ...form, cron: e.target.value })
+              }
+              placeholder="0 3 * * *"
+              className="font-mono text-xs"
+            />
+            <p className="text-[11px] text-muted-foreground">
+              {t('schedule.cronHint', {
+                defaultValue: '分 时 日 月 周；如 "0 3 * * *" 每天 03:00、"*/30 * * * *" 每 30 分钟',
+              })}
+            </p>
+          </div>
+          <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2.5">
+            <span className="text-sm">{t('schedule.enabled', { defaultValue: '启用' })}</span>
+            <Switch checked={form.enabled} onCheckedChange={(v) => onFormChange({ ...form, enabled: v })} />
+          </div>
+          {current?.last_task_id ? (
+            <p className="break-all font-mono text-[11px] text-muted-foreground">
+              {t('schedule.lastTask', { defaultValue: '最近触发' })}: {current.last_task_id}
+            </p>
+          ) : null}
+        </div>
+        <DialogFooter className="gap-2">
+          {current ? (
+            <Button variant="ghost" size="sm" onClick={onRemove}>
+              {t('schedule.remove', { defaultValue: '移除' })}
+            </Button>
+          ) : null}
+          <Button size="sm" onClick={onSave} disabled={!form.cron.trim()}>
+            {t('schedule.save', { defaultValue: '保存' })}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 function SaveAsDialog({ open, onOpenChange, defaultName, defaultId, pipelines, onConfirm }: SaveAsDialogProps) {
   const { t } = useTranslation('pipeline')
   const [name, setName] = useState('')
@@ -3108,6 +3190,11 @@ function PipelineEditor() {
   const [libraryError, setLibraryError] = useState(false)
   /** 当前画布对应的服务端管线 id（null = 未保存的本地画布） */
   const [currentId, setCurrentId] = useState<string | null>(null)
+  const [scheduleOpen, setScheduleOpen] = useState(false)
+  const [scheduleForm, setScheduleForm] = useState({ cron: '0 3 * * *', enabled: true })
+  const [scheduleCurrent, setScheduleCurrent] = useState<
+    | { cron: string; enabled: boolean; last_task_id?: string | null } | null
+  >(null)
   const [currentSource, setCurrentSource] = useState<'builtin' | 'custom' | null>(null)
   /** 上次加载 / 保存时的画布指纹，用于判定未保存更改 */
   const [baseline, setBaseline] = useState(() =>
@@ -3936,6 +4023,82 @@ function PipelineEditor() {
     [savePipelineToServer],
   )
 
+  /** 导出当前服务端管线为分享 JSON（触发浏览器下载） */
+  const handleExportCurrent = useCallback(() => {
+    if (!currentId) return
+    const a = document.createElement('a')
+    a.href = api.exportPipelineUrl(currentId)
+    a.download = `${currentId}.pipeline.json`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    toast.success(t('share.exported', { defaultValue: '已导出分享 JSON' }), {
+      description: `${currentId}.pipeline.json`,
+    })
+  }, [currentId, t])
+
+  /** 导入分享 JSON → 服务端直接建管线 → 选入编辑器 */
+  const handleImportShare = useCallback(
+    async (file: File) => {
+      try {
+        const text = await file.text()
+        const res = await api.importPipelineShare(text)
+        toast.success(t('share.imported', { defaultValue: '导入成功' }), {
+          description: `${res.name} (${res.id})`,
+        })
+        refreshPipelines()
+        void handleSelectPipeline(res.id)
+      } catch (err) {
+        toast.error(t('share.importFailed', { defaultValue: '导入失败' }), {
+          description: errMsg(err),
+        })
+      }
+    },
+    // handleSelectPipeline 内部稳定引用；refreshPipelines 来自库刷新 hook
+    [refreshPipelines, t],
+  )
+
+  /** 打开定时对话框时拉取当前计划 */
+  const openScheduleDialog = useCallback(async () => {
+    if (!currentId) return
+    setScheduleForm({ cron: '0 3 * * *', enabled: true })
+    setScheduleCurrent(null)
+    setScheduleOpen(true)
+    try {
+      const info = await api.getSchedule(currentId)
+      setScheduleCurrent(info.schedule)
+      setScheduleForm({ cron: info.schedule.cron, enabled: info.schedule.enabled })
+    } catch {
+      // 未配置过 → 保持缺省表单
+    }
+  }, [currentId])
+
+  const saveSchedule = useCallback(async () => {
+    if (!currentId) return
+    try {
+      await api.putSchedule(currentId, scheduleForm)
+      toast.success(t('schedule.saved', { defaultValue: '定时计划已保存' }))
+      setScheduleOpen(false)
+    } catch (err) {
+      toast.error(t('schedule.saveFailed', { defaultValue: '保存失败' }), {
+        description: errMsg(err),
+      })
+    }
+  }, [currentId, scheduleForm, t])
+
+  const removeSchedule = useCallback(async () => {
+    if (!currentId) return
+    try {
+      await api.deleteSchedule(currentId)
+      toast.success(t('schedule.removed', { defaultValue: '定时计划已移除' }))
+      setScheduleOpen(false)
+    } catch (err) {
+      toast.error(t('schedule.saveFailed', { defaultValue: '保存失败' }), {
+        description: errMsg(err),
+      })
+    }
+  }, [currentId, t])
+
   /** 本地 JSON 定义文件导入（保留原有交互；导入后视为未保存的本地画布） */
   const handleLoad = useCallback(
     (def: PipelineDefinition) => {
@@ -4242,6 +4405,11 @@ function PipelineEditor() {
         onLoad={handleLoad}
         onValidate={handleValidate}
         onExecute={handleExecute}
+        canExport={currentId != null}
+        onExport={handleExportCurrent}
+        onImportShare={(f) => void handleImportShare(f)}
+        canSchedule={currentId != null}
+        onSchedule={() => void openScheduleDialog()}
       />
 
       <PipelineLibraryBar
@@ -4448,6 +4616,17 @@ function PipelineEditor() {
         defaultName={name}
         pipelines={pipelines}
         onConfirm={handleSaveAsConfirm}
+      />
+
+      <ScheduleDialog
+        open={scheduleOpen}
+        onOpenChange={setScheduleOpen}
+        pipelineId={currentId}
+        form={scheduleForm}
+        onFormChange={setScheduleForm}
+        current={scheduleCurrent}
+        onSave={() => void saveSchedule()}
+        onRemove={() => void removeSchedule()}
       />
 
       <ExecuteDialog

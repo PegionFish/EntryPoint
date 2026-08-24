@@ -50,7 +50,7 @@ pub struct CronError(pub String);
 
 impl fmt::Display for CronError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "cron 表达式无效: {}", self.0)
+        write!(f, "{}", self.0)
     }
 }
 impl std::error::Error for CronError {}

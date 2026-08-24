@@ -2,6 +2,7 @@ import type {
   AppConfig,
   DepReport,
   DeviceResponse,
+  ScheduleInfo,
   ExecutePipelineRequest,
   ExecutePipelineResponse,
   ImportRequest,
@@ -294,6 +295,30 @@ export const api = {
     }),
   deletePipeline: (id: string) =>
     apiFetch<{ ok: boolean }>(`/pipelines/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+  /** 导出分享 JSON（自包含信封，entrypoint-pipeline/v1） */
+  exportPipelineUrl: (id: string) =>
+    `/api/pipelines/${encodeURIComponent(id)}/export`,
+  importPipelineShare: (jsonText: string) =>
+    apiFetch<{ ok: boolean; id: string; name: string }>('/pipelines/import', {
+      method: 'POST',
+      body: jsonText,
+      headers: { 'Content-Type': 'application/json' },
+    }),
+  // 定时调度（cron）
+  getSchedule: (id: string) =>
+    apiFetch<ScheduleInfo>(`/pipelines/${encodeURIComponent(id)}/schedule`),
+  putSchedule: (
+    id: string,
+    body: { cron: string; enabled?: boolean; inputs?: unknown; params?: unknown },
+  ) =>
+    apiFetch<{ ok: boolean }>(`/pipelines/${encodeURIComponent(id)}/schedule`, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    }),
+  deleteSchedule: (id: string) =>
+    apiFetch<{ ok: boolean }>(`/pipelines/${encodeURIComponent(id)}/schedule`, {
       method: 'DELETE',
     }),
   executePipeline: (body: ExecutePipelineRequest) =>

@@ -169,5 +169,11 @@
   "pipeline.module.variantFollowActive": "Follow active variant",
   "pipeline.module.deviceAuto": "auto (scheduler assigns)",
   "pipeline.module.deviceUnknown": "Device not detected locally; execution will warn and fall back to auto (soft constraint, non-blocking)",
-  "pipelineSidebar.noCapabilities": "No capabilities declared"
+  "pipelineSidebar.noCapabilities": "No capabilities declared",
+  "pipelineToolbar.export": "Export",
+  "pipelineToolbar.exportTitle": "Export this pipeline as a self-contained share JSON",
+  "pipelineToolbar.importShare": "Import share",
+  "pipelineToolbar.importShareTitle": "Import a shared pipeline JSON as a server-side pipeline",
+  "pipelineToolbar.schedule": "Schedule",
+  "pipelineToolbar.scheduleTitle": "Configure cron-based scheduled execution for this pipeline"
 }

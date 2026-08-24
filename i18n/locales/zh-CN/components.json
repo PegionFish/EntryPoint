@@ -169,5 +169,11 @@
   "pipeline.module.variantFollowActive": "跟随激活变体",
   "pipeline.module.deviceAuto": "auto（调度器自动分配）",
   "pipeline.module.deviceUnknown": "本机未检测到该设备；执行时将警告并回退 auto（软约束，不阻断）",
-  "pipelineSidebar.noCapabilities": "未声明能力"
+  "pipelineSidebar.noCapabilities": "未声明能力",
+  "pipelineToolbar.export": "导出",
+  "pipelineToolbar.exportTitle": "导出当前管线为分享 JSON（自包含文件，可直接分享）",
+  "pipelineToolbar.importShare": "导入分享",
+  "pipelineToolbar.importShareTitle": "导入分享的管线 JSON，直接创建为服务端管线",
+  "pipelineToolbar.schedule": "定时",
+  "pipelineToolbar.scheduleTitle": "配置本管线的 cron 定时执行"
 }

@@ -210,5 +210,19 @@
   "vram.toggleTitle": "Per-device VRAM ledger (§6.3)",
   "ptasks.statusQueued": "Queued",
   "template.exampleDenoiseNode": "DeepFilter denoise",
-  "template.exampleAsrNodeFw": "Faster-Whisper speech recognition"
+  "template.exampleAsrNodeFw": "Faster-Whisper speech recognition",
+  "share.exported": "Share JSON exported",
+  "share.imported": "Imported successfully",
+  "share.importFailed": "Import failed",
+  "schedule.title": "Scheduled execution",
+  "schedule.description": "Run this pipeline periodically via a 5-field cron (local timezone); saved input templates are used on trigger.",
+  "schedule.cron": "Cron expression",
+  "schedule.cronHint": "min hour day month weekday; e.g. \"0 3 * * *\" daily 03:00, \"*/30 * * * *\" every 30 minutes",
+  "schedule.enabled": "Enabled",
+  "schedule.lastTask": "Last trigger",
+  "schedule.remove": "Remove",
+  "schedule.save": "Save",
+  "schedule.saved": "Schedule saved",
+  "schedule.removed": "Schedule removed",
+  "schedule.saveFailed": "Operation failed"
 }

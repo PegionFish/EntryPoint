@@ -766,6 +766,17 @@ Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平�
   双分支并行+合并 3.46s（串行应 ~6.5s）
 - 门禁：workspace **1271 tests** 全过 + clippy 零警告 + webui build 过
 
+### 追加（同日第九轮——管线页 UI：导出/导入分享/cron 窗口）
+
+- 🎨 工具栏新增 导出（下载自包含分享 JSON）/ 分享导入（选文件→服务端建管
+  →自动选入编辑器）/ 定时（cron 对话框）三钮；无 currentId 时禁用导出与定时
+- 🎨 ScheduleDialog：cron 输入+启用开关+最近触发任务号展示；保存/移除走
+  /schedule API；api/client.ts 增 exportPipelineUrl/importPipelineShare/
+  getSchedule/putSchedule/deleteSchedule；i18n zh/en 全键补齐
+- ✅ 真机烟雾：schedule PUT 非法表达式本地化报错、PUT/GET/DELETE 回环、
+  导出附件名 fanout-demo.pipeline.json；演示样例管线 fanout-demo 入库
+- 门禁：workspace **1271 tests** 全过 + clippy 零警告 + tsc/build 过
+
 ### 待办（恢复工作时的接续点）
 
 1. daemon 新二进制重启未完成（暂停时中断）——重启后 E2 走平台全链：
