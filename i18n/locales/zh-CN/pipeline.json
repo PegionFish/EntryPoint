@@ -210,5 +210,19 @@
   "vram.toggleTitle": "VRAM 每设备账本（§6.3）",
   "ptasks.statusQueued": "排队中",
   "template.exampleDenoiseNode": "DeepFilter 降噪",
-  "template.exampleAsrNodeFw": "Faster-Whisper 语音识别"
+  "template.exampleAsrNodeFw": "Faster-Whisper 语音识别",
+  "share.exported": "已导出分享 JSON",
+  "share.imported": "导入成功",
+  "share.importFailed": "导入失败",
+  "schedule.title": "定时调度",
+  "schedule.description": "按五段 cron（本地时区）周期自动执行本管线；触发时使用保存的输入模板。",
+  "schedule.cron": "cron 表达式",
+  "schedule.cronHint": "分 时 日 月 周；如 \"0 3 * * *\" 每天 03:00、\"*/30 * * * *\" 每 30 分钟",
+  "schedule.enabled": "启用",
+  "schedule.lastTask": "最近触发",
+  "schedule.remove": "移除",
+  "schedule.save": "保存",
+  "schedule.saved": "定时计划已保存",
+  "schedule.removed": "定时计划已移除",
+  "schedule.saveFailed": "操作失败"
 }

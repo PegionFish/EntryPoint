@@ -2,6 +2,11 @@ import { useRef } from 'react'
 import type { ChangeEvent } from 'react'
 import { CircleCheck, FolderOpen, GitBranch, PanelLeft, Play, Save } from 'lucide-react'
 import { toast } from 'sonner'
+import {
+  Download,
+  FileUp,
+  Timer,
+} from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
@@ -20,6 +25,14 @@ interface PipelineToolbarProps {
   onLoad: (def: PipelineDefinition) => void
   onValidate: () => void
   onExecute: () => void
+  /** 导出当前服务端管线为分享 JSON（无 currentId 时禁用） */
+  canExport: boolean
+  onExport: () => void
+  /** 导入分享 JSON → 直接创建服务端管线 */
+  onImportShare: (file: File) => void
+  /** 打开定时调度对话框（需 currentId） */
+  canSchedule: boolean
+  onSchedule: () => void
 }
 
 /** 管线编辑器工具栏：节点库开关 + 命名 + 统计 + 保存 / 加载 / 验证 / 执行 */
@@ -34,9 +47,22 @@ export function PipelineToolbar({
   onLoad,
   onValidate,
   onExecute,
+  canExport,
+  onExport,
+  onImportShare,
+  canSchedule,
+  onSchedule,
 }: PipelineToolbarProps) {
   const { t } = useTranslation('components')
   const fileRef = useRef<HTMLInputElement>(null)
+  const shareRef = useRef<HTMLInputElement>(null)
+
+  const handleShareFile = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    onImportShare(file)
+  }
 
   const handleFile = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
@@ -118,6 +144,38 @@ export function PipelineToolbar({
           <FolderOpen className="h-3.5 w-3.5" />
           <span className="hidden md:inline">{t('pipelineToolbar.load')}</span>
         </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={!canExport}
+          onClick={onExport}
+          title={t('pipelineToolbar.exportTitle')}
+          aria-label={t('pipelineToolbar.export')}
+        >
+          <Download className="h-3.5 w-3.5" />
+          <span className="hidden md:inline">{t('pipelineToolbar.export')}</span>
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => shareRef.current?.click()}
+          title={t('pipelineToolbar.importShareTitle')}
+          aria-label={t('pipelineToolbar.importShare')}
+        >
+          <FileUp className="h-3.5 w-3.5" />
+          <span className="hidden md:inline">{t('pipelineToolbar.importShare')}</span>
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={!canSchedule}
+          onClick={onSchedule}
+          title={t('pipelineToolbar.scheduleTitle')}
+          aria-label={t('pipelineToolbar.schedule')}
+        >
+          <Timer className="h-3.5 w-3.5" />
+          <span className="hidden md:inline">{t('pipelineToolbar.schedule')}</span>
+        </Button>
         <Separator orientation="vertical" className="mx-0.5 h-5" />
         <Button
           variant="outline"
@@ -149,6 +207,13 @@ export function PipelineToolbar({
         aria-hidden="true"
         tabIndex={-1}
       />
+        <input
+          ref={shareRef}
+          type="file"
+          accept="application/json,.json"
+          className="hidden"
+          onChange={handleShareFile}
+        />
     </div>
   )
 }

@@ -35,5 +35,9 @@
   "single.autostartTimeout": "Module '{{module_id}}' did not become healthy within {{secs}}s after autostart",
   "single.submitFailed": "Direct execution submit failed: {{detail}}",
   "vramBudget.specEmpty": "VRAM budget request has no nodes",
-  "vramBudget.cycleDetected": "Pipeline contains a cycle; VRAM budget cannot be computed"
+  "vramBudget.cycleDetected": "Pipeline contains a cycle; VRAM budget cannot be computed",
+  "schedule.cronRequired": "Missing cron expression",
+  "schedule.cronInvalid": "Invalid cron expression: {{detail}}",
+  "schedule.notSet": "No schedule configured for this pipeline",
+  "schedule.saveFailed": "Failed to save schedule: {{detail}}"
 }

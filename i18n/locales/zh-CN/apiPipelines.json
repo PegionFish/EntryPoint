@@ -35,5 +35,9 @@
   "single.autostartTimeout": "模块 '{{module_id}}' 自动拉起后 {{secs}}s 内未就绪",
   "single.submitFailed": "直跑任务提交失败: {{detail}}",
   "vramBudget.specEmpty": "VRAM 预算请求缺少节点",
-  "vramBudget.cycleDetected": "管线存在环，无法计算 VRAM 预算"
+  "vramBudget.cycleDetected": "管线存在环，无法计算 VRAM 预算",
+  "schedule.cronRequired": "缺少 cron 表达式",
+  "schedule.cronInvalid": "cron 表达式无效：{{detail}}",
+  "schedule.notSet": "该管线未配置定时计划",
+  "schedule.saveFailed": "定时计划保存失败：{{detail}}"
 }

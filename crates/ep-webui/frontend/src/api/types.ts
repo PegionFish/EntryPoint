@@ -136,6 +136,19 @@ export interface AppConfig {
   active_models?: Record<string, string>
 }
 
+/** 管线定时计划（cron；GET /pipelines/{id}/schedule） */
+export interface ScheduleInfo {
+  id: string
+  schedule: {
+    cron: string
+    enabled: boolean
+    inputs?: unknown
+    params?: unknown
+    last_checked: number
+    last_task_id?: string | null
+  }
+}
+
 // ===== Models =====
 /** 模型来源：HuggingFace / ModelScope / 自定义 URL */
 export type ModelSource = 'huggingface' | 'modelscope' | 'url'
