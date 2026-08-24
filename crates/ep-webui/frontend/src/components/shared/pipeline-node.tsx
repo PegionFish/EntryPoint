@@ -18,6 +18,7 @@ import {
   Type,
   type LucideIcon,
 } from 'lucide-react'
+import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { cn } from '@/lib/utils'
 import { categoryLabel } from '@/lib/constants'
@@ -174,10 +175,19 @@ export interface ParamSpec {
   label: string
   /**
    * 字段类型。textarea = 多行文本（llm.system_prompt）；
-   * string_array = 逐条增删改的字符串数组（ffmpeg.args，P0-2）。
+   * string_array = 逐条增删改的字符串数组；
+   * command_line = 整条命令行文本框（shell 词法分拆为数组存储，ffmpeg.args
+   * 默认交互——用户输入 `ffmpeg -i {input} ... {output}` 自动分拆，免逐参数编辑）
    * 渲染由 ParamSpecField 统一承接（C3 NodeParamsPanel 可整体委托）。
    */
-  type: 'string' | 'number' | 'boolean' | 'select' | 'textarea' | 'string_array'
+  type:
+    | 'string'
+    | 'number'
+    | 'boolean'
+    | 'select'
+    | 'textarea'
+    | 'string_array'
+    | 'command_line'
   options?: string[]
   defaultValue?: ParamValue
   placeholder?: string
@@ -413,13 +423,23 @@ export const BUILTIN_DEFS: Record<BuiltinKind, BuiltinDef> = {
     outputs: [{ id: 'out', get label() { return t('components:pipeline.port.output') }, dataType: 'file' }],
     params: [
       {
-        // P0-2：args 数组化编辑（逐条增删改），序列化恒数组（后端契约形状）
+        // 命令行整串交互（用户输入自动 shell 分拆为 args 数组存储，
+        // 序列化恒数组=后端契约形状；{input.<上游节点>} 定向多上游引用）
         name: 'args',
         get label() { return t('components:pipeline.param.args') },
-        type: 'string_array',
+        type: 'command_line',
         defaultValue: ['-i', '{input}', '{output}'],
-        get placeholder() { return t('components:pipeline.param.args.itemPlaceholder', { defaultValue: '单个参数，如 -c:v libx264' }) },
-        get hint() { return t('components:pipeline.param.args.hintArray', { defaultValue: '每行一个参数（数组）；{input}/{output} 为占位符' }) },
+        get placeholder() {
+          return t('components:pipeline.param.args.cmdPlaceholder', {
+            defaultValue: 'ffmpeg -i {input} -vf negate -c:v libx264 -an {output}',
+          })
+        },
+        get hint() {
+          return t('components:pipeline.param.args.hintCmd', {
+            defaultValue:
+              '占位符：{input} 首个上游文件 · {input.<节点id>} 定向多上游 · {output} 本节点产物；开头可省略 ffmpeg',
+          })
+        },
       },
       {
         // P0-2：补 output_extension（决定本节点中间产物扩展名，executor 消费）
@@ -857,6 +877,51 @@ export interface ParamSpecFieldProps {
  * 通用参数字段渲染：string / textarea / number(min/max/step) / boolean /
  * select / string_array 全类型覆盖（manifest schema 与 llm builtin 共用）。
  */
+
+// ─── 命令行整串 ⇄ 参数数组（ffmpeg command_line 交互）───────────────────
+
+/** 参数数组 → 命令行文本：含空格/引号的 token 加双引号包裹 */
+export function joinCommandLine(tokens: string[]): string {
+  return tokens
+    .map((t) => (/[\s"']/.test(t) ? `"${t.replace(/(["\\])/g, '\\$1')}"` : t))
+    .join(' ')
+}
+
+/** 命令行文本 → 参数数组：shell 词法分拆（单/双引号、反斜杠转义；
+ *  未闭合引号容忍到串尾）。自动剥去可选的前导 `ffmpeg` 程序名。 */
+export function splitCommandLine(text: string): string[] {
+  const tokens: string[] = []
+  let cur = ''
+  let hasCur = false
+  let quote: '"' | "'" | null = null
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!
+    if (quote === null && /\s/.test(ch)) {
+      if (hasCur) { tokens.push(cur); cur=''; hasCur=false }
+      continue
+    }
+    if (quote === "'" ) {
+      if (ch === "'") quote = null
+      else cur += ch
+      continue
+    }
+    if (quote === '"') {
+      if (ch === '"') quote = null
+      else if (ch === '\\' && i+1 < text.length && /["\\$`]/.test(text[i+1]!)) { cur += text[++i]! }
+      else cur += ch
+      continue
+    }
+    if (ch === "'" || ch === '"') { quote = ch; hasCur = true; continue }
+    if (ch === '\\' && i+1 < text.length) { cur += text[++i]!; hasCur=true; continue }
+    cur += ch
+    hasCur = true
+  }
+  if (hasCur || cur) tokens.push(cur)
+  // 可选前导程序名：用户习惯性输入 `ffmpeg ...`
+  if (tokens.length > 1 && /^\.?\/?(ffmpeg|ffprobe)$/i.test(tokens[0]!)) tokens.shift()
+  return tokens
+}
+
 export function ParamSpecField({ spec, value, onChange }: ParamSpecFieldProps) {
   const { t: tc } = useTranslation('components')
   const numberValue = typeof value === 'number' && Number.isFinite(value) ? value : ''
@@ -928,7 +993,39 @@ export function ParamSpecField({ spec, value, onChange }: ParamSpecFieldProps) {
       {spec.type === 'string_array' && (
         <StringArrayField value={value} onChange={onChange} placeholder={spec.placeholder} />
       )}
+      {spec.type === 'command_line' && (
+        <CommandLineField value={value} onChange={onChange} placeholder={spec.placeholder} />
+      )}
     </div>
+  )
+}
+
+/** 整条命令行编辑框：展示=数组拼回文本，提交=shell 词法分拆存数组 */
+function CommandLineField({
+  value,
+  onChange,
+  placeholder,
+}: {
+  value: ParamValue | undefined
+  onChange: (v: ParamValue) => void
+  placeholder?: string
+}) {
+  const tokens = Array.isArray(value) ? value : typeof value === 'string' && value.trim() ? splitCommandLine(value) : []
+  const [text, setText] = useState<string | null>(null)
+  // 展示优先级：正在编辑的文本 > 数组拼回（外部载入/切换节点时同步）
+  const display = text ?? joinCommandLine(tokens)
+  return (
+    <textarea
+      className="min-h-16 w-full resize-y rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs leading-relaxed outline-none transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:shadow-[0_0_0_3px_var(--ring-glow)]"
+      rows={3}
+      value={display}
+      placeholder={placeholder}
+      onChange={(e) => {
+        setText(e.target.value)
+        onChange(splitCommandLine(e.target.value))
+      }}
+      onBlur={() => setText(null)}
+    />
   )
 }
 
