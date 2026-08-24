@@ -1036,22 +1036,53 @@ function CommandLineField({
   onChange: (v: ParamValue) => void
   placeholder?: string
 }) {
+  const { t: tc } = useTranslation('components')
   const tokens = Array.isArray(value) ? value : typeof value === 'string' && value.trim() ? splitCommandLine(value) : []
   const [text, setText] = useState<string | null>(null)
   // 展示优先级：正在编辑的文本 > 数组拼回（外部载入/切换节点时同步）
   const display = text ?? joinCommandLine(tokens)
+  // 实时分拆预览：编辑期按当前文本现拆，让「输入 → 自动分拆」可见可确认
+  const previewTokens = text !== null ? splitCommandLine(text) : tokens
   return (
-    <textarea
-      className="min-h-24 w-full resize-y rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs leading-relaxed outline-none transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:shadow-[0_0_0_3px_var(--ring-glow)]"
-      rows={5}
-      value={display}
-      placeholder={placeholder}
-      onChange={(e) => {
-        setText(e.target.value)
-        onChange(splitCommandLine(e.target.value))
-      }}
-      onBlur={() => setText(null)}
-    />
+    <div className="space-y-1.5">
+      <textarea
+        className="min-h-24 w-full resize-y rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs leading-relaxed outline-none transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:shadow-[0_0_0_3px_var(--ring-glow)]"
+        rows={5}
+        value={display}
+        placeholder={placeholder}
+        onChange={(e) => {
+          setText(e.target.value)
+          onChange(splitCommandLine(e.target.value))
+        }}
+        onBlur={() => setText(null)}
+      />
+      {/* 分拆结果实时预览：与实际存储/下发给 ffmpeg 的 argv 逐一对应 */}
+      <div className="rounded-md border border-border bg-muted/30 px-2 py-1.5">
+        <p className="text-[10px] text-muted-foreground">
+          {tc('pipeline:params.splitPreview', {
+            defaultValue: '分拆预览（{{count}} 个参数，即实际执行 argv）',
+            count: previewTokens.length,
+          })}
+        </p>
+        {previewTokens.length > 0 ? (
+          <div className="mt-1 flex flex-wrap gap-1">
+            {previewTokens.map((tok, i) => (
+              <span
+                key={`${i}-${tok}`}
+                className="max-w-full truncate rounded bg-background px-1.5 py-0.5 font-mono text-[10px] text-foreground/90"
+                title={tok}
+              >
+                {tok}
+              </span>
+            ))}
+          </div>
+        ) : (
+          <p className="mt-1 font-mono text-[10px] text-muted-foreground/60">
+            {tc('pipeline:params.splitEmpty', { defaultValue: '（空——执行时自动补 -i 上游 与 输出路径）' })}
+          </p>
+        )}
+      </div>
+    </div>
   )
 }
 
