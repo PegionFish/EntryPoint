@@ -105,6 +105,11 @@ pub enum ModelSource {
     Huggingface,
     Modelscope,
     Url,
+    /// 本地自建/导入（无远端 URL）：E7 自建 ONNX 等场景——获取方式由
+    /// 模块 README 说明（脚本导出/浏览器导入），平台按「存在即就绪」
+    /// 处理，不做任何下载。
+    #[serde(rename = "local_import")]
+    LocalImport,
 }
 
 impl ModelSource {
@@ -114,6 +119,7 @@ impl ModelSource {
             Self::Huggingface => "huggingface",
             Self::Modelscope => "modelscope",
             Self::Url => "url",
+            Self::LocalImport => "local_import",
         }
     }
 }
@@ -210,6 +216,8 @@ impl ModelDecl {
                         self.id
                     )
                 })?,
+                // 本地自建：无远端定位符，位置即目标目录（存在性由就绪检查判定）
+                ModelSource::LocalImport => self.target_dir.clone(),
             };
             return Ok((self.source, location, self.revision.clone()));
         }
@@ -383,6 +391,9 @@ impl ModuleManifest {
                             model.id
                         ));
                     }
+                }
+                ModelSource::LocalImport => {
+                    // 本地自建：无远端字段要求（就绪性按 target_dir 存在判定）
                 }
             }
 
