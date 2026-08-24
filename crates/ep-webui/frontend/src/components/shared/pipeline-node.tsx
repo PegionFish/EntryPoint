@@ -907,12 +907,34 @@ export function splitCommandLine(text: string): string[] {
     }
     if (quote === '"') {
       if (ch === '"') quote = null
-      else if (ch === '\\' && i+1 < text.length && /["\\$`]/.test(text[i+1]!)) { cur += text[++i]! }
+      else if (ch === '\\' && i+1 < text.length) {
+        const nxt = text[i+1]!
+        // 双引号内 shell 同样移除 \换行 续行（bash 语义）
+        if (nxt === '\n' || nxt === '\r') {
+          i++
+          if (nxt === '\r' && text[i+1] === '\n') i++
+          continue
+        }
+        // 仅转义 " \ $ `；其余反斜杠按字面保留（与 bash 一致）
+        if (/["\\$`]/.test(nxt)) { cur += nxt; i++ }
+        else cur += ch
+      }
       else cur += ch
       continue
     }
     if (ch === "'" || ch === '"') { quote = ch; hasCur = true; continue }
-    if (ch === '\\' && i+1 < text.length) { cur += text[++i]!; hasCur=true; continue }
+    if (ch === '\\' && i+1 < text.length) {
+      const nxt = text[i+1]!
+      // shell 续行：反斜杠+换行（容忍 \r\n）整体吞掉，不产生 token
+      if (nxt === '\n' || nxt === '\r') {
+        i++
+        if (nxt === '\r' && text[i+1] === '\n') i++
+        continue
+      }
+      cur += nxt
+      hasCur = true
+      continue
+    }
     cur += ch
     hasCur = true
   }
@@ -928,17 +950,21 @@ export function ParamSpecField({ spec, value, onChange }: ParamSpecFieldProps) {
   const stringValue = typeof value === 'string' ? value : value === undefined ? '' : String(value)
   return (
     <div className="space-y-1.5">
-      <div className="flex items-baseline justify-between gap-2">
-        <span className="text-xs font-medium">
-          {spec.label}
-          {spec.required && (
-            <span className="ml-0.5 text-status-error" aria-hidden>
-              *
-            </span>
-          )}
-        </span>
-        {spec.hint && <span className="text-[10px] text-muted-foreground">{spec.hint}</span>}
-      </div>
+      {/* label 与 hint 分行：窄侧栏下同行布局会把 label 挤成一字一行（用户截图实证）；
+          hint 为说明文案，独占一行全宽换行 */}
+      <span className="block whitespace-nowrap text-xs font-medium">
+        {spec.label}
+        {spec.required && (
+          <span className="ml-0.5 text-status-error" aria-hidden>
+            *
+          </span>
+        )}
+      </span>
+      {spec.hint && (
+        <p className="whitespace-normal text-[10px] leading-relaxed text-muted-foreground">
+          {spec.hint}
+        </p>
+      )}
       {spec.type === 'string' && (
         <Input
           className="h-8 font-mono text-xs"
@@ -1016,8 +1042,8 @@ function CommandLineField({
   const display = text ?? joinCommandLine(tokens)
   return (
     <textarea
-      className="min-h-16 w-full resize-y rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs leading-relaxed outline-none transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:shadow-[0_0_0_3px_var(--ring-glow)]"
-      rows={3}
+      className="min-h-24 w-full resize-y rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs leading-relaxed outline-none transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:shadow-[0_0_0_3px_var(--ring-glow)]"
+      rows={5}
       value={display}
       placeholder={placeholder}
       onChange={(e) => {
