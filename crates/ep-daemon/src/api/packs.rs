@@ -1129,6 +1129,14 @@ fn reference_descriptor(mf: &ModuleManifest, decl: &ModelDecl) -> Result<Pending
                 revision: decl.revision.clone(),
             })
         }
+        ModelSource::LocalImport => {
+            // 本地自建（E7）：打包面按引用声明收录 target_dir，不做下载
+            Ok(PendingDownload {
+                source: decl.source.as_str().to_string(),
+                location: decl.target_dir.clone(),
+                revision: decl.revision.clone(),
+            })
+        }
     }
 }
 

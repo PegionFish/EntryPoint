@@ -385,6 +385,8 @@ impl ModelManager {
                 model.repo_id.clone().unwrap_or_default()
             }
             ModelSource::Url => model.url.clone().unwrap_or_default(),
+            // 本地自建：无下载脚本语义 → 生成 no-op 脚本（存在即就绪）
+            ModelSource::LocalImport => String::new(),
         };
         // 校验失败（本 pub 签名无法返回 Result）时生成"报错退出"的占位脚本，
         // 绝不把非法输入（target_dir 穿越 / 注入字符）拼进可执行 python 代码
@@ -459,6 +461,19 @@ impl ModelManager {
         local_dir_str: &str,
     ) -> Result<String> {
         match source {
+            // 本地自建（E7）：无远端可下，产出 no-op 脚本——目录存在即就绪，
+            // 缺失时报错文案引导用户查看模块 README 的获取说明
+            ModelSource::LocalImport => {
+                let dir = local_dir_str;
+                let script = format!(
+                    "import os, sys\ndir_ = r\"{dir}\"\n\
+                     if not os.path.isdir(dir_) or not os.listdir(dir_):\n    \
+                     sys.stderr.write('local-import model missing: ' + dir_ + ' (see module README for how to obtain it)\\n')\n    \
+                     sys.exit(1)\n\
+                     print('local-import model present:', dir_)\n"
+                );
+                Ok(script)
+            }
             ModelSource::Huggingface => {
                 let repo_id = location;
                 validate_repo_id(repo_id)?;
@@ -667,6 +682,11 @@ impl ModelManager {
                 fetch_modelscope_modified(&client, &self.modelscope_endpoint, &repo_id).await
             }
             ModelSource::Url => unreachable!("url source handled above"),
+            // 本地权重无远端更新语义：以纪元哨兵走「已是最新」分支
+            ModelSource::LocalImport => Ok((
+                chrono::DateTime::from_timestamp(0, 0).unwrap(),
+                String::new(),
+            )),
         };
 
         match remote_time {
@@ -1406,6 +1426,7 @@ impl ModelManager {
                     ModelSource::Huggingface => "huggingface",
                     ModelSource::Modelscope => "modelscope",
                     ModelSource::Url => "url",
+                    ModelSource::LocalImport => "local_import",
                 };
 
                 views.push(ModelView {
@@ -1894,6 +1915,7 @@ fn default_revision_for(source: ModelSource) -> &'static str {
         ModelSource::Huggingface => "main",
         ModelSource::Modelscope => "master",
         ModelSource::Url => "",
+        ModelSource::LocalImport => "",
     }
 }
 

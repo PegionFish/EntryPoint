@@ -108,6 +108,16 @@ fn reference_descriptor(
                 revision: decl.revision.clone(),
             })
         }
+        ModelSource::LocalImport => {
+            // 本地自建（E7）：无远端可下，打包面按「引用声明」处理——
+            // 打包器只校验 target_dir 存在并收录文件，不做下载
+            let location = decl.target_dir.clone();
+            Ok(PendingDownload {
+                source: decl.source.as_str().to_string(),
+                location,
+                revision: decl.revision.clone(),
+            })
+        }
     }
 }
 

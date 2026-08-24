@@ -421,6 +421,7 @@ async fn handle_upload(
                 decl.repo_id.clone().unwrap_or_default()
             }
             ModelSource::Url => String::new(),
+            ModelSource::LocalImport => String::new(),
         },
         revision: String::new(),
         downloaded_at: chrono::Utc::now().to_rfc3339(),
