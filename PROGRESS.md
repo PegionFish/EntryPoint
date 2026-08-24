@@ -793,6 +793,18 @@ Windows PC（NVIDIA GPU + Intel NPU + iGPU 异构真机测试）+ Linux 双平�
   输出一致。至此 G1 记分板 E7 由诚实占位转绿，异构矩阵七项全过
 - 门禁：workspace tests 全过 + clippy 零警告
 
+### 追加（同日第十一轮——ffmpeg 节点整条命令行交互）
+
+- 🎨 ffmpeg.args 编辑从「逐参数增删改」改为**单框整条命令行**：展示=数组
+  拼回文本，提交=shell 词法分拆存数组（序列化恒数组=后端契约不变，
+  后端 string 形态兼容本就存在）。分词器支持单/双引号、反斜杠转义、
+  容忍未闭合引号、自动剥可选前导 `ffmpeg` 程序名；含空格 token 拼回时
+  自动加引号，roundtrip 稳定。占位符提示覆盖 {input}/{input.<节点id>}/
+  {output} 与多上游定向引用
+- ✅ 分词器边界用例 node 实测（引号嵌套/未闭合/无前导程序名）；tsc/build
+  过、lint 零新增；嵌入产物经 daemon 服务验证为新 bundle
+- 门禁：workspace **1271 tests** 全过 + clippy 零警告
+
 ### 待办（恢复工作时的接续点）
 
 1. daemon 新二进制重启未完成（暂停时中断）——重启后 E2 走平台全链：
