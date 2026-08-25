@@ -73,6 +73,70 @@ size_estimate_mb = 500
 source = "modelscope"
 repo_id = "pengzhendong/faster-whisper-small"
 
+[[models]]
+id = "tiny"
+name = "Whisper Tiny (最小)"
+source = "huggingface"
+repo_id = "Systran/faster-whisper-tiny"
+target_dir = "faster-whisper-tiny"
+size_estimate_mb = 75
+
+[[models]]
+id = "tiny-en"
+name = "Whisper Tiny English"
+source = "huggingface"
+repo_id = "Systran/faster-whisper-tiny.en"
+target_dir = "faster-whisper-tiny.en"
+size_estimate_mb = 75
+
+[[models]]
+id = "base"
+name = "Whisper Base (快速)"
+source = "huggingface"
+repo_id = "Systran/faster-whisper-base"
+target_dir = "faster-whisper-base"
+size_estimate_mb = 145
+
+[[models]]
+id = "base-en"
+name = "Whisper Base English"
+source = "huggingface"
+repo_id = "Systran/faster-whisper-base.en"
+target_dir = "faster-whisper-base.en"
+size_estimate_mb = 145
+
+[[models]]
+id = "small-en"
+name = "Whisper Small English"
+source = "huggingface"
+repo_id = "Systran/faster-whisper-small.en"
+target_dir = "faster-whisper-small.en"
+size_estimate_mb = 500
+
+[[models]]
+id = "medium-en"
+name = "Whisper Medium English"
+source = "huggingface"
+repo_id = "Systran/faster-whisper-medium.en"
+target_dir = "faster-whisper-medium.en"
+size_estimate_mb = 1500
+
+[[models]]
+id = "large-v1"
+name = "Whisper Large V1"
+source = "huggingface"
+repo_id = "Systran/faster-whisper-large-v1"
+target_dir = "faster-whisper-large-v1"
+size_estimate_mb = 3100
+
+[[models]]
+id = "large-v2"
+name = "Whisper Large V2"
+source = "huggingface"
+repo_id = "Systran/faster-whisper-large-v2"
+target_dir = "faster-whisper-large-v2"
+size_estimate_mb = 3100
+
 [interface]
 type = "http"
 health_endpoint = "/health"
@@ -86,6 +150,7 @@ output_type = "json"
 max_file_size_mb = 2048
 
 [interface.capabilities.params]
+precision = { type = "select", options = ["float16", "int8"], default = "float16", description = "推理精度；CPU 自动锁定 int8" }
 language = { type = "string", default = "auto", description = "语言代码或 auto" }
 timestamps = { type = "boolean", default = true, description = "输出词级时间戳" }
 beam_size = { type = "integer", default = 5, min = 1, max = 20 }

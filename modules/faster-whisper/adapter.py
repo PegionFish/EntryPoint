@@ -52,12 +52,13 @@ DEVICE_MAP = {
 # ── 模型状态 ──────────────────────────────────────────────
 model = None
 model_device = "cpu"  # 模型实际加载所用设备（回退后为 cpu）
+model_compute_type: Optional[str] = None  # 模型实际加载所用精度（compute_type）
 model_load_error: Optional[str] = None
 
 
 def _load_model():
     """加载 faster-whisper 模型"""
-    global model, model_device, model_load_error
+    global model, model_device, model_compute_type, model_load_error
 
     if not EP_MODEL_DIR:
         model_load_error = "EP_MODEL_DIR environment variable is not set"
@@ -75,6 +76,7 @@ def _load_model():
 
         device = DEVICE_MAP.get(EP_BACKEND, "cpu")
         compute_type = COMPUTE_TYPE_MAP.get(EP_BACKEND, "int8")
+        loaded_compute_type = compute_type
 
         logger.info(
             "Loading model from %s | device=%s compute_type=%s",
@@ -88,7 +90,7 @@ def _load_model():
             )
         except ValueError:
             # 部分 GPU（如 Tesla P4）不支持 float16，回退到 int8
-            fallback = "int8" if device == "cuda" else "int8"
+            fallback = "int8"
             logger.warning(
                 "compute_type=%s not supported, falling back to %s",
                 compute_type, fallback,
@@ -98,7 +100,9 @@ def _load_model():
                 device=device,
                 compute_type=fallback,
             )
+            loaded_compute_type = fallback
         model_device = device
+        model_compute_type = loaded_compute_type
         logger.info("Model loaded successfully")
     except Exception as exc:
         model_load_error = f"Failed to load model: {exc}"
@@ -107,13 +111,14 @@ def _load_model():
 
 def _reload_model_on_cpu() -> bool:
     """GPU 推理失败时的设备级回退：以 CPU 重新加载模型。成功返回 True。"""
-    global model, model_device, model_load_error
+    global model, model_device, model_compute_type, model_load_error
     try:
         from faster_whisper import WhisperModel
 
         logger.warning("Reloading model on CPU (device-level fallback)")
         model = WhisperModel(str(Path(EP_MODEL_DIR)), device="cpu", compute_type="int8")
         model_device = "cpu"
+        model_compute_type = "int8"
         model_load_error = None
         return True
     except Exception as exc:
@@ -170,6 +175,51 @@ def _clamp_beam_size(value) -> int:
         return 5
 
 
+PRECISION_OPTIONS = ("float16", "int8")
+
+
+def _resolve_precision(requested) -> str:
+    """请求精度 → 实际 compute_type：CPU 强制 int8（即使参数 float16）。"""
+    if EP_BACKEND == "cpu" or str(EP_DEVICE).startswith("cpu"):
+        return "int8"
+    if isinstance(requested, str) and requested in PRECISION_OPTIONS:
+        return requested
+    return "float16"
+
+
+def _ensure_precision(precision: str) -> bool:
+    """确保模型以指定精度加载；已一致时不动作。重新加载失败时返回 False
+    （model_load_error 已内含原因，旧模型保留）。"""
+    global model, model_device, model_compute_type, model_load_error
+    if model is None:
+        return True
+    if model_device == "cpu":
+        # 设备级回退后（GPU 故障 → CPU int8）：CPU 锁定 int8，不发起 GPU 换载
+        precision = "int8"
+    if model_compute_type == precision:
+        return True
+    try:
+        from faster_whisper import WhisperModel
+
+        device = DEVICE_MAP.get(EP_BACKEND, "cpu")
+        logger.info(
+            "Reloading model with compute_type=%s (precision switch)", precision,
+        )
+        model = WhisperModel(
+            str(Path(EP_MODEL_DIR)),
+            device=device,
+            compute_type=precision,
+        )
+        model_device = device
+        model_compute_type = precision
+        model_load_error = None
+        return True
+    except Exception as exc:
+        model_load_error = f"Precision switch to {precision} failed: {exc}"
+        logger.exception(model_load_error)
+        return False
+
+
 def _srt_timestamp(seconds: float) -> str:
     """秒 → SRT 时间戳 HH:MM:SS,mmm"""
     ms = int(round(seconds * 1000))
@@ -219,6 +269,7 @@ def info():
                 "input_type": "audio",
                 "output_type": "json",
                 "params": {
+                    "precision": {"type": "select", "options": ["float16", "int8"], "default": "float16"},
                     "language": {"type": "string", "default": "auto"},
                     "timestamps": {"type": "boolean", "default": True},
                     "beam_size": {"type": "integer", "default": 5, "min": 1, "max": 20},
@@ -308,6 +359,14 @@ async def predict(
         beam_size = _clamp_beam_size(params_dict.get("beam_size", 5))
         vad_filter = bool(params_dict.get("vad_filter", True))
         condition_on_previous = bool(params_dict.get("condition_on_previous", True))
+        precision = _resolve_precision(params_dict.get("precision", "float16"))
+
+        if not _ensure_precision(precision):
+            return error_response(
+                503, "MODEL_LOAD_ERROR",
+                f"Failed to switch model precision to {precision}",
+                model_load_error,
+            )
 
         # 6) 执行推理（GPU 失败时设备级回退 CPU 重试一次）
         def _do_transcribe():
