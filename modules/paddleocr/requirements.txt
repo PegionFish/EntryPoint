@@ -1,9 +1,12 @@
 fastapi>=0.100.0
 uvicorn[standard]>=0.23.0
 python-multipart>=0.0.6
-paddleocr>=3.0,<4
+# PP-StructureV3 doc_understand + 普通 recognize 共用：
+# paddleocr/paddlex 版本对齐源 zip（PP-StructureV3-gpu-offline 内置 3.4 系）；
+# paddleocr>=3.7 的 PPStructureV3 不再接受 model_dir kwargs（A2 契约即 3.4 签名），
+# 故锁 3.4.x，缺失即 DependencyError/Unknown argument。
+paddleocr==3.4.*
+paddlex[ocr]==3.4.*
 paddlepaddle>=3.0,<4
-# PP-StructureV3 文档理解（doc_understand）
-paddlex>=3.3,<4
 pypdfium2>=4.0.0
 Pillow>=10.0.0

@@ -78,7 +78,7 @@ output_format = { type = "select", options = ["json", "text", "md"], default = "
 [[interface.capabilities]]
 name = "recognize_pdf"
 description = "PDF/图片 → 多页合并 Markdown（PDF 按 DPI 逐页渲染，逐页复用 recognize 的模型与提示词；`## Page {n}` 分隔，源 app.py 格式）"
-input_type = "pdf"
+input_type = "file"
 output_type = "json"
 max_file_size_mb = 200
 

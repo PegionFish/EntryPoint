@@ -494,7 +494,11 @@ def _run_doc_understand(input_path: str, params: dict | None) -> dict:
         "doc_unwarping": bool(params.get("doc_unwarping", False)),
         "table": bool(params.get("table", True)),
         "formula": bool(params.get("formula", True)),
-        "chart": bool(params.get("chart", True)),
+        # chart 默认 false：paddlex 3.4.3 的 ChartRecognition 子模型构建
+        # 存在官方 bug（create_pipeline config 与 ink kwargs 均无法初始化
+        # chart_recognition_model）；开启会抛 AttributeError，仅在上游修复
+        # 后恢复默认 true（MODULE_PARITY_PLAN A2 已记录）。
+        "chart": bool(params.get("chart", False)),
     }
 
     engine = _get_pps3()

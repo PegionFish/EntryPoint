@@ -87,6 +87,6 @@ doc_orientation = { type = "boolean", default = false, description = "文档方�
 doc_unwarping = { type = "boolean", default = false, description = "文档去扭曲（慢）" }
 table = { type = "boolean", default = true, description = "表格结构识别" }
 formula = { type = "boolean", default = true, description = "公式识别(LaTeX)" }
-chart = { type = "boolean", default = true, description = "图表识别(转入表格)" }
+chart = { type = "boolean", default = false, description = "图表识别(转入表格；paddlex 3.4.3 官方 bug，开启暂不可用)" }
 dpi = { type = "integer", default = 300, min = 150, max = 600, description = "PDF→图片 DPI" }
 output_format = { type = "select", options = ["json", "md"], default = "json", description = "json=markdown+页面原始结构；md=纯 Markdown（配合 output_path 产出文件）" }
