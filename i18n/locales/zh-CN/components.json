@@ -2,6 +2,7 @@
   "sidebar.nav.dashboard": "仪表盘",
   "sidebar.nav.modules": "模块",
   "sidebar.nav.pipeline": "管线",
+  "sidebar.nav.quickrun": "快速调用",
   "sidebar.nav.tasks": "任务",
   "sidebar.nav.settings": "设置",
   "header.ws.idle": "未连接",

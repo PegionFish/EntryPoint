@@ -481,15 +481,19 @@ export interface PackBuildResponse {
 
 // ===== 直跑（§5.3 / §8.1）=====
 
-/** POST /api/execute/single 请求（模块未运行时后端自动拉起并等健康） */
+/** POST /api/execute/single 请求（QUICK_RUN_PLAN §5.1：仅增可选字段，向后兼容） */
 export interface DirectExecRequest {
   module_id: string
   /** 能力裸名（来自 manifest capabilities，修 P0-1 命名失配） */
   capability: string
   /** 执行参数（按 CapabilityDecl.params schema 渲染提交） */
   params?: Record<string, unknown>
-  /** 服务器本地输入文件路径（浏览器端先经 uploadInput 暂存） */
-  input_path: string
+  /** 服务器本地输入文件路径（浏览器端先经 uploadInput 暂存；与 input_text 二选一） */
+  input_path?: string
+  /** 文本型输入（D2）：服务端物化为 workspace/uploads 下 .txt 后走文件链路 */
+  input_text?: string
+  /** true = 跳过提交前同步等健康，模块拉起在任务内完成（D3；快速调用页专用） */
+  lazy_start?: boolean
 }
 
 /** POST /api/execute/single 202 响应 */
