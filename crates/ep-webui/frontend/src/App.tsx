@@ -13,6 +13,7 @@ import { useModelUpdateToast } from '@/hooks/use-model-update-toast'
 import { DashboardPage } from '@/pages/dashboard'
 import { ModulesPage } from '@/pages/modules'
 import { PipelinePage } from '@/pages/pipeline'
+import { RunPage } from '@/pages/run'
 import { TasksPage } from '@/pages/tasks'
 import { SettingsPage } from '@/pages/settings'
 import { NotFoundPage } from '@/pages/not-found'
@@ -54,6 +55,8 @@ export default function App() {
               {/* W2：模块详情独立页裁撤，旧路由重定向回模块页（详情统一为抽屉） */}
               <Route path="/modules/:id" element={<Navigate to="/modules" replace />} />
               <Route path="/pipeline" element={<PipelinePage />} />
+              {/* 快速调用：与管线同级的单模块 ad hoc 直跑（QUICK_RUN_PLAN D1） */}
+              <Route path="/run" element={<RunPage />} />
               <Route path="/tasks" element={<TasksPage />} />
               <Route path="/settings" element={<SettingsPage />} />
               <Route path="*" element={<NotFoundPage />} />

@@ -6,6 +6,7 @@ import {
   ListTodo,
   Puzzle,
   Settings,
+  Zap,
   type LucideIcon,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -22,6 +23,7 @@ const NAV_ITEMS: NavItem[] = [
   { to: '/', labelKey: 'sidebar.nav.dashboard', icon: LayoutDashboard, end: true },
   { to: '/modules', labelKey: 'sidebar.nav.modules', icon: Puzzle },
   { to: '/pipeline', labelKey: 'sidebar.nav.pipeline', icon: GitBranch },
+  { to: '/run', labelKey: 'sidebar.nav.quickrun', icon: Zap },
   { to: '/tasks', labelKey: 'sidebar.nav.tasks', icon: ListTodo },
   { to: '/settings', labelKey: 'sidebar.nav.settings', icon: Settings },
 ]
