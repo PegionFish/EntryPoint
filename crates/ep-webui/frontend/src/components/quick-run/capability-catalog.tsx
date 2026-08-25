@@ -3,14 +3,15 @@ import type { CapabilityDecl } from '@/api/types'
 import { categoryLabel } from '@/lib/constants'
 import { cn } from '@/lib/utils'
 
-/** 能力目录条目（QUICK_RUN_PLAN D1：模块 × 能力扁平化，客户端聚合） */
+/** 能力目录条目（模块级入口：一个模型一个入口，能力在功能页内选择） */
 export interface CatalogEntry {
-  /** 选择键：`${moduleId}::${capability}` */
+  /** 选择键 = moduleId（模块粒度） */
   key: string
   moduleId: string
   moduleName: string
   category: string
-  capability: CapabilityDecl
+  /** 模块声明的全部能力（工作台内选择） */
+  capabilities: CapabilityDecl[]
   /** ModuleResponse.service_status 原值（running/starting/preparing/stopped/error…） */
   serviceStatus: string
   /** 运行中实例当前绑定的设备名（如 "cuda:0"；未运行为 null） */
@@ -35,8 +36,9 @@ function statusDotClass(status: string): string {
 }
 
 /**
- * 快速调用 · 能力目录左栏：
- * 分类筛选后的能力条目列表，单击选中进入右侧工作台。
+ * 快速调用 · 模型入口目录左栏：
+ * 一个模型一个入口（分类筛选后的模块列表），单击选中进入右侧功能页，
+ * 具体能力在功能页内选择（QUICK_RUN_PLAN D1 修订：模型粒度入口）。
  */
 export function CapabilityCatalog({
   entries,
@@ -61,6 +63,7 @@ export function CapabilityCatalog({
     <div className="space-y-1.5">
       {entries.map((e) => {
         const active = e.key === selectedKey
+        const caps = e.capabilities
         return (
           <button
             key={e.key}
@@ -85,28 +88,22 @@ export function CapabilityCatalog({
               <span className="truncate text-sm font-medium">
                 {e.moduleName}
               </span>
-              <span className="ml-auto shrink-0 font-mono text-[10px] text-muted-foreground">
+              <span className="ml-auto shrink-0 rounded-full border border-border bg-muted/60 px-1.5 py-px text-[10px] text-muted-foreground">
                 {categoryLabel(e.category)}
               </span>
             </div>
             <div className="mt-1 flex items-center gap-2 pl-4">
               <span className="truncate text-xs text-muted-foreground">
-                {e.capability.name}
-                {e.capability.description
-                  ? ` — ${e.capability.description}`
-                  : ''}
+                {caps.map((c) => c.name).join(' / ')}
               </span>
             </div>
-            <div className="mt-0.5 flex items-center gap-2 pl-4">
-              <span className="font-mono text-[10px] text-muted-foreground/80">
-                {e.capability.input_type} → {e.capability.output_type}
-              </span>
-              {e.modelReady === false && (
-                <span className="shrink-0 rounded-full border border-border bg-muted px-1.5 py-px text-[10px] text-muted-foreground">
+            {e.modelReady === false && (
+              <div className="mt-0.5 pl-4">
+                <span className="rounded-full border border-border bg-muted px-1.5 py-px text-[10px] text-muted-foreground">
                   {t('modelNotReady')}
                 </span>
-              )}
-            </div>
+              </div>
+            )}
           </button>
         )
       })}
