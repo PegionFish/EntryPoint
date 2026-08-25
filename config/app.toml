@@ -40,6 +40,9 @@ default_timeout_secs = 300
 default_node_timeout_secs = 0
 keep_workspace = false
 workspace_dir = "workspace"
+staging_mode = "auto"
+staging_floor_mb = 2048
+staging_max_ram_mb = 0
 
 [network]
 http_proxy = ""
@@ -49,13 +52,12 @@ no_proxy = "localhost,127.0.0.1"
 [packs]
 staging_dir = ".pack-staging"
 
+[modules]
+idle_timeout_secs = 1800
+
 [api]
 enabled = true
 
 [active_models]
 realesr = "realesrgan-animevideov3-x4-ncnn"
-
-[modules]
-# 空闲自动释放（秒）：运行中模块无任务触达超过该时长即停止，释放内存/显存；
-# 下次任务按需重载。0 = 常驻停用。
-idle_timeout_secs = 1800
+qwen3-tts = "0.6b"
