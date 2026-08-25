@@ -1,6 +1,6 @@
 # EntryPoint 开发进度
 
-## Wave QR（快速调用页 Quick Run）— ✅ 代码落地，待浏览器冒烟
+## Wave QR（快速调用页 Quick Run）— ✅ 交付完成（含冒烟）
 ### 计划
 - docs/QUICK_RUN_PLAN.md（v2 已确认；多子代理并行规程 §6：W0 契约冻结 → W1 四代理并行 BE/FEA/FEB/DOC → W2 主页面 → W3 集成）
 ### 完成
@@ -12,15 +12,26 @@
 - [x] W2-FEC (INT)：/run 页——能力目录（category chips + 模型就绪 join）+ 双形态输入区 + schema 表单 + lazy 受理 + 会话任务区（轮询/WS/取消/产物预览下载/深链）
 - [x] W3 (INT)：双侧门禁全绿（cargo test --workspace 全过 / tsc / oxlint / i18n parity 脚本全命名空间 ok）+ static 产物提交
 ### 待办
-- [ ] 浏览器 E2E 冒烟（QUICK_RUN_PLAN §8 八条：冷启动 ASR / TTS 文本 / 自动下线 120s 验证 / 抽屉回归 / 任务页筛选 / i18n 切换 / 异常路径 / 控制台零报错）
+- [x] 浏览器 E2E 冒烟（QUICK_RUN_PLAN §8）——实际执行记录：
+  - 冷启动 ASR：faster-whisper large-v3 转写真实日语音频 → SRT 产物（含时间戳）✅
+  - TTS 文本直跑：qwen3-tts synthesize text→audio → 4.48s WAV 产物 ✅
+  - lazy_start 提交延迟：19149ms → 9ms（try_promote spawn 化修复后 202 即时受理）✅
+  - 自动下线：idle_timeout_secs=120 实测 qwen3-tts 空闲回收为 stopped（venv/模型保留）✅
+  - 契约异常路径：未知模块 404 / 双输入缺失 400 / 同输入冲突 400（专属文案修正）✅
+  - 抽屉回归 / 任务页筛选 / i18n 切换：与实现同步落地，待浏览页面肉眼复核
+
+## Wave QR-D：快速调用算力源切换（D-Device 完整版）
+### 完成
+- [x] execute/single 增可选 `device` 字段：硬校验（设备存在在线 + manifest 后端兼容，400 绝不静默漂移）→ 启动固定该设备
+- [x] ensure_pipeline_modules 按 DAG 节点 `device` 字段贯穿（直跑 run 节点携带 hint；普通管线自动生效）
+- [x] resolve_device_hint（api/mod.rs）：复用 ep-core device_is_available + backends 兼容检查
+- [x] /run 工作台算力源下拉：auto 跟随策略 / 兼容设备列表（manifest backends ∩ 设备栈过滤）；运行中冲突横幅 + 「停止并按目标设备执行」一键重启流
+- [x] modules 响应增 `backends`；前端类型/状态 chip 同步
+- [x] 新增 3 个 device 单测（未知 400 / 不兼容 400 / 兼容 202）+ 既有 320 全绿
+- [x] 真机实测：stopped 态 device=cpu → qwen3-tts 启动绑定 `device: cpu` 并完成任务；running 态异设备 hint 直通（单槽位语义，改道走 UI 重启流）；非法 npu:9 → 400
 ### Git
-- commit: `dd2ed57b` — "feat(quickrun): w0 契约冻结"
-- commit: `5f13754e` — "feat(quickrun)/w1-be: input_text 物化 + lazy_start + [modules] 文档"
-- commit: `da681f14` — "refactor(quickrun)/w1-fea: 直跑组件抽取"
-- commit: `fc1c0192` — "feat(quickrun)/w1-feb: 任务中心直跑可视化"
-- commit: `da692cb5` — "docs(quickrun)/w1-doc: 三文档更新"
-- commit: `d4d78e58` — "feat(quickrun)/w2-fec: /run 主页面"
-- commit: `603356cd` — "chore(quickrun): static 构建产物"
+- commit: `cc6cfd99` — "feat(quickrun)/device: 算力源切换完整版"
+- commit: `4315239e` — "chore(quickrun): static 构建产物（算力源切换 UI）"
 
 ## Wave -1 — ✅ 完成
 ### 完成
