@@ -33,8 +33,9 @@ export function isTaskTerminal(status: string | null | undefined): boolean {
  * 不复用 apiFetch 的原因：需要 signal 控制长超时，且超时错误
  * 需与一般网络错误区分（UI 提示「模块启动等待超时」）。
  * 错误形状与 apiFetch 一致（`API <status>: <body>`），便于统一解析。
+ * 导出供快速调用页工作台复用（QUICK_RUN_PLAN W2）。
  */
-async function postExecuteSingle(
+export async function postExecuteSingle(
   body: DirectExecRequest,
 ): Promise<DirectExecResponse> {
   const controller = new AbortController()
