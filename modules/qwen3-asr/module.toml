@@ -86,9 +86,10 @@ output_type = "json"
 max_file_size_mb = 2048
 
 [interface.capabilities.params]
-language = { type = "string", default = "auto", description = "语言名（如 Chinese/English，兼容 ISO 代码 zh/en）或 auto 自动检测" }
+language = { type = "string", default = "auto", description = "语言名或 ISO 代码或 auto；共 30 语言枚举：Chinese/English/Cantonese/Arabic/German/French/Spanish/Portuguese/Indonesian/Italian/Korean/Russian/Thai/Vietnamese/Japanese/Turkish/Hindi/Malay/Dutch/Swedish/Danish/Finnish/Polish/Czech/Filipino/Persian/Greek/Romanian/Hungarian/Macedonian" }
 context = { type = "string", default = "", description = "上下文提示文本（热词/专名/领域描述，提升识别偏置）" }
 timestamps = { type = "boolean", default = true, description = "输出 segments 与 words 词级时间戳（需本地 Aligner 权重，缺失时自动降级为纯文本）" }
+srt_output = { type = "boolean", default = false, description = "同时输出 .srt 字幕文件产物（需 timestamps）" }
 
 [[interface.capabilities]]
 name = "align"
@@ -99,4 +100,4 @@ max_file_size_mb = 2048
 
 [interface.capabilities.params]
 text = { type = "string", default = "", description = "参考文本（必填；JSON 调用也可置于 body.input_text）" }
-language = { type = "string", default = "", description = "语言名或 ISO 代码（必填；align 不支持 auto 自动检测）" }
+language = { type = "string", default = "", description = "语言名或 ISO 代码（必填；align 不支持 auto 自动检测）；30 语言枚举同 transcribe" }

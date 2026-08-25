@@ -49,11 +49,23 @@ EP_BACKEND: str = os.getenv("EP_BACKEND", "cpu")
 
 # 与 module.toml [[models]] 的 id → target_dir 约定对齐（rembg 会话名即 model id，
 # 权重文件名为 <model id>.onnx，见 rembg sessions 各 download_models 实现）。
+# 补位 4 变体（冻结契约 §4.3 A5）：源应用 RemBg 全量 6 模型对齐，target_dir 即 id。
 MODEL_TARGET_DIRS: dict[str, str] = {
     "u2net": "rembg-u2net",
     "isnet-general-use": "rembg-isnet",
     "birefnet-general": "rembg-birefnet",
+    "u2netp": "u2netp",
+    "u2net_human_seg": "u2net_human_seg",
+    "isnet-anime": "isnet-anime",
+    "u2net_cloth_seg": "u2net_cloth_seg",
 }
+
+# alpha matting 支持面（§4.3 A5）：仅 general 系（isnet-general-use/
+# birefnet-general）可靠；u2net/u2netp/human_seg/cloth/anime 不支持或质量差，
+# 请求带 true 时警告降级关闭——绝不 crash。
+ALPHA_MATTING_MODELS: frozenset[str] = frozenset(
+    {"isnet-general-use", "birefnet-general"}
+)
 
 
 class ModelLocalMissingError(RuntimeError):
@@ -147,7 +159,7 @@ _effective_providers: List[str] = []
 
 app = FastAPI(
     title="RemBG Adapter",
-    version="2.1.0",
+    version="2.2.0",
     description="EntryPoint rembg 图像去背景模块",
 )
 
@@ -202,6 +214,22 @@ def _load_session(model_name: str):
     return _session
 
 
+def _resolve_alpha_matting(
+    model_name: str, alpha_matting: bool
+) -> tuple[bool, Optional[str]]:
+    """alpha matting 降级（§4.3 A5）：模型不在支持面内且请求开启时，
+    警告日志 + 返回 (False, note)——业务继续，绝不抛错。"""
+    if alpha_matting and model_name not in ALPHA_MATTING_MODELS:
+        note = (
+            f"alpha_matting is not supported by model '{model_name}' "
+            f"(supported: {', '.join(sorted(ALPHA_MATTING_MODELS))}); "
+            f"request downgraded to alpha_matting=false"
+        )
+        logger.warning(note)
+        return False, note
+    return alpha_matting, None
+
+
 # ---------------------------------------------------------------------------
 # 启动时预加载
 # ---------------------------------------------------------------------------
@@ -234,10 +262,12 @@ async def health():
 async def info():
     return {
         "module": "rembg",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "model": _session_model,
         "ready": _ready,
         "capabilities": ["remove_bg"],
+        # §4.3 A5：alpha matting 支持面（其余模型请求 true 时降级关闭）
+        "alpha_matting_models": sorted(ALPHA_MATTING_MODELS),
         # 与 module.toml [compute].backends 保持一致
         "backends": ["openvino", "cpu"],
         # EP_BACKEND 分派结果与 session 实际激活的 EP（E2/E3 验证观测点）
@@ -398,12 +428,15 @@ async def predict_remove_bg(
 
     model_name = model_override or EP_MODEL_NAME
 
+    # §4.3 A5：模型不支持 alpha matting 时警告降级（绝不 crash）
+    effective_alpha, alpha_warning = _resolve_alpha_matting(model_name, alpha_matting)
+
     # ---- 推理 ----
     try:
         output_bytes = _run_remove_bg(
             input_bytes,
             model_name=model_name,
-            alpha_matting=alpha_matting,
+            alpha_matting=effective_alpha,
             post_process=post_process,
         )
     except ModelLocalMissingError as exc:
@@ -441,9 +474,10 @@ async def predict_remove_bg(
         "output_path": str(out_path),
         "metadata": {
             "model": model_name,
-            "alpha_matting": alpha_matting,
+            "alpha_matting": effective_alpha,
             "post_process": post_process,
             "output_size_bytes": len(output_bytes),
+            **({"warning": alpha_warning} if alpha_warning else {}),
         },
         "elapsed_seconds": elapsed,
     }

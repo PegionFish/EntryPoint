@@ -44,6 +44,7 @@ EntryPoint ASR 模块：[Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) 语音�
 | 上下文提示 | **context 参数原生支持**：热词/专名/领域描述直接注入提示词，显著改善专名召回 | 无一等价机制（initial_prompt 效果有限） |
 | 时间戳 | 词级时间戳由独立的 ForcedAligner 模型产出（更精细，CJK 按字对齐） | 内建 word_timestamps（交叉注意力启发式） |
 | 语种 | 30 种（中文/多方言场景强项），语言名或 auto | ~99 种 VTT 语种 |
+| SRT 字幕产生产出 | `srt_output`/`output_format=srt`（均 30 语言通用） | `output_format=srt` |
 | 部署形态 | torch 全家桶，显存占用较高 | CT2 量化，CPU 友好、显存低 |
 | 选型建议 | 中文为主、需要热词偏置、需要高精度字幕对齐 | 多语种混合、低资源机器、长音频批量 |
 
@@ -57,7 +58,10 @@ curl http://127.0.0.1:18002/info
 # 转写（multipart）
 curl -X POST http://127.0.0.1:18002/predict/transcribe \
   -F "file=@test.wav" \
-  -F 'params={"language": "zh", "context": "这是一段关于量子计算的访谈", "timestamps": true}'
+  -F 'params={"language": "zh", "context": "这是一段关于量子计算的访谈", "timestamps": true, "srt_output": true}'
+
+# 转写 + SRT 字幕文件产物（srt_output=true 时写 work_dir，响应 output_path 指向 .srt；
+# 无 segments（timestamps 缺失/Alinger 未挂载）时降级为单条全文字幕）
 
 # 转写（JSON 路径输入，长音频分段在库内自动处理）
 curl -X POST http://127.0.0.1:18002/predict/transcribe \
@@ -77,9 +81,21 @@ curl -X POST http://127.0.0.1:18002/predict/align \
 `result.words` / align 的 `result.words` 为词级 `[{word,start,end}]`（秒，
 CJK 按字、拉丁按词，字段直接映射上游 ForcedAlignItem，未额外造字段）。
 
-`language` 参数接受规范语言名（`Chinese`…30 种）或常用 ISO 代码（`zh/en/ja/yue/...`）；
-`params.model` 支持变体临时覆盖（`0.6b` / `1.7b`），从 `EP_MODELS_ROOT` 解析本地权重，
-缺失时报 503 且不联网下载（ADAPTER_API.md §1.3 契约）。
+`language` 参数接受规范语言名（共 30 种）或常用 ISO 代码（`zh/en/ja/yue/...`）；
+30 语言枚举与 `auto` 一并校验：`Chinese、English、Cantonese、Arabic、German、
+French、Spanish、Portuguese、Indonesian、Italian、Korean、Russian、Thai、
+Vietnamese、Japanese、Turkish、Hindi、Malay、Dutch、Swedish、Danish、Finnish、
+Polish、Czech、Filipino、Persian、Greek、Romanian、Hungarian、Macedonian`
+（非法值 422 并列出枚举清单）。
+
+`params.model` 支持变体临时覆盖（`0.6b` / `1.7b`），从 `EP_MODELS_ROOT` 解析本地权重
+（`modules/models/qwen3-asr-0.6b`、`qwen3-asr-1.7b` 对应 `module.toml` 两变体
+target_dir），缺失时报 503 且不联网下载（ADAPTER_API.md §1.3 契约）。
+
+SRT 双路径：显式 `params.srt_output=true`（写 `EP_WORKSPACE`，响应 `output_path`
+指向 .srt；json 产物不变）；管线执行器注入 `output_format=srt` + `output_path` 时
+走 ADAPTER_API 文件产物协议（`output_type=file`，`result` 为路径字符串，
+faster-whisper 同口径）。
 
 ## 已知限制
 

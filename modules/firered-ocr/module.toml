@@ -10,7 +10,7 @@
 [module]
 id = "firered-ocr"
 name = "FireRed-OCR 文档识别"
-version = "0.1.0"
+version = "0.2.0"
 description = "基于 Qwen3-VL-2B 的端到端文档解析 OCR，图片转结构化 Markdown"
 category = "ocr"
 genre = "firered"
@@ -68,3 +68,21 @@ max_file_size_mb = 50
 languages = { type = "string", default = "", description = "可选语言提示，逗号分隔（如 zh,en）；留空不注入语言提示。适配器亦接受 JSON 列表" }
 max_new_tokens = { type = "integer", default = 8192, min = 64, max = 32768, description = "生成 token 上限（官方默认 8192）" }
 output_format = { type = "select", options = ["json", "text", "md"], default = "json", description = "text/md 配合执行器注入的 output_path 输出文件产物（MODULE_SPEC §5）" }
+
+# recognize_pdf（MODULE_PARITY_PLAN §4.3 A7 冻结契约）：
+# PDF/图片输入 → 逐页 OCR（复用同模型同提示词）→ `## Page {n}` + `---` 合并 Markdown。
+# dpi 对齐源 main.py PDF Tab（150-600 step50 default300）；max_pages 0=全部；
+# output_format=md 走 MODULE_SPEC §5 文件产物协议（执行器注入 output_path）。
+# 注意：PDF 渲染依赖（pdf2image/Poppler 或 pypdfium2）未在 requirements 中，
+# 属越权需求，待 INT 统一后启用；缺失时适配器返回 500 明确错误。
+[[interface.capabilities]]
+name = "recognize_pdf"
+description = "PDF/图片 → 多页合并 Markdown（PDF 按 DPI 逐页渲染，逐页复用 recognize 的模型与提示词；`## Page {n}` 分隔，源 app.py 格式）"
+input_type = "pdf"
+output_type = "json"
+max_file_size_mb = 200
+
+[interface.capabilities.params]
+dpi = { type = "integer", default = 300, min = 150, max = 600, description = "PDF→图片分辨率（越高越清晰越慢）" }
+max_pages = { type = "integer", default = 0, min = 0, max = 200, description = "最大页数（0=全部）" }
+output_format = { type = "select", options = ["json", "md"], default = "json", description = "md 配合执行器注入的 output_path 输出 md 文件产物（MODULE_SPEC §5）" }

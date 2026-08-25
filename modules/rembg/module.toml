@@ -1,7 +1,7 @@
 [module]
 id = "rembg"
 name = "RemBG 智能去背景"
-version = "2.1.0"
+version = "2.2.0"
 description = "基于 U2-Net/ISNet/BiRefNet 的 AI 图像背景移除（ONNX Runtime 多 EP）"
 category = "image"
 genre = "rembg"
@@ -66,6 +66,45 @@ target_dir = "rembg-birefnet"
 size_estimate_mb = 880
 vram_estimate_mb = 2048
 
+# 补位变体（源应用 RemBg 全量 6 模型，冻结契约 §4.3 A5）：
+# 权重文件名即 id 名（u2netp.onnx 等），target_dir 与 id 相同，
+# 由 W2 经「本地导入」从源 models/ 目录落入（.ep_meta source="local"）。
+[[models]]
+id = "u2netp"
+name = "U2-Net 轻量版 (低耗)"
+source = "url"
+url = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx"
+target_dir = "u2netp"
+size_estimate_mb = 5
+vram_estimate_mb = 256
+
+[[models]]
+id = "u2net_human_seg"
+name = "U2-Net 人像分割"
+source = "url"
+url = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net_human_seg.onnx"
+target_dir = "u2net_human_seg"
+size_estimate_mb = 176
+vram_estimate_mb = 512
+
+[[models]]
+id = "isnet-anime"
+name = "ISNet 动漫图"
+source = "url"
+url = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/isnet-anime.onnx"
+target_dir = "isnet-anime"
+size_estimate_mb = 176
+vram_estimate_mb = 512
+
+[[models]]
+id = "u2net_cloth_seg"
+name = "U2-Net 服装分割"
+source = "url"
+url = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net_cloth_seg.onnx"
+target_dir = "u2net_cloth_seg"
+size_estimate_mb = 176
+vram_estimate_mb = 512
+
 [interface]
 type = "http"
 health_endpoint = "/health"
@@ -79,5 +118,5 @@ output_type = "image"
 max_file_size_mb = 50
 
 [interface.capabilities.params]
-alpha_matting = { type = "boolean", default = false, description = "启用 alpha matting 精细边缘" }
+alpha_matting = { type = "boolean", default = false, description = "启用 alpha matting 精细边缘（仅 isnet-general-use/birefnet-general 支持；其余模型自动降级为 false 并提示）" }
 post_process = { type = "boolean", default = true, description = "后处理优化边缘" }

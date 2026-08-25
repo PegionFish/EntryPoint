@@ -15,8 +15,10 @@
 ## 功能
 
 - **recognize（image → json）**：文档图片 → Markdown 文本
+- **recognize_pdf（pdf/image → json 或 md 文件）**：PDF 按 DPI（150–600，默认 300）逐页渲染为图片，复用同模型同提示词逐页 OCR，结果以 `## Page {n}` + `---` 合并为单篇 Markdown（与源应用 PDF Tab 同格式：多图 Tab 为 `## Image {n}`）
+  - `max_pages`：最大页数（0=全部，上限 200）
+  - `output_format = md` + 执行器注入的 `output_path` 时输出 md 文件产物（MODULE_SPEC §5）
 - 可选 `languages` 语言提示（逗号分隔或 JSON 列表，如 `"zh,en"`）
-- `output_format = text/md` + 执行器注入的 `output_path` 时输出文件产物（MODULE_SPEC §5）
 - 后端：CUDA（BF16）/ CPU（FP32）
 
 ## 硬件建议
@@ -39,6 +41,16 @@ curl -X POST http://127.0.0.1:18001/predict/recognize \
 curl -X POST http://127.0.0.1:18001/predict/recognize \
   -F "file=@page.png" \
   -F 'params={"max_new_tokens": 8192}'
+
+# recognize_pdf：PDF → 多页合并 Markdown（`## Page {n}` + `---`）
+curl -X POST http://127.0.0.1:18001/predict/recognize_pdf \
+  -H "Content-Type: application/json" \
+  -d '{"input_path": "/path/to/doc.pdf", "params": {"dpi": 300, "max_pages": 0}}'
+
+# recognize_pdf：md 文件产物（output_path 由管线执行器注入，output_format=md）
+curl -X POST http://127.0.0.1:18001/predict/recognize_pdf \
+  -F "file=@doc.pdf" \
+  -F 'params={"dpi": 150, "max_pages": 10, "output_format": "md", "output_path": "/tmp/doc_output.md"}'
 ```
 
 成功响应（模型只产出 Markdown 文本，无坐标框/置信度，故 result 仅含 `text`）：
@@ -55,18 +67,46 @@ curl -X POST http://127.0.0.1:18001/predict/recognize \
 
 ## 参数
 
+### recognize（image）
+
 | 参数 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `languages` | string/list | 空 | 可选语言提示，逗号分隔（适配器亦接受 JSON 列表）；留空不注入提示行 |
 | `max_new_tokens` | integer | 8192 | 生成上限（官方默认 8192） |
 | `output_format` | select | json | `text`/`md` 配合 `output_path` 输出文件产物 |
 
+### recognize_pdf（pdf/image）
+
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `dpi` | integer | 300 | PDF→图片分辨率（150–600，越高越清晰越慢；源应用 Slider：min150 max600 step50 default300） |
+| `max_pages` | integer | 0 | 最大页数（0=全部；上限 200，超限截断） |
+| `output_format` | select | json | `md` 配合执行器注入的 `output_path` 输出 md 文件产物（MODULE_SPEC §5） |
+
+- 输入：`.pdf`（逐页渲染 OCR）或单张图片（按单页处理，§4.3「输入 pdf/image」）
+- 输出：`result.text` 为多页合并 Markdown（`## Page {n}` + `---`，源 `app.py` 格式），响应附 `pages_processed` / `dpi`；`output_format=md` 时返回 `output_type: "file"`
+- 渲染：pdf2image 优先、pypdfium2 回退（同 paddleocr 模块先例）；DPI 钳制 150–600
+
+```json
+{
+  "status": "completed",
+  "output_type": "json",
+  "result": {"text": "## Page 1\n\n# 标题……\n\n---\n\n## Page 2\n\n……"},
+  "pages_processed": 2,
+  "dpi": 300,
+  "output_path": null,
+  "elapsed_seconds": 24.6
+}
+```
+
 ## 依赖说明
 
-requirements 以官方 `main.py` 的推理期依赖为准：`transformers>=4.57.0`（Qwen3-VL 架构自 4.57 起）、`torch==2.11.0`（cu130 索引，对齐 constraints.txt 全家桶锁）、`accelerate`（官方 `device_map="auto"` 所需）、`Pillow`。官方 main.py 另含 `gradio`（WebUI）与 `pdf2image`（PDF 转图，需系统 Poppler）——本适配器仅封装图片推理路径，二者未纳入；PDF 场景请在管线中先行转图。
+requirements 以官方 `main.py` 的推理期依赖为准：`transformers>=4.57.0`（Qwen3-VL 架构自 4.57 起）、`torch==2.11.0`（cu130 索引，对齐 constraints.txt 全家桶锁）、`accelerate`（官方 `device_map="auto"` 所需）、`Pillow`。官方 main.py 另含 `gradio`（WebUI）与 `pdf2image`（PDF 转图，需系统 Poppler），二者未纳入。
+
+**越权需求（待 INT 统一）**：`recognize_pdf` 需要 PDF→图片依赖——`pdf2image>=1.17`（需系统 Poppler 二进制）或 `pypdfium2`（自带 pdfium，无系统依赖）。当前模块 requirements 与 venv 均未安装；依赖缺失时 `recognize_pdf` 返回 500（消息提示安装项），`recognize` 不受影响。
 
 ## 已知限制
 
 - 无检测框/置信度输出（与上游能力一致；需要 bbox 请用 paddleocr 模块）
-- 单图逐页处理；多页 PDF 需管线拆页
+- `recognize_pdf` 契约仅单一输入（PDF 或单图）；多图批量上传（源多图 Tab `## Image {n}` 合并）不在 A7 冻结参数面内，需要时由管线逐张调用或 INT 扩参
 - 模型目录缺失时返回 503 `MODEL_NOT_LOADED`，不静默联网下载（ADAPTER_API §1.3）

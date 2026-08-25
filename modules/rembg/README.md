@@ -1,12 +1,14 @@
 # RemBG 智能去背景模块
 
-基于 [rembg](https://github.com/danielgatis/rembg) 的 AI 图像背景移除模块，支持 U2-Net / ISNet / BiRefNet 三种模型。
+基于 [rembg](https://github.com/danielgatis/rembg) 的 AI 图像背景移除模块，
+支持 U2-Net / ISNet / BiRefNet 共 7 个变体（6 个与源应用 RemBg 全量对齐）。
 
 ## 功能
 
 - **remove_bg** — 移除图片背景，输出透明 PNG
   - 支持 multipart 文件上传或服务器端路径输入
-  - 可选 alpha matting 精细边缘
+  - 可选 alpha matting 精细边缘（仅 isnet-general-use / birefnet-general
+    支持；其余模型传 true 时自动降级为 false，响应 metadata.warning 提示，绝不报错）
   - 可选后处理优化
 
 ## 快速开始
@@ -72,7 +74,7 @@ module.toml `[compute].backends = ["openvino", "cpu"]`：
 |------|------|------|------|
 | `file` | file | 二选一 | 上传图片文件 |
 | `input_path` | string | 二选一 | 服务器端文件路径 |
-| `model` | string | 否 | 模型名（u2net / isnet-general-use / birefnet-general） |
+| `model` | string | 否 | 模型名（u2net / u2netp / u2net_human_seg / u2net_cloth_seg / isnet-general-use / isnet-anime / birefnet-general） |
 | `alpha_matting` | bool | 否 | 启用 alpha matting（默认 false） |
 | `post_process` | bool | 否 | 后处理优化边缘（默认 true） |
 
@@ -99,11 +101,19 @@ curl -X POST http://127.0.0.1:8900/predict/remove_bg \
 
 ## 模型
 
-| 模型 | 大小 | 说明 |
-|------|------|------|
-| u2net | ~176 MB | 通用，默认 |
-| isnet-general-use | ~176 MB | 高精度 |
-| birefnet-general | ~880 MB | 最新，效果最佳 |
+| 模型 | 大小 | 说明 | alpha matting |
+|------|------|------|------|
+| u2net | ~176 MB | 通用，默认 | 否（降级） |
+| u2netp | ~5 MB | 轻量低耗 | 否（降级） |
+| u2net_human_seg | ~176 MB | 人像分割 | 否（降级） |
+| u2net_cloth_seg | ~176 MB | 服装分割 | 否（降级） |
+| isnet-general-use | ~176 MB | 高精度 | 是 |
+| isnet-anime | ~176 MB | 动漫图 | 否（降级） |
+| birefnet-general | ~880 MB | 最新，效果最佳 | 是 |
+
+> alpha matting：仅 general 系（isnet-general-use / birefnet-general）受支持；
+> 其余模型请求 `alpha_matting=true` 时降级关闭，响应 `metadata.warning` 给出
+> 说明（业务继续，不报错）。
 
 ## 许可
 

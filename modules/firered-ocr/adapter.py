@@ -10,6 +10,12 @@ main.py / GitHub Quick Start):
 
 模型输出为纯 Markdown 文本（无坐标框/置信度），result 仅含 `text` 字段，
 不虚构 regions 等上游不存在的结构。
+
+新能力 `recognize_pdf`（MODULE_PARITY_PLAN §4.3 A7）：PDF（或单图）输入，
+按 dpi（150-600）逐页渲染图片（pdf2image 优先、pypdfium2 回退，同官方
+main.py PDF Tab），复用同一模型与提示词逐页 OCR，结果以 `## Page {n}` +
+`---` 合并（源 app.py ocr_pdf_stream 格式）；max_pages 截断；
+output_format=md + 执行器注入 output_path 走 MODULE_SPEC §5 文件产物。
 """
 
 from __future__ import annotations
@@ -42,8 +48,13 @@ EP_MODEL_DIR = os.getenv("EP_MODEL_DIR", "")
 EP_MODEL_ID = os.getenv("EP_MODEL_ID", "")
 EP_MODULE_ID = os.getenv("EP_MODULE_ID", "firered-ocr")
 
-MODULE_VERSION = "0.1.0"
+MODULE_VERSION = "0.2.0"
 MAX_FILE_SIZE_MB = 50
+MAX_PDF_SIZE_MB = 200
+MIN_DPI = 150
+MAX_DPI = 600
+DEFAULT_DPI = 300
+MAX_PAGES = 200
 
 logging.basicConfig(
     level=logging.INFO,
@@ -243,6 +254,109 @@ def _run_ocr(image_path: str, languages: list[str], max_new_tokens: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# recognize_pdf（MODULE_PARITY_PLAN §4.3 A7）
+# ---------------------------------------------------------------------------
+
+
+def _clamp_int(raw: Any, lo: int, hi: int, default: int) -> int:
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        val = default
+    return max(lo, min(hi, val))
+
+
+def _render_pdf(pdf_path: str, dpi: int, limit: int = 0) -> list[Any]:
+    """PDF → PIL.Image 列表（pdf2image 优先，pypdfium2 回退）。
+
+    limit > 0 时仅渲染前 limit 页（max_pages 截断，免渲染超限页）；
+    pypdfium2 以 scale=dpi/72（pdfium 默认 72 dpi）对齐 pdf2image 的 dpi 语义。
+    """
+    images: list[Any] | None = None
+    try:
+        from pdf2image import convert_from_path
+    except ImportError:
+        convert_from_path = None
+    if convert_from_path is not None:
+        try:
+            kwargs: dict[str, Any] = dict(dpi=dpi, fmt="png")
+            if limit > 0:
+                kwargs.update(first_page=1, last_page=limit)
+            images = list(convert_from_path(pdf_path, **kwargs))
+        except Exception as exc:
+            logger.warning("pdf2image 渲染失败（%s），回退 pypdfium2", exc)
+            images = None
+    if images is not None:
+        return images
+
+    try:
+        import pypdfium2 as pdfium
+    except ImportError as exc:
+        raise RuntimeError(
+            "PDF→图片依赖缺失：请安装 pdf2image（需系统 Poppler）或 pypdfium2；"
+            "当前环境两者均未安装（见 README「越权需求」）"
+        ) from exc
+
+    pdf = pdfium.PdfDocument(pdf_path)
+    try:
+        count = len(pdf)
+        if limit > 0:
+            count = min(count, limit)
+        return [pdf[idx].render(scale=dpi / 72.0).to_pil() for idx in range(count)]
+    finally:
+        pdf.close()
+
+
+def _ocr_page_parts(
+    images: list[Any], languages: list[str], max_new_tokens: int
+) -> list[str]:
+    """逐页 OCR → `## Page {n}` 片段（源 app.py ocr_pdf_stream 合并格式）。"""
+    parts: list[str] = []
+    workdir = tempfile.mkdtemp(prefix="ep_firered_ocr_pdf_")
+    try:
+        for idx, page_image in enumerate(images, 1):
+            if page_image.mode != "RGB":
+                page_image = page_image.convert("RGB")
+            page_path = os.path.join(workdir, f"page_{idx:04d}.png")
+            page_image.save(page_path, format="PNG")
+            page_md = _run_ocr(page_path, languages, max_new_tokens)
+            parts.append(f"## Page {idx}\n\n{page_md}\n\n---\n")
+            logger.info("Page %d/%d OCR done (%d chars)", idx, len(images), len(page_md))
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    return parts
+
+
+def _run_ocr_pdf(
+    pdf_path: str,
+    languages: list[str],
+    max_new_tokens: int,
+    dpi: int,
+    max_pages: int,
+) -> tuple[str, int]:
+    """PDF 逐页 OCR：渲染 → 逐页复用 _run_ocr → `## Page {n}`+`---` 合并。"""
+    images = _render_pdf(pdf_path, dpi, limit=max_pages)
+    if not images:
+        raise RuntimeError("PDF 渲染为空：未获得任何页面图片")
+    parts = _ocr_page_parts(images, languages, max_new_tokens)
+    return "\n".join(parts), len(parts)
+
+
+def _run_ocr_image_page(
+    image_path: str, languages: list[str], max_new_tokens: int
+) -> tuple[str, int]:
+    """recognize_pdf 的图片输入分支：单图按单页合并（§4.3「输入 pdf/image」）。"""
+    from PIL import Image
+
+    img = Image.open(image_path)
+    img.load()
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    parts = _ocr_page_parts([img], languages, max_new_tokens)
+    return "\n".join(parts), 1
+
+
+# ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
 
@@ -285,6 +399,46 @@ def _validate_image_path(image_path: str) -> None:
                 "status": "error",
                 "error_code": "INVALID_INPUT",
                 "message": f"File too large ({size_mb:.1f} MB). Maximum is {MAX_FILE_SIZE_MB} MB.",
+                "detail": None,
+            },
+        )
+
+
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff", ".jpe"}
+
+
+def _validate_pdf_input(input_path: str) -> None:
+    """recognize_pdf 输入校验：文件存在 + 大小上限 + PDF/图片后缀。"""
+    p = Path(input_path)
+    if not p.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "status": "error",
+                "error_code": "FILE_NOT_FOUND",
+                "message": f"Input not found: {input_path}",
+                "detail": None,
+            },
+        )
+    size_mb = p.stat().st_size / (1024 * 1024)
+    if size_mb > MAX_PDF_SIZE_MB:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "status": "error",
+                "error_code": "INVALID_INPUT",
+                "message": f"File too large ({size_mb:.1f} MB). Maximum is {MAX_PDF_SIZE_MB} MB.",
+                "detail": None,
+            },
+        )
+    suffix = p.suffix.lower()
+    if suffix != ".pdf" and suffix not in _IMAGE_SUFFIXES:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "status": "error",
+                "error_code": "INVALID_INPUT",
+                "message": f"recognize_pdf 仅支持 PDF 或图片输入（[{', '.join(sorted(_IMAGE_SUFFIXES))}]），收到后缀: {suffix or '(无)'}",
                 "detail": None,
             },
         )
@@ -344,6 +498,84 @@ async def _recognize(image_path: str, params: dict) -> dict:
         "status": "completed",
         "output_type": "json",
         "result": result_payload,
+        "output_path": None,
+        "elapsed_seconds": elapsed,
+    }
+
+
+async def _recognize_pdf(input_path: str, params: dict) -> dict:
+    """recognize_pdf 主流程（冻结契约 A7）：PDF/图片 → 多页合并 Markdown。
+
+    dpi 钳制 150-600（默认 300）；max_pages 钳制 0-200（0=全部）；
+    output_format=md + 执行器注入 output_path 走 MODULE_SPEC §5 文件产物。
+    """
+    started = time.time()
+
+    languages = _normalize_languages(params.get("languages"))
+    try:
+        max_new_tokens = max(64, min(32768, int(params.get("max_new_tokens", 8192))))
+    except (TypeError, ValueError):
+        max_new_tokens = 8192
+
+    dpi = _clamp_int(params.get("dpi", DEFAULT_DPI), MIN_DPI, MAX_DPI, DEFAULT_DPI)
+    max_pages = _clamp_int(
+        params.get("max_pages", 0), 0, MAX_PAGES, 0
+    )
+
+    is_pdf = Path(input_path).suffix.lower() == ".pdf"
+
+    try:
+        if is_pdf:
+            text, pages = await run_in_threadpool(
+                _run_ocr_pdf, input_path, languages, max_new_tokens, dpi, max_pages
+            )
+        else:
+            text, pages = await run_in_threadpool(
+                _run_ocr_image_page, input_path, languages, max_new_tokens
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("recognize_pdf failed: %s\n%s", exc, traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "status": "error",
+                "error_code": "INFERENCE_ERROR",
+                "message": str(exc),
+                "detail": None,
+            },
+        )
+
+    elapsed = round(time.time() - started, 3)
+
+    # ── 文件产物模式（MODULE_SPEC §5.2：执行器注入 output_path，同 recognize）──
+    output_format = str(params.get("output_format") or "json").strip().lower()
+    output_path = params.get("output_path")
+    if output_format != "json" and output_path:
+        try:
+            p = Path(str(output_path))
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text, encoding="utf-8")
+            logger.info("recognize_pdf result written to %s (format=%s)", p, output_format)
+            return {
+                "status": "completed",
+                "output_type": "file",
+                "result": str(p),
+                "output_path": str(p),
+                "pages_processed": pages,
+                "dpi": dpi if is_pdf else None,
+                "elapsed_seconds": elapsed,
+            }
+        except Exception as exc:
+            logger.warning("Failed to write result file (%s); falling back to JSON", exc)
+
+    return {
+        "status": "completed",
+        "output_type": "json",
+        "result": {"text": text},
+        "pages_processed": pages,
+        "dpi": dpi if is_pdf else None,
         "output_path": None,
         "elapsed_seconds": elapsed,
     }
@@ -426,6 +658,87 @@ async def predict_recognize(
                 pass
 
 
+@app.post("/predict/recognize_pdf")
+async def predict_recognize_pdf(
+    request: Request,
+    file: Optional[UploadFile] = File(None),
+    input_path_form: Optional[str] = Form(None, alias="input_path"),
+    params_form: Optional[str] = Form(None, alias="params"),
+):
+    """Recognise a PDF（或单图，§4.3「输入 pdf/image」）为多页合并 Markdown。
+
+    与 recognize 同契约双形态（multipart file/input_path + params JSON 字符串，
+    或 JSON body {input_path, params}）；PDF 按 dpi 逐页渲染→逐页复用同模型
+    同提示词 OCR（`## Page {n}` + `---` 合并，源 app.py 格式），max_pages 截断；
+    output_format=md + output_path 走 MODULE_SPEC §5 文件产物。
+    """
+    tmp_path: str | None = None
+
+    try:
+        params = _parse_params(params_form)
+
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            body = await request.json()
+            params.update(_parse_params(body.get("params")))
+            input_path = body.get("input_path")
+            if not input_path:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "status": "error",
+                        "error_code": "INVALID_INPUT",
+                        "message": "Provide either a multipart 'file' upload or an 'input_path' field.",
+                        "detail": None,
+                    },
+                )
+        elif file is not None and file.filename:
+            suffix = Path(file.filename).suffix or ".pdf"
+            fd, tmp_path = tempfile.mkstemp(
+                suffix=suffix, prefix="ep_firered_ocr_pdf_"
+            )
+            os.close(fd)
+            with open(tmp_path, "wb") as f:
+                shutil.copyfileobj(file.file, f)
+            input_path = tmp_path
+        elif input_path_form:
+            input_path = input_path_form
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "status": "error",
+                    "error_code": "INVALID_INPUT",
+                    "message": "Provide either a multipart 'file' upload or an 'input_path' field.",
+                    "detail": None,
+                },
+            )
+
+        _validate_pdf_input(input_path)
+
+        if _state == "error":
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "status": "error",
+                    "error_code": "MODEL_NOT_LOADED",
+                    "message": "Model failed to load; see module logs.",
+                    "detail": _state_detail,
+                },
+            )
+
+        return JSONResponse(content=await _recognize_pdf(input_path, params))
+
+    except HTTPException:
+        raise
+    finally:
+        if tmp_path and Path(tmp_path).exists():
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 @app.get("/health")
 async def health():
     if _state == "ready":
@@ -469,7 +782,38 @@ async def info():
                         "default": "json",
                     },
                 },
-            }
+            },
+            {
+                "name": "recognize_pdf",
+                "description": (
+                    "PDF/图片 → 多页合并 Markdown（PDF 按 DPI 逐页渲染，复用"
+                    "同模型同提示词；`## Page {n}` + `---` 合并）"
+                ),
+                "input_type": "pdf",
+                "output_type": "json",
+                "params": {
+                    "dpi": {
+                        "type": "integer",
+                        "default": DEFAULT_DPI,
+                        "min": MIN_DPI,
+                        "max": MAX_DPI,
+                        "description": "PDF→图片分辨率（越高越清晰越慢）",
+                    },
+                    "max_pages": {
+                        "type": "integer",
+                        "default": 0,
+                        "min": 0,
+                        "max": MAX_PAGES,
+                        "description": "最大页数（0=全部）",
+                    },
+                    "output_format": {
+                        "type": "select",
+                        "options": ["json", "md"],
+                        "default": "json",
+                        "description": "md 配合执行器注入的 output_path 输出 md 文件产物（MODULE_SPEC §5）",
+                    },
+                },
+            },
         ],
     }
 

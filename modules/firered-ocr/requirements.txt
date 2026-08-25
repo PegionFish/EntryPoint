@@ -22,5 +22,7 @@ accelerate>=1.0.0
 # 官方 main.py 图像输入处理（PIL.Image）
 Pillow>=10.0.0
 
-# 官方 main.py 另含 gradio（WebUI）与 pdf2image（PDF 转图，需系统 Poppler），
-# 本适配器仅封装图片 OCR 推理路径，均未纳入；PDF 场景由管线先行转图。
+# 官方 main.py 另含 gradio（WebUI）与 pdf2image（PDF 转图，需系统 Poppler）。
+# 本适配器封装图片 OCR 推理路径；recognize_pdf（AI_Applications Parity）用
+# pypdfium2 渲染 PDF（免系统 Poppler，pdf2image 优先、pypdfium2 回退）。
+pypdfium2>=4.0.0

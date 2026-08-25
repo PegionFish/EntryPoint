@@ -73,6 +73,17 @@ ALIGNER_REPO_HINT = (
     f"经平台模型管理器下载到 <models_root>/{ALIGNER_TARGET_DIR} 后重启模块"
 )
 
+# 30 语言枚举（来源 qwen_asr.SUPPORTED_LANGUAGES，锁定顺序与官方一致）；
+# 供 language 校验、错误提示与 /info 说明使用，不改推理行为
+SUPPORTED_LANGUAGES: tuple[str, ...] = (
+    "Chinese", "English", "Cantonese", "Arabic", "German", "French", "Spanish",
+    "Portuguese", "Indonesian", "Italian", "Korean", "Russian", "Thai",
+    "Vietnamese", "Japanese", "Turkish", "Hindi", "Malay", "Dutch", "Swedish",
+    "Danish", "Finnish", "Polish", "Czech", "Filipino", "Persian", "Greek",
+    "Romanian", "Hungarian", "Macedonian",
+)
+LANGS_HINT = "、".join(SUPPORTED_LANGUAGES)
+
 # 常用 ISO 639-1/639-3 代码 → qwen_asr 规范语言名（SUPPORTED_LANGUAGES 共 30 种，
 # 此处收录有通行代码者；规范名可直接传入，其余交由底层校验报错）
 ISO_LANG_MAP: dict[str, str] = {
@@ -149,12 +160,35 @@ def _parse_params(raw: Any) -> dict:
     return raw if isinstance(raw, dict) else {}
 
 
+def _as_bool(v: Any, default: bool = False) -> bool:
+    """健壮布尔解析（防字符串 "false" 被 bool() 误判为 True）。"""
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
+
+
 def _normalize_language(raw: Any) -> Optional[str]:
     """"auto"/空 → None（自动检测）；ISO 代码 → 规范语言名；其余透传由底层校验。"""
     s = str(raw or "").strip()
     if not s or s.lower() in ("auto", "und"):
         return None
     return ISO_LANG_MAP.get(s.lower(), s)
+
+
+def _check_language(language: Optional[str]) -> Optional[str]:
+    """30 语言校验：None（auto）放行；不在 SUPPORTED_LANGUAGES 的返回错误文案。"""
+    if language is None:
+        return None
+    if language in SUPPORTED_LANGUAGES:
+        return None
+    return (
+        f"不支持的语言: {language!r}；支持 auto/规范语言名之一（{LANGS_HINT}）"
+        "或常用 ISO 代码（zh/en/yue/ja/...）"
+    )
 
 
 def _has_config(path: Path) -> bool:
@@ -405,6 +439,48 @@ def _audio_duration(path: str) -> float:
 
 
 # ---------------------------------------------------------------------------
+# SRT 字幕产物（srt_output 显式参数 / output_format=srt 注入双路径）
+# ---------------------------------------------------------------------------
+def _srt_timestamp(seconds: float) -> str:
+    """秒 → SRT 时间戳 HH:MM:SS,mmm（faster-whisper 同口径）。"""
+    ms = int(round(seconds * 1000))
+    h, ms = divmod(ms, 3600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _segments_to_srt(segments: list, fallback_text: str = "", duration: float = 0.0) -> str:
+    """segments [{start,end,text}] → SRT 文本；无 segments 时降级为单条全文。"""
+    if not segments:
+        if not fallback_text:
+            return ""
+        segments = [{"start": 0.0, "end": duration if duration > 0.0 else 1.0, "text": fallback_text}]
+    lines: list[str] = []
+    for idx, seg in enumerate(segments, start=1):
+        lines.append(str(idx))
+        lines.append(
+            f"{_srt_timestamp(float(seg['start']))} --> {_srt_timestamp(float(seg['end']))}"
+        )
+        lines.append(str(seg.get("text", "")).strip())
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _export_srt(srt_text: str, output_path: Optional[str] = None) -> str:
+    """写 .srt 文件。优先写入执行器注入的 output_path，否则写 WORKSPACE。"""
+    if output_path:
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        WORKSPACE.mkdir(parents=True, exist_ok=True)
+        out = WORKSPACE / f"transcribe_{int(time.time() * 1000)}.srt"
+    out.write_text(srt_text, encoding="utf-8")
+    logger.info("SRT 产物: %s (%d bytes)", out, out.stat().st_size)
+    return str(out)
+
+
+# ---------------------------------------------------------------------------
 # 输入解析（multipart 文件上传 / JSON input_path 双形态）
 # ---------------------------------------------------------------------------
 async def _extract_audio_request(request: Request, file: Optional[UploadFile], params_form: Optional[str]):
@@ -486,8 +562,11 @@ async def info():
                     "language": {"type": "string", "default": "auto"},
                     "context": {"type": "string", "default": ""},
                     "timestamps": {"type": "boolean", "default": True},
+                    "srt_output": {"type": "boolean", "default": False, "description": "同时输出 .srt 字幕文件产物（需 timestamps）"},
                     "model": {"type": "string", "default": ""},
                 },
+                "supported_languages": list(SUPPORTED_LANGUAGES),
+                "language_hint": f"auto 或规范语言名/ISO 代码之一（共 30 种：{LANGS_HINT}）",
             },
             {
                 "name": "align",
@@ -509,7 +588,7 @@ async def predict_transcribe(
     file: Optional[UploadFile] = File(None),
     params_form: Optional[str] = Form(None, alias="params"),
 ):
-    """语音转文字。params: language(auto)/context 提示文本/timestamps/model 变体覆盖。"""
+    """语音转文字。params: language(auto)/context 提示文本/timestamps/srt_output/model 变体覆盖。"""
     t0 = time.perf_counter()
     tmp_file: Optional[Path] = None
     try:
@@ -524,6 +603,9 @@ async def predict_transcribe(
         context = str(params.get("context", "") or "")
         timestamps = bool(params.get("timestamps", True))
         language = _normalize_language(language_raw)
+        lang_err = _check_language(language)
+        if lang_err:
+            return _error(422, "INVALID_PARAMS", lang_err)
 
         try:
             model, aligner_ok = await _get_asr(params.get("model"))
@@ -564,7 +646,33 @@ async def predict_transcribe(
             words = _items_to_words(items)
             segments = _segments_from_words(full_text, items)
 
+        # SRT 产物：srt_output=true（显式参数）或 output_format=srt（执行器注入，带 output_path）
+        srt_output = _as_bool(params.get("srt_output", False))
+        output_format = str(params.get("output_format") or "").strip().lower()
+        injected_output_path = str(params.get("output_path") or "").strip() or None
+        srt_path: Optional[str] = None
+        if srt_output or output_format == "srt":
+            try:
+                srt_text = _segments_to_srt(
+                    segments,
+                    fallback_text=full_text,
+                    duration=_audio_duration(audio_path),
+                )
+                srt_path = _export_srt(srt_text, injected_output_path)
+            except OSError as exc:
+                logger.exception("SRT 写入失败")
+                return _error(500, "FILE_WRITE_ERROR", f"SRT 文件写入失败: {exc}")
+
         elapsed = round(time.perf_counter() - t0, 3)
+        # output_format=srt 注入契约：返回文件产物形态（faster-whisper 同口径）
+        if output_format == "srt":
+            return {
+                "status": "completed",
+                "output_type": "file",
+                "result": srt_path,
+                "output_path": srt_path,
+                "elapsed_seconds": elapsed,
+            }
         return {
             "status": "completed",
             "output_type": "json",
@@ -577,7 +685,7 @@ async def predict_transcribe(
                 "timestamps": bool(words),
                 "timestamps_degraded": bool(timestamps and not words),
             },
-            "output_path": None,
+            "output_path": srt_path,
             "elapsed_seconds": elapsed,
         }
     finally:
@@ -632,8 +740,11 @@ async def predict_align(
             return _error(
                 422, "INVALID_PARAMS",
                 "align 必须显式指定 language（不支持 auto 自动检测）",
-                f"支持语言名或 ISO 代码（如 Chinese/en、Japanese/ja）；收到: {raw_lang!r}",
+                f"支持规范语言名或 ISO 代码（共 30 种: {LANGS_HINT}）；收到: {raw_lang!r}",
             )
+        lang_err = _check_language(language)
+        if lang_err:
+            return _error(422, "INVALID_PARAMS", lang_err)
 
         if not audio_path:
             return _error(400, "INVALID_INPUT", "缺少音频输入（multipart 'file' 或 JSON 'input_path'）")

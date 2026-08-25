@@ -5,11 +5,13 @@ DeepFilter 音频降噪模块 — EntryPoint adapter
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
 import shutil
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -48,6 +50,15 @@ _df_state = None
 _sr: int = 48000
 _backend_used: str = "none"  # "deepfilternet" | "scipy" | "none"
 _model_load_error: Optional[str] = None
+
+# 当前 deepfilternet 版本的 df.enhance.enhance() 实际接受的关键字参数集
+# （0.5.6 仅 pad/atten_lim_db；≥0.6 对齐 libDF 全参数面）。启动时通过
+# inspect 检测，调用时只传入签名支持的键（kwargs 透传型接线）。
+_enhance_kwargs: Optional[frozenset] = None
+
+# post_filter/pf_beta 在 0.5.6 无原生 kwargs，靠运行时切换模型属性实现；
+# 共享模型需临界区，防止并发请求互相覆盖（默认路径无状态切换，不额外互斥）。
+_enhance_lock = threading.Lock()
 
 
 def _load_model() -> None:
@@ -90,7 +101,20 @@ def _load_model() -> None:
             _sys.modules.setdefault("torchaudio.backend", _backend)
             _sys.modules["torchaudio.backend.common"] = _common
 
-        from df.enhance import init_df
+        from df.enhance import enhance as _enhance_fn, init_df
+
+        # 装模型前先探测 enhance() 签名：0.5.6 只有 pad/atten_lim_db，
+        # 0.6+ 具备 libDF 的 post_filter/pf_beta/min_db_thresh/
+        # max_db_erb_thresh/max_db_df_thresh/reduce_mask 原生参数。
+        global _enhance_kwargs
+        try:
+            _enhance_sig = inspect.signature(inspect.unwrap(_enhance_fn)).parameters
+            _enhance_kwargs = frozenset(
+                k for k in _enhance_sig if k not in ("model", "df_state", "audio")
+            )
+        except (TypeError, ValueError):
+            _enhance_kwargs = frozenset()
+        log.info("df.enhance.enhance 支持参数: %s", sorted(_enhance_kwargs))
 
         model_path = None
         # 检查 EP_MODEL_DIR 下是否有解压后的模型
@@ -148,15 +172,113 @@ def _load_model() -> None:
 # 音频处理
 # ---------------------------------------------------------------------------
 
+class InvalidParamError(ValueError):
+    """参数值非法（乱参 → HTTP 400）。"""
+
+
+def _strict_bool(value, name: str) -> bool:
+    """严格布尔解析：True/False、数字 0/1、字符串 true/false/1/0/yes/no。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0.0, 1.0):
+        return bool(value)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("true", "1", "yes", "on"):
+            return True
+        if s in ("false", "0", "no", "off"):
+            return False
+    raise InvalidParamError(f"参数 {name} 需要布尔值，得到: {value!r}")
+
+
+def _strict_float(value, name: str, lo: float, hi: float) -> float:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        raise InvalidParamError(f"参数 {name} 需要数值，得到: {value!r}") from None
+    if not (lo <= v <= hi):
+        raise InvalidParamError(f"参数 {name} 需要在 [{lo}, {hi}] 范围，得到: {value!r}")
+    return v
+
+
+def _strict_int(value, name: str, lo: int, hi: int) -> int:
+    if isinstance(value, bool):
+        raise InvalidParamError(f"参数 {name} 需要整数，得到: {value!r}")
+    try:
+        fv = float(value)
+    except (TypeError, ValueError):
+        raise InvalidParamError(f"参数 {name} 需要整数，得到: {value!r}") from None
+    if fv != int(fv):
+        raise InvalidParamError(f"参数 {name} 需要整数，得到: {value!r}")
+    v = int(fv)
+    if not (lo <= v <= hi):
+        raise InvalidParamError(f"参数 {name} 需要在 [{lo}, {hi}] 范围，得到: {value!r}")
+    return v
+
+
+def _build_enhance_kwargs(
+    attenuation: int,
+    compensate_delay,
+    post_filter: bool,
+    pf_beta: float,
+    min_db_thresh: float,
+    max_db_erb_thresh: float,
+    max_db_df_thresh: float,
+    reduce_mask: int,
+    native: frozenset,
+):
+    """构造传给 df.enhance.enhance() 的 kwargs（只含签名支持的键）。
+
+    libDF CLI 参数面 → python 后端映射：
+      --atten-lim-db       → atten_lim_db
+      --compensate-delay   → pad（真=补偿，假=不补偿）
+      --post-filter/--pf-beta → post_filter / pf_beta
+      --min-db-thresh/--max-db-erb-thresh/--max-db-df-thresh/--reduce-mask
+                           → 同名 kwargs（≥0.6 原生；0.5.6 不支持，降级处理）
+
+    compensate_delay=None 表示用户未显式传参：保持现有行为（pad=True），
+    即 module.toml 名义默认 false 不改变当前未传参时的输出。
+    """
+    pad = True if compensate_delay is None else bool(compensate_delay)
+    kwargs: dict = {"atten_lim_db": float(attenuation)}
+    if "pad" in native:
+        kwargs["pad"] = pad
+    native_map = {
+        "post_filter": post_filter,
+        "pf_beta": pf_beta,
+        "min_db_thresh": min_db_thresh,
+        "max_db_erb_thresh": max_db_erb_thresh,
+        "max_db_df_thresh": max_db_df_thresh,
+        "reduce_mask": reduce_mask,
+    }
+    for key, val in native_map.items():
+        if key in native:
+            kwargs[key] = val
+    return kwargs, pad
+
+
 def _denoise_deepfilternet(
-    audio: np.ndarray, sr: int, attenuation: int, min_db: float
+    audio: np.ndarray,
+    sr: int,
+    attenuation: int,
+    min_db: float,
+    post_filter: bool = False,
+    pf_beta: float = 0.02,
+    min_db_thresh: float = -15.0,
+    max_db_erb_thresh: float = 35.0,
+    max_db_df_thresh: float = 35.0,
+    reduce_mask: int = 1,
+    compensate_delay: Optional[bool] = None,
 ) -> np.ndarray:
     """使用 DeepFilterNet 进行降噪。
 
-    注意：deepfilternet 0.5.6 的 enhance() 签名为
-    enhance(model, df_state, audio, pad=True, atten_lim_db=None)，不接受
-    min_db 参数（传入会 TypeError 导致推理 500）。min_db（最小增益下限）
-    改由 adapter 在 enhance 之后通过 _apply_gain_floor 实现，API 语义不变。
+    参数面 = 源应用 libDF CLI（enhance_wav）的 CLI 参数映射，透传 policy:
+    - enhance() 原生支持的参数（0.6+ 全参数面；0.5.6 仅 pad/atten_lim_db）
+      → kwargs 透传；
+    - 0.5.6 的 post_filter/pf_beta → 运行时切换 DeepFilterNet3 模型属性
+      （forward 中 post_filter/post_filter_beta 生效，语义与 libDF 一致）；
+    - min_db（最小增益下限）非 enhance() 参数，由 adapter 通过
+      _apply_gain_floor 实现，API 语义不变。
     """
     import torch
     from df.enhance import enhance
@@ -173,13 +295,43 @@ def _denoise_deepfilternet(
     else:
         tensor = torch.from_numpy(audio_f32.T)  # (channels, samples)
 
-    with torch.no_grad():
-        enhanced = enhance(
-            _model,
-            _df_state,
-            tensor,
-            atten_lim_db=float(attenuation),
-        )
+    native = _enhance_kwargs if _enhance_kwargs is not None else frozenset()
+    kwargs, pad = _build_enhance_kwargs(
+        attenuation,
+        compensate_delay,
+        post_filter,
+        pf_beta,
+        min_db_thresh,
+        max_db_erb_thresh,
+        max_db_df_thresh,
+        reduce_mask,
+        native,
+    )
+
+    with torch.no_grad(), _enhance_lock:
+        # 0.5.6 无原生 post_filter：DF3 模型的 post_filter/post_filter_beta 是
+        # forward 内生效的属性，运行时切换等价于 libDF CLI 的 --post-filter/--pf-beta；
+        # DF1/DF2 系（PF 嵌入 Mask）无运行时开关 → 不支持，警告后忽略。
+        # 切换+推理必须在锁内，避免并发请求互相覆盖共享模型状态。
+        toggled = None
+        if post_filter and "post_filter" not in native:
+            if hasattr(_model, "post_filter"):
+                toggled = (_model.post_filter, getattr(_model, "post_filter_beta", None))
+                _model.post_filter = True
+                if hasattr(_model, "post_filter_beta"):
+                    _model.post_filter_beta = pf_beta
+                log.info("post_filter=on (pf_beta=%.3g) 运行时切换生效", pf_beta)
+            else:
+                log.warning(
+                    "当前模型不支持运行时 post_filter（DF1/DF2 系），参数被忽略"
+                )
+        try:
+            enhanced = enhance(_model, _df_state, tensor, **kwargs)
+        finally:
+            if toggled is not None:
+                _model.post_filter = toggled[0]
+                if toggled[1] is not None and hasattr(_model, "post_filter_beta"):
+                    _model.post_filter_beta = toggled[1]
 
     result = enhanced.squeeze(0).cpu().numpy()
     # min_db：增益下限后处理，防止过度抑制把弱语音压成静音
@@ -466,6 +618,36 @@ async def predict_denoise(
         except (TypeError, ValueError):
             min_db = -60.0
 
+        # ---- libDF CLI 参数面（A6 新增，全部追加式；既有参数行为不变）----
+        # 严格解析：乱参/越界 → 400 INVALID_PARAM；全部默认值等于现有/CLI 语义。
+        new_keys = (
+            "post_filter", "pf_beta", "min_db_thresh", "max_db_erb_thresh",
+            "max_db_df_thresh", "reduce_mask", "compensate_delay",
+        )
+        provided = {k for k in new_keys if k in params_dict}
+        try:
+            post_filter = _strict_bool(params_dict.get("post_filter", False), "post_filter")
+            pf_beta = _strict_float(params_dict.get("pf_beta", 0.02), "pf_beta", 0.0, 2.0)
+            min_db_thresh = _strict_float(
+                params_dict.get("min_db_thresh", -15.0), "min_db_thresh", -100.0, 0.0
+            )
+            max_db_erb_thresh = _strict_float(
+                params_dict.get("max_db_erb_thresh", 35.0),
+                "max_db_erb_thresh", 0.0, 100.0,
+            )
+            max_db_df_thresh = _strict_float(
+                params_dict.get("max_db_df_thresh", 35.0),
+                "max_db_df_thresh", 0.0, 100.0,
+            )
+            reduce_mask = _strict_int(params_dict.get("reduce_mask", 1), "reduce_mask", 1, 2)
+            if "compensate_delay" in params_dict:
+                compensate_delay = _strict_bool(params_dict.get("compensate_delay"), "compensate_delay")
+            else:
+                # 未显式传 → None：保持现有行为（enhance pad=True，延迟补偿开启）
+                compensate_delay = None
+        except InvalidParamError as exc:
+            return _error(400, "INVALID_PARAM", f"参数校验失败: {exc}")
+
         # 读取音频
         try:
             audio, sr = sf.read(str(src_path), dtype="float32")
@@ -477,8 +659,21 @@ async def predict_denoise(
         # 降噪
         t0 = time.time()
         if _backend_used == "deepfilternet":
-            enhanced = _denoise_deepfilternet(audio, sr, attenuation, min_db)
+            enhanced = _denoise_deepfilternet(
+                audio, sr, attenuation, min_db,
+                post_filter=post_filter,
+                pf_beta=pf_beta,
+                min_db_thresh=min_db_thresh,
+                max_db_erb_thresh=max_db_erb_thresh,
+                max_db_df_thresh=max_db_df_thresh,
+                reduce_mask=reduce_mask,
+                compensate_delay=compensate_delay,
+            )
         else:
+            if provided:
+                log.warning(
+                    "scipy fallback 不支持新参数，已忽略: %s", ", ".join(sorted(provided))
+                )
             enhanced = _denoise_scipy(audio, sr, attenuation, min_db)
         elapsed = time.time() - t0
         log.info("降噪完成: %.2fs 音频, 耗时 %.2fs", duration, elapsed)
@@ -505,6 +700,14 @@ async def predict_denoise(
                 "duration_secs": round(duration, 3),
                 "attenuation": attenuation,
                 "min_db": min_db,
+                "post_filter": post_filter,
+                "pf_beta": pf_beta,
+                "min_db_thresh": min_db_thresh,
+                "max_db_erb_thresh": max_db_erb_thresh,
+                "max_db_df_thresh": max_db_df_thresh,
+                "reduce_mask": reduce_mask,
+                # None（未显式传）→ 现有行为：延迟补偿开启
+                "compensate_delay": True if compensate_delay is None else compensate_delay,
             },
             "elapsed_seconds": round(elapsed, 3),
         }

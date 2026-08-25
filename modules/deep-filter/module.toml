@@ -51,3 +51,11 @@ max_file_size_mb = 500
 [interface.capabilities.params]
 attenuation = { type = "integer", default = 100, min = 0, max = 100, description = "降噪强度 (dB)" }
 min_db = { type = "float", default = -60.0, min = -100.0, max = 0.0, step = 1.0, description = "最小增益 (dB)" }
+# ---- A6：源应用 libDF CLI（enhance_wav）参数面对齐（全部追加式）----
+post_filter = { type = "boolean", default = false, description = "启用后置滤波（高噪段补偿）" }
+pf_beta = { type = "float", default = 0.02, min = 0.0, max = 2.0, step = 0.01, description = "后置滤波强度" }
+min_db_thresh = { type = "float", default = -15.0, min = -100.0, max = 0.0, step = 1.0, description = "DNN 本地 SNR 阈值下限" }
+max_db_erb_thresh = { type = "float", default = 35.0, min = 0.0, max = 100.0, step = 1.0, description = "ERB 解码器 SNR 上限" }
+max_db_df_thresh = { type = "float", default = 35.0, min = 0.0, max = 100.0, step = 1.0, description = "DF 解码器 SNR 上限" }
+reduce_mask = { type = "integer", default = 1, min = 1, max = 2, description = "多声道 mask 归并 1=max 2=mean" }
+compensate_delay = { type = "boolean", default = false, description = "补偿 STFT/模型 lookahead 延迟" }
