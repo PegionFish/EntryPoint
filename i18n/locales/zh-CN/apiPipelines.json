@@ -1,6 +1,7 @@
 {
   "execute.eitherRequired": "必须提供 pipeline_id 或 spec 之一",
   "execute.mutuallyExclusive": "pipeline_id 与 spec 不能同时提供",
+  "single.inputConflict": "input_path 与 input_text 只能提供其一",
   "execute.pipelineNotFound": "管线不存在: {{id}}",
   "execute.inputsUnknownNode": "inputs 引用的节点不存在: {{nodeId}}",
   "execute.inputsNotObject": "inputs[\"{{nodeId}}\"] 必须是参数对象",
