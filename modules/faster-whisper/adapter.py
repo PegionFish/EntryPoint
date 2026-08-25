@@ -36,6 +36,39 @@ MODULE_VERSION = "1.1.0"
 
 logger = logging.getLogger(EP_MODULE_ID)
 
+
+class _EpProgress:
+    """[EP-PROGRESS] 进度上报：msg 以 0–100 整数开头，前端取首个整数。
+
+    百分比单调递增；同类事件节流（步进 ≥ min_step_pct 或距上次 ≥
+    min_interval_s 才打印）；100 恒定上报。仅 print(flush=True)。
+    """
+
+    __slots__ = ("_min_step", "_min_interval", "_last_pct", "_last_ts")
+
+    def __init__(self, min_step_pct: int = 1, min_interval_s: float = 0.5) -> None:
+        self._min_step = max(1, int(min_step_pct))
+        self._min_interval = float(min_interval_s)
+        self._last_pct = -1
+        self._last_ts = 0.0
+
+    def report(self, pct: int, msg: str = "") -> None:
+        pct = max(0, min(100, int(pct)))
+        if pct < self._last_pct:
+            return
+        now = time.monotonic()
+        if (
+            pct < 100
+            and self._last_pct >= 0
+            and (pct - self._last_pct) < self._min_step
+            and (now - self._last_ts) < self._min_interval
+        ):
+            return
+        self._last_pct = pct
+        self._last_ts = now
+        text = f"{pct} {msg}".strip()
+        print(f"[EP-PROGRESS] {text}", flush=True)
+
 # ── 计算类型映射 ──────────────────────────────────────────
 COMPUTE_TYPE_MAP = {
     "cuda": "float16",
@@ -104,6 +137,7 @@ def _load_model():
         model_device = device
         model_compute_type = loaded_compute_type
         logger.info("Model loaded successfully")
+        _EpProgress().report(5, "model loaded")
     except Exception as exc:
         model_load_error = f"Failed to load model: {exc}"
         logger.exception(model_load_error)
@@ -213,6 +247,7 @@ def _ensure_precision(precision: str) -> bool:
         model_device = device
         model_compute_type = precision
         model_load_error = None
+        _EpProgress().report(5, "model reloaded (precision switch)")
         return True
     except Exception as exc:
         model_load_error = f"Precision switch to {precision} failed: {exc}"
@@ -369,6 +404,8 @@ async def predict(
             )
 
         # 6) 执行推理（GPU 失败时设备级回退 CPU 重试一次）
+        progress = _EpProgress(min_step_pct=5)
+
         def _do_transcribe():
             t0 = time.perf_counter()
             segments_gen, transcribe_info = model.transcribe(
@@ -379,6 +416,8 @@ async def predict(
                 word_timestamps=word_timestamps,
                 condition_on_previous_text=condition_on_previous,
             )
+
+            total_duration = float(getattr(transcribe_info, "duration", 0.0) or 0.0)
 
             # 消费生成器
             segments_out = []
@@ -401,6 +440,12 @@ async def predict(
                     ]
                 segments_out.append(seg_data)
                 full_text_parts.append(seg.text.strip())
+                if total_duration > 0:
+                    ratio = min(max(seg.end / total_duration, 0.0), 1.0)
+                    progress.report(
+                        5 + int(ratio * 90),
+                        f"segment {min(seg.end, total_duration):.1f}/{total_duration:.1f}s",
+                    )
 
             elapsed = round(time.perf_counter() - t0, 3)
             full_text = " ".join(full_text_parts)
@@ -439,6 +484,8 @@ async def predict(
                     500, "INFERENCE_ERROR",
                     f"Transcription failed: {exc}",
                 )
+
+        progress.report(100, "transcribe done")
 
         # 7) 文件导出：output_format=srt 时把识别结果写成字幕文件
         #    （output_path 由管线执行器注入，见 MODULE_SPEC 模块产物协议）

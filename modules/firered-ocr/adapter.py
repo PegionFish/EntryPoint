@@ -62,6 +62,39 @@ logging.basicConfig(
 )
 logger = logging.getLogger(EP_MODULE_ID)
 
+
+class _EpProgress:
+    """[EP-PROGRESS] 进度上报：msg 以 0–100 整数开头，前端取首个整数。
+
+    百分比单调递增；同类事件节流（步进 ≥ min_step_pct 或距上次 ≥
+    min_interval_s 才打印）；100 恒定上报。仅 print(flush=True)。
+    """
+
+    __slots__ = ("_min_step", "_min_interval", "_last_pct", "_last_ts")
+
+    def __init__(self, min_step_pct: int = 1, min_interval_s: float = 0.5) -> None:
+        self._min_step = max(1, int(min_step_pct))
+        self._min_interval = float(min_interval_s)
+        self._last_pct = -1
+        self._last_ts = 0.0
+
+    def report(self, pct: int, msg: str = "") -> None:
+        pct = max(0, min(100, int(pct)))
+        if pct < self._last_pct:
+            return
+        now = time.monotonic()
+        if (
+            pct < 100
+            and self._last_pct >= 0
+            and (pct - self._last_pct) < self._min_step
+            and (now - self._last_ts) < self._min_interval
+        ):
+            return
+        self._last_pct = pct
+        self._last_ts = now
+        text = f"{pct} {msg}".strip()
+        print(f"[EP-PROGRESS] {text}", flush=True)
+
 # 官方 conv_for_infer.py 的默认提示词（PDF 图片 -> 结构化 Markdown）
 DEFAULT_PROMPT = """You are an AI assistant specialized in converting PDF images to Markdown format. Please follow these instructions for the conversion:
 
@@ -322,6 +355,10 @@ def _ocr_page_parts(
             page_md = _run_ocr(page_path, languages, max_new_tokens)
             parts.append(f"## Page {idx}\n\n{page_md}\n\n---\n")
             logger.info("Page %d/%d OCR done (%d chars)", idx, len(images), len(page_md))
+            _EpProgress().report(
+                10 + (idx * 90) // len(images),
+                f"ocr page {idx}/{len(images)}",
+            )
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
     return parts
@@ -338,6 +375,7 @@ def _run_ocr_pdf(
     images = _render_pdf(pdf_path, dpi, limit=max_pages)
     if not images:
         raise RuntimeError("PDF 渲染为空：未获得任何页面图片")
+    _EpProgress().report(10, f"pdf rendered {len(images)} pages")
     parts = _ocr_page_parts(images, languages, max_new_tokens)
     return "\n".join(parts), len(parts)
 

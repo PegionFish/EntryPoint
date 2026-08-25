@@ -124,6 +124,39 @@ logging.basicConfig(
 )
 logger = logging.getLogger("qwen3-tts")
 
+
+class _EpProgress:
+    """[EP-PROGRESS] 进度上报：msg 以 0–100 整数开头，前端取首个整数。
+
+    百分比单调递增；同类事件节流（步进 ≥ min_step_pct 或距上次 ≥
+    min_interval_s 才打印）；100 恒定上报。仅 print(flush=True)。
+    """
+
+    __slots__ = ("_min_step", "_min_interval", "_last_pct", "_last_ts")
+
+    def __init__(self, min_step_pct: int = 1, min_interval_s: float = 0.5) -> None:
+        self._min_step = max(1, int(min_step_pct))
+        self._min_interval = float(min_interval_s)
+        self._last_pct = -1
+        self._last_ts = 0.0
+
+    def report(self, pct: int, msg: str = "") -> None:
+        pct = max(0, min(100, int(pct)))
+        if pct < self._last_pct:
+            return
+        now = time.monotonic()
+        if (
+            pct < 100
+            and self._last_pct >= 0
+            and (pct - self._last_pct) < self._min_step
+            and (now - self._last_ts) < self._min_interval
+        ):
+            return
+        self._last_pct = pct
+        self._last_ts = now
+        text = f"{pct} {msg}".strip()
+        print(f"[EP-PROGRESS] {text}", flush=True)
+
 # ---------------------------------------------------------------------------
 # 全局状态
 # ---------------------------------------------------------------------------
@@ -299,6 +332,7 @@ def _load_qwen3_tts(model_path: Path) -> bool:
             device_map = "cpu"
             dtype = torch.float32
 
+        _EpProgress().report(0, f"model load start {model_path.name}")
         logger.info(
             "正在加载 Qwen3-TTS 模型: %s (backend=%s, device_map=%s, dtype=%s)",
             model_path, BACKEND, device_map, dtype,
@@ -315,6 +349,7 @@ def _load_qwen3_tts(model_path: Path) -> bool:
             "Qwen3-TTS 模型加载完成 (device_map=%s, type=%s)",
             device_map, _qwen_model_type(_model),
         )
+        _EpProgress().report(40, "model ready")
         return True
     except Exception as exc:
         _load_error = f"Qwen3-TTS 加载失败: {exc}"
@@ -792,6 +827,7 @@ async def _predict(
 
     # ---- 执行 ----
     t0 = time.time()
+    progress = _EpProgress()
     fallback_note: Optional[str] = None
     sr = sample_rate
     try:
@@ -802,6 +838,7 @@ async def _predict(
             err = await _ensure_capability_model(inference_cap)
             if err is not None:
                 return _error(503, "MODEL_NOT_LOADED", err)
+            progress.report(40, f"generate {inference_cap} ({len(text)} chars)")
             try:
                 duration, sr = await asyncio.get_event_loop().run_in_executor(
                     None, _sync_generate,
@@ -829,6 +866,8 @@ async def _predict(
                 else:
                     return _error(400, "UNSUPPORTED_CAPABILITY", str(cm_exc))
 
+        progress.report(95, "synthesis done")
+
         # edge-tts 无法转 WAV 时可能降级输出同名 .mp3
         if not output_path.exists():
             alt = output_path.with_suffix(".mp3")
@@ -837,6 +876,7 @@ async def _predict(
             else:
                 raise RuntimeError("合成完成但输出文件不存在")
 
+        progress.report(100, f"{cap} done")
         elapsed = round(time.time() - t0, 3)
         metadata: dict[str, Any] = {
             "engine": _engine,

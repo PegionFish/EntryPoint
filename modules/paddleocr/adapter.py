@@ -54,6 +54,45 @@ logging.basicConfig(
 )
 logger = logging.getLogger(MODULE_ID)
 
+
+# ---------------------------------------------------------------------------
+# Structured progress reporting ([EP-PROGRESS] contract)
+# ---------------------------------------------------------------------------
+
+
+class _EpProgress:
+    """[EP-PROGRESS] 进度上报：msg 以 0–100 整数开头，前端取首个整数。
+
+    百分比单调递增；同类事件节流（步进 ≥ min_step_pct 或距上次 ≥
+    min_interval_s 才打印）；100 恒定上报。仅 print(flush=True)。
+    """
+
+    __slots__ = ("_min_step", "_min_interval", "_last_pct", "_last_ts")
+
+    def __init__(self, min_step_pct: int = 1, min_interval_s: float = 0.5) -> None:
+        self._min_step = max(1, int(min_step_pct))
+        self._min_interval = float(min_interval_s)
+        self._last_pct = -1
+        self._last_ts = 0.0
+
+    def report(self, pct: int, msg: str = "") -> None:
+        pct = max(0, min(100, int(pct)))
+        if pct < self._last_pct:
+            return
+        now = time.monotonic()
+        if (
+            pct < 100
+            and self._last_pct >= 0
+            and (pct - self._last_pct) < self._min_step
+            and (now - self._last_ts) < self._min_interval
+        ):
+            return
+        self._last_pct = pct
+        self._last_ts = now
+        text = f"{pct} {msg}".strip()
+        print(f"[EP-PROGRESS] {text}", flush=True)
+
+
 # ---------------------------------------------------------------------------
 # Lazy OCR engine
 # ---------------------------------------------------------------------------
@@ -501,8 +540,12 @@ def _run_doc_understand(input_path: str, params: dict | None) -> dict:
         "chart": bool(params.get("chart", False)),
     }
 
+    progress = _EpProgress()
+    if _pps3_engine is None:
+        progress.report(0, "pps3 pipeline build")
     engine = _get_pps3()
     _check_pps3_switches(engine, switches)
+    progress.report(8, "pps3 pipeline ready")
 
     workdir = Path(tempfile.mkdtemp(prefix="ep_docu_"))
     try:
@@ -553,7 +596,12 @@ def _run_doc_understand(input_path: str, params: dict | None) -> dict:
                 "doc_understand page %d/%d done (md %d chars)",
                 idx, len(page_images), len(page_text),
             )
+            progress.report(
+                8 + (idx * 90) // len(page_images),
+                f"page {idx}/{len(page_images)}",
+            )
 
+        progress.report(100, "doc_understand done")
         md_full = "\n\n".join(part for part in md_parts if part).rstrip()
         payload = {
             "markdown": md_full,
