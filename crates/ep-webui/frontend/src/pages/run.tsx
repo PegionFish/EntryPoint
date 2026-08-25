@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api } from '@/api/client'
-import type { ModuleResponse } from '@/api/types'
+import type { DeviceResponse, ModuleResponse } from '@/api/types'
 import { PageContainer } from '@/components/layout/page-container'
 import { SegmentedTabs } from '@/components/shared/segmented-tabs'
 import {
@@ -46,6 +46,7 @@ export function RunPage() {
     Map<string, Map<string, string>>
   >(new Map())
   const [idleMinutes, setIdleMinutes] = useState<number | null>(null)
+  const [devices, setDevices] = useState<DeviceResponse[]>([])
   const [category, setCategory] = useState('')
   const [selectedKey, setSelectedKey] = useState<string | null>(null)
   const [sessionTasks, setSessionTasks] = useState<string[]>([])
@@ -76,6 +77,10 @@ export function RunPage() {
         }
         setModelStatusMap(map)
       })
+      .catch(() => {})
+    api
+      .devices()
+      .then((list) => !cancelled && setDevices(list))
       .catch(() => {})
     return () => {
       cancelled = true
@@ -112,6 +117,8 @@ export function RunPage() {
           category: (mod.category || 'custom').trim().toLowerCase(),
           capability: cap,
           serviceStatus: mod.service_status,
+          device: mod.device ?? null,
+          backends: (mod.backends ?? []).map((b) => b.toLowerCase()),
           modelReady:
             variant === null
               ? null
@@ -218,8 +225,15 @@ export function RunPage() {
             {selected ? (
               <RunWorkbench
                 entry={selected}
+                devices={devices}
                 idleMinutes={idleMinutes}
                 onSubmitted={handleSubmitted}
+                onModuleChanged={() => {
+                  api
+                    .modules()
+                    .then(setModules)
+                    .catch(() => {})
+                }}
               />
             ) : (
               <div className="rounded-xl border border-dashed border-border p-8 text-center text-sm text-muted-foreground">

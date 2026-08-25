@@ -26,5 +26,10 @@
   "modelNotReady": "模型未就绪",
   "goModules": "去模块页下载",
   "statusRunning": "运行中",
-  "statusStopped": "已停止"
+  "statusStopped": "已停止",
+  "device.label": "算力源",
+  "device.auto": "自动（跟随计算策略）",
+  "device.conflict": "模块正运行于 {{current}}；所选 {{target}} 需重启切换",
+  "device.restartRun": "重启并在此设备执行",
+  "device.switching": "正在停止模块…"
 }

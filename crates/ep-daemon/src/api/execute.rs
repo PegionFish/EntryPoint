@@ -534,6 +534,14 @@ async fn execute_single(
         .get("lazy_start")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // device（D-Device 完整版）：显式指定算力源（"cuda:0"/"rocm:0"/"cpu"…，
+    // 空串与 "auto" 视为未指定）。值语义校验在 manifest 解析后（需后端信息）。
+    let device_hint: Option<String> = body
+        .get("device")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto"))
+        .map(str::to_string);
     let request_params = match body.get("params") {
         None | Some(Value::Null) => json!({}),
         Some(p) if p.is_object() => p.clone(),
@@ -614,7 +622,19 @@ async fn execute_single(
         }
     };
 
-    // ── 4. 输入落位：Path 校验既有存在性；Text 物化为 uploads 下 .txt（D2）──
+    // ── 4. 设备指定硬校验（D-Device）：非法 hint 快速失败 400，不占闸门 ──
+    if let Some(hint) = device_hint.as_deref() {
+        if let Err(msg) =
+            super::resolve_device_hint(&state, &manifest, Some(hint)).await
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("设备指定非法：{msg}") })),
+            );
+        }
+    }
+
+    // ── 5. 输入落位：Path 校验既有存在性；Text 物化为 uploads 下 .txt（D2）──
     let input_path = match &input_choice {
         SingleInput::Path(p) => {
             // 输入文件必须已存在于服务器本地（含 workspace/uploads 暂存）
@@ -637,18 +657,31 @@ async fn execute_single(
         }
     };
 
-    // ── 5. 模块自动拉起（§6.5：未运行 → 启动并等健康；超时计入任务错误语义）
+    // ── 6. 模块自动拉起（§6.5：未运行 → 启动并等健康；超时计入任务错误语义）
     //    D3：lazy_start=true 跳过本步——拉起改由任务准入后 ensure_pipeline_modules
-    //    幂等安全网完成，冷启动全程任务可见可追踪，失败计入任务错误。 ──
+    //    幂等安全网完成，冷启动全程任务可见可追踪，失败计入任务错误。
+    //    D-Device：预启动带显式设备指定（已硬校验）。 ──
     if lazy_start {
         info!(module_id = %module_id, "lazy_start=true：跳过提交前预启动，模块拉起由任务内安全网完成");
-    } else if let Err(e) = autostart::ensure_module_running(&state, &module_id).await {
+    } else if let Err(e) =
+        autostart::ensure_module_running_on_device(&state, &module_id, device_hint.as_deref()).await
+    {
         return autostart_error_response(&state, e).await;
     }
 
-    // ── 6. 提交退化三节点 DAG（B3 实现；任务/产物/WS 全套复用） ──
-    match execution::submit_direct(&state, &module_id, &capability, params, input_path).await {
-        Ok(task_id) => (StatusCode::ACCEPTED, Json(json!({ "task_id": task_id }))),
+    // ── 7. 提交退化三节点 DAG（B3 实现；任务/产物/WS 全套复用） ──
+    match execution::submit_direct_full(
+        &state,
+        &module_id,
+        &capability,
+        params,
+        input_path,
+        device_hint.as_deref(),
+        execution::SubmitOptions::default(),
+    )
+    .await
+    {
+        Ok(outcome) => (StatusCode::ACCEPTED, Json(json!({ "task_id": outcome.task_id }))),
         Err(e) => {
             err_response(
                 &state,
@@ -702,8 +735,7 @@ async fn autostart_error_response(
                 &[("detail", detail)],
             )
             .await
-        }
-        AutoStartError::PortAllocationFailed(detail) => {
+        }        AutoStartError::PortAllocationFailed(detail) => {
             err_response(
                 state,
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -720,6 +752,12 @@ async fn autostart_error_response(
                 &[("detail", detail)],
             )
             .await
+        }
+        AutoStartError::DeviceHint(msg) => {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("设备指定非法：{msg}") })),
+            )
         }
         AutoStartError::HealthTimeout {
             module_id,
@@ -1864,5 +1902,121 @@ mode = {{ type = "string", default = "fast", enum = ["fast", "slow"] }}
         assert_eq!(record.pipeline_id, "direct/lazy-mod");
         let record = wait_terminal(&task_id).await.expect("任务应终结");
         assert_eq!(record.status, execution::TaskState::Failed);
+    }
+
+    // ── 15. D-Device：显式算力源指定（快速调用算力源切换） ─────────────────────
+
+    /// 带设备快照的测试态：devices = [CPU]（direct_manifest_toml backends 即 cpu）。
+    fn device_test_state(root: std::path::PathBuf) -> Arc<AppState> {
+        let manifest: ModuleManifest = toml::from_str(&direct_manifest_toml()).unwrap();
+        let module = ep_core::module::discovery::DiscoveredModule {
+            path: root.join("modules").join("direct-mod"),
+            manifest: Some(manifest),
+            status: ep_core::module::discovery::DiscoveryStatus::Valid,
+        };
+        let cpu = ep_core::types::ComputeDevice {
+            id: ep_core::types::DeviceId::Cpu,
+            backend: ep_core::types::ComputeBackend::Cpu,
+            name: "CPU".to_string(),
+            total_memory_mb: None,
+            used_memory_mb: None,
+            utilization: None,
+            temperature: None,
+        };
+        let rocm = ep_core::types::ComputeDevice {
+            id: ep_core::types::DeviceId::Rocm(0),
+            backend: ep_core::types::ComputeBackend::Rocm,
+            name: "AMD RX 7900".to_string(),
+            total_memory_mb: None,
+            used_memory_mb: None,
+            utilization: None,
+            temperature: None,
+        };
+        Arc::new(AppState::new(
+            root,
+            AppConfig::default(),
+            vec![cpu, rocm],
+            vec![module],
+            PortManager::new(48360, 48370),
+        ))
+    }
+
+    /// 非法设备（不存在/不在线）→ 400，且不占闸门、无需预启动
+    #[tokio::test]
+    async fn test_single_device_hint_unknown_400() {
+        let _guard = execution::lock_for_tests();
+        execution::clear_registry_for_tests();
+        let state = device_test_state(unique_root("d-hint-unknown"));
+        let input = state.root.join("in.txt");
+        std::fs::write(&input, "data").unwrap();
+        let resp = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(state)
+            .oneshot(single_request(json!({
+                "module_id": "direct-mod",
+                "capability": "run",
+                "params": { "beam_size": 5 },
+                "input_path": input.display().to_string(),
+                "device": "cuda:0"
+            })))
+            .await
+            .unwrap();
+        let (status, json) = single_response(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "响应: {json}");
+        assert!(json["error"].as_str().unwrap().contains("cuda:0"));
+    }
+
+    /// 兼容性硬校验：hint 指向的设备后端与 manifest backends 不兼容 → 400
+    #[tokio::test]
+    async fn test_single_device_hint_incompatible_400() {
+        let _guard = execution::lock_for_tests();
+        execution::clear_registry_for_tests();
+        // 单测态设备池加 cuda 设备（manifest 只声明 cpu）→ 不兼容命中
+        let state = device_test_state(unique_root("d-hint-incompat"));
+        let input = state.root.join("in.txt");
+        std::fs::write(&input, "data").unwrap();
+        let resp = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(state)
+            .oneshot(single_request(json!({
+                "module_id": "direct-mod",
+                "capability": "run",
+                "params": { "beam_size": 5 },
+                "input_path": input.display().to_string(),
+                "device": "rocm:0"
+            })))
+            .await
+            .unwrap();
+        let (status, json) = single_response(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "响应: {json}");
+        assert!(json["error"].as_str().unwrap().contains("不兼容"));
+    }
+
+    /// 兼容 hint + lazy_start → 202（hint 校验通过并随任务流转）
+    #[tokio::test]
+    async fn test_single_device_hint_compatible_202() {
+        let _guard = execution::lock_for_tests();
+        execution::clear_registry_for_tests();
+        let state = device_test_state(unique_root("d-hint-ok"));
+        let input = state.root.join("in.txt");
+        std::fs::write(&input, "data").unwrap();
+        let resp = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(state)
+            .oneshot(single_request(json!({
+                "module_id": "direct-mod",
+                "capability": "run",
+                "params": { "beam_size": 5 },
+                "input_path": input.display().to_string(),
+                "lazy_start": true,
+                "device": "cpu"
+            })))
+            .await
+            .unwrap();
+        let (status, json) = single_response(resp).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "响应: {json}");
+        let task_id = json["task_id"].as_str().unwrap().to_string();
+        let record = execution::snapshot(&task_id).expect("任务应已入册");
+        assert_eq!(record.pipeline_id, "direct/direct-mod");
     }
 }

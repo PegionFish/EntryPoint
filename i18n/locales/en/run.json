@@ -26,5 +26,10 @@
   "modelNotReady": "Model not ready",
   "goModules": "Download in Modules",
   "statusRunning": "Running",
-  "statusStopped": "Stopped"
+  "statusStopped": "Stopped",
+  "device.label": "Compute source",
+  "device.auto": "Auto (follow compute strategy)",
+  "device.conflict": "Module is running on {{current}}; target {{target}} requires a restart",
+  "device.restartRun": "Restart & run here",
+  "device.switching": "Stopping module…"
 }

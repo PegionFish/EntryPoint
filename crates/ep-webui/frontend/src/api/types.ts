@@ -60,6 +60,8 @@ export interface ModuleResponse {
    * 无模型模块为 null）——模块卡「变体选择器」选中值的权威数据源
    */
   active_model_id?: string | null
+  /** manifest 声明的计算后端（D-Device：算力源下拉兼容性过滤依据） */
+  backends?: string[]
 }
 
 export interface ModuleStatusResponse {
@@ -494,6 +496,8 @@ export interface DirectExecRequest {
   input_text?: string
   /** true = 跳过提交前同步等健康，模块拉起在任务内完成（D3；快速调用页专用） */
   lazy_start?: boolean
+  /** 显式算力源（D-Device 完整版："cuda:0"/"rocm:0"/"cpu"…；缺省 auto 跟随策略） */
+  device?: string
 }
 
 /** POST /api/execute/single 202 响应 */
