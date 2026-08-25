@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import {
   Activity,
   ChevronDown,
@@ -34,6 +34,12 @@ import { cn, formatBytes, formatUptime } from '@/lib/utils'
 
 /** 任务列表轮询间隔（毫秒），与模块状态页保持一致 */
 const POLL_INTERVAL = 5000
+
+/** ?focus= 深链定位后的临时高亮持续时长（毫秒） */
+const FOCUS_HIGHLIGHT_MS = 2000
+
+/** 直跑任务 pipeline_id 前缀（QUICK_RUN_PLAN D4：direct/<module_id>） */
+const DIRECT_PIPELINE_PREFIX = 'direct/'
 
 /** WS progress 消息节流窗口（毫秒）：一批进度消息只触发一次刷新 */
 const WS_REFRESH_DELAY = 300
@@ -138,6 +144,28 @@ function parseTaskFilter(raw: string | null): TaskFilter {
     raw === 'cancelled'
     ? raw
     : 'all'
+}
+
+/** 任务类型筛选值（QUICK_RUN_PLAN D4：与状态筛选正交的客户端过滤） */
+type TaskTypeFilter = 'all' | 'pipeline' | 'direct'
+
+/** 类型筛选会话保持键（与状态筛选同策略） */
+const TASK_TYPE_FILTER_STORAGE_KEY = 'ep.tasks.typeFilter'
+
+function parseTaskTypeFilter(raw: string | null): TaskTypeFilter {
+  return raw === 'pipeline' || raw === 'direct' ? raw : 'all'
+}
+
+/** 直跑任务判别式：pipeline_id 以 direct/ 开头；历史任务字段缺失视为管线类 */
+function isDirectRun(task: Pick<TaskSummary, 'pipeline_id'>): boolean {
+  return task.pipeline_id?.startsWith(DIRECT_PIPELINE_PREFIX) === true
+}
+
+/** 直跑任务 → 所属模块 id（非直跑返回 null） */
+function directModuleId(task: Pick<TaskSummary, 'pipeline_id'>): string | null {
+  return isDirectRun(task)
+    ? task.pipeline_id!.slice(DIRECT_PIPELINE_PREFIX.length)
+    : null
 }
 
 /** 任务开始时间戳格式（与前端支持的两种语言一一对应） */
@@ -301,12 +329,15 @@ function TaskCard({
   expanded,
   onToggle,
   onCancelled,
+  moduleNames,
 }: {
   task: TaskSummary
   expanded: boolean
   onToggle: () => void
   /** 取消受理成功后回调（页面层立即刷新列表） */
   onCancelled: () => void
+  /** 模块 id → 显示名（直跑任务名称 join 用；页面已有模块列表数据） */
+  moduleNames: Map<string, string>
 }) {
   const { t, i18n } = useTranslation('tasks')
   const [detail, setDetail] = useState<TaskDetail | null>(null)
@@ -319,6 +350,17 @@ function TaskCard({
 
   const terminal = isTerminalStatus(task.status)
 
+  // 直跑任务：徽章 + 「直跑 · 模块名」；模块 join 不到时回退原始 pipeline_id
+  const directModule = directModuleId(task)
+  const displayName =
+    directModule !== null
+      ? t('directName', {
+          defaultValue: 'Quick run · {{name}}',
+          name:
+            moduleNames.get(directModule) ?? (task.pipeline_id as string),
+        })
+      : (task.pipeline_name || task.id)
+
   /** 取消任务（排队中 → 立即终结；运行中 → 逻辑终态 cancelled） */
   async function handleCancel() {
     if (cancelling || terminal) return
@@ -327,7 +369,7 @@ function TaskCard({
       await api.cancelTask(task.id)
       toast.success(
         t('toast.cancelSucceeded', { defaultValue: '任务已取消' }),
-        { description: task.pipeline_name || task.id },
+        { description: displayName },
       )
       onCancelled()
     } catch (e) {
@@ -441,8 +483,16 @@ function TaskCard({
               !expanded && '-rotate-90',
             )}
           />
+          {directModule !== null && (
+            <Badge
+              variant="outline"
+              className="shrink-0 border-primary/30 bg-primary/10 text-primary"
+            >
+              {t('directBadge', { defaultValue: 'Quick run' })}
+            </Badge>
+          )}
           <span className="min-w-0 flex-1 truncate text-sm font-medium">
-            {task.pipeline_name || task.id}
+            {displayName}
           </span>
           <TaskStateBadge state={task.status} />
           <span className="font-mono text-xs text-muted-foreground">
@@ -625,6 +675,7 @@ function TaskCard({
 
 export function TasksPage() {
   const { t } = useTranslation('tasks')
+  const [searchParams, setSearchParams] = useSearchParams()
   const [modules, setModules] = useState<ModuleResponse[] | null>(null)
   const [statuses, setStatuses] = useState<
     Record<string, ModuleStatusResponse>
@@ -637,12 +688,26 @@ export function TasksPage() {
   const [statusFilter, setStatusFilter] = useState<TaskFilter>(() =>
     parseTaskFilter(sessionStorage.getItem(TASK_FILTER_STORAGE_KEY)),
   )
+  /** 任务类型筛选（全部/管线/直跑；与状态筛选正交，会话内保持） */
+  const [typeFilter, setTypeFilter] = useState<TaskTypeFilter>(() =>
+    parseTaskTypeFilter(
+      sessionStorage.getItem(TASK_TYPE_FILTER_STORAGE_KEY),
+    ),
+  )
+  /** ?focus= 深链命中的任务卡片临时高亮 id（~2s 后移除） */
+  const [focusHighlightId, setFocusHighlightId] = useState<string | null>(null)
   // 轮询失败只在恢复前提示一次，避免每 5s 弹 toast
   const taskToastShown = useRef(false)
+  /** 任务卡片 DOM 注册表：?focus= 深链 scrollIntoView 用 */
+  const cardRefs = useRef(new Map<string, HTMLDivElement>())
 
   useEffect(() => {
     sessionStorage.setItem(TASK_FILTER_STORAGE_KEY, statusFilter)
   }, [statusFilter])
+
+  useEffect(() => {
+    sessionStorage.setItem(TASK_TYPE_FILTER_STORAGE_KEY, typeFilter)
+  }, [typeFilter])
 
   const refresh = useCallback(async () => {
     try {
@@ -735,12 +800,79 @@ export function TasksPage() {
     return counts
   }, [tasks])
 
+  // ── 类型筛选（QUICK_RUN_PLAN D4）：直跑/管线计数与客户端过滤 ──
+  const typeCounts = useMemo(() => {
+    let pipeline = 0
+    let direct = 0
+    for (const task of tasks ?? []) {
+      if (isDirectRun(task)) direct += 1
+      else pipeline += 1
+    }
+    return { pipeline, direct }
+  }, [tasks])
+
+  // 模块 id → 显示名（复用页面已有的 GET /api/modules 数据，无需额外请求）
+  const moduleNames = useMemo(
+    () => new Map((modules ?? []).map((m) => [m.id, m.name])),
+    [modules],
+  )
+
   const filteredTasks = useMemo(() => {
     if (!tasks) return null
-    if (statusFilter === 'all') return tasks
-    const hit = TASK_FILTER_STATES[statusFilter]
-    return tasks.filter((task) => hit.has(task.status.trim().toLowerCase()))
-  }, [tasks, statusFilter])
+    return tasks.filter((task) => {
+      if (
+        statusFilter !== 'all' &&
+        !TASK_FILTER_STATES[statusFilter].has(task.status.trim().toLowerCase())
+      ) {
+        return false
+      }
+      if (typeFilter === 'pipeline' && isDirectRun(task)) return false
+      if (typeFilter === 'direct' && !isDirectRun(task)) return false
+      return true
+    })
+  }, [tasks, statusFilter, typeFilter])
+
+  // ── ?focus=<task_id> 深链（QUICK_RUN_PLAN D4）：
+  // 展开目标卡片 + 平滑滚动居中 + 临时高亮，随后清掉参数；
+  // 目标被当前筛选隐藏时先重置筛选；任务不存在则静默忽略 ──
+  useEffect(() => {
+    const focusId = searchParams.get('focus')
+    if (!focusId || tasks === null) return
+    const target = tasks.find((task) => task.id === focusId)
+    if (!target || !filteredTasks?.some((task) => task.id === focusId)) {
+      if (target) {
+        // 任务存在但被筛选隐藏：重置筛选，待下一轮渲染后定位
+        setStatusFilter('all')
+        setTypeFilter('all')
+        return
+      }
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev)
+          next.delete('focus')
+          return next
+        },
+        { replace: true },
+      )
+      return
+    }
+    const el = cardRefs.current.get(focusId)
+    if (!el) return // 卡片尚未挂载完成，等下一轮渲染
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev)
+        next.delete('focus')
+        return next
+      },
+      { replace: true },
+    )
+    setExpandedId(focusId)
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    setFocusHighlightId(focusId)
+    window.setTimeout(() => {
+      setFocusHighlightId((cur) => (cur === focusId ? null : cur))
+    }, FOCUS_HIGHLIGHT_MS)
+  }, [searchParams, tasks, filteredTasks, setSearchParams])
 
   const filterItems = [
     {
@@ -771,6 +903,25 @@ export function TasksPage() {
       label: t('filter.cancelled', { defaultValue: '取消' }),
       count: filterCounts.cancelled,
       tone: 'text-status-preparing',
+    },
+  ]
+
+  // ── 类型筛选 chips（全部/管线/直跑）──
+  const typeFilterItems = [
+    {
+      value: 'all' as TaskTypeFilter,
+      label: t('type.all', { defaultValue: '全部' }),
+      count: tasks?.length,
+    },
+    {
+      value: 'pipeline' as TaskTypeFilter,
+      label: t('type.pipeline', { defaultValue: '管线' }),
+      count: typeCounts.pipeline,
+    },
+    {
+      value: 'direct' as TaskTypeFilter,
+      label: t('type.direct', { defaultValue: '直跑' }),
+      count: typeCounts.direct,
     },
   ]
 
@@ -903,17 +1054,26 @@ export function TasksPage() {
             title={t('stats.pipelineTasks')}
             count={tasks?.length}
           />
-          {/* 状态筛选（§7.4）：全部 / 运行中 / 已完成 / 失败 / 取消 */}
+          {/* 筛选：状态（§7.4）+ 类型（QUICK_RUN_PLAN D4）正交共存 */}
           {tasks !== null && tasks.length > 0 && (
-            <SegmentedTabs
-              items={filterItems}
-              value={statusFilter}
-              onChange={setStatusFilter}
-              ariaLabel={t('filter.ariaLabel', {
-                defaultValue: '按状态筛选任务',
-              })}
-              className="mb-3"
-            />
+            <div className="mb-3 flex flex-wrap items-center gap-2">
+              <SegmentedTabs
+                items={filterItems}
+                value={statusFilter}
+                onChange={setStatusFilter}
+                ariaLabel={t('filter.ariaLabel', {
+                  defaultValue: '按状态筛选任务',
+                })}
+              />
+              <SegmentedTabs
+                items={typeFilterItems}
+                value={typeFilter}
+                onChange={setTypeFilter}
+                ariaLabel={t('filter.typeAriaLabel', {
+                  defaultValue: '按类型筛选任务',
+                })}
+              />
+            </div>
           )}
           {tasksError && (
             <div className="mb-3 flex items-center gap-2 rounded-lg border border-status-error/30 bg-status-error/10 px-4 py-3 text-sm text-status-error">
@@ -963,15 +1123,30 @@ export function TasksPage() {
           ) : (
             <div className="space-y-3">
               {(filteredTasks ?? []).map((task) => (
-                <TaskCard
+                <div
                   key={task.id}
-                  task={task}
-                  expanded={expandedId === task.id}
-                  onToggle={() =>
-                    setExpandedId((cur) => (cur === task.id ? null : task.id))
-                  }
-                  onCancelled={() => void refreshTasks()}
-                />
+                  ref={(el) => {
+                    if (el) cardRefs.current.set(task.id, el)
+                    else cardRefs.current.delete(task.id)
+                  }}
+                  className={cn(
+                    'rounded-lg transition-shadow duration-(--duration-base)',
+                    focusHighlightId === task.id &&
+                      'glow-primary ring-2 ring-primary/70',
+                  )}
+                >
+                  <TaskCard
+                    task={task}
+                    expanded={expandedId === task.id}
+                    onToggle={() =>
+                      setExpandedId((cur) =>
+                        cur === task.id ? null : task.id,
+                      )
+                    }
+                    onCancelled={() => void refreshTasks()}
+                    moduleNames={moduleNames}
+                  />
+                </div>
               ))}
             </div>
           )}
