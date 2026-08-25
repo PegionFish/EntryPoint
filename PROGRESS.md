@@ -1,5 +1,27 @@
 # EntryPoint 开发进度
 
+## Wave QR（快速调用页 Quick Run）— ✅ 代码落地，待浏览器冒烟
+### 计划
+- docs/QUICK_RUN_PLAN.md（v2 已确认；多子代理并行规程 §6：W0 契约冻结 → W1 四代理并行 BE/FEA/FEB/DOC → W2 主页面 → W3 集成）
+### 完成
+- [x] W0 契约冻结：DirectExecRequest 增 `input_text`/`lazy_start` 可选字段（TS）；run i18n 命名空间（zh/en 28 键）+ sidebar.nav.quickrun
+- [x] W1-BE (Agent)：execute/single 文本输入物化 uploads/*.txt（复用 store_input_file 口径）+ lazy_start 跳过预启动 + 二选一 400 校验；新增 5 测试；CONFIG_REFERENCE 补 [modules] 章节
+- [x] W1-FEA (Agent)：ParamField/产物预览工具抽取至 components/quick-run/；模块卡空闲下线提示
+- [x] W1-FEB (Agent)：任务中心直跑徽章（direct/* 美化）+ 类型筛选 chips + ?focus= 深链高亮
+- [x] W1-DOC (Agent)：README 特性 / DESIGN §5.4 / WEBUI_GUIDE §6 快速调用章节（编号顺延）
+- [x] W2-FEC (INT)：/run 页——能力目录（category chips + 模型就绪 join）+ 双形态输入区 + schema 表单 + lazy 受理 + 会话任务区（轮询/WS/取消/产物预览下载/深链）
+- [x] W3 (INT)：双侧门禁全绿（cargo test --workspace 全过 / tsc / oxlint / i18n parity 脚本全命名空间 ok）+ static 产物提交
+### 待办
+- [ ] 浏览器 E2E 冒烟（QUICK_RUN_PLAN §8 八条：冷启动 ASR / TTS 文本 / 自动下线 120s 验证 / 抽屉回归 / 任务页筛选 / i18n 切换 / 异常路径 / 控制台零报错）
+### Git
+- commit: `dd2ed57b` — "feat(quickrun): w0 契约冻结"
+- commit: `5f13754e` — "feat(quickrun)/w1-be: input_text 物化 + lazy_start + [modules] 文档"
+- commit: `da681f14` — "refactor(quickrun)/w1-fea: 直跑组件抽取"
+- commit: `fc1c0192` — "feat(quickrun)/w1-feb: 任务中心直跑可视化"
+- commit: `da692cb5` — "docs(quickrun)/w1-doc: 三文档更新"
+- commit: `d4d78e58` — "feat(quickrun)/w2-fec: /run 主页面"
+- commit: `603356cd` — "chore(quickrun): static 构建产物"
+
 ## Wave -1 — ✅ 完成
 ### 完成
 - [x] ep-ui 重命名为 ep-desktop
