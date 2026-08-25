@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api } from '@/api/client'
 import type { DeviceResponse, ModuleResponse } from '@/api/types'
 import { PageContainer } from '@/components/layout/page-container'
 import { SegmentedTabs } from '@/components/shared/segmented-tabs'
+import { categoryVisual } from '@/components/shared/pipeline-node'
+import { categoryLabel } from '@/lib/constants'
 import {
   CapabilityCatalog,
   type CatalogEntry,
@@ -14,15 +17,18 @@ import { RunTaskCard } from '@/components/quick-run/run-task-card'
 /** 模块状态轮询间隔（毫秒），与任务中心一致 */
 const POLL_INTERVAL = 5000
 
-/** 分类 chips 展示顺序（其余 category 追加在后） */
+/** 分类 chips 展示顺序（与管线节点面板分组逻辑对齐：直观功能序）
+ *  未知类别归入尾部、以「其他」视觉兜底 */
 const CATEGORY_ORDER = [
   'asr',
   'tts',
   'denoise',
+  'audio',
   'ocr',
   'image',
   'video',
   'translate',
+  'llm',
   'custom',
 ]
 
@@ -141,25 +147,45 @@ export function RunPage() {
     return out
   }, [modules, modelStatusMap])
 
-  /** 分类 chips（含计数） */
-  const categories = useMemo(() => {
-    const counts = new Map<string, number>()
-    for (const e of entries) counts.set(e.category, (counts.get(e.category) ?? 0) + 1)
-    const ordered = [
-      ...CATEGORY_ORDER.filter((c) => counts.has(c)),
-      ...[...counts.keys()]
-        .filter((c) => !CATEGORY_ORDER.includes(c))
-        .sort(),
-    ]
-    return [
-      { value: '', label: t('categoryAll'), count: entries.length },
-      ...ordered.map((c) => ({
-        value: c,
-        label: c,
-        count: counts.get(c) ?? 0,
-      })),
-    ]
-  }, [entries, t])
+interface CategoryChip {
+  value: string
+  label: ReactNode
+  count: number
+  tone?: string
+}
+
+/** 分类 chip 构造：工程键 → 直观标签 + 管线面板同款图标/配色 */
+function chipOf(value: string, count: number, label: ReactNode): CategoryChip {
+  const visual = categoryVisual(value)
+  const Icon = visual.icon
+  return {
+    value,
+    count,
+    label: value === '' ? label : (
+      <span className="inline-flex items-center gap-1.5">
+        <Icon className="size-3.5" aria-hidden />
+        {label}
+      </span>
+    ),
+    // 具体类别才带 accent（「全部」保持中性主色）
+    // tone 仅取 text-* 部分（bg 由 SegmentedTabs 激活态主色铺垫）
+    tone: value === '' ? undefined : visual.accent.split(' ')[1],
+  }
+}
+
+/** 分类 chips（与管线节点面板同款直观分类：图标 + 中文标签 + 计数） */
+const categories = useMemo<CategoryChip[]>(() => {
+  const counts = new Map<string, number>()
+  for (const e of entries) counts.set(e.category, (counts.get(e.category) ?? 0) + 1)
+  const ordered = [
+    ...CATEGORY_ORDER.filter((c) => counts.has(c)),
+    ...[...counts.keys()].filter((c) => !CATEGORY_ORDER.includes(c)).sort(),
+  ]
+  return [
+    chipOf('', entries.length, t('categoryAll')),
+    ...ordered.map((c) => chipOf(c, counts.get(c) ?? 0, categoryLabel(c))),
+  ]
+}, [entries, t])
 
   const filtered = useMemo(
     () => (category ? entries.filter((e) => e.category === category) : entries),
