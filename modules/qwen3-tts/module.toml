@@ -1,14 +1,14 @@
 [module]
 id = "qwen3-tts"
 name = "Qwen3-TTS 语音合成"
-version = "1.0.0"
-description = "基于 Qwen3 的高质量多语言语音合成"
+version = "1.1.0"
+description = "基于 Qwen3 的高质量多语言语音合成（VoiceDesign 声音设计 / 参考音频克隆 / 内置音色 + 情感指导）"
 category = "tts"
 genre = "qwen-tts"
 authors = ["EntryPoint Community"]
 license = "Apache-2.0"
 homepage = "https://github.com/QwenLM/Qwen3-TTS"
-tags = ["tts", "speech-synthesis", "multilingual", "chinese"]
+tags = ["tts", "speech-synthesis", "multilingual", "chinese", "voice-clone"]
 
 [runtime]
 type = "python"
@@ -20,6 +20,8 @@ start_command = "{venv_python} {MODULE_DIR}/{entrypoint}"
 [compute]
 backends = ["cuda", "cpu"]
 default_backend = "cuda"
+# R1 缓解：默认档位给 0.6B/存量 1.7B 单模；VoiceDesign/Base 1.7B 变体显存需求
+# 在各自 [[models]].vram_estimate_mb 单独声明（约 8G 起），缺显存时由管理器提示。
 vram_estimate_mb = 3000
 min_vram_mb = 2048
 
@@ -46,18 +48,78 @@ repo_id = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 target_dir = "qwen3-tts-0.6b"
 size_estimate_mb = 2500
 
+# ─── 1.7B 三模变体（MODULE_PARITY_PLAN §4.3 A1 / §3 A1；W2 经本地导入
+#    /home/bob/AI_Applications/Qwen3TTS/models/Qwen3-TTS-12Hz-1.7B-* 到对应 target_dir） ───
+[[models]]
+id = "tts-voice-design"
+name = "Qwen3-TTS 1.7B VoiceDesign"
+source = "modelscope"
+repo_id = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+target_dir = "qwen3-tts-12hz-1.7b-voice-design"
+size_estimate_mb = 4500
+vram_estimate_mb = 8000
+
+[[models]]
+id = "tts-base-clone"
+name = "Qwen3-TTS 1.7B Base(克隆)"
+source = "modelscope"
+repo_id = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+target_dir = "qwen3-tts-12hz-1.7b-base-clone"
+size_estimate_mb = 4500
+vram_estimate_mb = 8000
+
+[[models]]
+id = "tts-custom-voice"
+name = "Qwen3-TTS 1.7B CustomVoice"
+source = "modelscope"
+repo_id = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+target_dir = "qwen3-tts-12hz-1.7b-custom-voice"
+size_estimate_mb = 4500
+vram_estimate_mb = 8000
+
 [interface]
 type = "http"
 health_endpoint = "/health"
 ready_timeout_secs = 120
 
+# ─── synthesize（保留兼容 + A1 扩展）：text + language(11 枚举) + instruct ───
 [[interface.capabilities]]
 name = "synthesize"
-description = "文本转语音，输出 WAV 音频文件"
+description = "文本转语音（VoiceDesign 语音设计 / CustomVoice 内置音色），输出 WAV 音频文件"
 input_type = "text"
 output_type = "audio"
 
 [interface.capabilities.params]
-voice = { type = "string", default = "default", description = "音色名称" }
-speed = { type = "float", default = 1.0, min = 0.5, max = 2.0, step = 0.1, description = "语速倍率" }
+voice = { type = "string", default = "default", description = "音色名称（CustomVoice 模型生效，兼容旧调用）" }
+language = { type = "select", options = ["auto", "chinese", "english", "german", "italian", "portuguese", "spanish", "japanese", "korean", "french", "russian"], default = "auto", description = "目标语言（auto=自动检测；共 10 种正名 + auto）" }
+instruct = { type = "string", default = "", description = "自然语言声音描述（VoiceDesign 模型）" }
+speed = { type = "float", default = 1.0, min = 0.5, max = 2.0, step = 0.1, description = "语速倍率（qwen-tts 库暂不支持时仅记录 metadata）" }
+sample_rate = { type = "integer", default = 24000, description = "输出采样率" }
+
+# ─── clone_voice（新）：Base 模型参考音频克隆，ref_text 留空 → x-vector 零样本 ───
+[[interface.capabilities]]
+name = "clone_voice"
+description = "参考音频声音克隆（Base 模型；ICL 克隆或零样本 x-vector），输出 WAV 音频文件"
+input_type = "text"
+output_type = "audio"
+
+[interface.capabilities.params]
+ref_audio = { type = "string", default = "", description = "参考音频服务器路径（前端上传后回填）" }
+ref_text = { type = "string", default = "", description = "参考文本；留空走 x-vector 零样本克隆" }
+language = { type = "select", options = ["auto", "chinese", "english", "german", "italian", "portuguese", "spanish", "japanese", "korean", "french", "russian"], default = "auto", description = "目标语言（auto=自动检测）" }
+speed = { type = "float", default = 1.0, min = 0.5, max = 2.0, step = 0.1, description = "语速倍率（qwen-tts 库暂不支持时仅记录 metadata）" }
+sample_rate = { type = "integer", default = 24000, description = "输出采样率" }
+
+# ─── custom_voice（新）：CustomVoice 九音色 + 情绪/风格 instruct ───
+[[interface.capabilities]]
+name = "custom_voice"
+description = "内置音色语音合成（9 音色 + 情绪指导），输出 WAV 音频文件"
+input_type = "text"
+output_type = "audio"
+
+[interface.capabilities.params]
+spk_id = { type = "select", options = ["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ryan", "Aiden", "Ono_Anna", "Sohee"], default = "Vivian", description = "内置音色" }
+instruct = { type = "string", default = "", description = "情绪/风格自然语言（如 生气、开心）" }
+language = { type = "select", options = ["auto", "chinese", "english", "german", "italian", "portuguese", "spanish", "japanese", "korean", "french", "russian"], default = "auto", description = "目标语言（auto=自动检测）" }
+speed = { type = "float", default = 1.0, min = 0.5, max = 2.0, step = 0.1, description = "语速倍率（qwen-tts 库暂不支持时仅记录 metadata）" }
 sample_rate = { type = "integer", default = 24000, description = "输出采样率" }
