@@ -1,5 +1,27 @@
 # EntryPoint 开发进度
 
+## Wave Parity（AI_Applications 功能对齐）— ✅ 交付完成（含真 E2E）
+### 计划
+- docs/MODULE_PARITY_PLAN.md（v2 已确认；多子代理并行规程：W0 契约冻结 → W1 七代理并行 → W2 权重导入 → W3 集成）
+### 完成
+- [x] W1-MOD-A1 (Agent)：qwen3-tts 三模（VoiceDesign synthesize+instruct / clone_voice 参考音频+零样本x-vector→ICL / custom_voice 9音色+风格instruct）+ 11 语言枚举 + 1.7B 三变体；adapter 跨变体换载
+- [x] W1-MOD-A2 (Agent)：paddleocr 新增 doc_understand（PP-StructureV3 文档理解：版面/表格结构/公式LaTeX/方向/去扭曲/DPI/PDF 多页/md+json 输出）+ recognize 保留
+- [x] W1-MOD-A3 (Agent)：faster-whisper 8 新变体（tiny/base/en系列/large-v1/v2）+ precision（fp16/int8 CPU锁定）
+- [x] W1-MOD-A4 (Agent)：qwen3-asr SRT 输出 + 30 语言枚举 + 1.7B 权重接线（权重 W2 导入）
+- [x] W1-MOD-A5 (Agent)：rembg 4 新变体（u2netp/u2net_human_seg/isnet-anime/u2net_cloth_seg）+ alpha_matting 模型白名单降级（isnet-general/birefnet 支持，其余 warn+关）
+- [x] W1-MOD-A6 (Agent)：deep-filter 7 新参数（post_filter/pf_beta/min_db_thresh/max_db_erb_thresh/max_db_df_thresh/reduce_mask/compensate_delay）
+- [x] W1-MOD-A7 (Agent)：firered-ocr recognize_pdf（PDF DPI 150-600/max_pages/多页 ## Page 合并/md+json 产物）
+- [x] W2：权重导入——TTS 1.7B 三件套(12.9G)/qwen3-asr-1.7B(20G)/rembg 4 onnx/whisper 8 HF/PP-Structure 14 子模型(3.1G)
+- [x] W3：真 E2E —— qwen3-tts custom_voice(Vivian 音色 4.88s WAV)+clone_voice(参考音频 5.52s WAV) / paddleocr doc_understand(PP-Structure GPU markdown 产物) / rembg remove_bg 真推理全部 ✅
+- [x] 真 E2E 踩坑修复：paddle PP-StructureV3 需 paddle 3.3.1 cu130(5090 sm_120)+paddleocr 3.4.0+paddlex[ocr]3.4.3；chart 识别 paddlex 3.4.3 官方 bug 默认关；firered input_type pdf→file（DataType 枚举）
+- [x] 回归门禁：cargo test --workspace 全绿（515/320/316 + 新）+ tsc 0 + clippy 0
+### Git
+- commit: `df30a781` "feat(parity)/mod-qwen3-tts: 1.7B 三模"
+- commit: `0564ff29` "feat(parity)/mod-paddleocr: PP-StructureV3 doc_understand"
+- commit: `1d51ed62` "feat(parity)/mod-faster-whisper: 8 新变体+precision"
+- commit: `679504d6` "feat(parity): qwen3-asr SRT+30语言+1.7B接线；rembg 4变体+alpha降级；deep-filter 7参数；firered OCR PDF"
+- commit: `6fc97a9e` "fix(parity)/w3: PP-StructureV3 真推理依赖栈 + chart 默认关 + firered input_type 修正"
+
 ## Wave QR（快速调用页 Quick Run）— ✅ 交付完成（含冒烟）
 ### 计划
 - docs/QUICK_RUN_PLAN.md（v2 已确认；多子代理并行规程 §6：W0 契约冻结 → W1 四代理并行 BE/FEA/FEB/DOC → W2 主页面 → W3 集成）
