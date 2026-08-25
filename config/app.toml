@@ -60,4 +60,4 @@ enabled = true
 
 [active_models]
 realesr = "realesrgan-animevideov3-x4-ncnn"
-qwen3-tts = "0.6b"
+qwen3-tts = "tts-base-clone"
