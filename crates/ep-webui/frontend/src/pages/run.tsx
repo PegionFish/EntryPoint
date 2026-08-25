@@ -55,7 +55,10 @@ export function RunPage() {
   const [devices, setDevices] = useState<DeviceResponse[]>([])
   const [category, setCategory] = useState('')
   const [selectedKey, setSelectedKey] = useState<string | null>(null)
-  const [sessionTasks, setSessionTasks] = useState<string[]>([])
+  /** 会话任务（含所属模块：进度流/日志尾巴/冷启动徽章按 module 过滤） */
+  const [sessionTasks, setSessionTasks] = useState<
+    { taskId: string; moduleId: string }[]
+  >([])
   const sessionRef = useRef<HTMLDivElement | null>(null)
 
   // 首次加载：config（空闲阈值）+ 模型状态；模块列表由轮询覆盖
@@ -206,8 +209,12 @@ const categories = useMemo<CategoryChip[]>(() => {
     [filtered, selectedKey],
   )
 
-  const handleSubmitted = useCallback((taskId: string) => {
-    setSessionTasks((prev) => (prev.includes(taskId) ? prev : [...prev, taskId]))
+  const handleSubmitted = useCallback((taskId: string, moduleId: string) => {
+    setSessionTasks((prev) =>
+      prev.some((t) => t.taskId === taskId)
+        ? prev
+        : [...prev, { taskId, moduleId }],
+    )
     // 提交后模块进入拉起流程，立即刷新一次状态点
     api
       .modules()
@@ -272,15 +279,22 @@ const categories = useMemo<CategoryChip[]>(() => {
         {sessionTasks.length > 0 && (
           <section ref={sessionRef} className="space-y-3">
             <div className="grid gap-3 lg:grid-cols-2">
-              {sessionTasks.map((id) => (
-                <RunTaskCard
-                  key={id}
-                  taskId={id}
-                  onDismiss={() =>
-                    setSessionTasks((prev) => prev.filter((x) => x !== id))
-                  }
-                />
-              ))}
+              {sessionTasks.map(({ taskId, moduleId }) => {
+                const mod = modules.find((m) => m.id === moduleId)
+                return (
+                  <RunTaskCard
+                    key={taskId}
+                    taskId={taskId}
+                    moduleId={moduleId}
+                    moduleStatus={mod?.service_status ?? null}
+                    onDismiss={() =>
+                      setSessionTasks((prev) =>
+                        prev.filter((t) => t.taskId !== taskId),
+                      )
+                    }
+                  />
+                )
+              })}
             </div>
           </section>
         )}

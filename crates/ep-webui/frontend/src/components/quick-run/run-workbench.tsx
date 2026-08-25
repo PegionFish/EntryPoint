@@ -60,7 +60,7 @@ export function RunWorkbench({
   devices: DeviceResponse[]
   /** 模块空闲自动下线阈值（分钟）；0/null = 常驻 */
   idleMinutes: number | null
-  onSubmitted: (taskId: string) => void
+  onSubmitted: (taskId: string, moduleId: string) => void
   /** 停止+重启切换算力源后通知父级刷新模块状态 */
   onModuleChanged: () => void
 }) {
@@ -163,7 +163,7 @@ export function RunWorkbench({
     try {
       const resp = await postExecuteSingle(buildRequest())
       toast.success(t('accepted'), { description: resp.task_id })
-      onSubmitted(resp.task_id)
+      onSubmitted(resp.task_id, entry.moduleId)
     } catch (e) {
       if (
         e instanceof Error &&
@@ -197,7 +197,7 @@ export function RunWorkbench({
       toast.success(t('accepted'), {
         description: `${resp.task_id} · ${deviceSel}`,
       })
-      onSubmitted(resp.task_id)
+      onSubmitted(resp.task_id, entry.moduleId)
     } catch (e) {
       toast.error(tModels('run.submitFailed'), { description: errMsg(e) })
     } finally {
