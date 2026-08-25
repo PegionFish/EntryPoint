@@ -21,7 +21,7 @@ use std::sync::Arc;
 use axum::{Router, extract::State, http::StatusCode, routing::post, Json};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::warn;
+use tracing::{info, warn};
 
 use ep_core::module::manifest::{CapabilityDecl, ModuleManifest, ParamSchema};
 use ep_core::pipeline::dag::Pipeline;
@@ -30,6 +30,7 @@ use ep_core::pipeline::load_pipeline;
 use super::autostart::{self, AutoStartError};
 use crate::api::err_response;
 use crate::api::pipelines::pipeline_bridge::{spec_to_pipeline, PipelineSpec};
+use crate::api::upload::{staging_id, store_input_file, UploadError};
 use crate::state::AppState;
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -349,6 +350,93 @@ fn check_param_type(name: &str, decl: &ParamSchema, value: &Value) -> Result<(),
     Ok(())
 }
 
+// ─── 直跑输入二选一（QUICK_RUN_PLAN D2：input_text 文本输入） ────────────────
+
+/// 直跑输入来源（纯数据，单测直接断言；handler 据此分流落位）
+#[derive(Debug, PartialEq)]
+pub(crate) enum SingleInput {
+    /// 服务器已有文件路径（既有链路，行为不变）
+    Path(PathBuf),
+    /// 文本内容（UTF-8 原文；handler 物化为 uploads 下 .txt 后走同一文件链路）
+    Text(String),
+}
+
+/// 二选一校验失败（handler 映射 400 + 既有 i18n 键，响应形状不变）
+#[derive(Debug, PartialEq)]
+pub(crate) enum SingleInputError {
+    /// 均缺失（含空白串）→ `apiPipelines.single.missingInputPath`（与旧契约一致）
+    Missing,
+    /// 同时给出 → 400（复用既有互斥键位）
+    BothProvided,
+}
+
+/// 空白串视为未给出（对齐既有 `input_path` 非空校验口径）
+fn single_input_present(raw: Option<&str>) -> bool {
+    raw.map(str::trim).filter(|s| !s.is_empty()).is_some()
+}
+
+/// `input_path` / `input_text` 二选一判定（D2，纯函数单测直接断言）：
+/// 均缺失或同时给出 → [`SingleInputError`]；文本原样保留（不做 trim）。
+pub(crate) fn choose_single_input(
+    input_path: Option<&str>,
+    input_text: Option<&str>,
+) -> Result<SingleInput, SingleInputError> {
+    match (
+        single_input_present(input_path),
+        single_input_present(input_text),
+    ) {
+        (false, false) => Err(SingleInputError::Missing),
+        (true, true) => Err(SingleInputError::BothProvided),
+        (true, false) => Ok(SingleInput::Path(PathBuf::from(
+            input_path.unwrap_or_default(),
+        ))),
+        (false, true) => Ok(SingleInput::Text(
+            input_text.unwrap_or_default().to_string(),
+        )),
+    }
+}
+
+/// D2：文本输入物化 —— 先写系统临时目录，再经共享助手
+/// [`store_input_file`] 落盘 `workspace/uploads/<module_id>-<capability>-<unix_ts>.txt`
+/// （UTF-8 原文），与 v1 门面（inference.rs submit_json）同一落盘口径；
+/// 重名由 place_input_file 追加序号消解。返回最终路径供既有 input_path 链路流转。
+async fn materialize_input_text(
+    state: &Arc<AppState>,
+    module_id: &str,
+    capability: &str,
+    text: &str,
+) -> Result<PathBuf, UploadError> {
+    // 暂存目录/命名对齐 inference.rs 先例（staging_id：纳秒 + 序号 + pid）
+    let temp_dir = std::env::temp_dir().join(format!("ep-execute-single-{}", std::process::id()));
+    if let Err(e) = tokio::fs::create_dir_all(&temp_dir).await {
+        return Err(UploadError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            key: "apiModels.uploadStagingFailed",
+            params: vec![("detail", e.to_string())],
+        });
+    }
+    let temp_path = temp_dir.join(format!("single-text-{}.txt", staging_id()));
+    let stored = match tokio::fs::write(&temp_path, text).await {
+        Ok(()) => {
+            let ts = chrono::Utc::now().timestamp();
+            store_input_file(
+                state,
+                &temp_path,
+                &format!("{module_id}-{capability}-{ts}.txt"),
+            )
+            .await
+        }
+        Err(e) => Err(UploadError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            key: "apiModels.uploadWriteFailed",
+            params: vec![("detail", e.to_string())],
+        }),
+    };
+    // 落盘成败与否都清理暂存文件（inference.rs 同款收尾）
+    let _ = tokio::fs::remove_file(&temp_path).await;
+    stored
+}
+
 /// 按 module_id 查找模块清单
 ///
 /// `pub(crate)`：inference.rs（v1 门面）共用同一查找口径。
@@ -367,10 +455,18 @@ pub(crate) async fn find_module_manifest(state: &AppState, module_id: &str) -> O
 
 /// POST /api/execute/single — 单模型直跑（§5.3）
 ///
-/// 请求体：`{module_id, capability, params?, input_path}`。
-/// 流程：字段/模块/capability/参数/输入文件校验 → 模块未运行则自动拉起并等健康
-/// （[`autostart::ensure_module_running`]，修 P1-2 直跑侧）→
+/// 请求体：`{module_id, capability, params?, input_path?, input_text?, lazy_start?}`
+///（QUICK_RUN_PLAN §5.1 仅增可选字段，向后兼容）。
+/// 流程：字段/模块/capability/参数/输入校验 → 模块未运行则自动拉起并等健康
+///（[`autostart::ensure_module_running`]，修 P1-2 直跑侧）→
 /// [`execution::submit_direct`]（B3：退化三节点 DAG）→ 202 `{"task_id"}`。
+///
+/// - `input_path` / `input_text` 二选一（D2）：均缺失或同传 → 400；
+///   文本经 [`materialize_input_text`] 落盘 uploads 后走既有文件链路，
+///   `build_direct_pipeline` 零改动；
+/// - `lazy_start = true` 时跳过提交前同步预启动（D3）：其余校验照旧同步
+///   快失败，模块拉起改由任务内 `ensure_pipeline_modules` 幂等安全网完成，
+///   失败计入任务错误；缺省 false 与现状完全一致。
 ///
 /// 状态码：400 字段/capability/参数/输入文件错误；404 模块不存在；
 /// 409 模型未就绪；500 venv/端口/启动/提交失败；504 自动拉起后等健康超时。
@@ -405,9 +501,15 @@ async fn execute_single(
             .await
         }
     };
-    let input_path = match body.get("input_path").and_then(|v| v.as_str()) {
-        Some(p) if !p.trim().is_empty() => PathBuf::from(p),
-        _ => {
+    // input_path / input_text 二选一（D2）：均缺失/同传 → 400（沿用既有
+    // 响应形状；判定位置与旧版 missingInputPath 同步——先于模块查找，旧客户端
+    // 错误优先级不变）。文本物化延后到校验全部通过后，非法请求不留垃圾文件。
+    let input_choice = match choose_single_input(
+        body.get("input_path").and_then(|v| v.as_str()),
+        body.get("input_text").and_then(|v| v.as_str()),
+    ) {
+        Ok(choice) => choice,
+        Err(SingleInputError::Missing) => {
             return err_response(
                 &state,
                 StatusCode::BAD_REQUEST,
@@ -416,7 +518,22 @@ async fn execute_single(
             )
             .await
         }
+        Err(SingleInputError::BothProvided) => {
+            return err_response(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "apiPipelines.execute.mutuallyExclusive",
+                &[],
+            )
+            .await
+        }
     };
+    // lazy_start（D3）：true = 跳过提交前同步预启动；缺省 false 与现状一致。
+    // 非 bool 值宽容按缺省处理（与本 handler 其余可选字段的宽松口径一致）。
+    let lazy_start = body
+        .get("lazy_start")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let request_params = match body.get("params") {
         None | Some(Value::Null) => json!({}),
         Some(p) if p.is_object() => p.clone(),
@@ -497,19 +614,35 @@ async fn execute_single(
         }
     };
 
-    // ── 4. 输入文件必须已存在于服务器本地（含 workspace/uploads 暂存） ──
-    if !input_path.is_file() {
-        return err_response(
-            &state,
-            StatusCode::BAD_REQUEST,
-            "apiPipelines.single.inputNotFound",
-            &[("path", input_path.display().to_string())],
-        )
-        .await;
-    }
+    // ── 4. 输入落位：Path 校验既有存在性；Text 物化为 uploads 下 .txt（D2）──
+    let input_path = match &input_choice {
+        SingleInput::Path(p) => {
+            // 输入文件必须已存在于服务器本地（含 workspace/uploads 暂存）
+            if !p.is_file() {
+                return err_response(
+                    &state,
+                    StatusCode::BAD_REQUEST,
+                    "apiPipelines.single.inputNotFound",
+                    &[("path", p.display().to_string())],
+                )
+                .await;
+            }
+            p.clone()
+        }
+        SingleInput::Text(text) => {
+            match materialize_input_text(&state, &module_id, &capability, text).await {
+                Ok(path) => path,
+                Err(ue) => return err_response(&state, ue.status, ue.key, &ue.params).await,
+            }
+        }
+    };
 
-    // ── 5. 模块自动拉起（§6.5：未运行 → 启动并等健康；超时计入任务错误语义） ──
-    if let Err(e) = autostart::ensure_module_running(&state, &module_id).await {
+    // ── 5. 模块自动拉起（§6.5：未运行 → 启动并等健康；超时计入任务错误语义）
+    //    D3：lazy_start=true 跳过本步——拉起改由任务准入后 ensure_pipeline_modules
+    //    幂等安全网完成，冷启动全程任务可见可追踪，失败计入任务错误。 ──
+    if lazy_start {
+        info!(module_id = %module_id, "lazy_start=true：跳过提交前预启动，模块拉起由任务内安全网完成");
+    } else if let Err(e) = autostart::ensure_module_running(&state, &module_id).await {
         return autostart_error_response(&state, e).await;
     }
 
@@ -1408,5 +1541,324 @@ mode = {{ type = "string", default = "fast", enum = ["fast", "slow"] }}
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body.0["error"], "模型未就绪：large-v3，请先在模型管理页下载或导入");
+    }
+
+    // ── 11. D2/D3：choose_single_input 纯函数单测（二选一判定） ─────────────
+
+    #[test]
+    fn test_choose_single_input_classification() {
+        // 仅 input_path → Path（原样，不 trim 值本身）
+        assert_eq!(
+            choose_single_input(Some("/a/b.txt"), None).unwrap(),
+            SingleInput::Path(PathBuf::from("/a/b.txt"))
+        );
+        // 仅 input_text → Text（UTF-8 原文保留，不做 trim）
+        assert_eq!(
+            choose_single_input(None, Some("  你好 world\n")).unwrap(),
+            SingleInput::Text("  你好 world\n".to_string())
+        );
+        // 均缺失 → Missing
+        assert_eq!(
+            choose_single_input(None, None).unwrap_err(),
+            SingleInputError::Missing
+        );
+        // 空白串等价缺失（对齐旧版 input_path 非空校验口径）
+        assert_eq!(
+            choose_single_input(Some(""), None).unwrap_err(),
+            SingleInputError::Missing
+        );
+        assert_eq!(
+            choose_single_input(None, Some("   ")).unwrap_err(),
+            SingleInputError::Missing
+        );
+        // 同传 → BothProvided
+        assert_eq!(
+            choose_single_input(Some("/a"), Some("b")).unwrap_err(),
+            SingleInputError::BothProvided
+        );
+        // 一侧为空白串不算"给出"，另一侧有效值正常放行
+        assert_eq!(
+            choose_single_input(Some("  "), Some("b")).unwrap(),
+            SingleInput::Text("b".to_string())
+        );
+        assert_eq!(
+            choose_single_input(Some("/a"), Some("")).unwrap(),
+            SingleInput::Path(PathBuf::from("/a"))
+        );
+    }
+
+    // ── 12. D2：双输入缺失 / 同传 → 400 ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_single_both_inputs_missing_400() {
+        let state = direct_test_state(unique_root("s-noinput-either"));
+        let app = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(state);
+
+        // 双缺 → 400，文案与旧契约逐字节一致（向后兼容证明）
+        let resp = app
+            .oneshot(single_request(json!({
+                "module_id": "direct-mod",
+                "capability": "run",
+                "params": { "beam_size": 5 }
+            })))
+            .await
+            .unwrap();
+        let (status, json) = single_response(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "缺少 input_path 字段");
+
+        // 空白串同样视为缺失
+        let app = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(direct_test_state(unique_root("s-blankpath")));
+        let resp = app
+            .oneshot(single_request(json!({
+                "module_id": "direct-mod",
+                "capability": "run",
+                "params": { "beam_size": 5 },
+                "input_path": "   "
+            })))
+            .await
+            .unwrap();
+        let (status, json) = single_response(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "缺少 input_path 字段");
+
+        let app = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(direct_test_state(unique_root("s-blanktext")));
+        let resp = app
+            .oneshot(single_request(json!({
+                "module_id": "direct-mod",
+                "capability": "run",
+                "params": { "beam_size": 5 },
+                "input_text": ""
+            })))
+            .await
+            .unwrap();
+        let (status, json) = single_response(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "缺少 input_path 字段");
+    }
+
+    #[tokio::test]
+    async fn test_single_both_inputs_provided_400() {
+        let state = direct_test_state(unique_root("s-bothinputs"));
+        let app = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(state);
+
+        let resp = app
+            .oneshot(single_request(json!({
+                "module_id": "direct-mod",
+                "capability": "run",
+                "params": { "beam_size": 5 },
+                "input_path": "/tmp/x.txt",
+                "input_text": "hello"
+            })))
+            .await
+            .unwrap();
+        let (status, json) = single_response(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // 复用既有互斥键位（i18n 键归 ep-core 所有，本代理不可新增）
+        assert_eq!(json["error"], "pipeline_id 与 spec 不能同时提供");
+    }
+
+    // ── 13. D2：input_text 物化成功（uploads 落盘 + 任务走该路径） ──────────
+
+    #[tokio::test]
+    async fn test_single_input_text_materializes_to_uploads_and_submits() {
+        let _guard = execution::lock_for_tests();
+        execution::clear_registry_for_tests();
+
+        let root = unique_root("s-textin");
+        let state = direct_test_state(root.clone());
+
+        let text = "快速调用文本 hello";
+        let resp = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(state.clone())
+            .oneshot(single_request(json!({
+                "module_id": "direct-mod",
+                "capability": "run",
+                "params": { "beam_size": 5 },
+                "input_text": text,
+                "lazy_start": true
+            })))
+            .await
+            .unwrap();
+        let (status, body) = single_response(resp).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "响应: {body}");
+        let task_id = body["task_id"].as_str().unwrap().to_string();
+
+        // workspace/uploads 下生成 <module_id>-<capability>-<unix_ts>.txt，
+        // 内容与 UTF-8 原文逐字节一致
+        let uploads = root.join("workspace").join("uploads");
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(&uploads)
+            .unwrap_or_else(|e| panic!("uploads 目录应已创建: {e}"))
+            .flatten()
+        {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("direct-mod-run-") && name.ends_with(".txt") {
+                assert_eq!(
+                    std::fs::read_to_string(entry.path()).unwrap(),
+                    text,
+                    "物化内容必须保留 UTF-8 原文"
+                );
+                found.push(name);
+            }
+        }
+        assert_eq!(found.len(), 1, "应恰好物化一个文本文件，实际: {found:?}");
+
+        // 任务提交走该路径：直跑命名空间入册（direct/<module_id>）
+        let record = execution::snapshot(&task_id).expect("任务应已入册");
+        assert_eq!(record.pipeline_id, "direct/direct-mod");
+
+        // lazy_start：任务内安全网拉起失败（端口无服务）→ Failed，
+        // 冷启动失败全程任务可见可追踪（D3 预期语义）
+        let record = wait_terminal(&task_id).await.expect("任务应终结");
+        assert_eq!(record.status, execution::TaskState::Failed);
+    }
+
+    // ── 14. D3：lazy_start=true 跳过提交前同步预启动 ─────────────────────────
+
+    /// 懒启动测试模块清单：与 direct_manifest_toml 同构（id=lazy-mod），
+    /// 但声明了 target_dir 永不存在的默认模型变体 → 提交前预启动必然
+    /// 409 ModelNotReady（确定性失败面，且不会拉起任何进程）。
+    fn lazy_manifest_toml() -> String {
+        let keepalive = if cfg!(target_os = "windows") {
+            "ping -n 30 127.0.0.1 > NUL"
+        } else {
+            "sleep 30"
+        };
+        format!(
+            r#"
+[module]
+id = "lazy-mod"
+name = "懒启动测试模块"
+version = "0.1.0"
+description = "lazy start test module"
+category = "asr"
+genre = "test"
+
+[runtime]
+type = "native"
+binaries = {{ "test" = "test" }}
+start_command = "{keepalive}"
+
+[compute]
+backends = ["cpu"]
+
+[[models]]
+id = "never-shipped"
+name = "未下载模型变体"
+source = "url"
+url = "auto"
+target_dir = "never-downloaded-lazy"
+default = true
+
+[interface]
+type = "http"
+health_endpoint = "/health"
+ready_timeout_secs = 1
+
+[[interface.capabilities]]
+name = "run"
+description = "run it"
+input_type = "file"
+output_type = "file"
+
+[interface.capabilities.params]
+beam_size = {{ type = "integer", min = 1, max = 20 }}
+language = {{ type = "string", default = "auto" }}
+mode = {{ type = "string", default = "fast", enum = ["fast", "slow"] }}
+"#
+        )
+    }
+
+    fn lazy_test_state(root: std::path::PathBuf) -> Arc<AppState> {
+        let manifest: ModuleManifest = toml::from_str(&lazy_manifest_toml()).unwrap();
+        let module = ep_core::module::discovery::DiscoveredModule {
+            path: root.join("modules").join("lazy-mod"),
+            manifest: Some(manifest),
+            status: ep_core::module::discovery::DiscoveryStatus::Valid,
+        };
+        Arc::new(AppState::new(
+            root,
+            AppConfig::default(),
+            vec![],
+            vec![module],
+            // 独立区间，避开 direct 组（48330-48340）
+            PortManager::new(48350, 48360),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_single_lazy_start_skips_preflight_autostart() {
+        let _guard = execution::lock_for_tests();
+        execution::clear_registry_for_tests();
+
+        let root = unique_root("s-lazy");
+        let input = root.join("in.txt");
+        std::fs::write(&input, "data").unwrap();
+
+        let state = lazy_test_state(root.clone());
+
+        // 对照组：缺省（false）→ 同步预启动生效，模型未就绪 → 409
+        let resp = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(state.clone())
+            .oneshot(single_request(json!({
+                "module_id": "lazy-mod",
+                "capability": "run",
+                "params": { "beam_size": 5 },
+                "input_path": input.display().to_string()
+            })))
+            .await
+            .unwrap();
+        let (status, json) = single_response(resp).await;
+        assert_eq!(status, StatusCode::CONFLICT, "响应: {json}");
+        assert!(json["error"].as_str().unwrap().contains("模型未就绪"));
+
+        // 实验组：lazy_start=true → 跳过预启动，其余校验照旧 → 202 入队
+        let resp = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(state.clone())
+            .oneshot(single_request(json!({
+                "module_id": "lazy-mod",
+                "capability": "run",
+                "params": { "beam_size": 5 },
+                "input_path": input.display().to_string(),
+                "lazy_start": true
+            })))
+            .await
+            .unwrap();
+        let (status, json) = single_response(resp).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "响应: {json}");
+        let task_id = json["task_id"].as_str().unwrap().to_string();
+
+        // "跳过"的行为学证明：同步路径上既无进程实例也无端口占用
+        assert!(state
+            .process_manager
+            .read()
+            .await
+            .get_instance("lazy-mod")
+            .is_none());
+        assert!(state
+            .port_manager
+            .read()
+            .await
+            .get_port("lazy-mod")
+            .is_none());
+
+        // 任务已入册；模块拉起由任务内安全网完成并失败 → Failed
+        //（冷启动失败计入任务错误语义，而非请求报错）
+        let record = execution::snapshot(&task_id).expect("任务应已入册");
+        assert_eq!(record.pipeline_id, "direct/lazy-mod");
+        let record = wait_terminal(&task_id).await.expect("任务应终结");
+        assert_eq!(record.status, execution::TaskState::Failed);
     }
 }
