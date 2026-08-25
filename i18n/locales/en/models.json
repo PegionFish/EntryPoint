@@ -3,6 +3,8 @@
   "page.description": "Browse model status by module. Download online, upload from this computer, or import from a server path.",
   "page.checkAllUpdates": "Check all for updates",
   "page.loadFailed": "Failed to load: {{error}}",
+  "idleHint": "The model auto-offlines after {{minutes}} min idle (adjustable in Settings)",
+  "idleHintAlways": "The model stays resident (idle auto-offline is disabled)",
   "guide.missingModels": "{{count}} model(s) are missing or incomplete. Get them in three ways: ① click \"Download\" in the list to fetch online; ② use \"Upload from this computer\" below to upload model files from your browser; ③ copy files to the server manually, then add them via \"Import from server path\".",
   "empty.title": "No models yet",
   "empty.description": "Once modules are installed, the models they require will appear here. There are three ways to get models: ① Download online — click \"Download\" in the model list; ② Upload from this computer — upload a model folder or archive from your browser to the server; ③ Copy model files to the server manually, then add them with \"Import from server path\" below.",

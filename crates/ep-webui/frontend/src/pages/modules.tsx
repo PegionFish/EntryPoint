@@ -37,7 +37,6 @@ import { toast } from 'sonner'
 import { api, uploadModelWithProgress, uploadModuleArchive } from '@/api/client'
 import type {
   CapabilityDecl,
-  CapabilityParamSchema,
   ModelInfo,
   ModelListResponse,
   ModelSource,
@@ -50,6 +49,11 @@ import { PageContainer } from '@/components/layout/page-container'
 import { ConfirmDialog } from '@/components/shared/confirm-dialog'
 import { EmptyState } from '@/components/shared/empty-state'
 import { LogViewer } from '@/components/shared/log-viewer'
+import {
+  fetchArtifactPreview,
+  type ArtifactPreview,
+} from '@/components/quick-run/artifact-preview'
+import { ParamField } from '@/components/quick-run/param-field'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -327,134 +331,6 @@ function useModuleLogs(moduleId: string | null): string[] {
 }
 
 // ─── 直跑抽屉 ───────────────────────────────────────────────────────────────
-
-/** 直跑参数表单：按 ParamSchema 类型渲染控件，提交前按类型归一 */
-function ParamField({
-  name,
-  schema,
-  value,
-  onChange,
-}: {
-  name: string
-  schema: CapabilityParamSchema
-  value: unknown
-  onChange: (value: unknown) => void
-}) {
-  const enumValues = schema.enum ?? schema.options ?? null
-  const type = (schema.type || 'string').toLowerCase()
-
-  if (enumValues && enumValues.length > 0) {
-    const current = value === undefined || value === null ? '' : String(value)
-    return (
-      <Select value={current} onValueChange={(v) => onChange(v)}>
-        <SelectTrigger className="w-full">
-          <SelectValue placeholder={name} />
-        </SelectTrigger>
-        <SelectContent>
-          {enumValues.map((opt) => (
-            <SelectItem key={opt} value={opt}>
-              {opt}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
-    )
-  }
-
-  if (type === 'boolean') {
-    const current = value === undefined || value === null ? '' : String(value)
-    return (
-      <Select value={current} onValueChange={(v) => onChange(v === 'true')}>
-        <SelectTrigger className="w-full">
-          <SelectValue placeholder={name} />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value="true">true</SelectItem>
-          <SelectItem value="false">false</SelectItem>
-        </SelectContent>
-      </Select>
-    )
-  }
-
-  if (type === 'integer' || type === 'float' || type === 'number') {
-    return (
-      <Input
-        type="number"
-        value={value === undefined || value === null ? '' : String(value)}
-        min={schema.min ?? undefined}
-        max={schema.max ?? undefined}
-        step={schema.step ?? (type === 'integer' ? 1 : 'any')}
-        onChange={(e) => {
-          const raw = e.target.value
-          if (raw === '') {
-            onChange(undefined)
-            return
-          }
-          const num =
-            type === 'integer' ? Number.parseInt(raw, 10) : Number.parseFloat(raw)
-          onChange(Number.isNaN(num) ? raw : num)
-        }}
-        className="font-mono text-xs"
-      />
-    )
-  }
-
-  return (
-    <Input
-      value={value === undefined || value === null ? '' : String(value)}
-      onChange={(e) => onChange(e.target.value)}
-      className="font-mono text-xs"
-    />
-  )
-}
-
-/** 直跑产物预览（文本 / 图片；其余类型仅下载） */
-interface ArtifactPreview {
-  nodeId: string
-  name: string
-  kind: 'text' | 'image' | 'binary'
-  text?: string
-  objectUrl?: string
-  size: number
-}
-
-const TEXT_PREVIEW_EXTS = /\.(txt|json|srt|vtt|ass|csv|log|md|toml)$/i
-const IMAGE_PREVIEW_EXTS = /\.(png|jpe?g|webp|gif|bmp)$/i
-/** 预览大小上限（超过仅下载） */
-const PREVIEW_MAX_BYTES = 2 * 1024 * 1024
-
-async function fetchArtifactPreview(
-  url: string,
-  nodeId: string,
-  name: string,
-): Promise<ArtifactPreview> {
-  const resp = await fetch(url)
-  if (!resp.ok) throw new Error(`API ${resp.status}`)
-  // P1：先读 Content-Length 预判体积，超限直接取消 body 放弃预览。
-  // 避免 await resp.blob() 把数 GB 产物全量下载进内存造成内存峰值。
-  const headerLen = Number(resp.headers.get('Content-Length'))
-  if (Number.isFinite(headerLen) && headerLen > PREVIEW_MAX_BYTES) {
-    void resp.body?.cancel()
-    return { nodeId, name, kind: 'binary', size: headerLen }
-  }
-  const blob = await resp.blob()
-  if (blob.size > PREVIEW_MAX_BYTES) {
-    return { nodeId, name, kind: 'binary', size: blob.size }
-  }
-  if (IMAGE_PREVIEW_EXTS.test(name)) {
-    return {
-      nodeId,
-      name,
-      kind: 'image',
-      objectUrl: URL.createObjectURL(blob),
-      size: blob.size,
-    }
-  }
-  if (TEXT_PREVIEW_EXTS.test(name)) {
-    return { nodeId, name, kind: 'text', text: await blob.text(), size: blob.size }
-  }
-  return { nodeId, name, kind: 'binary', size: blob.size }
-}
 
 /** 直跑抽屉节点 id → 展示名（退化三节点 DAG，build_direct_pipeline 契约） */
 const DIRECT_NODE_LABEL_KEYS: Record<string, string> = {
@@ -2934,6 +2810,26 @@ export function ModulesPage() {
   const [deleting, setDeleting] = useState(false)
   /** 列表级 tag 筛选（§5.1 chips 筛选；null = 不过滤） */
   const [tagFilter, setTagFilter] = useState<string | null>(null)
+  /** 模型空闲自动下线配置（秒；null = 未加载，不渲染提示） */
+  const [idleTimeoutSecs, setIdleTimeoutSecs] = useState<number | null>(null)
+
+  // 页面级配置：读取 modules.idle_timeout_secs 用于空闲自动下线提示
+  useEffect(() => {
+    let cancelled = false
+    api
+      .getConfig()
+      .then((cfg) => {
+        if (!cancelled) {
+          setIdleTimeoutSecs(cfg.modules?.idle_timeout_secs ?? null)
+        }
+      })
+      .catch(() => {
+        // 配置拉取失败则不显示该提示行
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   /** 全部数据源刷新（模块 + 模型；pack 导入/卸载后落位可能变化） */
   async function refreshAll() {
@@ -3621,6 +3517,20 @@ export function ModulesPage() {
       }
     >
       <div className="space-y-6">
+        {/* 模型空闲自动下线提示（D5③：>0 显示分钟数，=0 显示常驻语义） */}
+        {idleTimeoutSecs !== null && (
+          <p className="text-xs text-muted-foreground">
+            {idleTimeoutSecs > 0
+              ? t('models:idleHint', {
+                  minutes: Math.round(idleTimeoutSecs / 60),
+                  defaultValue:
+                    '模型空闲 {{minutes}} 分钟后将自动下线以释放资源（可在设置中调整）',
+                })
+              : t('models:idleHintAlways', {
+                  defaultValue: '模型将常驻运行（空闲自动下线已停用）',
+                })}
+          </p>
+        )}
         {loadError && (
           <div className="flex items-center gap-2 rounded-lg border border-status-error/30 bg-status-error/10 px-4 py-3 text-sm text-status-error">
             <TriangleAlert className="size-4 shrink-0" />
