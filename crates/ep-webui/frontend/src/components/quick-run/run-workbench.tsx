@@ -66,9 +66,10 @@ export function RunWorkbench({
 }) {
   const { t } = useTranslation('run')
   const { t: tModels } = useTranslation('models')
-  const cap = entry.capability
+  /** 模块内能力选择（功能页内选择；缺省第一项） */
+  const [capId, setCapId] = useState('')
 
-  const [params, setParams] = useState<Record<string, unknown>>({})
+  const [paramValues, setParamValues] = useState<Record<string, unknown>>({})
   const [inputPath, setInputPath] = useState('')
   const [inputText, setText] = useState('')
   const [uploading, setUploading] = useState(false)
@@ -78,17 +79,24 @@ export function RunWorkbench({
   const [switching, setSwitching] = useState(false)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
 
-  // 切换能力条目：重置输入与算力源，按 schema 预填默认参数
+  const capabilities = entry.capabilities
+  /** 当前能力：capId 或缺省第一项 */
+  const cap =
+    capabilities.find((c) => c.name === capId) ?? capabilities[0]
+  const effectiveCapId = cap?.name ?? ''
+
+  // 模块切换 或 能力选择变化：重置输入与算力源，按当前能力 schema 预填默认参数
   useEffect(() => {
     setInputPath('')
     setText('')
     setDeviceSel('')
-    setParams(defaultParamsOf(cap.params))
-  }, [entry.key, cap.params])
+    setParamValues(defaultParamsOf(cap?.params))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [entry.key, effectiveCapId])
 
   const paramEntries = useMemo(
     () =>
-      Object.entries(cap.params ?? {}).sort(([a], [b]) =>
+      Object.entries(cap?.params ?? {}).sort(([a], [b]) =>
         a.localeCompare(b),
       ),
     [cap],
@@ -142,7 +150,7 @@ export function RunWorkbench({
     return {
       module_id: entry.moduleId,
       capability: cap.name,
-      params,
+      params: paramValues,
       lazy_start: true,
       ...(textMode ? { input_text: inputText } : { input_path: inputPath.trim() }),
       ...(deviceSel !== '' ? { device: deviceSel } : {}),
@@ -223,7 +231,29 @@ export function RunWorkbench({
         </div>
       )}
 
-      {/* 1. 能力详情 */}
+      {/* 1. 功能选择（一个模型一个入口；具体功能在本功能页内选择） */}
+      <div className="space-y-2">
+        <label className="text-sm font-medium">{t('selectCapability')}</label>
+        <Select
+          value={effectiveCapId || undefined}
+          onValueChange={(v) => setCapId(v)}
+          disabled={submitting || switching}
+        >
+          <SelectTrigger className="w-full">
+            <SelectValue placeholder={t('selectCapability')} />
+          </SelectTrigger>
+          <SelectContent>
+            {capabilities.map((c) => (
+              <SelectItem key={c.name} value={c.name}>
+                {c.name}
+                {c.description ? ` — ${c.description}` : ''}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+
+      {/* 2. 能力详情 */}
       <div className="space-y-1">
         <div className="flex items-baseline gap-2">
           <h2 className="font-mono text-sm font-semibold">{cap.name}</h2>
@@ -240,7 +270,7 @@ export function RunWorkbench({
         </p>
       </div>
 
-      {/* 1.5 算力源选择（D-Device 完整版）：auto 跟随策略；显式指定固定本次启动设备 */}
+      {/* 2.5 算力源选择（D-Device 完整版）：auto 跟随策略；显式指定固定本次启动设备 */}
       <div className="space-y-2">
         <div className="flex items-center justify-between gap-2">
           <label className="text-sm font-medium">{t('device.label')}</label>
@@ -373,8 +403,10 @@ export function RunWorkbench({
               <ParamField
                 name={name}
                 schema={schema}
-                value={params[name]}
-                onChange={(v) => setParams((prev) => ({ ...prev, [name]: v }))}
+                value={paramValues[name]}
+                onChange={(v) =>
+                  setParamValues((prev) => ({ ...prev, [name]: v }))
+                }
               />
               {schema.description ? (
                 <p className="text-[11px] text-muted-foreground">

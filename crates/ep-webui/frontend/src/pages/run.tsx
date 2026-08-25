@@ -109,30 +109,30 @@ export function RunPage() {
     }
   }, [])
 
-  /** 能力目录条目（模块 × 能力扁平化） */
+  /** 模型目录条目（模块粒度：一个模型一个入口，能力在工作台内选择） */
   const entries = useMemo<CatalogEntry[]>(() => {
     const out: CatalogEntry[] = []
     for (const mod of modules) {
-      for (const cap of mod.capabilities ?? []) {
-        const variant = mod.active_model_id ?? null
-        const statusMap = variant ? modelStatusMap.get(mod.id) : undefined
-        out.push({
-          key: `${mod.id}::${cap.name}`,
-          moduleId: mod.id,
-          moduleName: mod.name,
-          category: (mod.category || 'custom').trim().toLowerCase(),
-          capability: cap,
-          serviceStatus: mod.service_status,
-          device: mod.device ?? null,
-          backends: (mod.backends ?? []).map((b) => b.toLowerCase()),
-          modelReady:
-            variant === null
-              ? null
-              : statusMap
-                ? isReadyStatus(statusMap.get(variant))
-                : null,
-        })
-      }
+      const caps = (mod.capabilities ?? []).slice()
+      if (caps.length === 0) continue
+      const variant = mod.active_model_id ?? null
+      const statusMap = variant ? modelStatusMap.get(mod.id) : undefined
+      out.push({
+        key: mod.id,
+        moduleId: mod.id,
+        moduleName: mod.name,
+        category: (mod.category || 'custom').trim().toLowerCase(),
+        capabilities: caps,
+        serviceStatus: mod.service_status,
+        device: mod.device ?? null,
+        backends: (mod.backends ?? []).map((b) => b.toLowerCase()),
+        modelReady:
+          variant === null
+            ? null
+            : statusMap
+              ? isReadyStatus(statusMap.get(variant))
+              : null,
+      })
     }
     const rank = (c: string) => {
       const i = CATEGORY_ORDER.indexOf(c)
@@ -141,8 +141,7 @@ export function RunPage() {
     out.sort(
       (a, b) =>
         rank(a.category) - rank(b.category) ||
-        a.moduleName.localeCompare(b.moduleName) ||
-        a.capability.name.localeCompare(b.capability.name),
+        a.moduleName.localeCompare(b.moduleName),
     )
     return out
   }, [modules, modelStatusMap])
