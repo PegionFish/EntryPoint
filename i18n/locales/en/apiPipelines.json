@@ -1,6 +1,7 @@
 {
   "execute.eitherRequired": "Either pipeline_id or spec must be provided",
   "execute.mutuallyExclusive": "pipeline_id and spec cannot be provided at the same time",
+  "single.inputConflict": "Provide either input_path or input_text, not both",
   "execute.pipelineNotFound": "Pipeline not found: {{id}}",
   "execute.inputsUnknownNode": "inputs reference a node that does not exist: {{nodeId}}",
   "execute.inputsNotObject": "inputs[\"{{nodeId}}\"] must be a parameter object",

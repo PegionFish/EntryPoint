@@ -378,7 +378,7 @@ mod tests {
     use ep_core::pipeline::dag::Pipeline;
     use ep_core::port::PortManager;
 
-    use crate::api::execute::execution::{TaskState, lock_for_tests};
+    use crate::api::execute::execution::{self, lock_for_tests};
 
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -449,7 +449,7 @@ to = ["output", "input"]
             .unwrap();
         for _ in 0..300 {
             if let Some(record) = execution::snapshot(&task_id) {
-                if !matches!(record.status, TaskState::Running) {
+                if record.status.is_terminal() {
                     return task_id;
                 }
             }
@@ -563,7 +563,7 @@ to = ["output", "input"]
         // 等待终结
         for _ in 0..300 {
             if let Some(r) = execution::snapshot(&task_id) {
-                if !matches!(r.status, TaskState::Running) {
+                if r.status.is_terminal() {
                     break;
                 }
             }
@@ -629,7 +629,7 @@ params = { path = "/nonexistent/missing-art.txt" }
             .unwrap();
         for _ in 0..300 {
             if let Some(r) = execution::snapshot(&empty_task) {
-                if !matches!(r.status, TaskState::Running) {
+                if r.status.is_terminal() {
                     break;
                 }
             }
@@ -780,7 +780,7 @@ params = { path = "/nonexistent/missing-dl.txt" }
             .unwrap();
         for _ in 0..300 {
             if let Some(r) = execution::snapshot(&empty_task) {
-                if !matches!(r.status, TaskState::Running) {
+                if r.status.is_terminal() {
                     break;
                 }
             }

@@ -522,7 +522,7 @@ async fn execute_single(
             return err_response(
                 &state,
                 StatusCode::BAD_REQUEST,
-                "apiPipelines.execute.mutuallyExclusive",
+                "apiPipelines.single.inputConflict",
                 &[],
             )
             .await
@@ -792,9 +792,12 @@ mod tests {
 
     /// 轮询等待任务终结
     async fn wait_terminal(task_id: &str) -> Option<execution::TaskRecord> {
+        // 仅在真终态返回（queued/running 均继续等）：提交路径的准入已
+        // spawn 化（QUICK_RUN_PLAN G4），202 之后任务可能短暂处于 queued，
+        // 首拍即返会误判。
         for _ in 0..300 {
             if let Some(record) = execution::snapshot(task_id) {
-                if !matches!(record.status, execution::TaskState::Running) {
+                if record.status.is_terminal() {
                     return Some(record);
                 }
             }
@@ -1662,8 +1665,9 @@ mode = {{ type = "string", default = "fast", enum = ["fast", "slow"] }}
             .unwrap();
         let (status, json) = single_response(resp).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        // 复用既有互斥键位（i18n 键归 ep-core 所有，本代理不可新增）
-        assert_eq!(json["error"], "pipeline_id 与 spec 不能同时提供");
+        // D2 专属互斥文案（W3 冒烟修正：不再借用管线端点的
+        // execute.mutuallyExclusive，避免「pipeline_id 与 spec…」误导）
+        assert_eq!(json["error"], "input_path 与 input_text 只能提供其一");
     }
 
     // ── 13. D2：input_text 物化成功（uploads 落盘 + 任务走该路径） ──────────
