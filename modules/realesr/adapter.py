@@ -84,6 +84,24 @@ class ExperimentalError(RuntimeError):
 # ---------------------------------------------------------------------------
 # 通用工具
 # ---------------------------------------------------------------------------
+_EP_PROGRESS = {"pct": -1, "t": 0.0}
+
+
+def _report_progress(pct: int, note: str = "", force: bool = False) -> None:
+    """[EP-PROGRESS] 结构化进度标记：pct 取 0-100 整数、单调递增；
+    节流——距上次上报 ≥1 个百分点或 ≥0.5s 才打印；force 供里程碑事件绕过节流。"""
+    pct = max(0, min(100, int(pct)))
+    prev = _EP_PROGRESS["pct"]
+    if pct < prev:
+        return
+    now = time.monotonic()
+    if not force and prev >= 0 and pct - prev < 1 and now - _EP_PROGRESS["t"] < 0.5:
+        return
+    print(f"[EP-PROGRESS] {pct}" + (f" {note}" if note else ""), flush=True)
+    _EP_PROGRESS["pct"] = pct
+    _EP_PROGRESS["t"] = now
+
+
 def _error(status_code: int, error_code: str, message: str, detail: Optional[str] = None):
     return JSONResponse(
         status_code=status_code,
@@ -124,10 +142,15 @@ def _probe_video(path: Path) -> dict:
         "ffprobe", "-v", "error", "-select_streams", "a",
         "-show_entries", "stream=index", "-of", "csv=p=0", str(path),
     ]).strip() != ""
+    try:
+        duration = float((info.get("format") or {}).get("duration") or 0.0)
+    except (TypeError, ValueError):
+        duration = 0.0
     return {
         "fps": fps,
         "width": int(stream.get("width") or 0),
         "height": int(stream.get("height") or 0),
+        "duration": duration,
         "has_audio": has_audio,
     }
 
@@ -309,10 +332,13 @@ def upscale_frames_torch(frames_in: Path, frames_out: Path, weight: Path,
     )
     import cv2  # realesrgan 依赖链自带 opencv-python-headless? 见 requirements-torch.txt
     frames_out.mkdir(parents=True, exist_ok=True)
-    for img_path in sorted(frames_in.glob("*.png")):
+    img_paths = sorted(frames_in.glob("*.png"))
+    total = len(img_paths)
+    for done, img_path in enumerate(img_paths, 1):
         img = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
         output, _ = upsampler.enhance(img, outscale=scale)
         cv2.imwrite(str(frames_out / img_path.name), output)
+        _report_progress(15 + done * 80 // total, f"infer {done}/{total}")
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +417,9 @@ def upscale_frames_openvino(frames_in: Path, frames_out: Path, weight: Path,
     infer = _make_infer()
 
     frames_out.mkdir(parents=True, exist_ok=True)
-    for img_path in sorted(frames_in.glob("*.png")):
+    img_paths = sorted(frames_in.glob("*.png"))
+    total = len(img_paths)
+    for done, img_path in enumerate(img_paths, 1):
         img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
         h, w = img.shape[:2]
         if tile > 0 and max(h, w) > tile * 2:
@@ -399,6 +427,7 @@ def upscale_frames_openvino(frames_in: Path, frames_out: Path, weight: Path,
         else:
             result = infer(img)
         cv2.imwrite(str(frames_out / img_path.name), result)
+        _report_progress(15 + done * 80 // total, f"infer {done}/{total}")
 
 
 def _tile_infer(img, tile: int, infer):
@@ -423,24 +452,43 @@ def _tile_infer(img, tile: int, infer):
 # 主流程
 # ---------------------------------------------------------------------------
 def run_upscale(input_path: Path, out_path: Path, params: dict) -> dict:
+    _report_progress(0, "start")
     probe = _probe_video(input_path)
     model_id = str(params.get("model") or EP_MODEL_ID or "realesr-animevideov3-pth")
     model_dir, how = resolve_model_dir(model_id)
+    _report_progress(5, "model resolved")
     scale = int(params.get("scale_factor") or params.get("scale") or 4)
     preset = str(params.get("target_preset") or "balanced").lower()
     tile = int(params.get("tile_size") or (0 if preset == "fast" else 256))
     fp32 = preset == "quality"
 
     # 帧序列落位：params.staging_dir（平台 RAM 暂存区，ep-core::staging 注入）
-    # 优先，缺省回退 workspace（第三方直连/旧平台兼容语义不变）
+    # 优先，缺省回退 workspace（第三方直连/旧平台兼容语义不变）。
+    # 容量护栏：长视频抽帧 PNG 可达数十 GB，估算超候选盘可用量 60% 即回落磁盘。
     staging_root = (params.get("staging_dir") or "").strip() if isinstance(params, dict) else ""
     work_base = staging_root or (EP_WORKSPACE or None)
+    est_frames = max(1, int(round(float(probe.get("duration") or 0) * probe["fps"])))
+    est_mb = est_frames * probe["width"] * probe["height"] * 0.6 / 1e6  # PNG 经验 ~0.6B/px
+    if work_base and staging_root and est_mb > 0:
+        try:
+            free_mb = shutil.disk_usage(work_base).free / 1e6
+            if est_mb > free_mb * 0.6:
+                logger.warning(
+                    "staging too small: %d frames ~%.0f MB needed, %.0f MB free on %s "
+                    "→ fallback to disk workspace",
+                    est_frames, est_mb, free_mb, work_base,
+                )
+                _report_progress(1, f"staging fallback to disk (need ~{int(est_mb)} MB)")
+                work_base = EP_WORKSPACE or tempfile.gettempdir()
+        except OSError:
+            pass
     work_root = Path(tempfile.mkdtemp(prefix="ep-vups-", dir=work_base))
     frames_in = work_root / "frames_in"
     try:
         n_frames = _extract_frames(input_path, frames_in)
         logger.info("extracted %d frames (%dx%d @%.3ffps)", n_frames,
                     probe["width"], probe["height"], probe["fps"])
+        _report_progress(15, f"extracted {n_frames} frames")
 
         frames_out = work_root / "frames_out"
         if EP_BACKEND == "vulkan":
@@ -467,7 +515,9 @@ def run_upscale(input_path: Path, out_path: Path, params: dict) -> dict:
         done = len(list(frames_out.glob("*.png")))
         if done != n_frames:
             raise RuntimeError(f"frame count mismatch after inference: {done} != {n_frames}")
+        _report_progress(95, "mux encode", force=True)
         _mux_video(frames_out, probe["fps"], input_path if probe["has_audio"] else None, out_path)
+        _report_progress(100, "done", force=True)
         return {"frames": done, "model": model_id, "model_source": how,
                 "backend": EP_BACKEND, "preset": preset, "scale": scale}
     finally:

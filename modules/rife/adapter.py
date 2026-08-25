@@ -89,6 +89,24 @@ class ExperimentalError(RuntimeError):
 # ---------------------------------------------------------------------------
 # 通用工具（与 video-upscale 同构）
 # ---------------------------------------------------------------------------
+_EP_PROGRESS = {"pct": -1, "t": 0.0}
+
+
+def _report_progress(pct: int, note: str = "", force: bool = False) -> None:
+    """[EP-PROGRESS] 结构化进度标记：pct 取 0-100 整数、单调递增；
+    节流——距上次上报 ≥1 个百分点或 ≥0.5s 才打印；force 供里程碑事件绕过节流。"""
+    pct = max(0, min(100, int(pct)))
+    prev = _EP_PROGRESS["pct"]
+    if pct < prev:
+        return
+    now = time.monotonic()
+    if not force and prev >= 0 and pct - prev < 1 and now - _EP_PROGRESS["t"] < 0.5:
+        return
+    print(f"[EP-PROGRESS] {pct}" + (f" {note}" if note else ""), flush=True)
+    _EP_PROGRESS["pct"] = pct
+    _EP_PROGRESS["t"] = now
+
+
 def _error(status_code: int, error_code: str, message: str, detail: Optional[str] = None):
     return JSONResponse(
         status_code=status_code,
@@ -113,6 +131,7 @@ def _probe_video(path: Path) -> dict:
     out = _run([
         "ffprobe", "-v", "error", "-select_streams", "v:0",
         "-show_entries", "stream=r_frame_rate,width,height",
+        "-show_entries", "format=duration",
         "-of", "json", str(path),
     ])
     info = json.loads(out or "{}")
@@ -126,8 +145,13 @@ def _probe_video(path: Path) -> dict:
         "ffprobe", "-v", "error", "-select_streams", "a",
         "-show_entries", "stream=index", "-of", "csv=p=0", str(path),
     ]).strip() != ""
+    try:
+        duration = float((info.get("format") or {}).get("duration") or 0.0)
+    except (TypeError, ValueError):
+        duration = 0.0
     return {"fps": fps, "width": int(stream.get("width") or 0),
-            "height": int(stream.get("height") or 0), "has_audio": has_audio}
+            "height": int(stream.get("height") or 0), "duration": duration,
+            "has_audio": has_audio}
 
 
 def _extract_frames(video: Path, frames_dir: Path) -> int:
@@ -232,6 +256,7 @@ def interp_frames_ncnn(frames_in: Path, model_dir: Path, model_name: str,
                "-m", str(ncnn_model)]
         logger.info("ncnn exec (pass %d/%d): %s", step + 1, passes, " ".join(cmd))
         _run(cmd)
+        _report_progress(15 + (step + 1) * 80 // passes, f"interp pass {step + 1}/{passes}")
 
         produced = len(list(out_dir.glob("*.png")))
         expected = cur_count * 2
@@ -353,12 +378,14 @@ def interp_frames_openvino(frames_in: Path, frames_out: Path, weight: Path,
         if i + 1 < len(imgs):
             cv2.imwrite(str(frames_out / f"{idx + 1:08d}.png"), infer_pair(img, imgs[i + 1]))
         idx += 2
+        _report_progress(15 + (i + 1) * 80 // len(imgs), f"interp {i + 1}/{len(imgs)}")
 
 
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 def run_interpolate(input_path: Path, out_path: Path, params: dict) -> dict:
+    _report_progress(0, "start")
     probe = _probe_video(input_path)
     src_fps = probe["fps"]
     target_fps = int(params.get("target_fps") or 0)
@@ -371,20 +398,38 @@ def run_interpolate(input_path: Path, out_path: Path, params: dict) -> dict:
 
     model_id = str(params.get("model") or EP_MODEL_ID or "rife-v4.6-ncnn")
     model_dir, how = resolve_model_dir(model_id)
+    _report_progress(5, "model resolved")
     # 默认取 manifest 默认变体 rife-v4.6 的模型子目录（params.model_name 可覆盖）；
     # 留空会让 find_ncnn_model_dir 按字典序误选 rife-HD
     model_name = str(params.get("model_name") or "rife-v4.6")
 
     # 帧序列落位：params.staging_dir（平台 RAM 暂存区，ep-core::staging 注入）
-    # 优先，缺省回退 workspace（第三方直连/旧平台兼容语义不变）
+    # 优先，缺省回退 workspace（第三方直连/旧平台兼容语义不变）。
+    # 容量护栏：长视频抽帧 PNG 可达数十 GB，估算超候选盘可用量 60% 即回落磁盘。
     staging_root = (params.get("staging_dir") or "").strip() if isinstance(params, dict) else ""
     work_base = staging_root or (EP_WORKSPACE or None)
+    est_frames = max(1, int(round(float(probe.get("duration") or 0) * probe["fps"])))
+    est_mb = est_frames * probe["width"] * probe["height"] * 0.6 / 1e6  # PNG 经验 ~0.6B/px
+    if work_base and staging_root and est_mb > 0:
+        try:
+            free_mb = shutil.disk_usage(work_base).free / 1e6
+            if est_mb > free_mb * 0.6:
+                logger.warning(
+                    "staging too small: %d frames ~%.0f MB needed, %.0f MB free on %s "
+                    "→ fallback to disk workspace",
+                    est_frames, est_mb, free_mb, work_base,
+                )
+                _report_progress(1, f"staging fallback to disk (need ~{int(est_mb)} MB)")
+                work_base = EP_WORKSPACE or tempfile.gettempdir()
+        except OSError:
+            pass
     work_root = Path(tempfile.mkdtemp(prefix="ep-vint-", dir=work_base))
     frames_in = work_root / "frames_in"
     try:
         n_src = _extract_frames(input_path, frames_in)
         logger.info("extracted %d source frames (%dx%d @%.3ffps) mult=%d passes=%d",
                     n_src, probe["width"], probe["height"], src_fps, multiplier, passes)
+        _report_progress(15, f"extracted {n_src} frames")
 
         final_dir = work_root / "final"
         if EP_BACKEND == "vulkan":
@@ -410,7 +455,9 @@ def run_interpolate(input_path: Path, out_path: Path, params: dict) -> dict:
             raise ExperimentalError(f"backend '{EP_BACKEND}' has no implementation branch")
 
         done = len(list(final_dir.glob("*.png")))
+        _report_progress(95, "mux encode", force=True)
         _mux_video(final_dir, out_fps, input_path if probe["has_audio"] else None, out_path)
+        _report_progress(100, "done", force=True)
         return {"src_frames": n_src, "out_frames": done, "src_fps": round(src_fps, 3),
                 "target_fps": round(out_fps, 3), "multiplier_effective": multiplier,
                 "passes": passes, "model": model_id, "model_source": how,
