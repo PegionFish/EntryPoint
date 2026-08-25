@@ -793,8 +793,16 @@ type = "http"
         }
         let manifest = ModuleManifest::from_file(&path).unwrap();
         assert!(manifest.validate().is_ok());
-        assert_eq!(manifest.models.len(), 3);
-        for model in &manifest.models {
+        // Parity（AI_Applications 对齐）：11 变体（3 原 + 8 新，新变体
+        // 主走本地导入可无 mirror）；仅原 3 变体断言有 HF+modelScope 双源
+        assert_eq!(manifest.models.len(), 11);
+        let mirrored: Vec<_> = manifest
+            .models
+            .iter()
+            .filter(|m| m.id == "large-v3" || m.id == "medium" || m.id == "small")
+            .collect();
+        assert_eq!(mirrored.len(), 3);
+        for model in &mirrored {
             assert_eq!(model.mirrors.len(), 1, "model {} should have 1 mirror", model.id);
             assert_eq!(model.mirrors[0].source, ModelSource::Modelscope);
             assert!(model.mirrors[0].repo_id.starts_with("pengzhendong/faster-whisper-"));
@@ -803,6 +811,17 @@ type = "http"
                 model.available_sources(),
                 vec![ModelSource::Huggingface, ModelSource::Modelscope]
             );
+        }
+        // 新 8 变体（本地导入优先）：无 mirror 可接受（本地导入后 available_sources 仍含 HF）
+        let new_ids = ["tiny", "tiny-en", "base", "base-en", "small-en", "medium-en", "large-v1", "large-v2"];
+        let new_models: Vec<_> = manifest
+            .models
+            .iter()
+            .filter(|m| new_ids.contains(&m.id.as_str()))
+            .collect();
+        assert_eq!(new_models.len(), 8);
+        for model in new_models {
+            assert!(model.mirrors.is_empty(), "{} new variant should not require mirror", model.id);
         }
     }
 
