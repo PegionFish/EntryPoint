@@ -735,8 +735,14 @@ pub async fn submit_pipeline_full(
         },
     );
 
-    // 立即尝试准入：闸门有空位时同一 await 内提升 running（快路径）
-    try_promote(state.clone()).await;
+    // 立即尝试准入：闸门有空位时提升 running（快路径）。
+    // spawn 化（QUICK_RUN_PLAN G4）：start_task 内的模块自动拉起会同步等待
+    // 健康就绪（冷启动可达数十秒），不应拖住提交响应——202 立即返回，
+    // 拉起过程经任务状态 queued→running 在任务中心可见。
+    tokio::spawn({
+        let state = state.clone();
+        async move { try_promote(state).await }
+    });
 
     if options.wait {
         let record = wait_until_terminal(state, &task_id).await;
@@ -1505,16 +1511,30 @@ fn fire_callback(task_id: &str, url: &str) {
 /// （超时计入任务错误）」——在闸门准入后、引擎执行前执行，修 P1-2
 /// （管线侧 + 直跑侧两个消费面）。
 async fn ensure_pipeline_modules(state: &Arc<AppState>, pipeline: &Pipeline) -> anyhow::Result<()> {
-    let mut module_ids: Vec<&str> = Vec::new();
+    // module_id → 显式设备指定（D-Device）：取该模块首个 Module 节点的
+    // device 字段（软约束字符串，auto/空 = None）。直跑退化 DAG 的 run
+    // 节点携带快速调用请求的 device hint；普通管线节点未设即 auto。
+    let mut module_devices: Vec<(&str, Option<&str>)> = Vec::new();
     for node in &pipeline.nodes {
-        if let NodeKind::Module { module_id, .. } = &node.kind {
-            if !module_ids.contains(&module_id.as_str()) {
-                module_ids.push(module_id.as_str());
+        if let NodeKind::Module {
+            module_id,
+            device,
+            ..
+        } = &node.kind
+        {
+            if let Some((_, existing)) =
+                module_devices.iter_mut().find(|(id, _)| *id == module_id.as_str())
+            {
+                if existing.is_none() {
+                    *existing = device.as_deref();
+                }
+            } else {
+                module_devices.push((module_id.as_str(), device.as_deref()));
             }
         }
     }
-    for module_id in module_ids {
-        ensure_module_running(state, module_id)
+    for (module_id, device) in module_devices {
+        ensure_module_running_on_device(state, module_id, device)
             .await
             .map_err(|e| anyhow::anyhow!("module `{module_id}`: {e}"))?;
     }
@@ -1526,8 +1546,15 @@ async fn ensure_pipeline_modules(state: &Arc<AppState>, pipeline: &Pipeline) -> 
 /// **门禁 #25 归一**：委托 `api/autostart.rs` 权威实现（B4 公共件，含模型就绪
 /// 前置检查、失败清理 stop_module+释放端口、并发竞态转等健康）。管线侧
 /// （ensure_pipeline_modules）与直跑侧（execute/single）共用同一拉起逻辑。
-pub async fn ensure_module_running(state: &Arc<AppState>, module_id: &str) -> anyhow::Result<()> {
-    crate::api::autostart::ensure_module_running(state, module_id)
+/// 同 [`ensure_module_running_on_device`]（自动拉起权威实现见
+/// `api/autostart.rs`）——管线侧（ensure_pipeline_modules）调用了带设备
+/// 指定的版本；本 wrapper 供无 hint 的语义直接复用（保留文档锚点）。
+pub async fn ensure_module_running_on_device(
+    state: &Arc<AppState>,
+    module_id: &str,
+    device_hint: Option<&str>,
+) -> anyhow::Result<()> {
+    crate::api::autostart::ensure_module_running_on_device(state, module_id, device_hint)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
@@ -1571,6 +1598,7 @@ pub async fn submit_direct(
         capability,
         params,
         input_path,
+        None,
         SubmitOptions::default(),
     )
     .await
@@ -1590,6 +1618,8 @@ pub async fn submit_direct_full(
     capability: &str,
     params: Value,
     input_path: PathBuf,
+    // 显式设备指定（D-Device；None/auto = 跟随策略）
+    device_hint: Option<&str>,
     options: SubmitOptions,
 ) -> Result<SubmitOutcome, SubmitError> {
     // 1. 模块 + manifest capability 校验（快速失败，不占闸门）；
@@ -1632,6 +1662,7 @@ pub async fn submit_direct_full(
         params,
         &input_path,
         Some(&capability_decl),
+        device_hint,
     );
     submit_pipeline_full(state, pipeline, None, options).await
 }
@@ -1651,7 +1682,14 @@ pub fn build_direct_pipeline(
     params: Value,
     input_path: &Path,
     capability_decl: Option<&CapabilityDecl>,
+    device_hint: Option<&str>,
 ) -> Pipeline {
+    // 显式设备指定（D-Device）：写入 run 节点 device 字段——任务内安全网
+    // 拉起（ensure_pipeline_modules）据此固定本次启动设备，且任务详情可追溯
+    let device_hint = device_hint
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto"))
+        .map(str::to_string);
     let make_node = |id: &str, kind: NodeKind, label: &str, params: Value| PipelineNode {
         id: id.to_string(),
         kind,
@@ -1699,7 +1737,7 @@ pub fn build_direct_pipeline(
                 module_id: module_id.to_string(),
                 capability: capability.to_string(),
                 model_id: None,
-                device: None,
+                device: device_hint,
             },
             "模块执行",
             params,
@@ -3090,6 +3128,7 @@ builtin = "file_output"
             serde_json::json!({ "atten_lim_db": 60 }),
             Path::new("/tmp/in.wav"),
             None,
+            None,
         );
         assert_eq!(pipeline.id, "direct/deep-filter", "B4 契约 id 形状");
         assert_eq!(pipeline.nodes.len(), 3);
@@ -3157,6 +3196,7 @@ builtin = "file_output"
             serde_json::json!({ "voice": "default" }),
             Path::new("/tmp/tts_input.txt"),
             Some(&tts),
+            None,
         );
         assert_eq!(p.nodes[2].params["extension"], "wav");
 
@@ -3168,6 +3208,7 @@ builtin = "file_output"
             serde_json::json!({ "output_format": "srt" }),
             Path::new("/tmp/speech.wav"),
             Some(&asr),
+            None,
         );
         assert_eq!(p.nodes[2].params["extension"], "srt");
         // 同能力不传 output_format → json 内联输出：省略 file_output 节点，
@@ -3178,6 +3219,7 @@ builtin = "file_output"
             serde_json::json!({}),
             Path::new("/tmp/speech.wav"),
             Some(&asr),
+            None,
         );
         assert_eq!(p.nodes.len(), 2, "json 输出不应带 file_output 节点");
         assert_eq!(p.edges.len(), 1);
@@ -3190,6 +3232,7 @@ builtin = "file_output"
             serde_json::json!({}),
             Path::new("/tmp/photo.png"),
             Some(&rembg),
+            None,
         );
         assert_eq!(p.nodes[2].params["extension"], "png");
 
@@ -3201,6 +3244,7 @@ builtin = "file_output"
             serde_json::json!({}),
             Path::new("/tmp/noisy.flac"),
             Some(&df),
+            None,
         );
         assert_eq!(p.nodes[2].params["extension"], "flac");
     }
@@ -3361,6 +3405,7 @@ output_type = "json"
             "transcribe",
             json!({}),
             input.clone(),
+            None,
             SubmitOptions {
                 wait: true,
                 callback_url: None,
@@ -3380,6 +3425,7 @@ output_type = "json"
             "transcribe",
             json!({}),
             input,
+            None,
             SubmitOptions::default(),
         )
         .await

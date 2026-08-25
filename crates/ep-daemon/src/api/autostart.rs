@@ -54,6 +54,9 @@ pub enum AutoStartError {
         module_id: String,
         timeout_secs: u64,
     },
+    /// 显式设备指定非法（不存在/不在线/与模块后端不兼容）→ 400
+    /// （快速调用算力源切换 D-Device）
+    DeviceHint(String),
 }
 
 impl std::fmt::Display for AutoStartError {
@@ -82,6 +85,7 @@ impl std::fmt::Display for AutoStartError {
                     "module '{module_id}' did not become healthy within {timeout_secs}s"
                 )
             }
+            Self::DeviceHint(msg) => write!(f, "invalid device hint: {msg}"),
         }
     }
 }
@@ -104,25 +108,47 @@ pub async fn ensure_module_running(
     state: &Arc<AppState>,
     module_id: &str,
 ) -> Result<(), AutoStartError> {
+    ensure_module_running_on_device(state, module_id, None).await
+}
+
+/// 同 [`ensure_module_running`]，附加显式设备指定（快速调用算力源切换
+/// D-Device）：`Some(hint)` 时本次启动固定到该设备（硬校验，非法即错）；
+/// 模块已 Running 时直通（单槽位语义——改道须先停止，由调用方 UI 引导）。
+pub async fn ensure_module_running_on_device(
+    state: &Arc<AppState>,
+    module_id: &str,
+    device_hint: Option<&str>,
+) -> Result<(), AutoStartError> {
     let timeout_secs = {
         let modules = state.modules.read().await;
         find_manifest(&modules, module_id)
             .and_then(|mf| mf.interface.ready_timeout_secs)
             .unwrap_or(DEFAULT_HEALTH_TIMEOUT_SECS)
     };
-    ensure_module_running_with_timeout(
+    ensure_module_running_with_timeout_on_device(
         state,
         module_id,
         Duration::from_secs(timeout_secs as u64),
+        device_hint,
     )
     .await
 }
 
-/// 同 [`ensure_module_running`]，健康等待上限显式参数化（测试与特殊调用方使用）。
+/// 同 [`ensure_module_running_with_timeout`]，附加显式设备指定（D-Device）。
+#[cfg(test)]
 pub async fn ensure_module_running_with_timeout(
     state: &Arc<AppState>,
     module_id: &str,
     timeout: Duration,
+) -> Result<(), AutoStartError> {
+    ensure_module_running_with_timeout_on_device(state, module_id, timeout, None).await
+}
+
+async fn ensure_module_running_with_timeout_on_device(
+    state: &Arc<AppState>,
+    module_id: &str,
+    timeout: Duration,
+    device_hint: Option<&str>,
 ) -> Result<(), AutoStartError> {
     // 1. 模块与清单查找（不存在 → 明确错误）
     let module = {
@@ -154,7 +180,15 @@ pub async fn ensure_module_running_with_timeout(
     };
 
     if needs_start {
-        start_via_existing_path(state, module_id, &manifest).await?;
+        // 显式设备指定先行硬校验（D-Device）；auto/None 走策略选择。
+        // 注意：Starting/Preparing 旁路（他人拉起中）不重复校验，等健康即可。
+        let device_override = match device_hint {
+            Some(hint) => super::resolve_device_hint(state, &manifest, Some(hint))
+                .await
+                .map_err(AutoStartError::DeviceHint)?,
+            None => None,
+        };
+        start_via_existing_path(state, module_id, &manifest, device_override).await?;
     }
 
     // 3. 轮询等待健康（失败时清理已拉起的进程与端口）
@@ -174,6 +208,7 @@ async fn start_via_existing_path(
     state: &Arc<AppState>,
     module_id: &str,
     manifest: &ModuleManifest,
+    device_override: Option<ep_core::types::DeviceId>,
 ) -> Result<(), AutoStartError> {
     // 1. 模型前置检查（与手动启动端点同语义：激活变体缺失 → 拒绝）。
     //    F1 修复：变体选择经 [`super::active_model_decl`] 三级回退（config
@@ -207,7 +242,11 @@ async fn start_via_existing_path(
     //    与手动启动（modules.rs）同源的共享助手——is_venv_ready 哈希门禁修复
     //    "半壳 venv"（只有解释器、未装依赖）误判就绪；未就绪才准备。仅 Python
     //    运行时实际生效。设备选择前移：分后端 venv 依赖本次分配 backend。
-    let device = super::select_module_device(state, manifest).await;
+    //    D-Device：显式指定优先于策略分配（已通过 resolve_device_hint 硬校验）。
+    let device = match device_override {
+        Some(d) => d,
+        None => super::select_module_device(state, manifest).await,
+    };
     super::ensure_module_venv_ready(state, module_id, manifest, Some(device.backend()))
         .await
         .map_err(AutoStartError::VenvPrepFailed)?;

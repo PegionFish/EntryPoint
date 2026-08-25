@@ -761,6 +761,7 @@ async fn run_inference(
         &cap.name,
         params,
         input_path,
+        None,
         options,
     )
     .await

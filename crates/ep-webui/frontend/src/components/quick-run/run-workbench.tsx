@@ -4,12 +4,19 @@ import { ArrowRight, Loader2, Play, TriangleAlert, Upload } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { api } from '@/api/client'
-import type { CapabilityParamSchema } from '@/api/types'
+import type { CapabilityParamSchema, DeviceResponse } from '@/api/types'
 import { postExecuteSingle } from '@/hooks/use-direct-exec'
 import type { CatalogEntry } from '@/components/quick-run/capability-catalog'
 import { ParamField } from '@/components/quick-run/param-field'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
@@ -43,13 +50,19 @@ function defaultParamsOf(
  */
 export function RunWorkbench({
   entry,
+  devices,
   idleMinutes,
   onSubmitted,
+  onModuleChanged,
 }: {
   entry: CatalogEntry
+  /** 在线计算设备（D-Device 算力源下拉数据源） */
+  devices: DeviceResponse[]
   /** 模块空闲自动下线阈值（分钟）；0/null = 常驻 */
   idleMinutes: number | null
   onSubmitted: (taskId: string) => void
+  /** 停止+重启切换算力源后通知父级刷新模块状态 */
+  onModuleChanged: () => void
 }) {
   const { t } = useTranslation('run')
   const { t: tModels } = useTranslation('models')
@@ -60,12 +73,16 @@ export function RunWorkbench({
   const [inputText, setText] = useState('')
   const [uploading, setUploading] = useState(false)
   const [submitting, setSubmitting] = useState(false)
+  /** 算力源选择：'' = auto（跟随计算策略）；否则为设备 id 字符串 */
+  const [deviceSel, setDeviceSel] = useState('')
+  const [switching, setSwitching] = useState(false)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
 
-  // 切换能力条目：重置输入，按 schema 预填默认参数
+  // 切换能力条目：重置输入与算力源，按 schema 预填默认参数
   useEffect(() => {
     setInputPath('')
     setText('')
+    setDeviceSel('')
     setParams(defaultParamsOf(cap.params))
   }, [entry.key, cap.params])
 
@@ -76,6 +93,28 @@ export function RunWorkbench({
       ),
     [cap],
   )
+
+  /** manifest 后端 ∩ 设备栈 → 可用算力源（backend 前缀匹配，与后端口径一致） */
+  const compatibleDevices = useMemo(() => {
+    if (entry.backends.length === 0) return devices
+    return devices.filter((d) =>
+      entry.backends.some((b) =>
+        [d.backend, ...(d.stacks ?? [])]
+          .map((s) => s.toLowerCase())
+          .some((s) => b === s || s.startsWith(b)),
+      ),
+    )
+  }, [devices, entry.backends])
+
+  const running = ['running', 'starting', 'preparing'].includes(
+    entry.serviceStatus.trim().toLowerCase(),
+  )
+  /** 模块已在其他设备运行时，切到目标设备需先停止（单槽位语义） */
+  const conflict =
+    running &&
+    deviceSel !== '' &&
+    entry.device !== null &&
+    entry.device !== deviceSel
 
   async function handleUpload(file: File) {
     setUploading(true)
@@ -90,33 +129,31 @@ export function RunWorkbench({
     }
   }
 
-  async function handleSubmit() {
-    if (submitting || uploading) return
+  function buildRequest(): {
+    module_id: string
+    capability: string
+    params: Record<string, unknown>
+    lazy_start: boolean
+    input_path?: string
+    input_text?: string
+    device?: string
+  } {
     const textMode = isTextInput(cap.input_type)
-    if (textMode) {
-      if (!inputText.trim()) return
-      // json 输入型：提交前本地校验合法性，避免整次任务白跑
-      if (cap.input_type.trim().toLowerCase() === 'json') {
-        try {
-          JSON.parse(inputText)
-        } catch (err: unknown) {
-          toast.error(t('previewFail'), { description: errMsg(err) })
-          return
-        }
-      }
-    } else if (!inputPath.trim()) {
-      return
+    return {
+      module_id: entry.moduleId,
+      capability: cap.name,
+      params,
+      lazy_start: true,
+      ...(textMode ? { input_text: inputText } : { input_path: inputPath.trim() }),
+      ...(deviceSel !== '' ? { device: deviceSel } : {}),
     }
+  }
 
+  async function handleSubmit() {
+    if (switching || submitting || uploading) return
     setSubmitting(true)
     try {
-      const resp = await postExecuteSingle({
-        module_id: entry.moduleId,
-        capability: cap.name,
-        params,
-        lazy_start: true,
-        ...(textMode ? { input_text: inputText } : { input_path: inputPath.trim() }),
-      })
+      const resp = await postExecuteSingle(buildRequest())
       toast.success(t('accepted'), { description: resp.task_id })
       onSubmitted(resp.task_id)
     } catch (e) {
@@ -135,10 +172,37 @@ export function RunWorkbench({
     }
   }
 
+  /** D-Device 完整版：冲突时停止模块 → 等 Stopped → 带 device hint 提交 */
+  async function handleRestartRun() {
+    if (switching || submitting) return
+    setSwitching(true)
+    try {
+      await api.stopModule(entry.moduleId)
+      for (let i = 0; i < 20; i++) {
+        const st = await api.moduleStatus(entry.moduleId)
+        if (st.status !== 'running' && st.status !== 'starting' && st.status !== 'preparing')
+          break
+        await new Promise((r) => setTimeout(r, 400))
+      }
+      onModuleChanged()
+      const resp = await postExecuteSingle(buildRequest())
+      toast.success(t('accepted'), {
+        description: `${resp.task_id} · ${deviceSel}`,
+      })
+      onSubmitted(resp.task_id)
+    } catch (e) {
+      toast.error(tModels('run.submitFailed'), { description: errMsg(e) })
+    } finally {
+      setSwitching(false)
+    }
+  }
+
   const textMode = isTextInput(cap.input_type)
   const canSubmit =
     !submitting &&
     !uploading &&
+    !switching &&
+    !conflict &&
     entry.modelReady !== false &&
     (textMode ? inputText.trim().length > 0 : inputPath.trim().length > 0)
 
@@ -175,6 +239,62 @@ export function RunWorkbench({
           {cap.max_file_size_mb ? ` · ≤ ${cap.max_file_size_mb} MB` : ''}
         </p>
       </div>
+
+      {/* 1.5 算力源选择（D-Device 完整版）：auto 跟随策略；显式指定固定本次启动设备 */}
+      <div className="space-y-2">
+        <div className="flex items-center justify-between gap-2">
+          <label className="text-sm font-medium">{t('device.label')}</label>
+          {running && entry.device && (
+            <span className="shrink-0 rounded-full border border-border bg-muted/60 px-1.5 py-px font-mono text-[10px] text-muted-foreground">
+              {t('statusRunning')} · {entry.device}
+            </span>
+          )}
+        </div>
+        <Select
+          value={deviceSel || undefined}
+          onValueChange={(v) => setDeviceSel(v === '__auto__' ? '' : v)}
+          disabled={submitting || switching}
+        >
+          <SelectTrigger className="w-full">
+            <SelectValue placeholder={t('device.auto')} />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="__auto__">{t('device.auto')}</SelectItem>
+            {compatibleDevices.map((d) => (
+              <SelectItem key={d.id} value={d.id}>
+                {d.name} · {d.backend}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+
+      {/* 1.6 运行中 + 目标 ≠ 当前：单槽位语义，需先重启模块（冲突横幅） */}
+      {conflict && (
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-status-starting/30 bg-status-starting/10 px-3 py-2 text-sm">
+          <TriangleAlert className="size-4 shrink-0 text-status-starting" />
+          <span>
+            {t('device.conflict', {
+              current: entry.device,
+              target: deviceSel,
+            })}
+          </span>
+          <Button
+            variant="outline"
+            size="sm"
+            className="ml-auto"
+            disabled={switching}
+            onClick={() => void handleRestartRun()}
+          >
+            {switching ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <Play className="size-3.5" />
+            )}
+            {switching ? t('device.switching') : t('device.restartRun')}
+          </Button>
+        </div>
+      )}
 
       {/* 2. 输入区：text/json 走 textarea，其余走 文件路径/上传 */}
       <div className="space-y-2">
@@ -266,15 +386,25 @@ export function RunWorkbench({
         </div>
       )}
 
-      {/* 4. 执行 */}
+      {/* 4. 执行（冲突态 = 停止并切换设备执行） */}
       <div className="space-y-2">
-        <Button className="w-full" disabled={!canSubmit} onClick={() => void handleSubmit()}>
-          {submitting ? (
+        <Button
+          className="w-full"
+          disabled={!canSubmit}
+          onClick={() => void (conflict ? handleRestartRun() : handleSubmit())}
+        >
+          {switching ? (
+            <Loader2 className="size-4 animate-spin" />
+          ) : submitting ? (
             <Loader2 className="size-4 animate-spin" />
           ) : (
             <Play className="size-4" />
           )}
-          {t('submit')}
+          {switching
+            ? t('device.switching')
+            : conflict
+              ? t('device.restartRun')
+              : t('submit')}
         </Button>
         <p className="text-[11px] text-muted-foreground">
           {t('startingHint')}

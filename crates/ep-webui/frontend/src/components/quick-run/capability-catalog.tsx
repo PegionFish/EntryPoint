@@ -12,6 +12,10 @@ export interface CatalogEntry {
   capability: CapabilityDecl
   /** ModuleResponse.service_status 原值（running/starting/preparing/stopped/error…） */
   serviceStatus: string
+  /** 运行中实例当前绑定的设备名（如 "cuda:0"；未运行为 null） */
+  device: string | null
+  /** manifest 声明的计算后端（D-Device 兼容性过滤依据） */
+  backends: string[]
   /**
    * 激活变体是否就绪（join GET /api/models 按 status==='ready'）；
    * null = 该模块不依赖模型权重

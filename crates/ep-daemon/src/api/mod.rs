@@ -113,6 +113,48 @@ pub(crate) async fn select_module_device(
     .unwrap_or(ep_core::types::DeviceId::Cpu)
 }
 
+/// 显式设备指定解析（快速调用算力源切换，QUICK_RUN_PLAN D-Device 完整版）：
+/// 与节点级软约束（`resolve_device_soft_constraint` 回退 auto）不同，
+/// 用户显式选择**硬校验**——未知/不在线设备、与 manifest 声明后端不兼容
+/// 均报错，绝不静默漂移。
+///
+/// 返回 `Ok(None)` = auto（跟随 `[compute].strategy`）；
+/// `Ok(Some(id))` = 本次启动固定到该设备。
+pub(crate) async fn resolve_device_hint(
+    state: &AppState,
+    manifest: &ep_core::module::manifest::ModuleManifest,
+    hint: Option<&str>,
+) -> Result<Option<ep_core::types::DeviceId>, String> {
+    let Some(hint) = hint
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto"))
+    else {
+        return Ok(None);
+    };
+    let devices = state.devices.read().await;
+    let ids: Vec<ep_core::types::DeviceId> =
+        devices.iter().map(|d| d.id.clone()).collect();
+    if !ep_core::pipeline::dag::device_is_available(Some(hint), &ids) {
+        return Err(format!("设备 {hint} 不存在或不在线"));
+    }
+    let target = devices
+        .iter()
+        .find(|d| {
+            d.id.to_string().eq_ignore_ascii_case(hint)
+                || d.backend.to_string().eq_ignore_ascii_case(hint)
+        })
+        .expect("device_is_available 已确认存在");
+    if !manifest.compute.backends.is_empty()
+        && !manifest.compute.backends.contains(&target.backend)
+    {
+        return Err(format!(
+            "设备 {hint}（后端 {}）与模块声明后端不兼容",
+            target.backend
+        ));
+    }
+    Ok(Some(target.id.clone()))
+}
+
 /// 模块启动环境变量统一构建（缺陷 #4 残余修复）：手动启动（modules.rs）与
 /// 自动拉起（autostart.rs）两条路径共用 ep-core 公共构建函数
 /// [`ep_core::process::build_module_env`]（与 daemon 独立模式 `--run-module`、
