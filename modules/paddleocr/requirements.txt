@@ -3,4 +3,7 @@ uvicorn[standard]>=0.23.0
 python-multipart>=0.0.6
 paddleocr>=3.0,<4
 paddlepaddle>=3.0,<4
+# PP-StructureV3 文档理解（doc_understand）
+paddlex>=3.3,<4
+pypdfium2>=4.0.0
 Pillow>=10.0.0
