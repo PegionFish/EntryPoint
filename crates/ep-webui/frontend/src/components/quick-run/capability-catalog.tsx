@@ -1,5 +1,6 @@
 import { useTranslation } from 'react-i18next'
 import type { CapabilityDecl } from '@/api/types'
+import { categoryLabel } from '@/lib/constants'
 import { cn } from '@/lib/utils'
 
 /** 能力目录条目（QUICK_RUN_PLAN D1：模块 × 能力扁平化，客户端聚合） */
@@ -85,7 +86,7 @@ export function CapabilityCatalog({
                 {e.moduleName}
               </span>
               <span className="ml-auto shrink-0 font-mono text-[10px] text-muted-foreground">
-                {e.category}
+                {categoryLabel(e.category)}
               </span>
             </div>
             <div className="mt-1 flex items-center gap-2 pl-4">
