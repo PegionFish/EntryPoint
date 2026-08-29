@@ -88,7 +88,7 @@ to = ["output", "in"]
 /// 脚手架 README（作者指南速览；完整版由 C8 文档代理产出）。
 const README_TEMPLATE: &str = r#"# 整合包作者目录
 
-本目录由 `ep-pack new` 生成，是一个 EntryPoint 模型整合包（.epzip）的源目录。
+本目录由 `ep-pack new` 生成，是一个 EntryPoint 模型整合包（.zip）的源目录。
 
 ## 布局
 
@@ -100,12 +100,12 @@ const README_TEMPLATE: &str = r#"# 整合包作者目录
 
 ```text
 ep-pack validate .            # 清单/schema/管线/CHECKSUMS 全项校验
-ep-pack build . -o out.epzip  # 打包（自动生成 CHECKSUMS.toml，确定性字节）
-ep-pack info out.epzip        # 查看归档摘要与 CHECKSUMS 状态
-ep-pack import out.epzip --root <EP 应用根>   # 导入验证（--dry-run 先出报告）
+ep-pack build . -o out.zip  # 打包（自动生成 CHECKSUMS.toml，确定性字节）
+ep-pack info out.zip        # 查看归档摘要与 CHECKSUMS 状态
+ep-pack import out.zip --root <EP 应用根>   # 导入验证（--dry-run 先出报告）
 ```
 
-构建产物（.epzip）可自行上传 GitHub Release 等平台分发。
+构建产物（.zip）可自行上传 GitHub Release 等平台分发。
 "#;
 
 pub fn run(argv: &[String]) -> ExitCode {

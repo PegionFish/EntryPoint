@@ -3,7 +3,7 @@
 > 适用于 EntryPoint v0.x | 契约依据：PACK_UNIFY_PLAN §4（设计 B：模型整合包 SDK）
 
 本文档面向**整合包作者**：如何把自己调好的"模型 + 管线 + 运行约束"打包成
-`.epzip` 分发，以及他人如何导入使用。
+整合包归档（标准 zip / tar.gz）分发，以及他人如何导入使用。
 
 ---
 
@@ -24,12 +24,13 @@
 
 ---
 
-## 2. 归档布局（`.epzip`，冻结契约）
+## 2. 归档布局（冻结契约）
 
-`.epzip` 就是一个 zip 归档，内部布局：
+整合包归档就是**标准 zip 或 tar.gz 归档**（导入按文件魔数识别容器，
+不依赖扩展名），内部布局：
 
 ```
-<pack-id>-<version>.epzip
+<pack-id>-<version>.zip
 ├── ep-pack.toml              ← 必须。包清单（§3 字段参考）
 ├── CHECKSUMS.toml            ← 必须。包内所有文件的 sha256（§4）
 ├── models/<target_dir>/      ← 可选。bundle 模式的模型权重
@@ -170,11 +171,11 @@ file = "pipelines/video_to_srt.toml"          # 归档内相对路径（/ 分隔
 | 命令 | 用途 |
 |---|---|
 | `ep-pack new` | 脚手架：生成包源目录（ep-pack.toml 模板 + pipelines/ 骨架） |
-| `ep-pack validate` | 校验包源目录或 .epzip：清单 schema + 校验和 + 路径安全，不落盘任何东西 |
-| `ep-pack build` | 从包源目录构建 .epzip（生成清单校验 + CHECKSUMS.toml + 打包） |
-| `ep-pack import` | 命令行导入 .epzip 到指定 EntryPoint 根（走与 daemon 相同的 ep-pack 导入编排） |
-| `ep-pack info` | 只读查看 .epzip 的清单摘要 / 内容清单 / 适配前置信息 |
-| `ep-pack export` | 从已安装包注册表导出 .epzip（与 `GET /api/packs/{id}/export` 同源） |
+| `ep-pack validate` | 校验包源目录或 .zip 归档：清单 schema + 校验和 + 路径安全，不落盘任何东西 |
+| `ep-pack build` | 从包源目录构建 .zip 归档（生成清单校验 + CHECKSUMS.toml + 打包） |
+| `ep-pack import` | 命令行导入 .zip/.tar.gz 归档到指定 EntryPoint 根（走与 daemon 相同的导入编排） |
+| `ep-pack info` | 只读查看 .zip 归档的清单摘要 / 内容清单 / 适配前置信息 |
+| `ep-pack export` | 从已安装包注册表导出 .zip 归档（与 `GET /api/packs/{id}/export` 同源） |
 
 典型作者工作流：
 
@@ -182,7 +183,7 @@ file = "pipelines/video_to_srt.toml"          # 归档内相对路径（/ 分隔
 ep-pack new my-kit                  # 1. 脚手架
 # 2. 编辑 ep-pack.toml（§3），放入 pipelines/*.toml 与（bundle 时）models/ 权重
 ep-pack validate my-kit             # 3. 自检
-ep-pack build my-kit -o my-kit-1.0.0.epzip   # 4. 出包（CHECKSUMS 自动生成）
+ep-pack build my-kit -o my-kit-1.0.0.zip   # 4. 出包（CHECKSUMS 自动生成）
 # 5. 上传 GitHub Release（§8）
 ```
 
@@ -192,11 +193,11 @@ ep-pack build my-kit -o my-kit-1.0.0.epzip   # 4. 出包（CHECKSUMS 自动生�
 |---|---|
 | `GET /api/packs` | 已装包列表（注册表 `runtime/packs/<pack-id>.json`） |
 | `POST /api/packs/import` | `{source:"local",path}` 或 `{source:"url",url}` → 202 `{pack_id}`，进度走 WS `pack_import` |
-| `POST /api/packs/upload` | multipart `.epzip` 浏览器上传 → 202 同上 |
+| `POST /api/packs/upload` | multipart 归档（.zip/.tar.gz）浏览器上传 → 202 同上 |
 | `GET /api/packs/{id}` | 详情（内容清单 / 适配报告） |
 | `DELETE /api/packs/{id}` | 卸载；`?keep_models=true` 保留模型文件 |
 | `POST /api/packs/build` | `{models:[qualified_id@variant], pipelines:[id], bundle:[qualified_id], tags?:[tag]}` → 202，构建完成可下载 |
-| `GET /api/packs/{id}/export` | `.epzip` 流式下载 |
+| `GET /api/packs/{id}/export` | `.zip` 归档流式下载 |
 
 ---
 
@@ -235,7 +236,7 @@ ep-pack build my-kit -o my-kit-1.0.0.epzip   # 4. 出包（CHECKSUMS 自动生�
 
 | 渠道 | 导入方式 |
 |---|---|
-| **GitHub Release**（推荐） | 把 `.epzip` 作为 Release 资产上传；导入方 `POST /api/packs/import {source:"url",url}` 填 Release 资产直链，或 `ep-pack import` |
+| **GitHub Release**（推荐） | 把归档（.zip/.tar.gz）作为 Release 资产上传；导入方 `POST /api/packs/import {source:"url",url}` 填 Release 资产直链，或 `ep-pack import` |
 | 任意 HTTP(S) URL | 同上（URL 导入） |
 | 本地文件 | `{source:"local",path}` 或 `ep-pack import <file>` |
 | 浏览器上传 | WebUI 整合包页（`POST /api/packs/upload`） |
@@ -260,7 +261,7 @@ ep-pack build my-kit -o my-kit-1.0.0.epzip   # 4. 出包（CHECKSUMS 自动生�
 
 ## 10. 模块的标准压缩包分发（v1.3-draft 增补）
 
-> 本节面向**模块作者**（分发 `modules/<id>/` 目录），与上文整合包（`.epzip`）是
+> 本节面向**模块作者**（分发 `modules/<id>/` 目录），与上文整合包归档是
 > 两条独立通道。设计依据：HETERO_DIST_PLAN §2.2（分发载体）与 §2.3（平台导入/
 > 导出 API）。
 
@@ -268,7 +269,7 @@ ep-pack build my-kit -o my-kit-1.0.0.epzip   # 4. 出包（CHECKSUMS 自动生�
 v2 变更）：模块分发一律采用**标准压缩档案**——`modules/<module-id>/` 目录本身就是
 分发单元，打成 zip 或 tar.gz 即为发布物；任何"根部含一个 `module.toml`"的标准
 压缩包都可被平台导入。不引入专有扩展名、专有清单或专用工具链。
-（`.epzip` 整合包为已交付的历史功能，维持现状、不扩散，见 §1–§9。）
+（整合包容器为标准 zip / tar.gz 归档，导入按魔数识别，见 §1–§9。）
 
 发布物清单：
 

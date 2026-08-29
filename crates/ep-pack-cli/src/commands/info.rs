@@ -1,6 +1,6 @@
-//! `ep-pack info <archive.epzip | pack-id> [--root <dir>]`
+//! `ep-pack info <archive.zip | pack-id> [--root <dir>]`
 //!
-//! - 位置参数是**已存在的文件** → 归档模式：流式读 `.epzip`（不全量解包），
+//! - 位置参数是**已存在的文件** → 归档模式：流式读 `.zip`（不全量解包），
 //!   输出清单摘要 + 文件清单 + CHECKSUMS 状态（逐文件重算 sha256 核对）。
 //! - 否则按 **pack id** 在 `--root`（缺省当前目录）的已装包注册表
 //!   （`runtime/packs/<id>.json`）查找 → 注册表模式。
@@ -25,7 +25,7 @@ use crate::args::{self, OptDef};
 use crate::output::{self, EXIT_FAILURE, EXIT_OK, EXIT_USAGE};
 
 const USAGE: &str =
-    "usage: ep-pack info <archive.epzip | pack-id> [--root <dir>] [--json]";
+    "usage: ep-pack info <archive.zip | pack-id> [--root <dir>] [--json]";
 
 /// 流式哈希缓冲：1 MiB。
 const HASH_CHUNK_SIZE: usize = 1024 * 1024;

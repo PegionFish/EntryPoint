@@ -1,4 +1,4 @@
-//! `ep-pack import <archive.epzip> [--root <dir>] [--modules-dir <dir>] [--dry-run]`
+//! `ep-pack import <archive.zip> [--root <dir>] [--modules-dir <dir>] [--dry-run]`
 //!
 //! 正式导入走 ep-pack `import_pack` 编排（§4.4 全流程）：extract + CHECKSUMS
 //! 全量校验 + 清单校验/semver 门禁 + bundle 落位 + meta + 管线落位 + 注册表。
@@ -18,7 +18,7 @@ use std::process::ExitCode;
 use ep_core::compute::detect_all_devices;
 use ep_core::types::ComputeDevice;
 use ep_pack::checksum::ChecksumTable;
-use ep_pack::extract::{extract_epzip, ExtractLimits, MANIFEST_FILE_NAME};
+use ep_pack::extract::{extract_pack, ExtractLimits, MANIFEST_FILE_NAME};
 use ep_pack::import::{
     adapt_model, import_pack, read_installed_pack, registry_entry_path, AdaptationVerdict,
     ImportOptions, ImportReport, ImportTargets, PackAdaptationEntry,
@@ -30,7 +30,7 @@ use crate::commands::join_pack_rel;
 use crate::output::{self, EXIT_FAILURE, EXIT_OK, EXIT_USAGE};
 use crate::resolve::{load_module_catalog, resolve_entry};
 
-const USAGE: &str = "usage: ep-pack import <archive.epzip> [--root <dir>] [--modules-dir <dir>] [--dry-run] [--json]";
+const USAGE: &str = "usage: ep-pack import <archive.zip> [--root <dir>] [--modules-dir <dir>] [--dry-run] [--json]";
 
 /// 测试/低配环境钩子：设置该环境变量则跳过本机设备检测（适配报告以
 /// 「无已检测设备」视角生成；reference/bundle 的校验语义不受影响）。
@@ -279,7 +279,7 @@ fn run_dry_run(
     // 1) 解包到暂存（zip-slip / symlink / 大小上限防护见 ep_pack::extract）
     let extract_dir = staging_root.join(format!("dryrun-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&extract_dir); // 防上次残留
-    let extracted = match extract_epzip(archive, &extract_dir, &ExtractLimits::default()) {
+    let extracted = match extract_pack(archive, &extract_dir, &ExtractLimits::default()) {
         Ok(_) => true,
         Err(e) => {
             errors.push(format!("extract failed: {e}"));

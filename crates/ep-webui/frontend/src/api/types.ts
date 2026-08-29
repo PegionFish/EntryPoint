@@ -476,7 +476,7 @@ export interface PackBuildRequest {
   description?: string
 }
 
-/** POST /api/packs/build 202 响应：构建完成后经 export 端点下载 .epzip */
+/** POST /api/packs/build 202 响应：构建完成后经 export 端点下载 .zip */
 export interface PackBuildResponse {
   pack_id: string
 }

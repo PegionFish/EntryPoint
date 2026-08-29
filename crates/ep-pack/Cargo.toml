@@ -12,8 +12,10 @@ serde_json.workspace = true
 toml.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
-# 整合包归档（.epzip = zip）：依赖写法与 ep-daemon 的 api/upload.rs 解包侧保持一致
+# 整合包归档容器：标准 zip 与 tar.gz（依赖写法与 ep-daemon 的 api/upload.rs 解包侧保持一致）
 zip = { version = "2", default-features = false, features = ["deflate"] }
+tar = "0.4"
+flate2 = "1"
 # CHECKSUMS.toml 全量校验（sha256）
 sha2 = "0.11"
 hex = "0.4"

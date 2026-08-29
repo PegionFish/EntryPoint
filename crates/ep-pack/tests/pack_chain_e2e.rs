@@ -148,7 +148,7 @@ fn devices() -> Vec<ComputeDevice> {
     ]
 }
 
-/// build .epzip → import；返回 targets
+/// build .zip → import；返回 targets
 fn build_and_import(root: &Path) -> ImportTargets {
     let src = root.join("src");
     write_file(&src.join("ep-pack.toml"), MANIFEST.as_bytes());
@@ -160,7 +160,7 @@ fn build_and_import(root: &Path) -> ImportTargets {
         &src.join("pipelines").join("main.toml"),
         PIPELINE_MAIN.as_bytes(),
     );
-    let archive = root.join("chain-pack.epzip");
+    let archive = root.join("chain-pack.zip");
     build_pack(&BuildPlan::new(&src, &archive)).unwrap();
 
     let targets = ImportTargets::from_root(root);
@@ -254,7 +254,7 @@ fn double_import_rejected_state_intact() {
     let targets = build_and_import(&root);
 
     let src = root.join("src");
-    let archive = root.join("chain-pack.epzip");
+    let archive = root.join("chain-pack.zip");
     let err = import_pack(
         &archive,
         &root.join(".pack-staging"),

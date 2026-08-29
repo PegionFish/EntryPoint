@@ -17,7 +17,7 @@
 //!
 //! # 流程（§4.4）
 //!
-//! 1. **Extracting** — [`extract_epzip`] 解包到 staging 下的唯一子目录
+//! 1. **Extracting** — [`extract_pack`] 解包到 staging 下的唯一子目录
 //!    （zip-slip / symlink / 大小上限防护见 [`crate::extract`]）；
 //! 2. **Verifying** — [`ChecksumTable::read`] + [`ChecksumTable::verify`]
 //!    全量校验（缺失/多余/篡改一次性报告）；
@@ -46,7 +46,7 @@ use ep_core::model_id::PinnedModelId;
 use ep_core::types::{ComputeBackend, ComputeDevice};
 
 use crate::checksum::{ChecksumError, ChecksumTable};
-use crate::extract::{extract_epzip, ExtractError, ExtractLimits, MANIFEST_FILE_NAME};
+use crate::extract::{extract_pack, ExtractError, ExtractLimits, MANIFEST_FILE_NAME};
 use crate::manifest::{semver, ModelMode, PackManifest, PackManifestError, PackModelEntry};
 
 /// 模型元数据文件名（与 `ep_core::model::META_FILE_NAME`（私有）保持同步）。
@@ -71,7 +71,7 @@ static EXTRACT_SEQ: AtomicUsize = AtomicUsize::new(0);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "lowercase")]
 pub enum ImportSource {
-    /// 本地 `.epzip` 路径
+    /// 本地 `.zip` 路径
     Local { path: PathBuf },
     /// 远程 URL（调用方下载进暂存目录后再导入）
     Url { url: String },
@@ -649,7 +649,7 @@ fn scan_existing_pipelines(pipelines_dir: &Path) -> (BTreeMap<String, String>, B
 /// 导入编排（§4.4 全流程，同步执行；daemon 侧经 `spawn_blocking` 调用）。
 ///
 /// 参数：
-/// - `archive`：已暂存的 `.epzip` 归档路径（URL 来源须先由调用方下载）；
+/// - `archive`：已暂存的 `.zip` 归档路径（URL 来源须先由调用方下载）；
 /// - `staging_root`：解包隔离区（`.pack-staging`）；本函数在其下创建唯一
 ///   子目录，成功后整体删除，失败保留供排查；
 /// - `targets` / `options`：落位路径与解包约束/版本门禁参数；
@@ -693,7 +693,7 @@ where
         std::process::id(),
         EXTRACT_SEQ.fetch_add(1, Ordering::SeqCst)
     ));
-    let summary = extract_epzip(archive, &extract_dir, &options.limits)?;
+    let summary = extract_pack(archive, &extract_dir, &options.limits)?;
     emit(
         ImportStage::Extracting,
         BAND_EXTRACT.1,
@@ -1225,19 +1225,19 @@ mod tests {
     #[test]
     fn import_source_serde_matches_api_contract() {
         let local: ImportSource =
-            serde_json::from_str(r#"{"source":"local","path":"a.epzip"}"#).unwrap();
+            serde_json::from_str(r#"{"source":"local","path":"a.zip"}"#).unwrap();
         assert_eq!(
             local.local_path(),
-            Some(Path::new("a.epzip")),
+            Some(Path::new("a.zip")),
         );
 
         let url: ImportSource =
-            serde_json::from_str(r#"{"source":"url","url":"https://x/y.epzip"}"#).unwrap();
+            serde_json::from_str(r#"{"source":"url","url":"https://x/y.zip"}"#).unwrap();
         assert!(url.local_path().is_none());
 
         let upload: ImportSource =
-            serde_json::from_str(r#"{"source":"upload","path":"u.epzip"}"#).unwrap();
-        assert_eq!(upload.local_path(), Some(Path::new("u.epzip")));
+            serde_json::from_str(r#"{"source":"upload","path":"u.zip"}"#).unwrap();
+        assert_eq!(upload.local_path(), Some(Path::new("u.zip")));
 
         // 未知 source 拒绝
         assert!(

@@ -181,14 +181,14 @@ mod tests {
     fn positional_and_options_mixed() {
         let p = parse(
             &args(&[
-                "pack.epzip", "--root", "C:\\ep", "-o", "out.epzip", "--dry-run", "--json",
+                "pack.zip", "--root", "C:\\ep", "-o", "out.zip", "--dry-run", "--json",
             ]),
             &test_opts(),
         )
         .unwrap();
-        assert_eq!(p.positional, vec!["pack.epzip"]);
+        assert_eq!(p.positional, vec!["pack.zip"]);
         assert_eq!(p.value("root"), Some("C:\\ep"));
-        assert_eq!(p.value("output"), Some("out.epzip"));
+        assert_eq!(p.value("output"), Some("out.zip"));
         assert!(p.switch("dry-run"));
         assert!(p.switch("json"));
     }

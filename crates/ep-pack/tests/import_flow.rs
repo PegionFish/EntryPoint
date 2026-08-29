@@ -1,5 +1,5 @@
 //! 整合包导入全流程集成测试（§4.4）— tempdir 往返：
-//! A4 `build_pack` 生成真实小 `.epzip` → `import_pack` → 断言
+//! A4 `build_pack` 生成真实小 `.zip` → `import_pack` → 断言
 //! meta / 注册表 / 适配报告 / 管线落位 / 进度阶段。
 //!
 //! 分支覆盖：bundle+reference 混合、缺模块、重名管线、checksum 篡改、
@@ -127,9 +127,9 @@ fn sample_pack_source(root: &Path, manifest: &str, with_weights: bool) -> PathBu
     src
 }
 
-/// build_pack 生成 .epzip
+/// build_pack 生成 .zip
 fn build_fixture(root: &Path, src: &Path) -> PathBuf {
-    let archive = root.join("demo-pack.epzip");
+    let archive = root.join("demo-pack.zip");
     build_pack(&BuildPlan::new(src, &archive)).unwrap();
     archive
 }
@@ -493,7 +493,7 @@ fn checksum_tamper_aborts_before_any_placement() {
     let root = unique_root("checksum");
     let src = sample_pack_source(&root, FIXTURE_MANIFEST, true);
     let archive = build_fixture(&root, &src);
-    let tampered = root.join("tampered.epzip");
+    let tampered = root.join("tampered.zip");
     tamper_archive(
         &archive,
         &tampered,
@@ -731,7 +731,7 @@ fn pipeline_invalid_toml_hard_error() {
 fn zip_slip_archive_rejected_at_extract_stage() {
     let root = unique_root("zip-slip");
     // 直接构造恶意 zip（含 ep-pack.toml 与 ../evil.txt）
-    let archive = root.join("evil.epzip");
+    let archive = root.join("evil.zip");
     {
         let file = File::create(&archive).unwrap();
         let mut zip = ZipWriter::new(file);

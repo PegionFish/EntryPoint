@@ -24,19 +24,19 @@ ep-pack — EntryPoint 整合包作者离线工具
 命令:
   new <dir>                脚手架整合包作者目录（清单模板 + pipelines/ + models/ + README）
   validate [dir]           校验清单 schema/semver/qualified_id/管线 §6.2/CHECKSUMS（缺省当前目录）
-  build [dir] [-o <out>]   校验先行并打包为 .epzip（缺省输出 <id>-<version>.epzip 于当前目录）
-  import <archive.epzip>   导入 .epzip 到目标根
+  build [dir] [-o <out>]   校验先行并打包为 .zip（缺省输出 <id>-<version>.zip 于当前目录）
+  import <archive.zip>   导入 .zip 到目标根
       --root <dir>           目标 EP 应用根（缺省当前目录，按 models/ config/ runtime/ 布局）
       --modules-dir <dir>    模块清单目录（缺省 <root>/modules；resolve 匹配 qualified_id）
       --dry-run              只出适配/校验报告，不落位
-  info <archive.epzip|pack-id>
+  info <archive.zip|pack-id>
                            归档模式：清单摘要 + 文件清单 + CHECKSUMS 状态
                            注册表模式：--root 下已装包条目（runtime/packs/<id>.json）
       --root <dir>           注册表所在应用根（缺省当前目录）
-  export <pack-id>         已装包重建 .epzip
+  export <pack-id>         已装包重建 .zip
       --root <dir>           应用根（缺省当前目录）
       --modules-dir <dir>    模块清单目录（缺省 <root>/modules）
-      -o, --output <out>     输出路径（缺省当前目录 <id>-<version>.epzip）
+      -o, --output <out>     输出路径（缺省当前目录 <id>-<version>.zip）
 
 全局选项:
   --json                   机器可读 JSON 输出（stdout 仅一个 JSON 对象）

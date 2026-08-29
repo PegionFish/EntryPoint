@@ -1,7 +1,7 @@
-//! `ep-pack build [dir] [-o out.epzip]` — 校验先行，随后 `build_pack`
+//! `ep-pack build [dir] [-o out.zip]` — 校验先行，随后 `build_pack`
 //! 确定性打包（§4.5）。
 //!
-//! 缺省输出路径：当前工作目录下 `<pack.id>-<pack.version>.epzip`；
+//! 缺省输出路径：当前工作目录下 `<pack.id>-<pack.version>.zip`；
 //! 输出不得位于源目录内（build_pack 护栏）。
 
 use std::path::PathBuf;
@@ -13,7 +13,7 @@ use crate::args::{self, OptDef};
 use crate::commands::validate::validate_pack_dir;
 use crate::output::{self, EXIT_FAILURE, EXIT_OK, EXIT_USAGE};
 
-const USAGE: &str = "usage: ep-pack build [dir] [-o|--output <file.epzip>] [--json]";
+const USAGE: &str = "usage: ep-pack build [dir] [-o|--output <file.zip>] [--json]";
 
 pub fn run(argv: &[String]) -> ExitCode {
     let opts = [OptDef {
@@ -82,7 +82,7 @@ pub fn run(argv: &[String]) -> ExitCode {
         Some(o) => PathBuf::from(o),
         None => std::env::current_dir()
             .unwrap_or_default()
-            .join(format!("{}-{}.epzip", manifest.pack.id, manifest.pack.version)),
+            .join(format!("{}-{}.zip", manifest.pack.id, manifest.pack.version)),
     };
 
     match build_pack(&BuildPlan::new(&dir, &output_path)) {

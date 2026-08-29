@@ -6,7 +6,7 @@
 //! - dry-run 只出报告不落位
 //! - 恶意包拒绝（zip-slip / checksum 篡改 / 缺 CHECKSUMS）
 //! - 缺模块 → 适配报告 Unsupported（§4.4 报而不炸）
-//! - export 已装包重建 .epzip 往返
+//! - export 已装包重建 .zip 往返
 //! - 用法错误退出码 2 / 校验失败退出码 1
 //!
 //! 跨平台纪律：路径一律 Path::join；退出码断言双平台一致。
@@ -223,10 +223,10 @@ fn write_demo_source(root: &Path, with_weights: bool) -> PathBuf {
     src
 }
 
-/// 构建 demo 包归档（CLI build），返回 .epzip 路径。
+/// 构建 demo 包归档（CLI build），返回 .zip 路径。
 fn build_demo_archive(root: &Path) -> PathBuf {
     let src = write_demo_source(root, true);
-    let archive = root.join("demo.epzip");
+    let archive = root.join("demo.zip");
     let out = run(ep_pack()
         .current_dir(root)
         .args(["build"])
@@ -278,10 +278,10 @@ fn scaffold_full_chain() {
     out.assert_code(0, "validate scaffold");
     assert_eq!(out.json()["ok"], true);
 
-    // build：缺省输出名 <id>-<version>.epzip 于当前目录
+    // build：缺省输出名 <id>-<version>.zip 于当前目录
     let out = run(ep_pack().current_dir(&root).args(["build", "mypack", "--json"]));
     out.assert_code(0, "build scaffold");
-    let archive = root.join("your-name.my-pack-0.1.0.epzip");
+    let archive = root.join("your-name.my-pack-0.1.0.zip");
     assert!(archive.is_file(), "default archive name missing");
 
     // info（归档模式）：清单摘要 + 文件清单 + CHECKSUMS OK
@@ -496,7 +496,7 @@ fn dry_run_reports_without_placing() {
 #[test]
 fn import_rejects_zip_slip() {
     let root = temp_root("zip-slip");
-    let evil = root.join("evil.epzip");
+    let evil = root.join("evil.zip");
     write_raw_zip(
         &evil,
         &[
@@ -530,7 +530,7 @@ fn import_rejects_checksum_tamper_and_missing() {
     std::fs::create_dir_all(&target).unwrap();
 
     // 4a. CHECKSUMS 篡改：哈希与内容不符
-    let tampered = root.join("tampered.epzip");
+    let tampered = root.join("tampered.zip");
     write_raw_zip(
         &tampered,
         &[
@@ -556,7 +556,7 @@ fn import_rejects_checksum_tamper_and_missing() {
     assert!(!target.join("models").join("asr-v1").exists());
 
     // 4b. 缺 CHECKSUMS.toml：导入硬失败
-    let no_checksums = root.join("no-checksums.epzip");
+    let no_checksums = root.join("no-checksums.zip");
     write_raw_zip(
         &no_checksums,
         &[("ep-pack.toml", DEMO_MANIFEST.as_bytes())],
@@ -757,8 +757,8 @@ fn export_installed_pack_roundtrip() {
         .arg("--json"));
     out.assert_code(0, "import before export");
 
-    // export：注册表 → 重建 .epzip（bundle 权重硬链接/复制自 models/）
-    let exported = root.join("exported.epzip");
+    // export：注册表 → 重建 .zip（bundle 权重硬链接/复制自 models/）
+    let exported = root.join("exported.zip");
     let out = run(ep_pack()
         .current_dir(&root)
         .args(["export", "tester.demo-pack", "--root"])
@@ -837,7 +837,7 @@ fn usage_errors_exit_code_2() {
     // 不存在的归档
     let out = run(ep_pack()
         .current_dir(&root)
-        .args(["import", "no-such.epzip"]));
+        .args(["import", "no-such.zip"]));
     out.assert_code(2, "import missing archive");
 
     // info：不存在的文件且注册表无此 id
