@@ -175,6 +175,25 @@ export const api = {
   stopModule: (id: string) =>
     apiFetch<ModuleActionResult>(`/modules/${id}/stop`, { method: 'POST' }),
 
+  /**
+   * 模块扩展端点代理（COMFYUI_BRIDGE_PLAN §3.5/§3.6）：daemon 把
+   * /api/modules/{id}/extra/{*path} 原样转发给运行中适配器（模块未运行
+   * 返回 409），支持 GET / POST(FormData) / DELETE。path 按段做 URI 编码
+   * （如工作流文件名），调用方传原始字符串即可。
+   */
+  moduleExtra: <T>(
+    moduleId: string,
+    path: string,
+    init?: ApiFetchOptions,
+  ) =>
+    apiFetch<T>(
+      `/modules/${encodeURIComponent(moduleId)}/extra/${path
+        .split('/')
+        .map(encodeURIComponent)
+        .join('/')}`,
+      init,
+    ),
+
   // Config
   getConfig: () => apiFetch<AppConfig>('/config'),
 

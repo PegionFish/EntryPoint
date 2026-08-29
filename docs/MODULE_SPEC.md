@@ -879,3 +879,78 @@ curl -X POST http://localhost:18001/predict/transcribe \
   -F "file=@test.wav" \
   -F 'params={"language": "zh", "timestamps": true}'
 ```
+
+---
+
+## 10. 桥接模块模式（策略 C 复制模板）
+
+> 对应 ADAPTER_API.md §8（策略 C：桥接外部 HTTP 服务）；首个实例：
+> `modules/comfyui-bridge/`（契约 `CONTRACT.md`，用户文档 `README.md`）。
+> 本节是未来接入 A1111 / n8n 等其它带 HTTP API 的独立工具时的**复制模板**。
+
+### 10.1 适用判断
+
+满足以下全部条件时采用桥接模式，否则走 §1–§9 常规模块路径：
+
+- 目标工具是**独立进程**，自带完整 HTTP API（无法也不宜 import 其 Python 包）；
+- 工具由用户自行启动，平台仅**连接**（不拉起、不托管其进程）；
+- 交互形态是"提交任务 → 轮询 → 取回产物"（例如 A1111 的 `/sdapi/v1/txt2img`、
+  n8n 的 REST workflow API）。
+
+### 10.2 目录结构模板
+
+```
+modules/<bridge-id>/
+├── module.toml               # 契约要点见 10.3
+├── requirements.txt          # 仅 adapter 自身依赖：fastapi / uvicorn / python-multipart / httpx
+├── adapter.py                # 标准三端点 + 领域端点（如工作流/任务管理）
+├── <target>_client.py        # 外部 REST 客户端封装（超时/退避轮询/错误分类/回环绕过代理）
+├── workflows/ 或等效目录     # 领域资源落盘处（可选，按目标工具需要）
+├── tests/
+│   ├── mock_<target>.py      # 全端点仿真服务器（纯标准库，见 10.4）
+│   └── test_*.py             # 客户端单测 / 注入逻辑单测 / adapter 全流程测试
+├── CONTRACT.md               # 冻结契约（端点/参数键名/错误映射），多代理协作的前提
+└── README.md                 # 用户创作文档（快速开始/语法参考/限制边界）
+```
+
+### 10.3 module.toml 契约要点
+
+- `genre` 标识桥接目标族（如 `"comfyui"`、`"a1111"`），供前端按 genre 定制 UI；
+- `[compute]` `backends = ["cpu"]`，`default_backend = "cpu"`——代理本身不做计算；
+- `[compute.env]` 注入外部服务默认地址（如 `cpu = { COMFYUI_URL = "http://127.0.0.1:8188" }`）；
+- capability params **必须**提供 `base_url` 覆盖项（远程实例场景，参数优先于环境变量）；
+- **不声明 `[[models]]`**——桥接模块无权重文件；
+- `[interface]` `type = "http"` + `health_endpoint = "/health"`，`ready_timeout_secs` 取小值
+  （无模型加载，秒级就绪）；
+- adapter 实现遵守 ADAPTER_API.md §8：`/health` 503 表示**外部服务不可达**（代理探测
+  外部状态端点），文件类输出仍返回 `output_type = "file"` + `result` 为绝对路径。
+
+### 10.4 mock 服务器测试模式
+
+桥接模块的测试**永久不依赖真机**（CI 与开发环境均如此）：
+
+- `tests/mock_<target>.py` 仿真外部服务的全部被消费端点，含**错误注入开关**
+  （如恒拒绝提交、第 N 次轮询才完成、执行错误）——运行期可翻转的属性；
+- 纯标准库实现（如 `http.server.ThreadingHTTPServer`），提供
+  `create_server(host, port, **options)` + `serve_forever`，不依赖 pytest，
+  供客户端/adapter 测试与手动 curl 验证共用；
+- 单测覆盖：客户端重试/超时/错误分类、注入映射全路径（多组/多上游/非法键报错/多输出）、
+  adapter 对 mock 的端到端全流程；
+- 真机验证降级为**可选终验**（有真机时按清单走查，无真机以 mock 全绿 + 工程回归为验收上限）。
+
+参照行为矩阵：`modules/comfyui-bridge/CONTRACT.md` §6（mock_comfyui）。
+
+### 10.5 禁止事项
+
+- **不触碰引擎**：`crates/ep-core/**`、`executor.rs` / `dag.rs` / `runner.rs` 等
+  核心代码零改动——这是桥接模式的存在前提，确需引擎支持时走计划评审（如二期 service 节点），
+  不在模块内 hack；
+- **不托管外部进程**：平台/adapter 不拉起、不监控、不重启目标工具（用户明确选择"仅连接"）；
+- **不声明 `[[models]]`**：权重归目标工具管，模块清单只描述代理自身；
+- **不解析工作流/任务内部逻辑**：平台只保证发送合法数据包 + 注入前校验映射键存在性
+  （黑盒提交）；内部正确性问题由目标工具报错透传；
+- **不绑非回环地址**：adapter 绑定遵守 ADAPTER_API.md §1.2（读 `EP_HOST`，恒回环）；
+- **不引入目标工具依赖栈**：requirements 仅 adapter 自身所需，且落盘前与
+  `config/constraints.txt` 核对兼容性；
+- **不做安全增强伪装**：目标工具自身无认证时，adapter 不承诺补齐鉴权（文档如实声明
+  公网暴露风险，防护由部署侧负责）。

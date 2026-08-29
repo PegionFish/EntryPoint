@@ -49,6 +49,8 @@ pub(crate) struct ModuleResponse {
     /// 模块 manifest 声明的能力列表（§8.2，CapabilityDecl 逐字段原样序列化）。
     /// P0-1 根治：前端据此数据驱动渲染能力/参数表单，不再硬编码 capability 映射。
     capabilities: Vec<CapabilityDecl>,
+    /// manifest 声明的 genre 分组（ComfyUI 桥接类模块前端卡片判定依据）
+    genre: String,
     /// 当前绑定设备（如 "cuda:0"；未运行为 null）—— P2-4 设备列的真实数据源（§8.2）
     device: Option<String>,
     /// manifest 声明的计算后端（D-Device：前端算力源下拉的兼容性过滤依据）
@@ -101,7 +103,7 @@ pub async fn list_modules(
     let resp: Vec<ModuleResponse> = modules
         .iter()
         .map(|m| {
-            let (id, name, version, description, category, capabilities) =
+            let (id, name, version, description, category, genre, capabilities) =
                 if let Some(ref manifest) = m.manifest {
                     (
                         manifest.module.id.clone(),
@@ -109,6 +111,7 @@ pub async fn list_modules(
                         manifest.module.version.clone(),
                         manifest.module.description.clone(),
                         manifest.module.category.to_string(),
+                        manifest.module.genre.clone(),
                         manifest.interface.capabilities.clone(),
                     )
                 } else {
@@ -120,6 +123,7 @@ pub async fn list_modules(
                     (
                         dir_name.clone(),
                         dir_name.clone(),
+                        String::new(),
                         String::new(),
                         String::new(),
                         String::new(),
@@ -156,6 +160,7 @@ pub async fn list_modules(
                 version,
                 description,
                 category,
+                genre,
                 path: m.path.display().to_string(),
                 status: discovery_status,
                 service_status,

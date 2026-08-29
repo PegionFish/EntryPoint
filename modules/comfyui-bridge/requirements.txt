@@ -1,0 +1,9 @@
+# ComfyUI 桥接模块依赖 —— modules/comfyui-bridge/CONTRACT.md §1 冻结契约，仅此 4 行声明。
+# 兼容性核对结论（2026-08-29，子代理 D 实查 config/constraints.txt）：
+#   constraints 全文件仅一条 torch==2.11.0 版本约束；与本文件的
+#   fastapi / uvicorn[standard] / python-multipart / httpx 零交集 —— 无冲突。
+#   （代理模块本身不做推理，不引 torch 全家桶。）
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+python-multipart>=0.0.6
+httpx>=0.27.0

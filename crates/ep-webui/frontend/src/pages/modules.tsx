@@ -1,4 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+} from 'react'
 import {
   ChevronDown,
   Unplug,
@@ -29,6 +35,7 @@ import {
   Trash2,
   TriangleAlert,
   Upload,
+  Workflow,
   X,
   Zap,
 } from 'lucide-react'
@@ -46,7 +53,7 @@ import type {
 } from '@/api/types'
 import { wsManager } from '@/api/ws'
 import { PageContainer } from '@/components/layout/page-container'
-import { ConfirmDialog } from '@/components/shared/confirm-dialog'
+import { ConfirmDialog, confirmDialog } from '@/components/shared/confirm-dialog'
 import { EmptyState } from '@/components/shared/empty-state'
 import { LogViewer } from '@/components/shared/log-viewer'
 import {
@@ -197,6 +204,269 @@ function normalizeTags(tags: string[]): string[] {
     out.push(tag)
   }
   return out
+}
+
+// ─── ComfyUI 桥接：工作流管理 ──────────────────────────────────────────────
+
+/** 适配器 GET extra/workflows 条目（COMFYUI_BRIDGE_PLAN §3.2 契约形状） */
+interface ComfyWorkflowEntry {
+  name: string
+  size_bytes: number
+  mtime: number
+}
+
+/**
+ * ComfyUI 桥接类模块判定（§3.6：工作流管理卡片显示条件）。
+ * 首选 manifest 声明的 genre === "comfyui"（daemon ModuleResponse 回传
+ * genre 字段后即生效）；回退按 §3.1 契约冻结的桥接模块 id 兑底——
+ * comfyui-bridge 必然是 genre=comfyui，避免后端未回传时卡片不可见。
+ */
+function isComfyuiModule(m: ModuleResponse): boolean {
+  const genre = (m as ModuleResponse & { genre?: string }).genre
+  return genre === 'comfyui' || m.id === 'comfyui-bridge'
+}
+
+/** 工作流 mtime → 本地时间串（契约未定单位：秒级 epoch 值 < 1e12 按秒换算） */
+function formatWorkflowMtime(mtime: number): string {
+  const ms = mtime > 0 && mtime < 1e12 ? mtime * 1000 : mtime
+  return new Date(ms).toLocaleString()
+}
+
+/**
+ * ComfyUI 工作流管理卡片（D4 / §3.6）：经 daemon 模块代理（§3.5）调用
+ * 适配器工作流端点——GET / POST(FormData) / DELETE extra/workflows。
+ * 模块未运行时顶部提示条引导启动（复用页面级 onStart 语义，
+ * 不在此重复实现启动逻辑）；列表/上传操作前不发必败请求。
+ */
+function ComfyWorkflowsCard({
+  module,
+  running,
+  onStart,
+}: {
+  module: ModuleResponse
+  running: boolean
+  onStart: (module: ModuleResponse) => void
+}) {
+  const { t } = useTranslation('modules')
+  const [workflows, setWorkflows] = useState<ComfyWorkflowEntry[] | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [uploading, setUploading] = useState(false)
+  const [reloadKey, setReloadKey] = useState(0)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  // 运行中拉取列表（reloadKey 承载上传/删除后的刷新；未运行不发请求，避免必然的 409）
+  useEffect(() => {
+    if (!running) return
+    let cancelled = false
+    setLoading(true)
+    api
+      .moduleExtra<ComfyWorkflowEntry[]>(module.id, 'workflows')
+      .then((list) => {
+        if (!cancelled) setWorkflows(Array.isArray(list) ? list : [])
+      })
+      .catch((e) => {
+        if (!cancelled)
+          toast.error(t('comfyui.workflows.loadFailed'), {
+            description: errMsg(e),
+          })
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [module.id, running, reloadKey, t])
+
+  /** 上传 API 格式工作流 JSON（重名覆盖时按后端 replaced 标记提示） */
+  async function handleUpload(file: File) {
+    if (!running) {
+      // 模块未运行：代理端必返 409，先提示启动模块再操作
+      toast.warning(t('comfyui.workflows.uploadFirst'))
+      return
+    }
+    setUploading(true)
+    try {
+      const form = new FormData()
+      form.append('file', file)
+      const resp = await api.moduleExtra<{ name: string; replaced: boolean }>(
+        module.id,
+        'workflows',
+        { method: 'POST', body: form },
+      )
+      if (resp?.replaced) {
+        toast.success(t('comfyui.workflows.replaced', { name: resp.name }))
+      } else {
+        toast.success(t('comfyui.workflows.uploaded'))
+      }
+      setReloadKey((n) => n + 1)
+    } catch (e) {
+      toast.error(t('comfyui.workflows.uploadFailed'), {
+        description: errMsg(e),
+      })
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  /** 删除工作流（确认后 DELETE extra/workflows/{name}） */
+  async function handleDelete(name: string) {
+    const ok = await confirmDialog({
+      title: t('comfyui.workflows.confirmDelete', { name }),
+      description: t('comfyui.workflows.confirmDeleteDescription'),
+      confirmLabel: t('common:action.delete'),
+      variant: 'destructive',
+    })
+    if (!ok) return
+    try {
+      await api.moduleExtra<{ ok: boolean }>(
+        module.id,
+        `workflows/${name}`,
+        { method: 'DELETE' },
+      )
+      toast.success(t('comfyui.workflows.deleted'))
+      setReloadKey((n) => n + 1)
+    } catch (e) {
+      toast.error(t('comfyui.workflows.deleteFailed'), {
+        description: errMsg(e),
+      })
+    }
+  }
+
+  function handleFileChange(e: ChangeEvent<HTMLInputElement>) {
+    // 先复位 value：连续选择同一文件也能再次触发 onChange
+    e.target.value = ''
+    const file = e.target.files?.[0]
+    if (file) void handleUpload(file)
+  }
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <CardTitle className="flex items-center gap-2 text-sm font-semibold">
+          <Workflow className="size-4 text-primary" />
+          {t('comfyui.workflows.title')}
+        </CardTitle>
+        <CardDescription>{t('comfyui.workflows.description')}</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {/* 未运行提示条：工作流端点经模块代理转发，需适配器在线（409 预防） */}
+        {!running ? (
+          <div
+            className="flex items-start gap-3 rounded-lg border border-status-preparing/40 bg-status-preparing/10 px-3 py-2.5"
+            role="alert"
+          >
+            <TriangleAlert className="mt-0.5 size-4 shrink-0 text-status-preparing" />
+            <div className="flex min-w-0 flex-1 flex-wrap items-center justify-between gap-2">
+              <p className="min-w-0 text-sm text-status-preparing">
+                {t('comfyui.workflows.notRunning')}
+              </p>
+              <Button
+                variant="outline"
+                size="xs"
+                onClick={() => onStart(module)}
+              >
+                <Play />
+                {t('comfyui.workflows.goStart')}
+              </Button>
+            </div>
+          </div>
+        ) : null}
+
+        {/* 工作流列表（name / size / mtime，§3.2 契约形状） */}
+        {running ? (
+          loading ? (
+            <div className="space-y-2">
+              <Skeleton className="h-10 rounded-md" />
+              <Skeleton className="h-10 rounded-md" />
+            </div>
+          ) : workflows === null || workflows.length === 0 ? (
+            <p className="rounded-lg border border-dashed border-border px-3 py-4 text-center text-xs text-muted-foreground">
+              {t('comfyui.workflows.empty')}
+            </p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead>
+                  <tr className="border-b border-border text-muted-foreground">
+                    <th className="py-1 pr-3 font-normal">
+                      {t('comfyui.workflows.name')}
+                    </th>
+                    <th className="py-1 pr-3 font-normal">
+                      {t('comfyui.workflows.size')}
+                    </th>
+                    <th className="py-1 pr-3 font-normal">
+                      {t('comfyui.workflows.updated')}
+                    </th>
+                    <th className="py-1" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {workflows.map((w) => (
+                    <tr key={w.name} className="border-b border-border/50">
+                      <td className="max-w-44 py-1.5 pr-3 font-mono align-top">
+                        <span className="block truncate" title={w.name}>
+                          {w.name}
+                        </span>
+                      </td>
+                      <td className="py-1.5 pr-3 font-mono align-top">
+                        {formatBytes(w.size_bytes)}
+                      </td>
+                      <td className="py-1.5 pr-3 align-top text-muted-foreground">
+                        {formatWorkflowMtime(w.mtime)}
+                      </td>
+                      <td className="py-1.5 text-right align-top">
+                        <Button
+                          variant="ghost"
+                          size="icon-xs"
+                          className="text-muted-foreground/70 hover:text-destructive"
+                          disabled={uploading}
+                          onClick={() => void handleDelete(w.name)}
+                          title={t('comfyui.workflows.delete')}
+                          aria-label={t('comfyui.workflows.delete')}
+                        >
+                          <Trash2 className="size-3.5" />
+                        </Button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )
+        ) : null}
+
+        {/* 操作行：刷新 + 上传（accept 限定 API 格式导出的 .json） */}
+        <div className="flex items-center justify-end gap-1.5">
+          <Button
+            variant="ghost"
+            size="xs"
+            disabled={loading || uploading || !running}
+            onClick={() => setReloadKey((n) => n + 1)}
+            title={t('common:action.refresh')}
+            aria-label={t('common:action.refresh')}
+          >
+            <RefreshCw className={cn(loading && 'animate-spin')} />
+          </Button>
+          <Button
+            size="xs"
+            disabled={uploading}
+            onClick={() => fileInputRef.current?.click()}
+          >
+            {uploading ? <Loader2 className="animate-spin" /> : <Upload />}
+            {t('comfyui.workflows.upload')}
+          </Button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".json,application/json"
+            className="hidden"
+            onChange={handleFileChange}
+          />
+        </div>
+      </CardContent>
+    </Card>
+  )
 }
 
 // ─── 状态徽章 ────────────────────────────────────────────────────────────────
@@ -1284,6 +1554,17 @@ function ModuleDetailSheet({
               ))
             )}
           </div>
+
+          {/* ComfyUI 桥接：工作流管理（§3.6，仅 genre=comfyui 类模块显示；
+              key 按 module.id 重挂载以隔离不同模块的列表状态） */}
+          {module && isComfyuiModule(module) ? (
+            <ComfyWorkflowsCard
+              key={module.id}
+              module={module}
+              running={running}
+              onStart={onStart}
+            />
+          ) : null}
         </div>
       </SheetContent>
     </Sheet>

@@ -1,0 +1,49 @@
+# ComfyUI 桥接模块清单 —— 按 modules/comfyui-bridge/CONTRACT.md §1 冻结契约逐字落盘。
+# 桥接语义（docs/COMFYUI_BRIDGE_PLAN.md D1/D2 决策）：
+# 1. 仅连接【已运行】的 ComfyUI 实例：地址取 COMFYUI_URL 环境变量或 params.base_url，
+#    平台不拉起、不托管 ComfyUI 进程；实例未启动时模块照常可被发现，仅在执行时失败。
+# 2. GET /health 的 503 语义：adapter 探测上游 ComfyUI GET /system_stats，
+#    不可达 → 返回 503 {"status":"unavailable"}，使"管线执行前自动拉起"的失败
+#    原因（上游未就绪）在健康检查层面直白可见。
+# 3. 无 [[models]] 声明：桥接模块不携带任何权重文件，模型由 ComfyUI 实例侧自行管理
+#    （manifest 中 models 段可选，此处省略即声明"无模型"）。
+
+[module]
+id = "comfyui-bridge"
+name = "ComfyUI 桥接"
+version = "0.1.0"
+description = "把 ComfyUI HTTP API 包装为平台标准模块：向实例提交 API 格式工作流，注入上游文件/文本/常量，取回产物继续管线流转"
+category = "image"
+genre = "comfyui"
+authors = ["EntryPoint Community"]
+license = "MIT"
+tags = ["comfyui", "bridge", "workflow", "image", "txt2img", "upscale"]
+
+[runtime]
+type = "python"
+entrypoint = "adapter.py"
+start_command = "{venv_python} {MODULE_DIR}/{entrypoint}"
+
+[compute]
+backends = ["cpu"]          # 代理本身不做计算
+default_backend = "cpu"
+
+[compute.env]
+cpu = { COMFYUI_URL = "http://127.0.0.1:8188" }
+
+[interface]
+type = "http"
+health_endpoint = "/health"
+ready_timeout_secs = 60
+
+[[interface.capabilities]]
+name = "generate"
+description = "向 ComfyUI 提交工作流并取回产物"
+input_type = "file"
+output_type = "file"
+
+[interface.capabilities.params]
+workflow     = { type = "string", description = "已上传工作流名（不含 .json）" }
+inject       = { type = "string", description = "注入映射 JSON，语法见 README" }
+base_url     = { type = "string", description = "覆盖 COMFYUI_URL（远程实例）" }
+output_nodes = { type = "string", description = "取回输出的 Save 节点 id，逗号分隔；缺省取全部" }

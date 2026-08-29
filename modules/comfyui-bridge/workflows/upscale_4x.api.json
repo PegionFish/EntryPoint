@@ -1,0 +1,25 @@
+{
+  "1": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "__EP_INJECT__"
+    }
+  },
+  "3": {
+    "class_type": "ImageScale",
+    "inputs": {
+      "upscale_method": "nearest-exact",
+      "width": 1024,
+      "height": 1024,
+      "crop": "disabled",
+      "image": ["1", 0]
+    }
+  },
+  "4": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "filename_prefix": "ep_upscale_4x",
+      "images": ["3", 0]
+    }
+  }
+}

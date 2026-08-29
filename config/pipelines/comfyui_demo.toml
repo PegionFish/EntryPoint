@@ -1,0 +1,85 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# ComfyUI 桥接示例管线 1 — 图片放大（upscale_4x）
+#
+# 用途
+#   file_input → comfyui-bridge.generate → file_output：
+#   把上传的图片交给 ComfyUI 执行已上传的工作流 `upscale_4x`，
+#   取回放大后的图片落盘。配套示例模板
+#   modules/comfyui-bridge/workflows/upscale_4x.api.json
+#   （节点：1 = LoadImage、3 = ImageScale、4 = SaveImage）。
+#
+# 所需上游（执行前必须就绪）
+#   1. ComfyUI 实例已启动（默认 http://127.0.0.1:8188；远程实例用
+#      generate 节点 params.base_url 覆盖，见下方注释）。
+#   2. 工作流 JSON 需先在 WebUI 模块详情页「工作流管理」上传
+#      （ComfyUI 开发者模式 Save (API Format) 导出），或直接放入
+#      modules/comfyui-bridge/workflows/upscale_4x.json。
+#   3. inject 引用的工作流节点 id（"1" = LoadImage）须与上传工作流
+#      一致；不一致时 adapter 注入前校验返回 400 并列出可用节点清单
+#      （D6），不会误提交给 ComfyUI。
+#
+# 丢弃风险提示（输出目录）
+#   ComfyUI 产物由 adapter 下载到模块输出目录（EP_OUTPUT_DIR，缺省
+#   modules/comfyui-bridge/output/）：重跑同名覆盖、目录清理时文件可能
+#   丢失。请以 file_output 节点产出的产物为准，勿把该目录当长期存储。
+#
+# 节点 timeout_secs = 1800
+#   ComfyUI 放大任务耗时长，显式放宽节点硬超时，防止被节点默认 300s
+#   超时杀掉（docs/COMFYUI_BRIDGE_PLAN.md §七 风险与缓解）。
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[pipeline]
+id = "comfyui-demo"
+name = "ComfyUI 图片放大"
+description = "上传图片 → ComfyUI 执行 upscale_4x 工作流 → 取回放大结果"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+label = "输入图片"
+
+[[nodes]]
+id = "generate"
+kind = "module"
+module_id = "comfyui-bridge"
+capability = "generate"
+label = "ComfyUI 放大 (4x)"
+timeout_secs = 1800
+
+[nodes.params]
+# 已上传工作流名（不含 .json）
+workflow = "upscale_4x"
+# 注入映射 JSON：键 = "<工作流节点id>.inputs.<字段名>"，值 = 来源表达式。
+# "$input" = 首个上游产物文件（本管线即 file_input 的图片），
+# adapter 先 POST /upload/image 上传，再把服务器侧文件名写入该字段。
+# 完整语法见 modules/comfyui-bridge/README.md / CONTRACT.md §3。
+inject = '''
+{
+  "1.inputs.image": "$input"
+}
+'''
+# 字面量注入示例（可选）：覆盖模板 ImageScale 的目标尺寸
+#   "3.inputs.width": 2048
+#   "3.inputs.height": 2048
+# 可选：远程实例覆盖 COMFYUI_URL
+# base_url = "http://192.168.1.10:8188"
+# 可选：仅取回指定 Save 节点输出（缺省取全部有 images 的节点）
+# output_nodes = "4"
+
+[[nodes]]
+id = "output"
+kind = "builtin"
+builtin = "file_output"
+label = "输出图片"
+
+[nodes.params]
+extension = "png"
+
+[[edges]]
+from = ["input", "output"]
+to = ["generate", "input"]
+
+[[edges]]
+from = ["generate", "output"]
+to = ["output", "input"]

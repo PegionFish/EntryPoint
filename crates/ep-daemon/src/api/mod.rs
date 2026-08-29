@@ -8,6 +8,7 @@ pub mod inference;
 pub mod models;
 pub mod modules;
 pub mod module_import;
+pub mod module_proxy;
 pub mod packs;
 pub mod pipelines;
 pub mod tasks;
@@ -45,6 +46,7 @@ pub fn api_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .merge(tasks::router())
         .merge(deps::router())
         .merge(packs::router())
+        .merge(module_proxy::router())
         // 统一推理 API v1 门面（/v1/*，外部稳定契约；token 中间件仅作用其子路由）
         .merge(inference::router(state))
         // 未匹配的 /api/* → 404 + JSON，避免落入 SPA 的 HTML fallback

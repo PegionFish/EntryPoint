@@ -576,6 +576,10 @@ async def predict(...):
 
 **推荐策略 A**。仅在底层代码耦合过深、无法直接 import 时使用策略 B。
 
+当目标工具是**独立进程且自带完整 HTTP API**（无法也不宜 import，如 ComfyUI 实例）时，
+使用**策略 C：桥接外部 HTTP 服务**——adapter 不再包装目标程序的 Python API，而是把
+外部服务的 REST API 代理/编排为标准模块接口。契约细节见 §8。
+
 ---
 
 ## 7. 测试验证
@@ -607,3 +611,79 @@ curl -X POST http://localhost:18001/predict/transcribe \
 curl -X POST http://localhost:18001/predict/nonexistent
 # 期望: 404 + INVALID_CAPABILITY
 ```
+
+---
+
+## 8. 策略 C：桥接外部 HTTP 服务（ComfyUI 实例）
+
+> 参照实现：`modules/comfyui-bridge/`（契约见 `modules/comfyui-bridge/CONTRACT.md`，
+> 用户文档见 `modules/comfyui-bridge/README.md`）。
+
+### 8.1 动机：什么时候用桥接模式
+
+策略 A/B 的前提是目标工具的代码可以被 adapter 进程 import。但有一类工具是**重型独立进程**，
+自带完整 HTTP API 且通常已在运行（典型：ComfyUI，默认 `127.0.0.1:8188`，自带
+`POST /prompt` / `POST /upload/image` / `GET /history/{id}` / `GET /view` / `POST /interrupt`
+等端点）。对这类工具，adapter 的角色从"包装器"变为"**代理 + 编排器**"：
+
+- 收到 `/predict/{capability}` 后，把输入转发/上传给外部服务，提交任务，
+  轮询完成，再取回产物落盘，返回标准 `output_type = "file"` 响应；
+- 平台引擎、DAG 校验、模块自动拉起/健康检查/空闲回收**零改动**复用；
+- 平台不感知外部工作流内部逻辑（黑盒提交）。
+
+### 8.2 module.toml 形状要点
+
+```toml
+[compute]
+backends = ["cpu"]          # 代理本身不做计算，恒 cpu
+
+[compute.env]
+cpu = { COMFYUI_URL = "http://127.0.0.1:8188" }   # 外部服务默认地址经环境变量注入
+
+[interface]
+type = "http"
+health_endpoint = "/health"
+ready_timeout_secs = 60
+
+[interface.capabilities.params]
+workflow     = { type = "string", description = "已上传工作流名（不含 .json）" }
+inject       = { type = "string", description = "注入映射 JSON，语法见 README" }
+base_url     = { type = "string", description = "覆盖 COMFYUI_URL（远程实例）" }
+```
+
+要点：
+
+- **不声明 `[[models]]`**——桥接模块无权重文件，模型管理页不应出现下载项；
+- 外部服务地址走 `[compute.env]` 注入的环境变量，同时**必须**在 params 中提供
+  `base_url` 覆盖项（远程实例场景，参数优先于环境变量）；
+- 依赖仅 adapter 自身所需（`fastapi` / `uvicorn` / `python-multipart` / `httpx`），
+  不引入目标工具的依赖栈。
+
+### 8.3 `/health` 503 语义：外部不可达 ≠ 启动中
+
+普通模块的 `/health` 503 表示"自身启动中/模型加载中"（§2.1）。桥接模块的语义不同：
+
+> adapter 启动是秒级的（无模型加载）；`/health` 应**代理探测外部服务**
+> （如 ComfyUI `GET /system_stats`），外部不可达时返回 503
+> `{"status":"unavailable", "comfyui":"unreachable"}`，可达时返回 200。
+
+设计意图：外部服务由用户自行启动，EntryPoint 启动时它可以尚不可达。503 使
+"管线执行前自动拉起模块"的失败语义直白——模块活着但外部服务未就绪，而非模块本身故障。
+文档须向用户明确声明：**先启动外部服务，再跑管线**（见 comfyui-bridge README §1.1）。
+
+### 8.4 与普通模块的差异汇总
+
+| 维度 | 普通模块（策略 A） | 桥接模块（策略 C） |
+|---|---|---|
+| 计算发生地 | adapter 进程内 | 外部服务进程（另一台机器也可以） |
+| `[[models]]` | 通常声明权重 | **不声明** |
+| `/health` 503 含义 | 模型加载中/启动中 | adapter 已就绪但**外部服务不可达** |
+| 取消语义 | 客户端断开后推理自然收尾（§4.3，无法中断） | 尽力 `POST /interrupt`（best-effort，不保证外部真正中止） |
+| 进度 | 可选异步模式（§4.2） | 轮询估算 `EP-PROGRESS:NN%`（粗粒度，无需引擎改动） |
+| 超时 | per-node 超时 | per-node 超时**必须放宽**（长任务建议 `timeout_secs = 1800`） |
+| 工作内部逻辑 | adapter 自身实现 | 平台不校验（黑盒提交，仅注入前校验映射键存在性） |
+| 扩展端点 | 通常无 | 可附带领域端点（如工作流上传/列表/删除），经 daemon 模块代理 `/api/modules/{module_id}/extra/{*path}` 供 WebUI 调用 |
+
+共性约束不变：adapter 仍须实现 §2 标准端点形状、文件类输出仍须返回
+`output_type = "file"` + `result` 为绝对路径字符串（§2.3 result 规则）、
+绑定地址仍遵守 §1.2（只绑回环）。
