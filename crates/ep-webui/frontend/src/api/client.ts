@@ -362,7 +362,7 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
-  /** 上传整合包 .epzip（multipart 单文件；202 同 importPack） */
+  /** 上传整合包 .zip（multipart 单文件；202 同 importPack） */
   uploadPack: (file: File) => {
     const form = new FormData()
     form.append('file', file)
@@ -379,14 +379,14 @@ export const api = {
       { method: 'DELETE' },
     ),
 
-  /** 构建整合包（§4.5；202，构建完成后可下载 .epzip） */
+  /** 构建整合包（§4.5；202，构建完成后可下载 .zip） */
   buildPack: (body: PackBuildRequest) =>
     apiFetch<PackBuildResponse>('/packs/build', {
       method: 'POST',
       body: JSON.stringify(body),
     }),
 
-  /** 整合包 .epzip 下载 URL（直接用于 <a href> / window.open，不走 fetch） */
+  /** 整合包 .zip 下载 URL（直接用于 <a href> / window.open，不走 fetch） */
   packExportUrl: (id: string) => `/api/packs/${encodeURIComponent(id)}/export`,
 
   // 直跑（§5.3 / §8.1）

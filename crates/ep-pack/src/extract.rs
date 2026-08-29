@@ -1,4 +1,8 @@
-//! `.epzip` 解包与路径安全 — 冻结契约见计划 §4.4（暂存 → 解包 → CHECKSUMS 校验）。
+//! 整合包归档解包与路径安全 — 冻结契约见计划 §4.4（暂存 → 解包 → CHECKSUMS 校验）。
+//!
+//! 容器为标准归档格式：**zip 或 tar.gz**（按文件魔数嗅探，不依赖扩展名），
+//! 归档布局契约（根级 `ep-pack.toml` + `CHECKSUMS.toml` + `models/` +
+//! `pipelines/`）见 docs/PACK_AUTHORING.md §2。
 //!
 //! 实现所有者：Wave 1 **A4 (PackIO)**。
 //!
@@ -6,15 +10,16 @@
 //! - **路径清洗**：条目名逐组件校验，拒绝绝对路径（POSIX `/` 与 Windows
 //!   `C:` 前缀）、任何 `..` 分段、反斜杠分隔符（归档契约恒正斜杠）与
 //!   Windows 保留设备名（`CON`/`NUL`/…）；
-//! - **纵深防御**：清洗后再经 zip crate `enclosed_name()` 与拼接后词法
-//!   `starts_with` 双重兜底；
-//! - **symlink 逃逸防护**：zip symlink 条目直接拒绝；同时逐组件探测目标
-//!   路径祖先，任何已存在的符号链接（含暂存目录被预置链接的攻击面）都拒绝；
+//! - **纵深防御**：清洗后再经 zip crate `enclosed_name()`（zip 容器）与
+//!   拼接后词法 `starts_with` 双重兜底；
+//! - **symlink 逃逸防护**：symlink/hardlink 条目直接拒绝；同时逐组件探测
+//!   目标路径祖先，任何已存在的符号链接（含暂存目录被预置链接的攻击面）
+//!   都拒绝；
 //! - **特殊文件**：unix 类型位非普通文件/目录（FIFO/设备/socket）拒绝；
-//! - **大小上限**：解压字节数流式累计，超限立即中止（zip 炸弹防御）；
-//! - **重复条目**：大小写不敏感的同名条目拒绝——zip crate 读取侧会把完全
-//!   同名条目折叠为最后一个，而仅大小写不同的条目在 Windows（大小写不敏感
-//!   文件系统）上会静默互相覆盖，双平台落盘必须拒绝。
+//! - **大小上限**：解压字节数流式累计，超限立即中止（解压炸弹防御）；
+//! - **重复条目**：大小写不敏感的同名条目拒绝——读取侧会把完全同名条目
+//!   折叠为最后一个，而仅大小写不同的条目在 Windows（大小写不敏感文件
+//!   系统）上会静默互相覆盖，双平台落盘必须拒绝。
 //!
 //! 出错时不做自动清理：暂存目录生命周期归调用方（§4.4 导入编排），
 //! 出错后应整体丢弃 `dest`。
@@ -40,6 +45,7 @@ const EXTRACT_CHUNK_SIZE: usize = 256 * 1024;
 const S_IFMT: u32 = 0o170000;
 const S_IFREG: u32 = 0o100000;
 const S_IFDIR: u32 = 0o040000;
+const S_IFIFO: u32 = 0o010000;
 
 /// Windows 保留设备名（任意大小写、任意扩展名）：落盘会命中设备对象
 /// 而非文件（如 `NUL`），双平台统一拒绝。
@@ -113,6 +119,8 @@ pub enum ExtractError {
     DuplicateEntry(String),
     #[error("archive lacks manifest `ep-pack.toml`")]
     MissingManifest,
+    #[error("unsupported archive format (pack archives must be standard zip or tar.gz): {0}")]
+    UnsupportedFormat(String),
     #[error("extracted content exceeds size limit ({limit} bytes)")]
     SizeLimitExceeded { limit: u64 },
     #[error("extract destination {} is a symlink", path.display())]
@@ -121,11 +129,12 @@ pub enum ExtractError {
     DestNotDirectory { path: PathBuf },
 }
 
-/// 解包 `.epzip` 到 `dest`（暂存目录，不存在则创建）。
+/// 解包整合包归档到 `dest`（暂存目录，不存在则创建）。
 ///
+/// 容器按魔数嗅探：`PK…` → zip，`\x1f\x8b` → tar.gz；不依赖扩展名。
 /// 条目在落盘前逐条做安全校验（见模块级文档）；任何违规立即返回错误，
 /// 已写入的部分内容留给调用方整体丢弃。
-pub fn extract_epzip(
+pub fn extract_pack(
     archive_path: &Path,
     dest: &Path,
     limits: &ExtractLimits,
@@ -136,7 +145,44 @@ pub fn extract_epzip(
         path: archive_path.to_path_buf(),
         source,
     })?;
-    let mut archive = ZipArchive::new(BufReader::new(file)).map_err(ExtractError::Parse)?;
+
+    // 魔数嗅探容器格式（读 4 字节；不足 4 字节的文件必然不是合法归档）
+    let mut magic = [0u8; 4];
+    let mut reader = BufReader::new(file);
+    let n = reader.read(&mut magic).map_err(|source| ExtractError::Open {
+        path: archive_path.to_path_buf(),
+        source,
+    })?;
+    if n < 4 {
+        return Err(ExtractError::UnsupportedFormat(
+            archive_path.display().to_string(),
+        ));
+    }
+
+    match magic {
+        [0x50, 0x4b, 0x03, 0x04] => extract_zip(reader, dest, limits),
+        [0x1f, 0x8b, ..] => extract_tar_gz(reader, dest, limits),
+        _ => Err(ExtractError::UnsupportedFormat(
+            archive_path.display().to_string(),
+        )),
+    }
+}
+
+/// zip 容器解包（`extract_pack` 的 zip 分支）。
+fn extract_zip(
+    mut reader: BufReader<File>,
+    dest: &Path,
+    limits: &ExtractLimits,
+) -> Result<ExtractSummary, ExtractError> {
+    // 魔数嗅探已消费头部 4 字节，先回卷再交给 zip 解析器
+    use std::io::Seek;
+    reader
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|source| ExtractError::Io {
+            path: dest.to_path_buf(),
+            source,
+        })?;
+    let mut archive = ZipArchive::new(reader).map_err(ExtractError::Parse)?;
 
     // 前置校验：归档必须含清单（§4.2），缺失则在任何落盘前拒绝
     let mut has_manifest = false;
@@ -250,6 +296,164 @@ pub fn extract_epzip(
         total_bytes,
         manifest_path: manifest_path.is_file().then_some(manifest_path),
     })
+}
+
+/// tar.gz 容器解包（`extract_pack` 的 tar.gz 分支）。
+///
+/// 与 zip 分支同一套安全基线；清单前置校验改为解包后校验（tar.gz 需完整
+/// 流式解码才能枚举条目，重复解码一遍做前置扫描得不偿失）——归档缺清单时
+/// 内容已落暂存目录，但导入编排在本函数返回 MissingManifest 后整体丢弃
+/// 暂存目录，不会发生任何安装动作。
+fn extract_tar_gz(
+    mut reader: BufReader<File>,
+    dest: &Path,
+    limits: &ExtractLimits,
+) -> Result<ExtractSummary, ExtractError> {
+    // 魔数嗅探已消费头部 4 字节，先回卷再交给 gzip 解码器
+    use std::io::Seek;
+    reader
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|source| ExtractError::Io {
+            path: dest.to_path_buf(),
+            source,
+        })?;
+    let gz = flate2::read::GzDecoder::new(reader);
+    let mut archive = tar::Archive::new(gz);
+
+    let mut file_count: usize = 0;
+    let mut total_bytes: u64 = 0;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut buf = vec![0u8; EXTRACT_CHUNK_SIZE];
+
+    let entries = archive
+        .entries()
+        .map_err(|source| ExtractError::Io {
+            path: dest.to_path_buf(),
+            source,
+        })?;
+    for entry in entries {
+        let mut entry = entry.map_err(|source| ExtractError::Io {
+            path: dest.to_path_buf(),
+            source,
+        })?;
+        let header = entry.header();
+        let name = entry
+            .path()
+            .map_err(|source| ExtractError::Io {
+                path: dest.to_path_buf(),
+                source,
+            })?
+            .to_string_lossy()
+            .to_string();
+
+        // 1) symlink / hardlink 条目：一律拒绝（§4.4 symlink 逃逸防护）
+        match header.entry_type() {
+            tar::EntryType::Regular => {}
+            tar::EntryType::Directory => {}
+            tar::EntryType::Symlink | tar::EntryType::Link => {
+                return Err(ExtractError::SymlinkEntry(name));
+            }
+            other => {
+                return Err(ExtractError::SpecialFileEntry {
+                    name,
+                    mode: header.mode().unwrap_or(0) | format_type_tag(other),
+                });
+            }
+        }
+
+        // 2) unix 类型位：仅允许普通文件 / 目录（类型位缺省 = 0 视为普通）
+        if let Ok(mode) = header.mode() {
+            let ft = mode & S_IFMT;
+            if ft != 0 && ft != S_IFREG && ft != S_IFDIR {
+                return Err(ExtractError::SpecialFileEntry { name, mode });
+            }
+        }
+
+        // 3) 条目名清洗（主防线）
+        let rel =
+            sanitize_entry_name(&name).ok_or_else(|| ExtractError::UnsafePath(name.clone()))?;
+
+        // 4) 拼接后词法边界兜底
+        let out = resolve_within(dest, &rel)
+            .ok_or_else(|| ExtractError::UnsafePath(name.clone()))?;
+
+        // 5) 重复条目拒绝（大小写不敏感：Windows 文件系统大小写折叠）
+        if !seen.insert(name.to_ascii_lowercase()) {
+            return Err(ExtractError::DuplicateEntry(name));
+        }
+
+        // 6) 祖先 symlink 探测（与 zip 分支同语义）
+        if contains_symlink_below(dest, &rel).map_err(|source| ExtractError::Io {
+            path: out.clone(),
+            source,
+        })? {
+            return Err(ExtractError::SymlinkEscape(name));
+        }
+
+        if header.entry_type() == tar::EntryType::Directory {
+            std::fs::create_dir_all(&out).map_err(|source| ExtractError::Io {
+                path: out.clone(),
+                source,
+            })?;
+            continue;
+        }
+
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| ExtractError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let mut writer = File::create(&out).map_err(|source| ExtractError::Io {
+            path: out.clone(),
+            source,
+        })?;
+
+        loop {
+            let n = entry.read(&mut buf).map_err(|source| ExtractError::EntryIo {
+                name: name.clone(),
+                source,
+            })?;
+            if n == 0 {
+                break;
+            }
+            let n64 = n as u64;
+            // 先判额度再落盘：磁盘上累计字节永不超限
+            if total_bytes.saturating_add(n64) > limits.max_total_bytes {
+                return Err(ExtractError::SizeLimitExceeded {
+                    limit: limits.max_total_bytes,
+                });
+            }
+            writer
+                .write_all(&buf[..n])
+                .map_err(|source| ExtractError::EntryIo {
+                    name: name.clone(),
+                    source,
+                })?;
+            total_bytes += n64;
+        }
+        file_count += 1;
+    }
+
+    // 清单校验（tar.gz 为解包后校验，见函数头注释）
+    let manifest_path = dest.join(MANIFEST_FILE_NAME);
+    if !manifest_path.is_file() {
+        return Err(ExtractError::MissingManifest);
+    }
+    Ok(ExtractSummary {
+        dest_dir: dest.to_path_buf(),
+        file_count,
+        total_bytes,
+        manifest_path: Some(manifest_path),
+    })
+}
+
+/// 非 Regular/Directory 的 tar 条目类型标记（用于错误信息可读）
+fn format_type_tag(t: tar::EntryType) -> u32 {
+    match t {
+        tar::EntryType::Fifo => S_IFIFO,
+        _ => 0,
+    }
 }
 
 /// 校验/创建解包目标目录：本身不得是符号链接；已存在则必须是目录。
@@ -547,16 +751,71 @@ mod tests {
 
     // ── 正向：构建 → 解包 → 校验 全链 ────────────────────────────────────
 
+    /// tar.gz 容器正向链：解包 + CHECKSUMS 全量校验通过
+    #[test]
+    fn extract_tar_gz_roundtrip() {
+        use flate2::write::GzEncoder;
+        let root = unique_root("targz");
+        let src = sample_source(&root);
+        let manifest_text = std::fs::read_to_string(src.join(MANIFEST_FILE_NAME)).unwrap();
+
+        // 手工构造 tar.gz：<ep-pack.toml> + models/m1/weights.bin（目录条目按
+        // tar 惯例可省略，父目录由解包侧 create_dir_all 补齐）
+        let archive = root.join("pack.tar.gz");
+        {
+            let gz = GzEncoder::new(
+                std::fs::File::create(&archive).unwrap(),
+                flate2::Compression::default(),
+            );
+            let mut tar = tar::Builder::new(gz);
+            let add = |tar: &mut tar::Builder<GzEncoder<std::fs::File>>, name: &str, data: &[u8]| {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(data.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                tar.append_data(&mut h, name, data).unwrap();
+            };
+            add(&mut tar, MANIFEST_FILE_NAME, manifest_text.as_bytes());
+            add(&mut tar, "models/m1/weights.bin", b"weights-data");
+            let mut entries = std::collections::BTreeMap::new();
+            entries.insert(
+                MANIFEST_FILE_NAME.to_string(),
+                crate::checksum::sha256_file(&src.join(MANIFEST_FILE_NAME)).unwrap(),
+            );
+            entries.insert(
+                "models/m1/weights.bin".to_string(),
+                crate::checksum::sha256_file(&src.join("models/m1/weights.bin")).unwrap(),
+            );
+            let table = ChecksumTable::from_entries(entries);
+            add(&mut tar, CHECKSUMS_FILE_NAME, table.to_toml_string().unwrap().as_bytes());
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+
+        let dest = root.join("staging");
+        let xs = extract_pack(&archive, &dest, &ExtractLimits::default()).unwrap();
+        assert_eq!(xs.file_count, 3);
+        assert_eq!(xs.manifest_path, Some(dest.join(MANIFEST_FILE_NAME)));
+        assert_eq!(
+            std::fs::read(dest.join("models/m1/weights.bin")).unwrap(),
+            b"weights-data"
+        );
+
+        // 解包产物通过 CHECKSUMS 全量校验
+        let table = ChecksumTable::read(&dest).unwrap();
+        table.verify(&dest).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn build_extract_verify_roundtrip() {
         let root = unique_root("roundtrip");
         let src = sample_source(&root);
         std::fs::create_dir_all(src.join("models").join("empty-dir")).unwrap();
-        let archive = root.join("pack.epzip");
+        let archive = root.join("pack.zip");
         let summary = build_pack(&BuildPlan::new(&src, &archive)).unwrap();
 
         let dest = root.join("staging");
-        let xs = extract_epzip(&archive, &dest, &ExtractLimits::default()).unwrap();
+        let xs = extract_pack(&archive, &dest, &ExtractLimits::default()).unwrap();
         assert_eq!(xs.dest_dir, dest);
         assert_eq!(xs.file_count, summary.file_count); // 含 CHECKSUMS.toml
         // 字节数 = 源文件总和 + 归档内 CHECKSUMS.toml 文本
@@ -581,7 +840,7 @@ mod tests {
     #[test]
     fn rejects_zip_slip_parent_dir_entries() {
         let root = unique_root("zipslip");
-        let archive = root.join("evil.epzip");
+        let archive = root.join("evil.zip");
         write_fixture_zip(
             &archive,
             &[
@@ -591,7 +850,7 @@ mod tests {
             ],
         );
         let dest = root.join("staging");
-        let err = extract_epzip(&archive, &dest, &ExtractLimits::default()).unwrap_err();
+        let err = extract_pack(&archive, &dest, &ExtractLimits::default()).unwrap_err();
         assert!(matches!(err, ExtractError::UnsafePath(_)), "{err:?}");
         // 逃逸目标文件绝不得出现（../evil.txt 相对 staging 落在 root 下）
         assert!(!root.join("evil.txt").exists());
@@ -602,7 +861,7 @@ mod tests {
     #[test]
     fn rejects_absolute_path_entries_posix() {
         let root = unique_root("abs-posix");
-        let archive = root.join("evil.epzip");
+        let archive = root.join("evil.zip");
         write_fixture_zip(
             &archive,
             &[
@@ -611,7 +870,7 @@ mod tests {
             ],
         );
         let dest = root.join("staging");
-        let err = extract_epzip(&archive, &dest, &ExtractLimits::default()).unwrap_err();
+        let err = extract_pack(&archive, &dest, &ExtractLimits::default()).unwrap_err();
         assert!(matches!(err, ExtractError::UnsafePath(_)), "{err:?}");
         assert!(!dest.join("etc").exists());
         let _ = std::fs::remove_dir_all(&root);
@@ -620,7 +879,7 @@ mod tests {
     #[test]
     fn rejects_absolute_path_entries_windows_drive() {
         let root = unique_root("abs-win");
-        let archive = root.join("evil.epzip");
+        let archive = root.join("evil.zip");
         write_fixture_zip(
             &archive,
             &[
@@ -630,7 +889,7 @@ mod tests {
             ],
         );
         let dest = root.join("staging");
-        let err = extract_epzip(&archive, &dest, &ExtractLimits::default()).unwrap_err();
+        let err = extract_pack(&archive, &dest, &ExtractLimits::default()).unwrap_err();
         assert!(matches!(err, ExtractError::UnsafePath(_)), "{err:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -638,7 +897,7 @@ mod tests {
     #[test]
     fn rejects_backslash_separator_entries() {
         let root = unique_root("backslash");
-        let archive = root.join("evil.epzip");
+        let archive = root.join("evil.zip");
         write_fixture_zip(
             &archive,
             &[
@@ -647,7 +906,7 @@ mod tests {
             ],
         );
         let dest = root.join("staging");
-        let err = extract_epzip(&archive, &dest, &ExtractLimits::default()).unwrap_err();
+        let err = extract_pack(&archive, &dest, &ExtractLimits::default()).unwrap_err();
         assert!(matches!(err, ExtractError::UnsafePath(_)), "{err:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -655,7 +914,7 @@ mod tests {
     #[test]
     fn rejects_windows_reserved_device_names() {
         let root = unique_root("reserved");
-        let archive = root.join("evil.epzip");
+        let archive = root.join("evil.zip");
         write_fixture_zip(
             &archive,
             &[
@@ -664,7 +923,7 @@ mod tests {
             ],
         );
         let dest = root.join("staging");
-        let err = extract_epzip(&archive, &dest, &ExtractLimits::default()).unwrap_err();
+        let err = extract_pack(&archive, &dest, &ExtractLimits::default()).unwrap_err();
         assert!(matches!(err, ExtractError::UnsafePath(_)), "{err:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -672,7 +931,7 @@ mod tests {
     #[test]
     fn rejects_symlink_entry() {
         let root = unique_root("symlink-entry");
-        let archive = root.join("evil.epzip");
+        let archive = root.join("evil.zip");
         write_fixture_zip(
             &archive,
             &[
@@ -686,7 +945,7 @@ mod tests {
             ],
         );
         let dest = root.join("staging");
-        let err = extract_epzip(&archive, &dest, &ExtractLimits::default()).unwrap_err();
+        let err = extract_pack(&archive, &dest, &ExtractLimits::default()).unwrap_err();
         assert!(matches!(err, ExtractError::SymlinkEntry(_)), "{err:?}");
         // 既没有链接文件、也没有逃逸目标
         assert!(!dest.join("models").join("link").exists());
@@ -697,7 +956,7 @@ mod tests {
     #[test]
     fn rejects_special_file_entry() {
         let root = unique_root("fifo");
-        let archive = root.join("evil.epzip");
+        let archive = root.join("evil.zip");
         // ZipWriter 强制 S_IFREG → FIFO 类型位须字节级构造
         write_raw_zip(
             &archive,
@@ -715,7 +974,7 @@ mod tests {
             ],
         );
         let dest = root.join("staging");
-        let err = extract_epzip(&archive, &dest, &ExtractLimits::default()).unwrap_err();
+        let err = extract_pack(&archive, &dest, &ExtractLimits::default()).unwrap_err();
         assert!(matches!(err, ExtractError::SpecialFileEntry { .. }), "{err:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -723,10 +982,10 @@ mod tests {
     #[test]
     fn rejects_missing_manifest() {
         let root = unique_root("no-manifest");
-        let archive = root.join("evil.epzip");
+        let archive = root.join("evil.zip");
         write_fixture_zip(&archive, &[fixture("models/w.bin", b"x")]);
         let dest = root.join("staging");
-        let err = extract_epzip(&archive, &dest, &ExtractLimits::default()).unwrap_err();
+        let err = extract_pack(&archive, &dest, &ExtractLimits::default()).unwrap_err();
         assert!(matches!(err, ExtractError::MissingManifest), "{err:?}");
         // 拒绝发生在任何落盘之前
         assert!(!dest.join("models").exists());
@@ -736,7 +995,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_entries() {
         let root = unique_root("dup");
-        let archive = root.join("evil.epzip");
+        let archive = root.join("evil.zip");
         // 完全同名条目会被 zip crate 读取侧折叠，故用「仅大小写不同」的条目
         // 构造——它们在 Windows 上落盘会互相覆盖，必须拒绝。
         // （ZipWriter 拒绝重名条目 → 字节级构造。）
@@ -761,7 +1020,7 @@ mod tests {
             ],
         );
         let dest = root.join("staging");
-        let err = extract_epzip(&archive, &dest, &ExtractLimits::default()).unwrap_err();
+        let err = extract_pack(&archive, &dest, &ExtractLimits::default()).unwrap_err();
         assert!(matches!(err, ExtractError::DuplicateEntry(_)), "{err:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -769,7 +1028,7 @@ mod tests {
     #[test]
     fn size_limit_enforced_while_streaming() {
         let root = unique_root("sizelimit");
-        let archive = root.join("big.epzip");
+        let archive = root.join("big.zip");
         let block = vec![0xABu8; 64 * 1024];
         write_fixture_zip(
             &archive,
@@ -785,7 +1044,7 @@ mod tests {
         let limits = ExtractLimits {
             max_total_bytes: 100 * 1024,
         };
-        let err = extract_epzip(&archive, &dest, &limits).unwrap_err();
+        let err = extract_pack(&archive, &dest, &limits).unwrap_err();
         assert!(matches!(err, ExtractError::SizeLimitExceeded { .. }), "{err:?}");
         // 先判额度再落盘 → 磁盘占用不超限
         assert!(dir_size(&dest) <= limits.max_total_bytes);
@@ -796,11 +1055,11 @@ mod tests {
     fn rejects_dest_not_directory() {
         let root = unique_root("dest-file");
         let src = sample_source(&root);
-        let archive = root.join("pack.epzip");
+        let archive = root.join("pack.zip");
         build_pack(&BuildPlan::new(&src, &archive)).unwrap();
         let dest = root.join("staging");
         write_file(&dest, b"i am a file");
-        let err = extract_epzip(&archive, &dest, &ExtractLimits::default()).unwrap_err();
+        let err = extract_pack(&archive, &dest, &ExtractLimits::default()).unwrap_err();
         assert!(matches!(err, ExtractError::DestNotDirectory { .. }), "{err:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -810,13 +1069,13 @@ mod tests {
     fn rejects_dest_symlink() {
         let root = unique_root("dest-symlink");
         let src = sample_source(&root);
-        let archive = root.join("pack.epzip");
+        let archive = root.join("pack.zip");
         build_pack(&BuildPlan::new(&src, &archive)).unwrap();
         let real = root.join("elsewhere");
         std::fs::create_dir_all(&real).unwrap();
         let dest = root.join("staging");
         std::os::unix::fs::symlink(&real, &dest).unwrap();
-        let err = extract_epzip(&archive, &dest, &ExtractLimits::default()).unwrap_err();
+        let err = extract_pack(&archive, &dest, &ExtractLimits::default()).unwrap_err();
         assert!(matches!(err, ExtractError::DestIsSymlink { .. }), "{err:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -825,7 +1084,7 @@ mod tests {
     #[test]
     fn rejects_escape_via_preexisting_symlink_inside_dest() {
         let root = unique_root("symlink-inside");
-        let archive = root.join("evil.epzip");
+        let archive = root.join("evil.zip");
         write_fixture_zip(
             &archive,
             &[
@@ -837,7 +1096,7 @@ mod tests {
         std::fs::create_dir_all(&dest).unwrap();
         // 暂存目录内预置 sub → 指向外部的符号链接
         std::os::unix::fs::symlink(root.join("outside"), dest.join("sub")).unwrap();
-        let err = extract_epzip(&archive, &dest, &ExtractLimits::default()).unwrap_err();
+        let err = extract_pack(&archive, &dest, &ExtractLimits::default()).unwrap_err();
         assert!(matches!(err, ExtractError::SymlinkEscape(_)), "{err:?}");
         assert!(!root.join("outside").join("evil.txt").exists());
         let _ = std::fs::remove_dir_all(&root);
@@ -849,10 +1108,10 @@ mod tests {
     fn detects_tampered_file_after_extract() {
         let root = unique_root("tamper-after-extract");
         let src = sample_source(&root);
-        let archive = root.join("pack.epzip");
+        let archive = root.join("pack.zip");
         build_pack(&BuildPlan::new(&src, &archive)).unwrap();
         let dest = root.join("staging");
-        extract_epzip(&archive, &dest, &ExtractLimits::default()).unwrap();
+        extract_pack(&archive, &dest, &ExtractLimits::default()).unwrap();
 
         // 篡改已解包的权重文件 → 全量校验必须报 mismatched
         write_file(&dest.join("models").join("m1").join("weights.bin"), b"EVIL");
@@ -871,10 +1130,10 @@ mod tests {
     fn detects_missing_file_after_extract() {
         let root = unique_root("missing-after-extract");
         let src = sample_source(&root);
-        let archive = root.join("pack.epzip");
+        let archive = root.join("pack.zip");
         build_pack(&BuildPlan::new(&src, &archive)).unwrap();
         let dest = root.join("staging");
-        extract_epzip(&archive, &dest, &ExtractLimits::default()).unwrap();
+        extract_pack(&archive, &dest, &ExtractLimits::default()).unwrap();
 
         std::fs::remove_file(dest.join("pipelines").join("p.toml")).unwrap();
         let table = ChecksumTable::read(&dest).unwrap();
@@ -891,10 +1150,10 @@ mod tests {
     fn detects_unexpected_file_after_extract() {
         let root = unique_root("unexpected-after-extract");
         let src = sample_source(&root);
-        let archive = root.join("pack.epzip");
+        let archive = root.join("pack.zip");
         build_pack(&BuildPlan::new(&src, &archive)).unwrap();
         let dest = root.join("staging");
-        extract_epzip(&archive, &dest, &ExtractLimits::default()).unwrap();
+        extract_pack(&archive, &dest, &ExtractLimits::default()).unwrap();
 
         write_file(&dest.join("models").join("planted.bin"), b"malware");
         let table = ChecksumTable::read(&dest).unwrap();

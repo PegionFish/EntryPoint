@@ -1,5 +1,5 @@
 //! 整合包构建（`POST /api/packs/build` 与 CLI `ep-pack build` 共用）—
-//! 把备妥的包内容目录打包为 `.epzip`（§4.5）。
+//! 把备妥的包内容目录打包为 `.zip`（§4.5）。
 //!
 //! 实现所有者：Wave 1 **A4 (PackIO)**。
 //!
@@ -33,7 +33,7 @@ const FILE_MODE: u32 = 0o100644;
 /// 目录条目固定权限基础位（zip crate `add_directory` 会再并入 S_IFDIR）。
 const DIR_MODE: u32 = 0o755;
 
-/// 打包请求描述：备妥的包内容目录 → 目标 `.epzip` 路径。
+/// 打包请求描述：备妥的包内容目录 → 目标 `.zip` 路径。
 ///
 /// （模型圈选 / 管线选择 / bundle-reference 决策由编排层完成并布局到
 /// `source_dir`；见 §4.5 与 B2/C6 的消费面。）
@@ -41,7 +41,7 @@ const DIR_MODE: u32 = 0o755;
 pub struct BuildPlan {
     /// 包内容目录（必须已含 `ep-pack.toml`）
     pub source_dir: PathBuf,
-    /// 输出 `.epzip` 路径（不得位于 source_dir 内）
+    /// 输出 `.zip` 路径（不得位于 source_dir 内）
     pub output_path: PathBuf,
 }
 
@@ -57,7 +57,7 @@ impl BuildPlan {
 /// 打包结果摘要。
 #[derive(Debug, Clone)]
 pub struct BuildSummary {
-    /// 生成的 `.epzip` 路径
+    /// 生成的 `.zip` 路径
     pub archive_path: PathBuf,
     /// 归档文件条目数（含 CHECKSUMS.toml）
     pub file_count: usize,
@@ -109,7 +109,7 @@ fn dir_options() -> SimpleFileOptions {
         .unix_permissions(DIR_MODE)
 }
 
-/// 把 `source_dir` 打包为 `.epzip`（见模块级文档）。
+/// 把 `source_dir` 打包为 `.zip`（见模块级文档）。
 pub fn build_pack(plan: &BuildPlan) -> Result<BuildSummary, BuildError> {
     let source = &plan.source_dir;
     if !source.is_dir() {
@@ -303,7 +303,7 @@ mod tests {
     fn build_roundtrip_and_entry_names() {
         let root = unique_root("roundtrip");
         let src = sample_source(&root);
-        let out = root.join("out").join("t.p-1.0.0.epzip");
+        let out = root.join("out").join("t.p-1.0.0.zip");
 
         let summary = build_pack(&BuildPlan::new(&src, &out)).unwrap();
         assert_eq!(summary.archive_path, out);
@@ -349,8 +349,8 @@ mod tests {
     fn build_is_deterministic_byte_for_byte() {
         let root = unique_root("deterministic");
         let src = sample_source(&root);
-        let out1 = root.join("a.epzip");
-        let out2 = root.join("b.epzip");
+        let out1 = root.join("a.zip");
+        let out2 = root.join("b.zip");
 
         build_pack(&BuildPlan::new(&src, &out1)).unwrap();
         build_pack(&BuildPlan::new(&src, &out2)).unwrap();
@@ -366,7 +366,7 @@ mod tests {
         let root = unique_root("no-manifest");
         let src = root.join("src");
         write_file(&src.join("models").join("m.bin"), b"x"); // 无 ep-pack.toml
-        let err = build_pack(&BuildPlan::new(&src, root.join("o.epzip"))).unwrap_err();
+        let err = build_pack(&BuildPlan::new(&src, root.join("o.zip"))).unwrap_err();
         assert!(matches!(err, BuildError::ManifestMissing { .. }), "{err:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -374,7 +374,7 @@ mod tests {
     #[test]
     fn build_requires_existing_source_dir() {
         let root = unique_root("no-src");
-        let err = build_pack(&BuildPlan::new(root.join("missing"), root.join("o.epzip")))
+        let err = build_pack(&BuildPlan::new(root.join("missing"), root.join("o.zip")))
             .unwrap_err();
         assert!(matches!(err, BuildError::SourceDirMissing { .. }), "{err:?}");
         let _ = std::fs::remove_dir_all(&root);
@@ -384,7 +384,7 @@ mod tests {
     fn build_rejects_output_inside_source() {
         let root = unique_root("out-inside");
         let src = sample_source(&root);
-        let err = build_pack(&BuildPlan::new(&src, src.join("self.epzip"))).unwrap_err();
+        let err = build_pack(&BuildPlan::new(&src, src.join("self.zip"))).unwrap_err();
         assert!(matches!(err, BuildError::OutputInsideSource { .. }), "{err:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -399,7 +399,7 @@ mod tests {
             src.join("models").join("link.bin"),
         )
         .unwrap();
-        let err = build_pack(&BuildPlan::new(&src, root.join("o.epzip"))).unwrap_err();
+        let err = build_pack(&BuildPlan::new(&src, root.join("o.zip"))).unwrap_err();
         assert!(
             matches!(err, BuildError::Checksum(ChecksumError::SymlinkInSource { .. })),
             "{err:?}"

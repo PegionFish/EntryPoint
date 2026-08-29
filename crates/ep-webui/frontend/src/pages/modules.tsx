@@ -1431,10 +1431,10 @@ function PacksDrawer({
                         size="icon-xs"
                         onClick={() => triggerPackDownload(p.id)}
                         title={t('packs:drawer.download', {
-                          defaultValue: '下载 .epzip',
+                          defaultValue: '下载 .zip',
                         })}
                         aria-label={t('packs:drawer.download', {
-                          defaultValue: '下载 .epzip',
+                          defaultValue: '下载 .zip',
                         })}
                       >
                         <Download className="size-3.5" />
@@ -1812,7 +1812,7 @@ function ImportModuleDialog({
           <DialogDescription>
             {t('importModule.description', {
               defaultValue:
-                '支持服务器本地 .epzip 路径、URL 下载与浏览器上传；受理后模块 + 模型 + 管线落位，进度实时推送',
+                '支持服务器本地 .zip 路径、URL 下载与浏览器上传；受理后模块 + 模型 + 管线落位，进度实时推送',
             })}
           </DialogDescription>
         </DialogHeader>
@@ -1838,7 +1838,7 @@ function ImportModuleDialog({
               value={localPath}
               onChange={(e) => setLocalPath(e.target.value)}
               placeholder={t('packs:import.localPlaceholder', {
-                defaultValue: '服务器上 .epzip 文件的绝对路径',
+                defaultValue: '服务器上 .zip 文件的绝对路径',
               })}
               className="font-mono text-xs"
               disabled={submitting}
@@ -1858,7 +1858,7 @@ function ImportModuleDialog({
             <Input
               value={url}
               onChange={(e) => setUrl(e.target.value)}
-              placeholder="https://github.com/.../release/download/v1.0.0/pack.epzip"
+              placeholder="https://github.com/.../release/download/v1.0.0/pack.zip"
               className="font-mono text-xs"
               disabled={submitting}
             />
@@ -1906,13 +1906,13 @@ function ImportModuleDialog({
                 disabled={submitting}
               >
                 <FileArchive className="size-4" />
-                {t('packs:import.pickFile', { defaultValue: '选择 .epzip 文件' })}
+                {t('packs:import.pickFile', { defaultValue: '选择 .zip 文件' })}
               </Button>
             )}
             <input
               ref={fileInputRef}
               type="file"
-              accept=".epzip,.zip"
+              accept=".zip,.tar.gz,.tgz"
               className="hidden"
               onChange={(e) => {
                 const file = e.target.files?.[0]
@@ -2140,7 +2140,7 @@ function ExportModuleDialog({
           <DialogDescription>
             {t('exportModule.description', {
               defaultValue:
-                '勾选模块（含变体）与管线；构建完成后自动下载 .epzip 分发',
+                '勾选模块（含变体）与管线；构建完成后自动下载 .zip 分发',
             })}
           </DialogDescription>
         </DialogHeader>
@@ -2378,7 +2378,7 @@ function ExportModuleDialog({
 /**
  * 上传模块标准压缩档案（zip / tar.gz）导入为模块。
  *
- * 与「整合包导入」（ImportModuleDialog，.epzip 全链路）不同：本入口走
+ * 与「整合包导入」（ImportModuleDialog，.zip 全链路）不同：本入口走
  * POST /api/modules/import 同步链——安全解包校验（禁 zip-slip / 符号链接 /
  * 大小写冲突 / 超限）→ module.toml 校验 → semver 版本门禁（仅允许升级，
  * 降级/同版 409）→ 落位 modules/<id>/。成功 toast 回显模块摘要。

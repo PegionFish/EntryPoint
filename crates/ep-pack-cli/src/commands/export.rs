@@ -1,6 +1,6 @@
-//! `ep-pack export <pack-id> [--root <dir>] [--modules-dir <dir>] [-o out.epzip]`
+//! `ep-pack export <pack-id> [--root <dir>] [--modules-dir <dir>] [-o out.zip]`
 //!
-//! 已装包（注册表 `runtime/packs/<pack-id>.json`）→ 重建 `.epzip`：
+//! 已装包（注册表 `runtime/packs/<pack-id>.json`）→ 重建 `.zip`：
 //!
 //! 1. 注册表条目 + 模块清单解析（target_dir / backends 重建依据）；
 //! 2. 清单重建：`[pack]` 身份来自注册表，`[compute].backends` 取各模型所属
@@ -28,7 +28,7 @@ use crate::args::{self, OptDef};
 use crate::output::{self, EXIT_FAILURE, EXIT_OK, EXIT_USAGE};
 use crate::resolve::{load_module_catalog, resolve_entry};
 
-const USAGE: &str = "usage: ep-pack export <pack-id> [--root <dir>] [--modules-dir <dir>] [-o|--output <file.epzip>] [--json]";
+const USAGE: &str = "usage: ep-pack export <pack-id> [--root <dir>] [--modules-dir <dir>] [-o|--output <file.zip>] [--json]";
 
 pub fn run(argv: &[String]) -> ExitCode {
     let opts = [
@@ -270,7 +270,7 @@ pub fn run(argv: &[String]) -> ExitCode {
         Some(o) => PathBuf::from(o),
         None => std::env::current_dir()
             .unwrap_or_default()
-            .join(format!("{}-{}.epzip", pack.id, pack.version)),
+            .join(format!("{}-{}.zip", pack.id, pack.version)),
     };
     let result = match build_pack(&BuildPlan::new(&staging, &output_path)) {
         Ok(s) => s,

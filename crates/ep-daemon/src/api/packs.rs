@@ -6,11 +6,11 @@
 //! |---|---|
 //! | GET /api/packs | 已装包列表（注册表） |
 //! | POST /api/packs/import | `{source:"local",path}` \| `{source:"url",url}` → 202 `{pack_id}`，进度走 WS |
-//! | POST /api/packs/upload | multipart `.epzip`（字段名 `file`，仲裁 #3）→ 202 同上 |
+//! | POST /api/packs/upload | multipart `.zip`（字段名 `file`，仲裁 #3）→ 202 同上 |
 //! | GET /api/packs/{id} | 详情（注册条目 + 逐模型适配报告 §4.6） |
 //! | DELETE /api/packs/{id} | `?keep_models=true` 卸载（模型可选保留） |
 //! | POST /api/packs/build | 圈选模型+管线 → 202 → 构建完成可下载 |
-//! | GET /api/packs/{id}/export | `.epzip` 下载（302 → /api/pack-files 流式通道） |
+//! | GET /api/packs/{id}/export | `.zip` 下载（302 → /api/pack-files 流式通道） |
 //!
 //! # 架构要点
 //!
@@ -62,7 +62,7 @@ use ep_core::model::{DownloadHandle, DownloadProgress, DownloadState, ModelManag
 use ep_core::model_id::{PinnedModelId, QualifiedId};
 use ep_core::module::manifest::{ModelDecl, ModelSource, ModuleManifest};
 use ep_core::types::{ComputeBackend, ComputeDevice};
-use ep_pack::build::{build_pack as build_epzip, BuildError, BuildPlan};
+use ep_pack::build::{build_pack as build_pack_archive, BuildError, BuildPlan};
 use ep_pack::import::{
     adapt_model, import_pack as run_import_core, list_installed_packs, read_installed_pack,
     registry_entry_path, AdaptationVerdict, ImportError, ImportOptions, ImportTargets,
@@ -628,7 +628,7 @@ async fn import_pack(
             }
             // 契约：202 即带 pack_id → 下载必须先行（后台任务只跑导入剩余流程）
             let network_env = state.config.read().await.network.env_vars();
-            let temp = std::env::temp_dir().join(format!("ep-pack-dl-{}.epzip", unique_id()));
+            let temp = std::env::temp_dir().join(format!("ep-pack-dl-{}.pack", unique_id()));
             let dl_temp = temp.clone();
             let dl_url = url.clone();
             let download = tokio::task::spawn_blocking(move || {
@@ -671,7 +671,7 @@ async fn import_pack(
     }
 }
 
-/// POST /api/packs/upload — multipart `.epzip` 上传导入（字段名 `file`）。
+/// POST /api/packs/upload — multipart `.zip` 上传导入（字段名 `file`）。
 ///
 /// 临时落盘走 `std::env::temp_dir()`（双平台硬约束），逐 chunk 流式写盘；
 /// 成功后转后台导入任务（与 import 同流程），临时归档由后台任务清理。
@@ -691,7 +691,7 @@ async fn upload_pack(
         }
     };
 
-    let temp = std::env::temp_dir().join(format!("ep-pack-upload-{}.epzip", unique_id()));
+    let temp = std::env::temp_dir().join(format!("ep-pack-upload-{}.pack", unique_id()));
     let mut wrote_file = false;
 
     while let Ok(Some(mut field)) = multipart.next_field().await {
@@ -837,7 +837,7 @@ async fn delete_pack(
 
 /// POST /api/packs/build — 圈选模型（pin/tag）+ 管线 → 202 后台构建。
 ///
-/// 构建完成产物缓存 `runtime/pack-out/<id>-<version>.epzip`，
+/// 构建完成产物缓存 `runtime/pack-out/<id>-<version>.zip`，
 /// 经 GET /api/packs/{id}/export 下载；完成/失败经 WS pack_import
 /// （stage="build"）广播。
 async fn build_pack(
@@ -865,7 +865,7 @@ async fn build_pack(
     }
 }
 
-/// GET /api/packs/{id}/export — `.epzip` 下载。
+/// GET /api/packs/{id}/export — `.zip` 下载。
 ///
 /// 产物已缓存 → 302 到 `/api/pack-files/<filename>`（ServeDir 流式）；
 /// 已装包无缓存产物 → 按注册表内容即时重建；均不满足 → 404。
@@ -2016,7 +2016,7 @@ fn run_build(state: Arc<AppState>, job: BuildJob) -> Result<(), String> {
     let staging = staging_root(&state.root, &staging_cfg);
     let source_dir = staging.join(format!("build-{}-{}", job.pack_id, unique_id()));
     let output = pack_out_dir(&state.root).join(format!(
-        "{}-{}.epzip",
+        "{}-{}.zip",
         job.manifest.pack.id, job.manifest.pack.version
     ));
 
@@ -2086,9 +2086,9 @@ fn assemble_and_build(
             .map_err(|e| PackTaskError::detail("packs:errorInternal", e))?;
     }
 
-    // 4) 打包（CHECKSUMS.toml 由 build_epzip 生成并写入归档）
+    // 4) 打包（CHECKSUMS.toml 由 build_pack 生成并写入归档）
     let plan = BuildPlan::new(source_dir, output);
-    let summary = build_epzip(&plan).map_err(|e| build_failure(&e))?;
+    let summary = build_pack_archive(&plan).map_err(|e| build_failure(&e))?;
     Ok(summary.file_count)
 }
 
@@ -2128,7 +2128,7 @@ fn copy_dir_contents(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 /// export 产物定位：缓存命中 → 文件名；已装包 → 即时重建；否则 404。
 async fn ensure_export_artifact(state: &Arc<AppState>, id: &str) -> Result<String, PackApiError> {
-    // 1) 缓存命中（<id>-*.epzip）
+    // 1) 缓存命中（<id>-*.zip）
     if let Some(name) = find_cached_artifact(&state.root, id) {
         return Ok(name);
     }
@@ -2182,7 +2182,7 @@ async fn ensure_export_artifact(state: &Arc<AppState>, id: &str) -> Result<Strin
     }
 }
 
-/// 查找 pack-out 下 `<id>-*.epzip` 缓存产物（文件名，按字典序取最后一个）
+/// 查找 pack-out 下 `<id>-*.zip` 缓存产物（文件名，按字典序取最后一个）
 fn find_cached_artifact(root: &Path, id: &str) -> Option<String> {
     let dir = pack_out_dir(root);
     let mut matches: Vec<String> = std::fs::read_dir(&dir)
@@ -2190,7 +2190,12 @@ fn find_cached_artifact(root: &Path, id: &str) -> Option<String> {
         .flatten()
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
-            if name.starts_with(&format!("{id}-")) && name.ends_with(".epzip") {
+            if name.starts_with(&format!("{id}-"))
+                && (name.ends_with(".zip")
+                    || name.ends_with(".tar.gz")
+                    || name.ends_with(".tgz")
+                    || name.ends_with(".zip"))
+            {
                 Some(name)
             } else {
                 None
@@ -2317,7 +2322,7 @@ fn run_build_for_export(state: Arc<AppState>, job: BuildJob) -> Result<(), Strin
     let staging = staging_root(&state.root, &staging_cfg);
     let source_dir = staging.join(format!("rebuild-{}-{}", job.pack_id, unique_id()));
     let output = pack_out_dir(&state.root).join(format!(
-        "{}-{}.epzip",
+        "{}-{}.zip",
         job.manifest.pack.id, job.manifest.pack.version
     ));
     let result = assemble_and_build(&source_dir, &output, &job);
@@ -2504,8 +2509,8 @@ mod tests {
         (status, json)
     }
 
-    /// 构造合法最小 .epzip（ep-pack.toml + CHECKSUMS.toml）字节
-    fn build_test_epzip(pack_id: &str) -> Vec<u8> {
+    /// 构造合法最小 .zip（ep-pack.toml + CHECKSUMS.toml）字节
+    fn build_test_pack(pack_id: &str) -> Vec<u8> {
         let manifest_toml = format!(
             r#"[pack]
 id = "{pack_id}"
@@ -2613,7 +2618,7 @@ backends = ["cpu"]
             .oneshot(json_request(
                 Method::POST,
                 "/packs/import",
-                json!({ "path": "x.epzip" }),
+                json!({ "path": "x.zip" }),
             ))
             .await
             .unwrap();
@@ -2662,7 +2667,7 @@ backends = ["cpu"]
     async fn import_local_missing_file_400() {
         let root = unique_root("import-missing");
         let app = app(test_state(root.clone()));
-        let missing = root.join("no-such-pack.epzip");
+        let missing = root.join("no-such-pack.zip");
         let resp = app
             .oneshot(json_request(
                 Method::POST,
@@ -2696,9 +2701,9 @@ backends = ["cpu"]
         let root = unique_root("import-dup");
         seed_installed_pack(&root, "test.dup-pack");
 
-        // 构造同 id 的 .epzip 落盘为本地文件
-        let zip_bytes = build_test_epzip("test.dup-pack");
-        let archive = root.join("dup.epzip");
+        // 构造同 id 的 .zip 落盘为本地文件
+        let zip_bytes = build_test_pack("test.dup-pack");
+        let archive = root.join("dup.zip");
         std::fs::write(&archive, &zip_bytes).unwrap();
 
         let app = app(test_state(root.clone()));
@@ -2720,7 +2725,7 @@ backends = ["cpu"]
     async fn upload_missing_file_field_400() {
         let app = app(test_state(unique_root("upload-nofile")));
         let mut body = Vec::new();
-        form_part(&mut body, "wrongname", Some("pack.epzip"), b"data");
+        form_part(&mut body, "wrongname", Some("pack.zip"), b"data");
         body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
 
         let resp = app.oneshot(multipart_request(body)).await.unwrap();
@@ -2736,12 +2741,12 @@ backends = ["cpu"]
         let state = test_state(root.clone());
         let app = app(state.clone());
 
-        let zip_bytes = build_test_epzip("test.upload-pack");
+        let zip_bytes = build_test_pack("test.upload-pack");
         let mut body = Vec::new();
         form_part(
             &mut body,
             "file",
-            Some("test.upload-pack-1.0.0.epzip"),
+            Some("test.upload-pack-1.0.0.zip"),
             &zip_bytes,
         );
         body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());

@@ -30,7 +30,7 @@ export interface PackUploadProgress {
 export const PACK_UPLOAD_ABORTED = '__ep_pack_upload_aborted__'
 
 /**
- * XHR 上传 .epzip（整合包可达数 GB，进度反馈必需；fetch 无上传进度）。
+ * XHR 上传 .zip（整合包可达数 GB，进度反馈必需；fetch 无上传进度）。
  * 表单字段名 `file`（后端 /api/packs/upload 契约）。
  */
 export function uploadPackWithProgress(
@@ -108,7 +108,7 @@ export interface UsePackIoResult {
   /** URL 导入（202 受理，进度走 WS） */
   importUrl: (url: string) => Promise<PackImportResponse>
   /**
-   * 浏览器上传 .epzip（XHR 真实进度）；202 受理后自动登记进度条目。
+   * 浏览器上传 .zip（XHR 真实进度）；202 受理后自动登记进度条目。
    * 返回 promise 与 abort（关闭对话框时中止上传）。
    */
   upload: (

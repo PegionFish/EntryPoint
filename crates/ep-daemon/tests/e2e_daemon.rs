@@ -427,7 +427,7 @@ model = "ep.acme.asr@v1"
             &src.join("pipelines").join("main.toml"),
             PIPELINE_MAIN.as_bytes(),
         );
-        let archive = root.join("e2e-pack.epzip");
+        let archive = root.join("e2e-pack.zip");
         build_pack(&BuildPlan::new(&src, &archive)).unwrap();
 
         let targets = ImportTargets::from_root(root);

@@ -2,7 +2,7 @@
 //!
 //! # 冻结契约
 //!
-//! - 包格式（`ep-pack.toml` + `.epzip` 归档布局）：`docs/PACK_UNIFY_PLAN.md` §4.2
+//! - 包格式（`ep-pack.toml` + `.zip` 归档布局）：`docs/PACK_UNIFY_PLAN.md` §4.2
 //! - 全限定模型 ID：§4.3（解析/归一实现位于 `ep_core::model_id`，本 crate 统一消费）
 //! - 导入流程与安全模型：§4.4；构建/导出：§4.5；平台适配：§4.6
 //!
