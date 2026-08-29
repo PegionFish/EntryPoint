@@ -1,0 +1,95 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# ComfyUI 桥接示例管线 2 — 文生图（txt2img，文本注入验证）
+#
+# 用途
+#   file_input(.txt 提示词) → comfyui-bridge.generate → file_output：
+#   验证 inject 的定向文本注入 `$input.<上游节点id>`（CONTRACT.md §3：
+#   上游为文本产物 → 注入字符串字段），同时示例字符串/数字字面量注入
+#   （负面提示词、固定 seed）。
+#
+# 上游文本节点方案说明
+#   平台既有 schema 的内置节点只有 file_input / file_output / ffmpeg /
+#   llm / external_api（见 crates/ep-core/src/pipeline/dag.rs 的
+#   builtin_port_type），没有 text_input 内置节点。故本管线采用可行方案：
+#   file_input 读 .txt 文本产物充当"文本上游"——adapter 收到 .txt 上游
+#   产物时按文本注入候选处理（CONTRACT.md §2.3 第 1 步），inject 用
+#   "$input.input"（上游节点 id = "input"）把其文本内容写入工作流的
+#   正向提示词字段。
+#
+# 所需上游（执行前必须就绪）
+#   1. ComfyUI 实例已启动，且已装文生图基础模型（SD1.5/SDXL 任一）。
+#   2. 工作流 txt2img 需先在 WebUI 模块详情页「工作流管理」上传
+#      （API 格式导出；示例模板
+#      modules/comfyui-bridge/workflows/txt2img.api.json）。
+#   3. inject 键中的节点 id 已对齐随包模板
+#      modules/comfyui-bridge/workflows/txt2img.api.json：
+#      2 = CLIPTextEncode(正向)、3 = CLIPTextEncode(负向)、
+#      5 = KSampler、7 = SaveImage。自导出工作流编号若不同，
+#      按实际上传工作流改写；不一致时 adapter 注入前校验 400
+#      并列出可用节点清单（D6），不会误提交。
+#
+# 丢弃风险提示（输出目录）
+#   同 comfyui_demo.toml：产物落在模块输出目录（EP_OUTPUT_DIR，缺省
+#   modules/comfyui-bridge/output/），重跑同名覆盖、目录清理时文件可能
+#   丢失，请以 file_output 节点产出的产物为准。
+#
+# 节点 timeout_secs = 1800
+#   文生图任务耗时长，显式放宽节点硬超时，防止被节点默认 300s 超时
+#   杀掉（docs/COMFYUI_BRIDGE_PLAN.md §七 风险与缓解）。
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[pipeline]
+id = "comfyui-txt2img-demo"
+name = "ComfyUI 文生图（文本注入）"
+description = ".txt 提示词 → ComfyUI 执行 txt2img 工作流 → 取回生成图片"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+label = "提示词文件 (.txt)"
+
+[[nodes]]
+id = "generate"
+kind = "module"
+module_id = "comfyui-bridge"
+capability = "generate"
+label = "ComfyUI 文生图"
+timeout_secs = 1800
+
+[nodes.params]
+# 已上传工作流名（不含 .json）
+workflow = "txt2img"
+# 注入映射 JSON（键已对齐随包模板 txt2img.api.json 的节点编号）：
+#   "2.inputs.text"  "$input.input" = 定向引用上游节点 id="input" 的产物；
+#                    上游为 .txt 文本产物 → 原样注入正向提示词字符串字段
+#   "3.inputs.text"  字符串字面量：负面提示词（未映射字段保留模板默认值）
+#   "5.inputs.seed"  数字字面量：固定种子，保证可复现
+inject = '''
+{
+  "2.inputs.text": "$input.input",
+  "3.inputs.text": "lowres, blurry, watermark",
+  "5.inputs.seed": 42
+}
+'''
+# 可选：远程实例覆盖 COMFYUI_URL
+# base_url = "http://192.168.1.10:8188"
+# 可选：仅取回指定 Save 节点输出（缺省取全部有 images 的节点）
+# output_nodes = "7"
+
+[[nodes]]
+id = "output"
+kind = "builtin"
+builtin = "file_output"
+label = "输出图片"
+
+[nodes.params]
+extension = "png"
+
+[[edges]]
+from = ["input", "output"]
+to = ["generate", "input"]
+
+[[edges]]
+from = ["generate", "output"]
+to = ["output", "input"]
