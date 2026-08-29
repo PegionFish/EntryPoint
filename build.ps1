@@ -26,7 +26,7 @@ if ($Mode -eq "gui") {
     Write-Host "`n[FAIL] gui 模式已随桌面端退役（2026-08-13）。" -ForegroundColor Red
     Write-Host "  WebUI 为唯一 UI，请改用 server 模式构建：" -ForegroundColor Yellow
     Write-Host "    .\build.ps1 server" -ForegroundColor Cyan
-    Write-Host "  历史说明见 docs/DESKTOP_SUNSET_PLAN.md。`n" -ForegroundColor Yellow
+    Write-Host "" -ForegroundColor Cyan
     exit 1
 }
 if ($Mode -ne "server") {

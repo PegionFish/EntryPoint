@@ -61,7 +61,6 @@ case "$MODE" in
     gui)
         echo "  [FAIL] gui 模式已随桌面端退役（2026-08-13）。" >&2
         echo "  WebUI 为唯一 UI，请改用: ./build.sh server" >&2
-        echo "  历史说明见 docs/DESKTOP_SUNSET_PLAN.md。" >&2
         exit 1 ;;
     -h|--help) usage ;;
     *) die "未知模式: $MODE（仅支持 server）" ;;
