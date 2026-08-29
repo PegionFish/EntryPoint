@@ -839,6 +839,8 @@ type = "http"
             vram_estimate_mb: None,
             default,
             mirrors: vec![],
+            sha256: None,
+            sha256s: Default::default(),
         }
     }
 

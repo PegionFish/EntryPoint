@@ -44,6 +44,7 @@ name = "RealESRGANv2 animevideo xsx2 (动漫视频 2x·默认·pth)"
 source = "url"
 url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.3.0/RealESRGANv2-animevideo-xsx2.pth"
 target_dir = "animevideo-xsx2-pth"
+sha256 = "27985aa2198711ecd72f9bb274ec7b164e018fc9ce2933daaa7c7ab36a2bd3fe" # RealESRGANv2-animevideo-xsx2.pth
 size_estimate_mb = 3
 default = true
 qualified_id = "xinntao.realesrgan.animevideo-xsx2"

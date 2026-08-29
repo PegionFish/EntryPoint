@@ -48,6 +48,10 @@ uuid = { version = "1", features = ["v4"] }
 # Unix 平台进程控制（进程组级进程树回收，LNX-02；经 cfg(unix) 门控引入）
 libc = "0.2"
 
+# 模型文件 sha256 校验（下载/导入完成门禁）
+sha2 = "0.11"
+hex = "0.4"
+
 # Internal
 ep-core = { path = "crates/ep-core" }
 ep-pack = { path = "crates/ep-pack" }

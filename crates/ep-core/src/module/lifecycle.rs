@@ -302,6 +302,8 @@ mod tests {
                     vram_estimate_mb: None,
                     default: true,
                     mirrors: vec![],
+                    sha256: None,
+                    sha256s: Default::default(),
                 }]
             } else {
                 vec![]

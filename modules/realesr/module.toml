@@ -58,6 +58,7 @@ name = "RealESRGAN animevideov3 x4 (视频轻量·默认·pth)"
 source = "url"
 url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth"
 target_dir = "realesr-animevideov3-x4-pth"
+sha256 = "b8a8376811077954d82ca3fcf476f1ac3da3e8a68a4f4d71363008000a18b75d" # realesr-animevideov3.pth
 size_estimate_mb = 3
 default = true
 qualified_id = "xinntao.realesrgan.realesr-animevideov3-x4"
@@ -84,6 +85,7 @@ name = "RealESRGAN animevideov3 x4 (ncnn/vulkan 兜底)"
 source = "url"
 url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip"
 target_dir = "realesr-animevideov3-x4-ncnn"
+
 size_estimate_mb = 45
 qualified_id = "xinntao.realesrgan.animevideov3-x4-ncnn"
 
@@ -93,6 +95,19 @@ qualified_id = "xinntao.realesrgan.animevideov3-x4-ncnn"
 # （opset17/18，N/H/W 动轴），经 PSNR 对拍核验后作为 openvino 后端权威权重。
 # source=local_import：不随 URL 分发，获取方式见 README「ONNX 权重获取」
 # （自行运行导出脚本或平台本地导入）。许可随源权重 BSD-3-Clause。
+
+[models.sha256s]
+    "realesr-animevideov3-x2.bin" = "548a36f9c3f4ab8da56cd3b13badf23968bee207b396dad14d04b830e5f2ab2d"
+    "realesr-animevideov3-x2.param" = "b88ff4f00ebf019a7fdac17fdd45a7fd3665d37509efc5baf2e4da2e24420a04"
+    "realesr-animevideov3-x3.bin" = "548a36f9c3f4ab8da56cd3b13badf23968bee207b396dad14d04b830e5f2ab2d"
+    "realesr-animevideov3-x3.param" = "d1a5755008791d09b57e3425fc9dd0bd26b00fdf79c606210bc0e693f8230881"
+    "realesr-animevideov3-x4.bin" = "548a36f9c3f4ab8da56cd3b13badf23968bee207b396dad14d04b830e5f2ab2d"
+    "realesr-animevideov3-x4.param" = "850a248e7c14c27e5bd8cf7265113a9441036a7db63963bb8aa5169d788a435e"
+    "realesrgan-x4plus-anime.bin" = "fe01c269cfd10cdef8e018ab66ebe750cf79c7af4d1f9c16c737e1295229bacc"
+    "realesrgan-x4plus-anime.param" = "2b8fb6e0ae4d2d85704ca08c119a2f5ea40add4f2ecd512eb7f4cd44b6127ed4"
+    "realesrgan-x4plus.bin" = "713ee713b0353afaa27976f0563a64a5043bd70b9bd8936c2e26e25ebcdbcddf"
+    "realesrgan-x4plus.param" = "35330ececcea33b6c397a72548e788d5d53becee4734c50b7fada36e89f10a86"
+
 [[models]]
 id = "realesr-animevideov3-onnx"
 name = "RealESR animevideov3 x4 (ONNX/OpenVINO·自建)"

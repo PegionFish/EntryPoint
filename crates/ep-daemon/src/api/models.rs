@@ -1452,6 +1452,8 @@ mod tests {
             size_estimate_mb: Some(100),
             default: true,
             mirrors: vec![],
+            sha256: None,
+            sha256s: Default::default(),
             qualified_id: None,
             vram_estimate_mb: None,
         }
@@ -1469,6 +1471,8 @@ mod tests {
             size_estimate_mb: None,
             default: false,
             mirrors: vec![],
+            sha256: None,
+            sha256s: Default::default(),
             qualified_id: None,
             vram_estimate_mb: None,
         }
@@ -1689,6 +1693,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn test_download_accepted_and_completes() {
+        let _serial = download_flow_lock().await;
         use std::os::unix::fs::PermissionsExt;
 
         let state = test_state();
@@ -1715,7 +1720,7 @@ mod tests {
         assert_eq!(json.0["ok"], true);
 
         // 等待终态 WS 消息（子进程立即成功退出 → completed）
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut saw_completed = false;
         while tokio::time::Instant::now() < deadline && !saw_completed {
             match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
@@ -2118,6 +2123,14 @@ mod tests {
         permits
     }
 
+    /// 真实走闸门的下载流测试（spawn 假 python / occupy_gate）必须互相串行：
+    /// 闸门是进程级 static（容量 2），这些测试各自持坑时长不一（含 sleep 30），
+    /// 并发运行时互相占坑等待会饿死到超时（曾致全量测试稳定失败）。
+    async fn download_flow_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        LOCK.lock().await
+    }
+
     // ── tags 端点（§8.1）：写后 GET 可见的往返 ───────────────────────────
 
     #[tokio::test]
@@ -2341,6 +2354,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancel_queued_download() {
+        let _serial = download_flow_lock().await;
         let state = test_state();
         create_fake_venv_python(&state);
         let mut rx = state.model_download_tx.subscribe();
@@ -2413,6 +2427,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn test_cancel_active_download_unix() {
+        let _serial = download_flow_lock().await;
         let state = test_state();
         // 慢速假 python：保证取消时下载仍在进行中
         create_fake_venv_python_with(&state, "#!/bin/sh\nsleep 30\nexit 0\n");
@@ -2434,7 +2449,7 @@ mod tests {
             assert_eq!(map.get(&key).unwrap().state, "downloading");
         } else {
             let mut became_downloading = false;
-            for _ in 0..100 {
+            for _ in 0..600 {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 let map = state.downloads.lock().unwrap();
                 if map.get(&key).map(|e| e.state.as_str()) == Some("downloading") {
@@ -2444,7 +2459,7 @@ mod tests {
             }
             assert!(
                 became_downloading,
-                "queued download did not start within 5s (gate never freed)"
+                "queued download did not start within 30s (gate never freed)"
             );
         }
 
@@ -2461,7 +2476,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         // entry 落 cancelled 终态 + 闸门归还
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut cancelled = false;
         while tokio::time::Instant::now() < deadline && !cancelled {
             let st = state
@@ -2482,6 +2497,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_gate_queues_then_starts_when_freed() {
+        let _serial = download_flow_lock().await;
         let state = test_state();
         create_fake_venv_python(&state);
 

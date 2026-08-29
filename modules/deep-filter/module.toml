@@ -33,6 +33,7 @@ source = "url"
 # 原 GitHub release 资产已失效（所有 release 均无此文件）；改用 HuggingFace 镜像（文件内容与原版一致，2026-08-04 核实）
 url = "https://huggingface.co/Serkan007/DeepFilterNet3-ONNX/resolve/main/DeepFilterNet3_onnx.tar.gz"
 target_dir = "deep-filter-df3"
+
 size_estimate_mb = 8
 default = true
 
@@ -59,3 +60,11 @@ max_db_erb_thresh = { type = "float", default = 35.0, min = 0.0, max = 100.0, st
 max_db_df_thresh = { type = "float", default = 35.0, min = 0.0, max = 100.0, step = 1.0, description = "DF 解码器 SNR 上限" }
 reduce_mask = { type = "integer", default = 1, min = 1, max = 2, description = "多声道 mask 归并 1=max 2=mean" }
 compensate_delay = { type = "boolean", default = false, description = "补偿 STFT/模型 lookahead 延迟" }
+
+[models.sha256s]
+    "tmp/export/checkpoints/model_120.ckpt.best" = "23b92884f63ccf54bb026014604625ab231657b6480df65db4095c4c171e6003"
+    "tmp/export/config.ini" = "415eb925d44990d938fb739f514aa3662c1ec0ea836cff044fa1291b82cb4290"
+    "tmp/export/df_dec.onnx" = "23114ce3b0f6464b763ee62f7bb8aab6b2a129a21eabd5bcfe59413db05f278a"
+    "tmp/export/enc.onnx" = "7c5399d3da8a50ebef1c1a0ae421b33376aa5e45d0e92df16da7e83c9c131916"
+    "tmp/export/enhance.log" = "3617fb5f9ae8ae7964de4997b2d5d014941b2cd46fb2fb8a019ce5ce35ac74ee"
+    "tmp/export/erb_dec.onnx" = "ab669a1d10afe20911728b33053a452071042317a90581092b325da7b2f9d895"
