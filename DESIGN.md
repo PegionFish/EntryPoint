@@ -15,7 +15,7 @@
 
 ## 1. 项目概述
 
-EntryPoint 是一个 **server 形态的 AI 模型编排平台**（ep-daemon + WebUI 管理界面），用于统一管控本地部署的多个 AI 模型服务。WebUI（React）为唯一 UI，浏览器访问即用；桌面端已于 2026-08-13 退役（见 docs/DESKTOP_SUNSET_PLAN.md）。
+EntryPoint 是一个 **server 形态的 AI 模型编排平台**（ep-daemon + WebUI 管理界面），用于统一管控本地部署的多个 AI 模型服务。WebUI（React）为唯一 UI，浏览器访问即用；桌面端已于 2026-08-13 退役。
 
 核心能力：
 
