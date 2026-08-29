@@ -30,6 +30,7 @@ EntryPoint是一款AI创意/内容处理工具管控平台，能够统一调度�
 - [自动化集成指南](docs/AUTOMATION.md)
 - [整合包作者指南](docs/PACK_AUTHORING.md)
 - [配置参考](docs/CONFIG_REFERENCE.md)
+- [模型适配仓库同步](docs/MODEL_REPOS.md) — 各模型适配的独立插件 repo（`EntryPoint_<模型>`）与反向同步
 
 ## 开发环境搭建
 
@@ -121,7 +122,7 @@ cd EntryPoint-vX-linux-x86_64-server
 2. 双击包内 `start-daemon.bat` — 自动拉起 ep-daemon 并打开默认浏览器访问 `http://127.0.0.1:9800`
 3. 可选：`start-daemon.bat --no-browser` 跳过自动开浏览器（无人值守场景）
 
-WebUI 为唯一 UI（桌面端已于 2026-08-13 退役，决策依据见 docs/DESKTOP_SUNSET_PLAN.md）。
+WebUI 为唯一 UI（桌面端已于 2026-08-13 退役）。
 
 ## Arch Linux 打包
 
