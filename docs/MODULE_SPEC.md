@@ -12,6 +12,9 @@
 > 变体级 `vram_estimate_mb`（§2.4）；`[runtime] requirements_by_backend` schema
 > 冻结声明（本期不实现，§2.6）；venv 命名演进方向 `<module>--<backend>`（§3.1）。
 >
+> v1.3 变更：`[[models]]` 新增 `sha256` / `sha256s` 完整性校验声明（§2.4）——
+> 下载/本地导入完成时由 EP 主程序先校验再落 ready，失败清理残缺产物。
+>
 > v1.1 变更：新增 `[[models.mirrors]]` 备用下载源（§2.4）；新增"模块产物协议"章节（§5）；"模型管理"章节更新为三获取路径并修正与实现不符的旧描述（§6）。
 
 本文档是第三方开发者将 AI 工具接入 EntryPoint 平台的完整参考。
@@ -187,6 +190,13 @@ cpu = { TORCH_DEVICE = "cpu" }
 | `qualified_id` | string | ❌ | — | 全限定模型 ID `<publisher>.<vendor>.<model>`（PACK_UNIFY_PLAN §4.3）。缺省时旧式简单 id 自动归一为 `ep.<vendor>.<model>`（向后兼容层）；整合包与管线节点 pin 统一消费 |
 | `vram_estimate_mb` | u64 | ❌ | — | **变体级**显存/内存估算（MB）。VRAM 预算按变体取数：本字段优先，缺省回退模块级 `[compute].vram_estimate_mb`（§2.3） |
 | `mirrors` | array | ❌ | `[]` | 备用下载源列表（见下方 `[[models.mirrors]]`） |
+| `sha256` | string | ❌ | — | **单文件模型**主文件的期望 sha256（小写 hex）。下载/导入完成后 EP 主程序校验：目标目录内载荷文件（排除 `.ep_meta.json`）须恰有一个且摘要一致，否则判失败并清理残缺文件 |
+| `sha256s` | table | ❌ | `{}` | **多文件模型**逐文件期望摘要：相对路径（正斜杠）→ sha256。声明的每个文件都必须存在且摘要一致（未声明的额外文件不失败，兼容 HF 仓库附带文件）。TOML 写法：`[models.sha256s]` 子表 |
+
+> **完整性校验语义**（v1.3）：`sha256` / `sha256s` 任一声明即启用"校验通过才算
+> 下载/导入成功"门禁——校验失败按残缺产物清理目标目录（状态回 `Incomplete`），
+> 不会出现"半个模型文件被误判 ready"。两者均缺省时跳过校验（向后兼容）。
+> 手动放置权重（不走下载/导入）不做校验，行为不变。
 
 #### `[[models.mirrors]]` — 备用下载源（镜像，可重复）
 

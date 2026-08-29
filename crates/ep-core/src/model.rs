@@ -833,6 +833,9 @@ impl ModelManager {
             cmd.env(key, value);
         }
 
+        // 残缺产物清理依据：启动时目录是否为空（见 cleanup_partial_download）
+        let dir_was_empty_at_start = !dir_has_entries(&target_dir_path);
+
         let child = cmd
             .spawn()
             .with_context(|| format!("failed to spawn download for model '{}'", model.id))?;
@@ -844,8 +847,8 @@ impl ModelManager {
             let output = match child.wait_with_output().await {
                 Ok(output) => output,
                 Err(e) => {
-                    // P1：等待失败时清理已知临时文件（python 侧可能来不及清理）
-                    cleanup_download_temp_files(&target_dir_path);
+                    // P1：等待失败时清理残缺产物（python 侧可能来不及清理）
+                    cleanup_partial_download(&target_dir_path, dir_was_empty_at_start);
                     return Err(e).with_context(|| {
                         format!("failed to wait for download of model '{}'", model.id)
                     });
@@ -863,14 +866,23 @@ impl ModelManager {
             }
 
             if !output.status.success() {
-                // P1：失败时清理已知临时文件（python try/finally 的兜底）
-                cleanup_download_temp_files(&target_dir_path);
+                // P1：失败时清理残缺产物（python try/finally 的兜底）
+                cleanup_partial_download(&target_dir_path, dir_was_empty_at_start);
                 anyhow::bail!(
                     "download of model '{}' failed with exit code {:?}: {}",
                     model.id,
                     output.status.code(),
                     stderr.trim()
                 );
+            }
+
+            // 校验门禁：声明了 sha256/sha256s 时，校验通过才算下载成功；
+            // 失败按残缺产物清理，防止坏文件蒙混成 ready
+            if let Err(e) =
+                verify_model_checksum(&target_dir_path, &ModelChecksumSpec::from_decl(model), &model.id)
+            {
+                cleanup_partial_download(&target_dir_path, dir_was_empty_at_start);
+                anyhow::bail!("{e:#}");
             }
         } else {
             anyhow::bail!("download process for model '{}' was lost", model.id);
@@ -966,12 +978,15 @@ impl ModelManager {
             cmd.env(key, value);
         }
 
+        // 残缺产物清理依据：spawn 前判定目录是否为空（见 cleanup_partial_download）
+        let target_dir_path = self.model_dir(&model.target_dir);
+        let dir_was_empty_at_start = !dir_has_entries(&target_dir_path);
+
         let child = cmd
             .spawn()
             .with_context(|| format!("failed to spawn download for model '{}'", model.id))?;
 
         // 下载成功后要写入的元数据（total_size_bytes 由监督任务补齐）
-        let target_dir_path = self.model_dir(&model.target_dir);
         let meta = ModelMeta {
             module_id: module_id.to_string(),
             model_id: model.id.clone(),
@@ -993,6 +1008,8 @@ impl ModelManager {
             module_id.to_string(),
             model.id.clone(),
             Some(meta),
+            dir_was_empty_at_start,
+            ModelChecksumSpec::from_decl(model),
         ))
     }
 
@@ -1044,10 +1061,7 @@ impl ModelManager {
 
     /// 检查目录是否包含至少一个文件（非递归，仅检查直接子条目）
     fn dir_has_files(&self, dir: &Path) -> bool {
-        match fs::read_dir(dir) {
-            Ok(mut entries) => entries.next().is_some(),
-            Err(_) => false,
-        }
+        dir_has_entries(dir)
     }
 
     /// 在配置的本地缓存路径中搜索匹配的模型目录
@@ -1134,6 +1148,11 @@ impl ModelManager {
                     "model '{model_id}' not found in manifest of module '{module_id}', cannot import"
                 )
             })?;
+
+        // 校验门禁：声明了 sha256/sha256s 时，先校验源目录再复制落盘
+        verify_model_checksum(source_path, &ModelChecksumSpec::from_decl(decl), model_id)
+            .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+
         self.import_model_into(module_id, model_id, &decl.target_dir, source_path)
             .await
     }
@@ -1583,6 +1602,158 @@ fn cleanup_download_temp_files(dir: &Path) {
     }
 }
 
+/// 目录是否存在直接子条目（free 版本，供下载清理路径复用）
+fn dir_has_entries(dir: &Path) -> bool {
+    match fs::read_dir(dir) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(_) => false,
+    }
+}
+
+// ─── 模型文件 sha256 校验（下载/导入完成门禁）───────────────────────────────
+
+/// 模型文件校验声明（从 [`ModelDecl`] 的 `sha256` / `sha256s` 提取）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ModelChecksumSpec {
+    /// 单文件模型主文件期望摘要（url 源常见）
+    pub single: Option<String>,
+    /// 多文件模型：相对路径（正斜杠）→ sha256
+    pub files: std::collections::BTreeMap<String, String>,
+}
+
+impl ModelChecksumSpec {
+    fn from_decl(model: &crate::module::manifest::ModelDecl) -> Self {
+        Self {
+            single: model.sha256.clone(),
+            files: model.sha256s.clone(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.single.is_none() && self.files.is_empty()
+    }
+}
+
+/// 单文件 sha256（小写 hex）
+fn sha256_file_hex(path: &Path) -> std::io::Result<String> {
+    use sha2::Digest;
+    let mut file = fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// 递归收集目录下文件：相对路径（正斜杠）→ 绝对路径
+fn collect_files_relative(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, PathBuf>) -> std::io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_relative(root, &path, out)?;
+        } else {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.insert(rel, path);
+        }
+    }
+    Ok(())
+}
+
+/// 校验模型目录文件与声明的 sha256 一致（均未声明时直接通过）。
+///
+/// - `single`：目录内载荷文件（排除 `.ep_meta.json`）恰有一个且摘要一致；
+/// - `files`：声明的每个相对路径文件都存在且摘要一致（额外文件不失败，
+///   兼容 HF 仓库附带文件）。
+///
+/// 校验失败返回中文错误（用户可见），并附带期望/实际摘要便于排查。
+pub(crate) fn verify_model_checksum(dir: &Path, spec: &ModelChecksumSpec, model_id: &str) -> Result<()> {
+    if spec.is_empty() {
+        return Ok(());
+    }
+    let mut files = std::collections::BTreeMap::new();
+    collect_files_relative(dir, dir, &mut files)
+        .map_err(|e| anyhow::anyhow!("模型 '{model_id}' 校验失败：无法遍历目录 {}: {e}", dir.display()))?;
+    files.remove(META_FILE_NAME);
+
+    let hash_of = |path: &Path| -> Result<String> {
+        sha256_file_hex(path).map_err(|e| {
+            anyhow::anyhow!("模型 '{model_id}' 校验失败：无法读取文件 {}: {e}", path.display())
+        })
+    };
+
+    if let Some(expected) = &spec.single {
+        if files.len() != 1 {
+            anyhow::bail!(
+                "模型 '{model_id}' 校验失败：声明了单文件 sha256，但目录 {} 内有 {} 个载荷文件（期望恰 1 个）",
+                dir.display(), files.len()
+            );
+        }
+        let (rel, path) = files.iter().next().unwrap();
+        let actual = hash_of(path)?;
+        if !actual.eq_ignore_ascii_case(expected) {
+            anyhow::bail!(
+                "模型 '{model_id}' 校验失败：文件 '{rel}' sha256 不匹配（期望 {expected}，实际 {actual}）"
+            );
+        }
+    }
+
+    for (rel, expected) in &spec.files {
+        let path = files.get(rel).ok_or_else(|| {
+            anyhow::anyhow!("模型 '{model_id}' 校验失败：声明的文件 '{rel}' 不存在于 {}", dir.display())
+        })?;
+        let actual = hash_of(path)?;
+        if !actual.eq_ignore_ascii_case(expected) {
+            anyhow::bail!(
+                "模型 '{model_id}' 校验失败：文件 '{rel}' sha256 不匹配（期望 {expected}，实际 {actual}）"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// 取消/失败/超时后清理残缺下载产物。
+///
+/// 下载启动时目标目录为空（首次下载）→ 目录内任何文件都是本次子进程落盘的
+/// 残缺产物，全部移除（保留目录本身，状态回到 Incomplete）——修复"取消下载
+/// 留下半个模型文件却被状态检查误判 ready，且阻塞后续导入"的问题。
+/// 目录在启动前已有内容（多文件断点续传场景）→ 仅清理已知临时文件，不动
+/// 已有文件（保留续传语义）。
+fn cleanup_partial_download(dir: &Path, dir_was_empty_at_start: bool) {
+    if dir_was_empty_at_start {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let result = if path.is_dir() {
+                fs::remove_dir_all(&path)
+            } else {
+                fs::remove_file(&path)
+            };
+            if let Err(e) = result {
+                debug!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to remove partial download artifact"
+                );
+            }
+        }
+        return;
+    }
+    cleanup_download_temp_files(dir);
+}
+
 // ─── active_models 单槽位（§5.2）────────────────────────────────────────────
 
 /// 解析模块当前激活的模型变体 id — 版本单槽位语义（§5.2，冻结）。
@@ -1699,6 +1870,7 @@ impl DownloadHandle {
 /// WebUI 事件流同时订阅），且 broadcast 的 `send` 在无接收端时仅返回
 /// Err——忽略该错误即可保证"进度发送失败不影响下载本身"。
 /// 完成信号用 oneshot：只通知一次、语义清晰。
+#[allow(clippy::too_many_arguments)]
 fn spawn_tracked_download(
     child: Child,
     poll_dir: PathBuf,
@@ -1706,6 +1878,8 @@ fn spawn_tracked_download(
     module_id: String,
     model_id: String,
     meta: Option<ModelMeta>,
+    dir_was_empty_at_start: bool,
+    checksum: ModelChecksumSpec,
 ) -> DownloadHandle {
     let (progress_tx, _rx) = broadcast::channel::<DownloadProgress>(64);
     let (done_tx, done_rx) = oneshot::channel::<Result<u64, String>>();
@@ -1724,6 +1898,8 @@ fn spawn_tracked_download(
         cancel_rx,
         done_tx,
         meta,
+        dir_was_empty_at_start,
+        checksum,
     ));
 
     DownloadHandle {
@@ -1751,6 +1927,8 @@ async fn supervise_download(
     mut cancel_rx: oneshot::Receiver<()>,
     done_tx: oneshot::Sender<Result<u64, String>>,
     mut meta: Option<ModelMeta>,
+    dir_was_empty_at_start: bool,
+    checksum: ModelChecksumSpec,
 ) {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
@@ -1804,8 +1982,8 @@ async fn supervise_download(
                 );
                 let _ = child.start_kill();
                 let _ = child.wait().await; // 回收子进程
-                // P1：kill 无法触发 python try/finally，这里兜底清理临时文件
-                cleanup_download_temp_files(&poll_dir);
+                // P1：kill 无法触发 python try/finally，这里兜底清理残缺产物
+                cleanup_partial_download(&poll_dir, dir_was_empty_at_start);
                 let msg = format!(
                     "download exceeded the {} minute time limit and was aborted",
                     DOWNLOAD_MAX_DURATION_SECS / 60
@@ -1823,8 +2001,8 @@ async fn supervise_download(
                 info!(model_id = %model_id, "cancelling tracked model download");
                 let _ = child.start_kill();
                 let _ = child.wait().await; // 回收子进程
-                // P1：kill 无法触发 python try/finally，这里兜底清理临时文件
-                cleanup_download_temp_files(&poll_dir);
+                // P1：kill 无法触发 python try/finally，这里兜底清理残缺产物
+                cleanup_partial_download(&poll_dir, dir_was_empty_at_start);
                 let bytes = dir_total_size(&poll_dir);
                 emit(compute_percent(bytes, size_estimate_mb), bytes, DownloadState::Cancelled);
                 let _ = done_tx.send(Err("download cancelled".to_string()));
@@ -1833,6 +2011,17 @@ async fn supervise_download(
             wait_res = child.wait() => {
                 match wait_res {
                     Ok(status) if status.success() => {
+                        // 校验门禁：声明了 sha256/sha256s 时，校验通过才算完成；
+                        // 失败按残缺产物清理，落 Failed 终态
+                        if let Err(e) =
+                            verify_model_checksum(&poll_dir, &checksum, &model_id)
+                        {
+                            cleanup_partial_download(&poll_dir, dir_was_empty_at_start);
+                            let msg = format!("{e:#}");
+                            emit(0.0, 0, DownloadState::Failed(msg.clone()));
+                            let _ = done_tx.send(Err(msg));
+                            return;
+                        }
                         let bytes = dir_total_size(&poll_dir);
                         emit(100.0, bytes, DownloadState::Completed);
                         if let Some(meta) = meta.take() {
@@ -1852,7 +2041,7 @@ async fn supervise_download(
                     }
                     Ok(status) => {
                         // P1：失败兜底清理（python try/finally 通常已完成清理）
-                        cleanup_download_temp_files(&poll_dir);
+                        cleanup_partial_download(&poll_dir, dir_was_empty_at_start);
                         let summary = {
                             let q = stderr_tail.lock().unwrap_or_else(|e| e.into_inner());
                             let skip = q.len().saturating_sub(10);
@@ -1874,7 +2063,7 @@ async fn supervise_download(
                         return;
                     }
                     Err(e) => {
-                        cleanup_download_temp_files(&poll_dir);
+                        cleanup_partial_download(&poll_dir, dir_was_empty_at_start);
                         let msg = format!("failed to wait for download process: {e}");
                         emit(0.0, 0, DownloadState::Failed(msg.clone()));
                         let _ = done_tx.send(Err(msg));
@@ -2286,6 +2475,8 @@ mod tests {
             vram_estimate_mb: None,
             default: true,
             mirrors: vec![],
+            sha256: None,
+            sha256s: Default::default(),
         }
     }
 
@@ -2304,6 +2495,8 @@ mod tests {
             vram_estimate_mb: None,
             default: false,
             mirrors: vec![],
+            sha256: None,
+            sha256s: Default::default(),
         }
     }
 
@@ -2327,6 +2520,8 @@ mod tests {
                 repo_id: "pengzhendong/faster-whisper-large-v3".to_string(),
                 revision: Some("master".to_string()),
             }],
+            sha256: None,
+            sha256s: Default::default(),
         }
     }
 
@@ -2508,6 +2703,8 @@ mod tests {
             vram_estimate_mb: None,
             default: false,
             mirrors: vec![],
+            sha256: None,
+            sha256s: Default::default(),
         }
     }
 
@@ -2952,6 +3149,8 @@ mod tests {
             vram_estimate_mb: None,
             default: true,
             mirrors: vec![],
+            sha256: None,
+            sha256s: Default::default(),
         };
 
         let result = mgr.check_update_available(&model).await;
@@ -3289,6 +3488,8 @@ mod tests {
                     vram_estimate_mb: None,
                     default: true,
                     mirrors: vec![],
+                    sha256: None,
+                    sha256s: Default::default(),
                 },
                 ModelDecl {
                     id: "missing".to_string(),
@@ -3303,6 +3504,8 @@ mod tests {
                     vram_estimate_mb: None,
                     default: false,
                     mirrors: vec![],
+                    sha256: None,
+                    sha256s: Default::default(),
                 },
             ],
         );
@@ -3748,6 +3951,8 @@ mod tests {
             vram_estimate_mb: None,
             default: false,
             mirrors: vec![],
+            sha256: None,
+            sha256s: Default::default(),
         };
 
         let app_config = crate::config::AppConfig::default();
@@ -3810,6 +4015,8 @@ mod tests {
             "mod".to_string(),
             "tracked-model".to_string(),
             Some(meta),
+            true,
+            ModelChecksumSpec::default(),
         );
         assert_eq!(handle.module_id(), "mod");
         assert_eq!(handle.model_id(), "tracked-model");
@@ -3873,6 +4080,8 @@ mod tests {
             "mod".to_string(),
             "sleepy".to_string(),
             None,
+            true,
+            ModelChecksumSpec::default(),
         );
         let mut rx = handle.subscribe_progress();
 
@@ -3891,6 +4100,180 @@ mod tests {
                 .expect("timed out waiting for Cancelled event")
                 .expect("progress channel closed unexpectedly");
             if matches!(ev.state, DownloadState::Cancelled) {
+                break;
+            }
+        }
+
+        cleanup(&dir);
+    }
+
+    /// 取消下载后，首次下载（启动时空目录）落盘的残缺文件必须被清掉——
+    /// 否则状态检查会因"目录有文件"误判 ready，并阻塞后续导入。
+    #[tokio::test]
+    async fn test_tracked_download_cancel_cleans_partial_files() {
+        if cfg!(windows) {
+            return;
+        }
+        let dir = temp_dir("tracked_cancel_partial");
+
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.args(["-c", &format!(
+            "echo partial-content > {}/partial.onnx; sleep 30",
+            dir.display()
+        )])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = cmd.spawn().unwrap();
+
+        let mut handle = spawn_tracked_download(
+            child,
+            dir.clone(),
+            None,
+            "mod".to_string(),
+            "partial".to_string(),
+            None,
+            true,
+            ModelChecksumSpec::default(),
+        );
+
+        handle.cancel();
+        let err = handle.wait().await.unwrap_err();
+        assert!(err.contains("cancelled"), "err: {err}");
+
+        // 子进程已写入残缺文件；取消后目录必须被清空（保留目录本身）
+        assert!(
+            !dir_has_entries(&dir),
+            "partial download artifacts must be removed after cancel"
+        );
+
+        cleanup(&dir);
+    }
+
+    /// 目录在下载启动前已有内容（断点续传场景）→ 失败时只清临时文件，
+    /// 不得误删既有文件。
+    #[tokio::test]
+    async fn test_tracked_download_failure_keeps_preexisting_files() {
+        if cfg!(windows) {
+            return;
+        }
+        let dir = temp_dir("tracked_fail_keep");
+        fs::write(dir.join("existing.bin"), b"keep me").unwrap();
+
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.args(["-c", &format!(
+            "echo x > {}/fresh.bin; exit 3",
+            dir.display()
+        )])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = cmd.spawn().unwrap();
+
+        let handle = spawn_tracked_download(
+            child,
+            dir.clone(),
+            Some(10),
+            "mod".to_string(),
+            "failing".to_string(),
+            None,
+            false,
+            ModelChecksumSpec::default(),
+        );
+        let err = handle.wait().await.unwrap_err();
+        assert!(err.contains("download failed"), "err: {err}");
+
+        assert!(dir.join("existing.bin").exists(), "pre-existing files must be kept");
+        assert!(dir.join("fresh.bin").exists(), "pre-existing dir: no wipe");
+
+        cleanup(&dir);
+    }
+
+    /// 下载完成时 sha256 校验不匹配 → Failed 终态 + 残缺文件清理
+    #[tokio::test]
+    async fn test_tracked_download_checksum_mismatch_fails() {
+        if cfg!(windows) {
+            return;
+        }
+        let dir = temp_dir("tracked_checksum_bad");
+
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.args(["-c", &format!(
+            "echo corrupted-payload > {}/weights.bin; exit 0",
+            dir.display()
+        )])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = cmd.spawn().unwrap();
+
+        let checksum = ModelChecksumSpec {
+            single: Some("0".repeat(64)),
+            files: Default::default(),
+        };
+        let handle = spawn_tracked_download(
+            child,
+            dir.clone(),
+            Some(1),
+            "mod".to_string(),
+            "badsum".to_string(),
+            None,
+            true,
+            checksum,
+        );
+        let err = handle.wait().await.unwrap_err();
+        assert!(err.contains("校验失败"), "err: {err}");
+        assert!(err.contains("sha256 不匹配"), "err: {err}");
+
+        // 校验失败按残缺产物清理：目录必须被清空，坏文件不得蒙混成 ready
+        assert!(!dir_has_entries(&dir), "mismatched download must be cleaned");
+
+        cleanup(&dir);
+    }
+
+    /// sha256 匹配 → 正常 Completed 且 meta 落盘
+    #[tokio::test]
+    async fn test_tracked_download_checksum_match_completes() {
+        if cfg!(windows) {
+            return;
+        }
+        let dir = temp_dir("tracked_checksum_ok");
+
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.args(["-c", &format!(
+            "printf payload-bytes > {}/weights.bin; exit 0",
+            dir.display()
+        )])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = cmd.spawn().unwrap();
+
+        // 先离线算好期望摘要（与子进程写出的内容一致）
+        let payload = dir.join("weights.bin");
+        std::fs::write(&payload, b"payload-bytes").unwrap();
+        let expected = sha256_file_hex(&payload).unwrap();
+        std::fs::remove_file(&payload).unwrap();
+
+        let checksum = ModelChecksumSpec {
+            single: Some(expected),
+            files: Default::default(),
+        };
+        let handle = spawn_tracked_download(
+            child,
+            dir.clone(),
+            Some(1),
+            "mod".to_string(),
+            "oksum".to_string(),
+            None,
+            true,
+            checksum,
+        );
+        let mut rx = handle.subscribe_progress();
+        handle.wait().await.expect("download with matching sha256 must complete");
+
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("timed out waiting for progress events")
+                .expect("progress channel closed unexpectedly");
+            if matches!(ev.state, DownloadState::Completed) {
                 break;
             }
         }
@@ -3919,6 +4302,8 @@ mod tests {
             "mod".to_string(),
             "failing".to_string(),
             None,
+            true,
+            ModelChecksumSpec::default(),
         );
         let mut rx = handle.subscribe_progress();
         let err = handle.wait().await.unwrap_err();

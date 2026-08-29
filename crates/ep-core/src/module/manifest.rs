@@ -182,6 +182,20 @@ pub struct ModelDecl {
     /// 备用下载源列表（TOML 中为 `[[models.mirrors]]`）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mirrors: Vec<ModelMirror>,
+    /// 单文件模型（url 源常见）主文件的期望 sha256（小写 hex，可选）。
+    ///
+    /// 下载/导入完成后由 EP 主程序校验：目录内载荷文件（排除 `.ep_meta.json`）
+    /// 必须恰有一个且摘要一致，否则判失败并清理残缺文件。
+    /// 声明方式：TOML 中 `sha256 = "…"`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// 多文件模型（hf/ms 源）逐文件期望摘要：相对路径（正斜杠）→ sha256（可选）。
+    ///
+    /// 声明的每个文件都必须存在且摘要一致（未声明的额外文件不失败，兼容
+    /// HF 仓库附带文件）。声明方式：TOML 中 `sha256s = { "file" = "…" }`。
+    /// 两者均缺省时跳过校验（向后兼容既有 module.toml）。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub sha256s: std::collections::BTreeMap<String, String>,
 }
 
 impl ModelDecl {
