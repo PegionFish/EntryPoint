@@ -253,11 +253,21 @@ pub enum TaskStatus {
 // ─── 通用结果 ────────────────────────────────────────────────────────────────
 
 /// 管线节点输出
+///
+/// 序列化形状（serde externally tagged）：
+/// - `File` → `{"File":"/path"}`、`Text` → `{"Text":"..."}`、`Json` → `{"Json":...}`
+/// - `None` → 字符串 `"None"`（无负载 unit 变体，§5.6 file_gate skip 哨兵）。
+///   向后兼容：既有持久化数据不含该变体，反序列化不受影响；产物聚合
+///   （`TaskSummary.artifacts`）仅收集 `File`，`None` 不产生产物条目。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Artifact {
     File(PathBuf),
     Text(String),
     Json(serde_json::Value),
+    /// 无产物（`file_gate` 不满足且 `on_mismatch=skip` 时的输出，§5.6）。
+    /// runner 对「全部输入均为 `None`」的下游节点置 `NodeState::Skipped`
+    /// （引擎增强，原因注明 gate 无匹配输出）。
+    None,
 }
 
 // ─── 共享 Trait（Wave 0 定义，所有 agent 面向 trait 编程）───────────────────

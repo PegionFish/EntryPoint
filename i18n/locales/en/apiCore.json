@@ -10,5 +10,15 @@
   "module.notRunning": "Module is not running: {{id}}",
   "module.stopFailed": "Failed to stop module: {{detail}}",
   "config.saveFailed": "Failed to save configuration: {{detail}}",
-  "config.invalidPatch": "Invalid config patch: {{detail}}"
+  "config.invalidPatch": "Invalid config patch: {{detail}}",
+  "watcher.nameRequired": "Rule name is required",
+  "watcher.watchDirRequired": "Watch directory is required",
+  "watcher.watchDirNotAbsolute": "Watch directory must be an absolute path",
+  "watcher.actionRequired": "An action is required: configure either direct mode or pipeline mode",
+  "watcher.actionConflict": "Direct mode and pipeline mode are mutually exclusive: configure exactly one",
+  "watcher.inputNodeInvalid": "Input node does not exist in the selected pipeline",
+  "watcher.capabilityInvalid": "Module or capability does not exist: {{detail}}",
+  "watcher.outputRequired": "Direct mode requires an output config with an absolute destination directory",
+  "watcher.notFound": "Watch rule not found: {{id}}",
+  "watcher.saveFailed": "Failed to save watch rules: {{detail}}"
 }

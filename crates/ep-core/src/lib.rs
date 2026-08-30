@@ -17,6 +17,9 @@ pub mod model;
 // Wave 3 modules
 pub mod pipeline;
 
+// 产物归档命名/冲突处理纯函数（file_archive 节点与直调物化共用，§5.5）
+pub mod archive;
+
 // Wave 2 B3：任务注册表下沉（daemon/桌面共用，P1-4）
 pub mod task_registry;
 

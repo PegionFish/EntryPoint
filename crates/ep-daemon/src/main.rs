@@ -1,8 +1,10 @@
 mod api;
+pub(crate) mod eventlog;
 mod logging;
 mod schedule;
 mod state;
 mod updates;
+pub(crate) mod watcher;
 mod ws;
 
 use std::collections::HashMap;
@@ -500,6 +502,216 @@ async fn run_server(root: PathBuf, cfg: AppConfig) -> anyhow::Result<()> {
         });
     }
 
+    // 10.7 Spawn 触发器巡检循环（PLAN_TRIGGER_UNIFIED_LOG §5.2/§5.4，W1-E）：
+    //      每 10s 加载 runtime/watchers.json → collect_watch_events（纯函数：
+    //      水位线 + 在途稳定表，§5.2）→ 命中文件按规则模式提交：
+    //      - 管线模式：复用 submit_pipeline_for_schedule（零改动既有入口），
+    //        inputs = {input_node: {"path": 绝对路径}}。不传 `_meta` 保留键——
+    //        既有 apply_inputs 将 inputs 键一律按节点 id 解析（execution.rs
+    //        直调物化区段偏差声明），规则名注入仅直调物化期预渲染承担；
+    //      - 直调-仅归档 / 直调-模块：execution.rs 直调物化区段
+    //        submit_direct_archive / submit_direct_module（WatchArchiveOutput
+    //        按字段自规则 OutputConfig 映射，见 watcher_output）。
+    //      提交成功 → 写 watcher_trigger(submitted) 事件 + 回写 recent（环形 5）/
+    //      last_task_id（checkpoint / in_flight 已由 collect_watch_events 在新表
+    //      中推进）；QueueFull 等失败 → 写 rejected 事件 + **整轮放弃新注册表**
+    //      （触发文件保持待触发，沿用旧表下轮重试——W0-C 模块文档既定的
+    //      QueueFull 语义，不丢文件；collect 为纯函数，放弃新表即天然回滚）。
+    //      无状态变化不落盘。与 cron 巡检同为读-改-写窗口（§9 风险表既定，
+    //      单进程 10s 周期，不引入新锁）。
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(10));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let path = watcher::default_registry_path(&state.root);
+                let registry = watcher::WatchRegistry::load(&path);
+                if registry.rules.is_empty() {
+                    continue;
+                }
+                let now = chrono::Utc::now().timestamp();
+                let (hits, mut next) = watcher::collect_watch_events(&registry, now);
+                if hits.is_empty() {
+                    // 无状态变化不落盘（与 cron 巡检同款守卫）
+                    if !watcher_registry_changed(&registry, &next) {
+                        continue;
+                    }
+                    if let Err(e) = next.save(&path) {
+                        warn!(error = %e, "watchers.json 保存失败");
+                    }
+                    continue;
+                }
+                // 逐 hit 提交；任一失败 → abandoned：本轮**已成功提交**的 hit
+                // 状态推进必须合并保留后落盘（评审修复——否则旧表中该文件仍在
+                // in_flight 且签名一致，下轮 stable_ready 会重复提交同一文件）；
+                // 未提交 / 未尝试的 hit 沿用旧注册表（文件保持待触发，下轮
+                // 重试——W0-C 模块文档既定的 QueueFull 语义，不丢文件）。
+                let mut abandoned = false;
+                let mut outcomes: HashMap<String, RuleSubmitOutcome> = HashMap::new();
+                for hit in &hits {
+                    let rule = &hit.rule;
+                    let submit = if let Some(p) = &rule.pipeline {
+                        let mut inputs = HashMap::new();
+                        inputs.insert(
+                            p.input_node.clone(),
+                            serde_json::json!({ "path": hit.path }),
+                        );
+                        crate::api::execute::execution::submit_pipeline_for_schedule(
+                            &state,
+                            &p.pipeline_id,
+                            inputs,
+                            serde_json::Value::Null,
+                        )
+                        .await
+                    } else if let Some(d) = &rule.direct {
+                        let output = watcher_output(&rule.output);
+                        match &d.kind {
+                            watcher::DirectKind::Archive => {
+                                crate::api::execute::execution::submit_direct_archive(
+                                    &state,
+                                    &hit.rule_id,
+                                    &rule.name,
+                                    std::path::PathBuf::from(&hit.path),
+                                    &output,
+                                )
+                                .await
+                                .map_err(|e| e.to_string())
+                            }
+                            watcher::DirectKind::Module { module_id, capability } => {
+                                crate::api::execute::execution::submit_direct_module(
+                                    &state,
+                                    &hit.rule_id,
+                                    &rule.name,
+                                    module_id,
+                                    capability,
+                                    d.params.clone(),
+                                    std::path::PathBuf::from(&hit.path),
+                                    &output,
+                                )
+                                .await
+                                .map_err(|e| e.to_string())
+                            }
+                        }
+                    } else {
+                        Err("rule has neither pipeline nor direct action".to_string())
+                    };
+                    match submit {
+                        Ok(task_id) => {
+                            info!(rule_id = %hit.rule_id, file = %hit.path, task_id = %task_id, "watcher 触发已提交");
+                            eventlog::write_watcher_trigger(
+                                &state.root,
+                                &hit.rule_id,
+                                &hit.path,
+                                Some(&task_id),
+                                "submitted",
+                                None,
+                            );
+                            // recent（环形 5）/ last_task_id 回写进新表
+                            if let Some(r) = next.rules.get_mut(&hit.rule_id) {
+                                r.last_task_id = Some(task_id.clone());
+                                r.recent.push_front(watcher::EventRecord {
+                                    ts: now,
+                                    file: hit.path.clone(),
+                                    task_id: Some(task_id.clone()),
+                                    status: "submitted".to_string(),
+                                    detail: None,
+                                });
+                                r.recent.truncate(5);
+                            }
+                            // 直调模式：后台跟踪任务终态补写 archive_done /
+                            // archive_skipped 事件（§5.4；见
+                            // spawn_archive_outcome_watch 判别语义）
+                            if rule.direct.is_some() {
+                                spawn_archive_outcome_watch(
+                                    state.root.clone(),
+                                    hit.rule_id.clone(),
+                                    hit.path.clone(),
+                                    task_id,
+                                );
+                            }
+                            // 记录该规则本轮有成功提交：hit 必来自旧表 in_flight
+                            // 中签名一致的稳定条目，快照旧签名供 abandoned 合并
+                            let out = outcomes.entry(hit.rule_id.clone()).or_default();
+                            if let Some(sig) = registry
+                                .rules
+                                .get(&hit.rule_id)
+                                .and_then(|r| r.in_flight.get(&hit.path))
+                            {
+                                out.submitted.push((hit.path.clone(), *sig));
+                            }
+                        }
+                        Err(e) => {
+                            warn!(rule_id = %hit.rule_id, file = %hit.path, error = %e, "watcher 触发提交失败，本轮放弃新注册表");
+                            eventlog::write_watcher_trigger(
+                                &state.root,
+                                &hit.rule_id,
+                                &hit.path,
+                                None,
+                                "rejected",
+                                Some(&e),
+                            );
+                            // 失败规则的已提交 hit 走部分合并；失败 hit 的旧表
+                            // mtime 作为该规则水位线推进的封顶（hits 按规则内
+                            // mtime 升序，其后同规则未尝试 hit 的 mtime ≥ 它）
+                            if let Some(out) = outcomes.get_mut(&hit.rule_id) {
+                                out.all_submitted = false;
+                                out.failed_mtime = registry
+                                    .rules
+                                    .get(&hit.rule_id)
+                                    .and_then(|r| r.in_flight.get(&hit.path))
+                                    .map(|s| s.mtime);
+                            }
+                            abandoned = true;
+                            break;
+                        }
+                    }
+                }
+                if abandoned {
+                    // 合并已成功提交 hit 的状态推进后落盘；无变化不落盘
+                    //（同款守卫：全失败时 merged == 旧表，不写盘）
+                    let merged = merge_abandoned_registry(&registry, &next, &outcomes);
+                    if watcher_registry_changed(&registry, &merged) {
+                        if let Err(e) = merged.save(&path) {
+                            warn!(error = %e, "watchers.json 保存失败");
+                        }
+                    }
+                    continue;
+                }
+                if let Err(e) = next.save(&path) {
+                    warn!(error = %e, "watchers.json 保存失败");
+                }
+            }
+        });
+    }
+
+    // 10.8 Spawn 日志清理巡检（PLAN_TRIGGER_UNIFIED_LOG §5.7 / §4.2）：每 1h
+    //      按 general.log_retention_days 删除 runtime/logs/ 下 mtime 超期的
+    //      events-*.jsonl 与模块日志文件（复用 eventlog::cleanup_expired_logs）；
+    //      0 = 永久保留（清理函数内部直接跳过）。保留天数实时读取——运行期经
+    //      PUT /api/config 改动即时生效，无需重启。
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(3600));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let retention_days = {
+                    let cfg = state.config.read().await;
+                    cfg.general.log_retention_days
+                };
+                let removed = eventlog::cleanup_expired_logs(&state.root, retention_days);
+                if removed > 0 {
+                    info!(removed, retention_days, "日志保留期巡检清理完成");
+                }
+            }
+        });
+    }
+
     // 11. Spawn 后台模型更新自动检查（P1-10：general.check_updates 接线）。
     //     开关每轮实时读取——运行期经 PUT /api/config 改动即时生效，无需重启。
     updates::spawn_auto_update_checker(state.clone());
@@ -550,6 +762,175 @@ async fn stop_all_modules(state: &Arc<AppState>) {
             Err(e) => tracing::warn!(module_id = %module_id, error = %e, "failed to stop module on shutdown"),
         }
     }
+}
+
+/// 规则 `OutputConfig` → 直调物化 `WatchArchiveOutput` 的字段映射（W1-E ↔
+/// W1-D 契约：watcher.rs 与 execution.rs 直调物化区段零类型耦合，此处按字段
+/// 直传；`on_conflict` 枚举 → 小写字符串）。`output` 缺省按空目标/空模板
+/// 构造——`watch_archive_params` 会快速失败（dest_dir required）→ rejected
+/// 事件，防御绕过 API 校验的畸形规则。
+fn watcher_output(
+    output: &Option<watcher::OutputConfig>,
+) -> crate::api::execute::execution::WatchArchiveOutput {
+    let o = output.clone().unwrap_or(watcher::OutputConfig {
+        dest_dir: String::new(),
+        name_template: String::new(),
+        on_conflict: watcher::ConflictPolicy::Suffix,
+    });
+    crate::api::execute::execution::WatchArchiveOutput {
+        dest_dir: o.dest_dir,
+        name_template: o.name_template,
+        on_conflict: match o.on_conflict {
+            watcher::ConflictPolicy::Suffix => "suffix",
+            watcher::ConflictPolicy::Overwrite => "overwrite",
+            watcher::ConflictPolicy::Skip => "skip",
+        }
+        .to_string(),
+    }
+}
+
+/// 巡检后注册表是否有持久化可见的状态变化（checkpoint / 在途表逐规则比较；
+/// `in_flight` 的 `PartialEq` 与键序无关）。命中为空时 recent / last_task_id
+/// 必然未被触碰，二者即完整判据——无变化不落盘（与 cron 巡检同款守卫）。
+fn watcher_registry_changed(a: &watcher::WatchRegistry, b: &watcher::WatchRegistry) -> bool {
+    a.rules.len() != b.rules.len()
+        || a.rules.iter().any(|(k, ra)| match b.rules.get(k) {
+            Some(rb) => ra.checkpoint != rb.checkpoint || ra.in_flight != rb.in_flight,
+            None => true,
+        })
+}
+
+/// 单规则本轮提交结果（abandoned 路径合并 [`merge_abandoned_registry`] 的依据）
+#[derive(Default)]
+struct RuleSubmitOutcome {
+    /// 该规则本轮所有 hit 均提交成功（可整体采纳新表状态）
+    all_submitted: bool,
+    /// 成功提交的 hit：(文件路径, 旧注册表在途签名)。stable hit 必来自旧表
+    /// in_flight 签名一致的条目，签名内含 mtime 供水位线推进取值。
+    submitted: Vec<(String, watcher::FileSig)>,
+    /// 失败 hit 的旧表 mtime——水位线推进的封顶：不得越过未提交文件，
+    /// 否则其 mtime 落入水位线之下被永久排除（丢文件，违反 D6）。
+    failed_mtime: Option<i64>,
+}
+
+/// abandoned 路径的注册表合并（评审修复：部分提交失败不得丢弃已提交 hit 的
+/// 状态推进，否则旧表中该文件仍在 `in_flight` 且签名一致，下轮
+/// `stable_ready` 会**重复提交**同一文件）。
+///
+/// 逐规则三种情形：
+/// - 全部 hit 提交成功：整体采纳新表规则状态（checkpoint / in_flight /
+///   recent / last_task_id 连同本轮入表、过滤解决等推进一并保留，与正常
+///   落盘路径等价）；
+/// - 部分成功（含失败 hit 的规则）：以旧表为基做逐 hit 状态手术——仅移除
+///   已提交文件的在途条目、水位线推进到已提交文件的最大 mtime（封顶于失败
+///   hit 的 mtime 之前，保持未提交文件可考察可重试），recent / last_task_id
+///   取自新表（仅成功 hit 会回写二者）。其余状态（本轮新入表、过滤解决）
+///   沿用旧表，下轮重新巡检天然补齐，无丢失；
+/// - 无成功提交：原样保留旧表（merged == 旧表 → 守卫判定无变化不落盘）。
+///
+/// 水位线取值安全论证：静默期未决文件 mtime > now − stability ≥ 任何 hit
+/// mtime（stable hit 必过静默期），推进到 hit mtime 不会越过静默期文件；
+/// 唯一理论边角是同轮内 mtime 相同秒的部分失败（封顶使其保持可重试，代价是
+/// 同秒已提交文件可能被重新考察——重复提交优于静默丢文件，D6 取向）。
+fn merge_abandoned_registry(
+    old: &watcher::WatchRegistry,
+    next: &watcher::WatchRegistry,
+    outcomes: &HashMap<String, RuleSubmitOutcome>,
+) -> watcher::WatchRegistry {
+    let mut merged = old.clone();
+    for (rule_id, out) in outcomes {
+        if out.all_submitted {
+            if let Some(nr) = next.rules.get(rule_id) {
+                merged.rules.insert(rule_id.clone(), nr.clone());
+            }
+            continue;
+        }
+        // 部分成功：旧表为基，仅保留已提交 hit 的状态推进
+        let (Some(old_rule), Some(next_rule)) =
+            (old.rules.get(rule_id), next.rules.get(rule_id))
+        else {
+            continue;
+        };
+        let mut rule = old_rule.clone();
+        rule.recent = next_rule.recent.clone();
+        rule.last_task_id = next_rule.last_task_id.clone();
+        let mut max_submitted_mtime: Option<i64> = None;
+        for (path, sig) in &out.submitted {
+            rule.in_flight.remove(path);
+            max_submitted_mtime = Some(match max_submitted_mtime {
+                Some(m) => m.max(sig.mtime),
+                None => sig.mtime,
+            });
+        }
+        if let Some(mx) = max_submitted_mtime {
+            let cap = out.failed_mtime.map_or(i64::MAX, |m| m - 1);
+            rule.checkpoint = rule.checkpoint.max(mx.min(cap));
+        }
+        merged.rules.insert(rule_id.clone(), rule);
+    }
+    merged
+}
+
+/// 直调触发任务的归档结果跟踪（§5.4：archive_done / archive_skipped 事件）。
+///
+/// 提交期只拿得到 task_id（任务入队即返回，D6），归档真实发生在后台执行——
+/// 故 spawn 轻量跟踪：每秒轮询任务快照至终态（上限 1h），completed 时按
+/// 归档产物 mtime 判别 skip 命中：skip 命中时 file_archive 节点**透传上游
+/// 产物**（executor.rs `ConflictResolution::SkipHit` 分支，不复制落盘），
+/// 产物 mtime 必早于任务提交时刻；真实归档为 `fs::copy`，mtime ≥ 提交时刻。
+/// `file` 字段统一记原始触发文件，与 submitted / rejected 事件一致。
+/// failed / cancelled 不重复写——执行链路 finalize 统一出口已写 task_terminal。
+fn spawn_archive_outcome_watch(
+    root: std::path::PathBuf,
+    rule_id: String,
+    watch_file: String,
+    task_id: String,
+) {
+    tokio::spawn(async move {
+        use crate::api::execute::execution::TaskState;
+        for _ in 0..3600 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let Some(record) = crate::api::execute::execution::snapshot(&task_id) else {
+                return; // 注册表中已无此任务（异常清理）：放弃跟踪
+            };
+            if !record.status.is_terminal() {
+                continue;
+            }
+            if record.status != TaskState::Completed {
+                return;
+            }
+            let Some(artifact) = record.artifacts.get("archive") else {
+                tracing::debug!(%task_id, "watcher 直调任务完成但无 archive 产物，跳过归档事件");
+                return;
+            };
+            let threshold = record
+                .started_running_at
+                .unwrap_or(record.started_at)
+                .timestamp();
+            let skipped = std::fs::metadata(artifact)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                // 产物 mtime 取证失败（文件已消失等）：按完成处理，不误报 skip
+                .map(|mtime| mtime < threshold)
+                .unwrap_or(false);
+            eventlog::write_watcher_trigger(
+                &root,
+                &rule_id,
+                &watch_file,
+                Some(&task_id),
+                if skipped { "archive_skipped" } else { "archive_done" },
+                if skipped {
+                    Some("目标已存在（冲突策略 skip），归档跳过")
+                } else {
+                    None
+                },
+            );
+            return;
+        }
+        tracing::debug!(%task_id, "watcher 直调任务 1h 未达终态，停止归档结果跟踪");
+    });
 }
 
 /// 构建完整路由（API + WebSocket + SPA 静态资源）。
@@ -1214,6 +1595,227 @@ mod tests {
         crate::stop_all_modules(&state).await;
         let pm = state.process_manager.read().await;
         assert!(pm.list_running().is_empty());
+    }
+
+    // ── watcher abandoned 合并（评审修复：部分提交失败不得丢弃已提交 hit
+    //    的状态推进，否则下轮 stable_ready 会重复提交同一文件） ─────────────
+
+    use std::collections::{HashMap, VecDeque};
+    use std::path::PathBuf;
+
+    use crate::watcher::{self, FileSig, WatchRule};
+
+    /// 构造单条 watcher 规则（checkpoint + 在途表）
+    fn watch_rule(id: &str, checkpoint: i64, in_flight: Vec<(&str, FileSig)>) -> WatchRule {
+        WatchRule {
+            id: id.to_string(),
+            name: "test".into(),
+            enabled: true,
+            watch_dir: "/nowhere".into(),
+            recursive: false,
+            extensions: vec![],
+            include_modified: false,
+            stability_secs: 30,
+            backfill: false,
+            checkpoint,
+            in_flight: in_flight
+                .into_iter()
+                .map(|(p, s)| (p.to_string(), s))
+                .collect(),
+            max_batch: 16,
+            direct: None,
+            pipeline: None,
+            output: None,
+            last_task_id: None,
+            recent: VecDeque::new(),
+        }
+    }
+
+    fn registry_of(rules: Vec<WatchRule>) -> watcher::WatchRegistry {
+        let mut r = watcher::WatchRegistry::default();
+        for rule in rules {
+            r.rules.insert(rule.id.clone(), rule);
+        }
+        r
+    }
+
+    // 23. 评审 bug 场景：同规则 hit1 提交成功、hit2 失败 → 合并表必须保留
+    //     hit1 的状态推进（在途表移除 + 水位线推进 + recent/last_task_id），
+    //     hit2 保持待触发；下一轮巡检只重试 hit2，不重复提交 hit1。
+    #[test]
+    fn abandoned_merge_keeps_submitted_hit_state_and_retries_only_failed() {
+        let sig_a = FileSig { mtime: 1500, size: 100 };
+        let sig_b = FileSig { mtime: 1600, size: 200 };
+        let old = registry_of(vec![watch_rule(
+            "r1",
+            1000,
+            vec![("/d/a.mkv", sig_a), ("/d/b.mkv", sig_b)],
+        )]);
+        // 本轮 collect 推进后的新表：批次内全部解决 + hit1 回写
+        let mut next_rule = old.rules["r1"].clone();
+        next_rule.in_flight.clear();
+        next_rule.checkpoint = 1600;
+        next_rule.last_task_id = Some("task-a".into());
+        next_rule.recent.push_back(watcher::EventRecord {
+            ts: 2000,
+            file: "/d/a.mkv".into(),
+            task_id: Some("task-a".into()),
+            status: "submitted".into(),
+            detail: None,
+        });
+        let next = registry_of(vec![next_rule]);
+
+        let mut outcomes = HashMap::new();
+        outcomes.insert(
+            "r1".to_string(),
+            super::RuleSubmitOutcome {
+                all_submitted: false,
+                submitted: vec![("/d/a.mkv".to_string(), sig_a)],
+                failed_mtime: Some(1600),
+            },
+        );
+
+        let merged = super::merge_abandoned_registry(&old, &next, &outcomes);
+        let m = &merged.rules["r1"];
+        assert!(!m.in_flight.contains_key("/d/a.mkv"), "已提交文件必须移出在途表");
+        assert_eq!(
+            m.in_flight.get("/d/b.mkv"),
+            Some(&sig_b),
+            "未提交文件保持待触发（下轮重试）"
+        );
+        assert_eq!(
+            m.checkpoint, 1500,
+            "水位线推进到已提交文件，但不得越过未提交文件的 mtime"
+        );
+        assert_eq!(m.last_task_id.as_deref(), Some("task-a"), "last_task_id 回写保留");
+        assert_eq!(m.recent.len(), 1, "recent 速览保留");
+
+        // 端到端：合并表下一轮巡检只重试 b，不重复提交 a
+        let files = vec![
+            watcher::DirFile { path: PathBuf::from("/d/a.mkv"), mtime: 1500, size: 100 },
+            watcher::DirFile { path: PathBuf::from("/d/b.mkv"), mtime: 1600, size: 200 },
+        ];
+        let (hits, _) = watcher::collect_rule_events(m, &files, 2000);
+        assert_eq!(
+            hits,
+            vec!["/d/b.mkv".to_string()],
+            "只重试未提交文件，已提交文件不得重放"
+        );
+    }
+
+    // 24. 全部 hit 提交成功的规则整体采纳新表；失败规则之后未尝试的规则
+    //     （无 outcome 记录）原样保留旧表。
+    #[test]
+    fn abandoned_merge_adopts_next_rule_only_for_fully_submitted_rules() {
+        let sig = FileSig { mtime: 1500, size: 100 };
+        let r1_old = watch_rule("r1", 1000, vec![("/d/a.mkv", sig)]);
+        let r2_old = watch_rule("r2", 1000, vec![("/d/c.mkv", sig)]);
+        let old = registry_of(vec![r1_old.clone(), r2_old.clone()]);
+        // r1 本轮全部成功（新表推进）；r2 在失败点之后从未尝试（新表虽有
+        // collect 推进，但合并必须忽略）
+        let mut r1_next = r1_old.clone();
+        r1_next.in_flight.clear();
+        r1_next.checkpoint = 1500;
+        let mut r2_next = r2_old.clone();
+        r2_next.in_flight.clear();
+        r2_next.checkpoint = 1500;
+        let next = registry_of(vec![r1_next, r2_next]);
+
+        let mut outcomes = HashMap::new();
+        outcomes.insert(
+            "r1".to_string(),
+            super::RuleSubmitOutcome {
+                all_submitted: true,
+                submitted: vec![("/d/a.mkv".to_string(), sig)],
+                failed_mtime: None,
+            },
+        );
+
+        let merged = super::merge_abandoned_registry(&old, &next, &outcomes);
+        assert_eq!(
+            merged.rules["r1"].checkpoint, 1500,
+            "全成功规则采纳新表水位线"
+        );
+        assert!(merged.rules["r1"].in_flight.is_empty(), "全成功规则采纳新表在途表");
+        assert_eq!(
+            merged.rules["r2"].checkpoint, 1000,
+            "未尝试规则不得采纳新表（保持待触发下轮重试）"
+        );
+        assert_eq!(
+            merged.rules["r2"].in_flight.get("/d/c.mkv"),
+            Some(&sig),
+            "未尝试规则在途条目原样保留"
+        );
+    }
+
+    // 25. 无任何成功提交（首个 hit 即失败）→ 合并结果等于旧表：
+    //     watcher_registry_changed 判定无变化 → 不落盘语义保持。
+    #[test]
+    fn abandoned_merge_without_submitted_hits_is_noop() {
+        let sig = FileSig { mtime: 1500, size: 100 };
+        let old = registry_of(vec![watch_rule("r1", 1000, vec![("/d/a.mkv", sig)])]);
+        let mut next_rule = old.rules["r1"].clone();
+        next_rule.in_flight.clear();
+        next_rule.checkpoint = 1500;
+        let next = registry_of(vec![next_rule]);
+
+        let mut outcomes = HashMap::new();
+        outcomes.insert(
+            "r1".to_string(),
+            super::RuleSubmitOutcome {
+                all_submitted: false,
+                submitted: vec![],
+                failed_mtime: Some(1500),
+            },
+        );
+
+        let merged = super::merge_abandoned_registry(&old, &next, &outcomes);
+        assert!(
+            !super::watcher_registry_changed(&old, &merged),
+            "无成功提交时合并必须是无操作（不落盘）"
+        );
+        assert_eq!(merged.rules["r1"].checkpoint, 1000);
+        assert_eq!(merged.rules["r1"].in_flight.get("/d/a.mkv"), Some(&sig));
+    }
+
+    // 26. 同秒边角：已提交与失败 hit 的 mtime 相同 → 水位线封顶于失败 mtime
+    //     之前，失败文件保持可重试（宁可已提交文件被重新考察，不静默丢文件）。
+    #[test]
+    fn abandoned_merge_checkpoint_capped_below_failed_hit_mtime() {
+        let sig_a = FileSig { mtime: 1600, size: 100 };
+        let sig_b = FileSig { mtime: 1600, size: 200 };
+        let old = registry_of(vec![watch_rule(
+            "r1",
+            1000,
+            vec![("/d/a.mkv", sig_a), ("/d/b.mkv", sig_b)],
+        )]);
+        let next = registry_of(vec![{
+            let mut r = old.rules["r1"].clone();
+            r.in_flight.clear();
+            r.checkpoint = 1600;
+            r
+        }]);
+        let mut outcomes = HashMap::new();
+        outcomes.insert(
+            "r1".to_string(),
+            super::RuleSubmitOutcome {
+                all_submitted: false,
+                submitted: vec![("/d/a.mkv".to_string(), sig_a)],
+                failed_mtime: Some(1600),
+            },
+        );
+
+        let merged = super::merge_abandoned_registry(&old, &next, &outcomes);
+        let m = &merged.rules["r1"];
+        assert_eq!(
+            m.checkpoint, 1599,
+            "水位线必须封顶于失败 hit mtime 之前"
+        );
+        assert_eq!(
+            m.in_flight.get("/d/b.mkv"),
+            Some(&sig_b),
+            "失败文件保持待触发"
+        );
     }
 }
 

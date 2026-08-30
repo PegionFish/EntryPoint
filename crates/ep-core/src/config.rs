@@ -133,6 +133,11 @@ pub struct GeneralConfig {
     pub log_level: String,
     #[serde(default = "default_true")]
     pub check_updates: bool,
+    /// 统一日志保留天数（PLAN_TRIGGER_UNIFIED_LOG §5.7）：`runtime/logs/` 下
+    /// 事件日志（events-*.jsonl）与模块日志（*.log）按 mtime 清理巡检的保留
+    /// 窗口；**0 = 永久保留**。缺省 90。
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: u64,
 }
 
 impl Default for GeneralConfig {
@@ -142,6 +147,7 @@ impl Default for GeneralConfig {
             theme: default_theme(),
             log_level: default_log_level(),
             check_updates: true,
+            log_retention_days: default_log_retention_days(),
         }
     }
 }
@@ -750,6 +756,10 @@ fn default_theme() -> String {
 }
 fn default_log_level() -> String {
     "info".into()
+}
+/// 统一日志保留天数缺省（§5.7）：90 天，0 = 永久
+fn default_log_retention_days() -> u64 {
+    90
 }
 fn default_true() -> bool {
     true
@@ -1557,6 +1567,35 @@ workspace_dir = "workspace"
         // 段应为表却给标量 → 反序列化失败
         let patch = serde_json::json!({ "general": "dark" });
         assert!(config.merge_partial(&patch).is_err());
+    }
+
+    /// §5.7：日志保留天数（0 = 永久）默认值与 TOML/merge 支持
+    #[test]
+    fn log_retention_days_default_and_toml() {
+        // 缺省 90
+        let config = AppConfig::default();
+        assert_eq!(config.general.log_retention_days, 90);
+
+        // TOML 显式覆盖（含 0 = 永久）
+        let config: AppConfig =
+            toml::from_str("[general]\nlog_retention_days = 30\n").expect("parse");
+        assert_eq!(config.general.log_retention_days, 30);
+
+        let config: AppConfig =
+            toml::from_str("[general]\nlog_retention_days = 0\n").expect("parse zero");
+        assert_eq!(config.general.log_retention_days, 0);
+
+        // 无 [general] 节 → serde default 回填 90
+        let config: AppConfig = toml::from_str("").expect("parse empty");
+        assert_eq!(config.general.log_retention_days, 90);
+
+        // merge_partial 语义：显式覆盖、缺省保留
+        let mut config = AppConfig::default();
+        config
+            .merge_partial(&serde_json::json!({ "general": { "log_retention_days": 7 } }))
+            .expect("merge");
+        assert_eq!(config.general.log_retention_days, 7);
+        assert_eq!(config.general.language, "zh-CN");
     }
 
     #[test]

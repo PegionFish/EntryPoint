@@ -6,6 +6,8 @@ import type { AppConfig } from '@/api/types'
 
 /** AppConfig 超集：§8.3 新增字段（服务器序列化恒含，类型标可选以容错） */
 export interface AppConfigExt extends AppConfig {
+  /** §5.7 统一事件日志保留天数（0 = 永久；后端缺省 90，api/types.ts 对齐前本地补充） */
+  general: AppConfig['general'] & { log_retention_days?: number }
   python: AppConfig['python'] & { uv_cache_dir?: string; constraints?: string }
   compute: AppConfig['compute'] & {
     cuda_libs_dir?: string

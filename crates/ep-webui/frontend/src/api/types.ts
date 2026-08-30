@@ -580,6 +580,107 @@ export interface ModelVariantResponse {
   needs_restart?: boolean
 }
 
+// ===== 触发器规则（PLAN_TRIGGER_UNIFIED_LOG §5.1）=====
+
+/** 产物冲突策略（§5.5：suffix/overwrite/skip，后端 ConflictPolicy 小写序列化） */
+export type WatcherConflictPolicy = 'suffix' | 'overwrite' | 'skip'
+
+/** 产物归档输出配置（§5.1 OutputConfig） */
+export interface WatcherOutputConfig {
+  /** 目标目录（绝对路径） */
+  dest_dir: string
+  /** 命名模板，默认 "{name}.{ext}"；占位符 {name}/{ext}/{date}/{datetime}/{rule}/{seq} */
+  name_template?: string
+  on_conflict?: WatcherConflictPolicy
+}
+
+/**
+ * 直接动作（§5.1 DirectAction = { kind: DirectKind, params }）。
+ * kind 的 serde 变体名为 PascalCase（"Archive"/"Module"，冻结契约无
+ * rename_all），写入侧必须发 PascalCase；读取侧一律 toLowerCase 归一。
+ */
+export type WatcherDirectKind =
+  | { type: 'Archive' }
+  | { type: 'Module'; module_id: string; capability: string }
+
+export interface WatcherDirectAction {
+  kind: WatcherDirectKind
+}
+
+/** 管线动作（§5.1 PipelineAction）：D3 注入节点始终手动选择 */
+export interface WatcherPipelineAction {
+  pipeline_id: string
+  input_node: string
+}
+
+/** 最近触发速览条目（§5.1 EventRecord，环形 5 条） */
+export interface WatcherEventRecord {
+  ts: number
+  file: string
+  task_id?: string | null
+  status: string
+  detail?: string | null
+}
+
+/** 触发规则（GET /api/watchers 列表项） */
+export interface WatchRule {
+  id: string
+  name: string
+  enabled: boolean
+  /** 监控目录（绝对路径） */
+  watch_dir: string
+  recursive?: boolean
+  /** 扩展名白名单（小写无点；空 = 全部） */
+  extensions?: string[]
+  include_modified?: boolean
+  /** 静默秒数（后端钳制 ≥5，默认 30） */
+  stability_secs?: number
+  /** 含存量文件回灌 */
+  backfill?: boolean
+  /** 水位线（epoch 秒，服务端管理） */
+  checkpoint?: number
+  direct?: WatcherDirectAction | null
+  pipeline?: WatcherPipelineAction | null
+  output?: WatcherOutputConfig | null
+  last_task_id?: string | null
+  recent?: WatcherEventRecord[]
+}
+
+/** 创建/更新规则请求体（POST/PUT；id/checkpoint/in_flight/recent 服务端管理） */
+export interface WatchRuleInput {
+  name: string
+  enabled: boolean
+  watch_dir: string
+  recursive?: boolean
+  extensions?: string[]
+  include_modified?: boolean
+  stability_secs?: number
+  backfill?: boolean
+  direct?: WatcherDirectAction | null
+  pipeline?: WatcherPipelineAction | null
+  output?: WatcherOutputConfig | null
+}
+
+// ===== 统一事件日志（§5.7；GET /api/events）=====
+
+/** 事件条目（公共字段 ts/type；按事件类型可选字段） */
+export interface UnifiedEvent {
+  ts: number
+  type: string
+  /** watcher_trigger：规则 id */
+  rule?: string
+  /** watcher_trigger：触发文件绝对路径 */
+  file?: string
+  task_id?: string
+  /** watcher_trigger: submitted/rejected/archive_done/archive_skipped；task_terminal: completed/failed/cancelled */
+  status?: string
+  detail?: string
+  /** task_terminal：管线 id */
+  pipeline_id?: string
+  /** task_terminal：错误摘要 */
+  error?: string
+}
+
 // ===== 模块标准档案导入 / 导出（HETERO_DIST_PLAN §2.2/§2.3，WS-A-api）=====
 
 /** POST /api/modules/import 响应中的模块摘要（manifest 回显） */

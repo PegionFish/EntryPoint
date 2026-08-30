@@ -3,8 +3,8 @@
 > 适用于 EntryPoint v0.x | 契约依据：PACK_UNIFY_PLAN §6.5（管线即 API）与决策 6（watcher 示例）
 
 本文档面向**外部系统集成方**：如何用 HTTP API 把 EntryPoint 当作无人值守的
-媒体/模型处理后端——提交执行、跟踪任务、接收回调，以及 watcher 类触发器的
-接入模式。
+媒体/模型处理后端——提交执行、跟踪任务、接收回调，以及内建触发器与外部
+watcher 的接入模式。
 
 ---
 
@@ -112,12 +112,49 @@ multipart 单文件（字段名 `file`）→ 暂存 `workspace/uploads`，响应
 
 ---
 
-## 4. watcher 外部触发模式（决策 6）
+## 4. 内建触发器（Watch Rules）
 
-**EntryPoint 本期不内建触发器**（文件夹监控 / cron 列为后续方向）；无人值守
-场景由**外部 watcher 进程**承担，它只做两件事：发现素材 → 调 API 提交。
+**EntryPoint 已内建触发器**：在 WebUI「触发器」页配置规则（操作指南见
+[WEBUI_GUIDE.md](WEBUI_GUIDE.md) §7），daemon 以 **10 秒轮询**巡检监控目录，
+命中即自动提交任务（直接模式或管线模式），简单需求无需外部脚本、也无需先造管线。
+规则注册表存于 `runtime/watchers.json`（tmp+rename 原子落盘），REST 管理走
+`/api/watchers`（增删改查 + 启停；错误响应走 i18n `apiCore.watcher.*` 键）。
 
-推荐形态：
+### 4.1 触发语义（轮询 10s + 稳定窗口 + 水位线）
+
+- **轮询周期 10s**：每轮对每条启用规则扫描监控目录（`recursive` 开关决定是否递归子目录）；停用规则完全跳过，目录缺失/不可读仅告警不拖垮巡检循环。
+- **半截文件黑名单（内建）**：`.part` `.tmp` `.download` `.!qB` `.crdownload` `.bc` `.td` `.xltd` 后缀的文件永不触发（BT/浏览器下载防误触）。
+- **稳定窗口**：仅 mtime 已稳定 `stability_secs`（默认 30，最小钳制 5）秒的文件才可能触发——跨轮以（mtime, size）签名一致判定稳定，写一半的文件不会命中。
+- **水位线（checkpoint）**：仅 `mtime > checkpoint` 的候选进入判定。十万级存量文件天然被水位线排除、不进入任何索引结构，巡检内存与目录规模解耦（O(新文件到达速率)）。默认**不回灌存量**（创建规则时 checkpoint=now）；「含存量文件」开关（backfill）开启后从现存最旧文件按 mtime 有序追赶，每轮仅前沿批次进入在途表，内存有界。
+- **扩展名过滤**：规则级白名单（空 = 全部；自动去点转小写归一）。
+- **批量与背压**：触发按 mtime 升序、每轮每规则至多 `max_batch`（默认 16）个；全局在途任务 256 硬上限，队列满（`QueueFull`）时文件保持待触发、下轮重试，不丢文件。
+- **触发记录**：每次触发写统一事件日志（`watcher_trigger` 事件，`submitted` / `rejected` / `archive_done` / `archive_skipped`，见 [WEBUI_GUIDE.md](WEBUI_GUIDE.md) §10「日志体系」）；规则内仅保留最近 5 条速览，全量记录在事件日志。
+
+### 4.2 动作模式
+
+| 模式 | 提交方式 | 任务 `pipeline_id` |
+|---|---|---|
+| 管线模式 | 复用既有调度提交入口（零改动）：inputs 注入选定 `file_input` 节点（命中文件绝对路径）+ 保留键 `_meta.rule`（规则名，供 `file_archive` 的 `{rule}` 占位符渲染） | 真实管线 id |
+| 直接-仅归档 | 物化退化 DAG `file_input → file_archive`（归档参数渲染自规则输出配置） | `watcher/<rule_id>` |
+| 直接-模块 | 先自动拉起模块（`ensure_module_running`）→ 退化 DAG `file_input → module → file_archive` | `watcher/<rule_id>` |
+
+直接模式的产物投递与内置节点 `file_archive` 同款归档逻辑（命名模板 + 冲突策略，
+参数与占位符见 [PIPELINE_SPEC.md](PIPELINE_SPEC.md) §5.8）。管线图内的自动化范式：
+
+```
+file_input → file_gate →（ffmpeg / 模块）→ file_archive
+```
+
+### 4.3 外部 watcher 脚本（跨机 / 低延迟补充方案）
+
+内建触发器覆盖同机目录监控的绝大多数场景；以下情形仍推荐**外部 watcher 进程**
+（它只做两件事：发现素材 → 调 API 提交，提交方式见 §2）：
+
+- **跨机器**：素材位于 daemon 不可见的文件系统上（先 `POST /api/upload/input`
+  上传或挂载共享目录）；
+- **低延迟**：inotify / FileSystemWatcher 事件驱动的毫秒级响应，优于内建 10s 轮询。
+
+推荐形态与要点（幂等 `.done` 标记防重启重复提交、失败重试按业务策略）不变：
 
 ```
 [watcher]  监听目录（inotify / FileSystemWatcher）
@@ -130,15 +167,7 @@ multipart 单文件（字段名 `file`）→ 暂存 `workspace/uploads`，响应
 [watcher]  收到回调/轮询到 completed → 取产物 → 后处理（归档/通知/入库）
 ```
 
-要点：
-
-- watcher 与 daemon 同机时，`inputs` 里的路径就是本机路径，直接可用；跨机器
-  需先把素材上传（`POST /api/upload/input`）或挂载共享目录；
-- 幂等建议：watcher 自行记录已提交文件（如 `.done` 标记文件），避免重启重复提交；
-- 失败重试：任务 `failed` 时错误信息在任务详情里（用户可见文案走 i18n）；
-  watcher 按业务策略决定是否重提。
-
-**示例脚本**：`scripts/examples/`（Wave 4 D3 交付：Linux bash + inotifywait 与
+**示例脚本**：`scripts/examples/`（Linux bash + inotifywait 与
 Windows PowerShell + FileSystemWatcher 双版本，含提交与回调接收骨架）：
 
 - `scripts/examples/watcher-linux.sh` — bash + inotifywait 版（Linux）

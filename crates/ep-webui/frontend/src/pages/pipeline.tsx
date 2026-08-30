@@ -577,6 +577,17 @@ function toSpec(
         if (n.data.builtin === 'ffmpeg' && params.args !== undefined) {
           params.args = serializeArgsParam(params.args)
         }
+        // §5.6：file_gate 的 media 条件在 UI 以平铺键（media_*）编辑，
+        // 序列化时收敛为后端契约的嵌套 media 对象；仅写出已配置（>0）的条件
+        if (n.data.builtin === 'file_gate') {
+          const media: Record<string, number> = {}
+          for (const [flat, nested] of FILE_GATE_MEDIA_KEYS) {
+            const v = params[flat]
+            if (typeof v === 'number' && Number.isFinite(v) && v > 0) media[nested] = v
+          }
+          for (const [flat] of FILE_GATE_MEDIA_KEYS) delete params[flat]
+          if (Object.keys(media).length > 0) params.media = media as unknown as ParamValue
+        }
         return { ...common, params, kind: 'builtin', builtin: n.data.builtin }
       }
       case 'module':
@@ -696,6 +707,17 @@ function cascadeLayout(spec: PipelineSpec): Map<string, { x: number; y: number }
 }
 
 /**
+ * file_gate media 条件的 UI 平铺键 ↔ 后端契约嵌套键（§5.6）。
+ * UI 侧 `media_*` 平铺编辑，spec 侧收敛为嵌套 `media` 对象。
+ */
+const FILE_GATE_MEDIA_KEYS: [flat: string, nested: string][] = [
+  ['media_min_duration_secs', 'min_duration_secs'],
+  ['media_max_duration_secs', 'max_duration_secs'],
+  ['media_min_width', 'min_width'],
+  ['media_min_height', 'min_height'],
+]
+
+/**
  * 端口名归一：服务端 spec 的端口名（input/output，ep-core 契约）
  * ↔ 前端节点 handle id（in/out，BUILTIN_DEFS 定义）。
  * fallback 为对应方向的默认 handle。
@@ -749,6 +771,16 @@ function fromSpec(
     if (sn.kind === 'builtin') {
       const builtin = sn.builtin as BuiltinKind | undefined
       if (builtin && builtin in BUILTIN_DEFS) {
+        // §5.6：file_gate 的嵌套 media 对象还原为 UI 平铺键（往返不丢失；
+        // toSpec 序列化时按原键收敛回嵌套对象）
+        if (builtin === 'file_gate' && params.media && typeof params.media === 'object' && !Array.isArray(params.media)) {
+          const media = params.media as Record<string, unknown>
+          for (const [flat, nested] of FILE_GATE_MEDIA_KEYS) {
+            const v = media[nested]
+            if (typeof v === 'number' && Number.isFinite(v)) params[flat] = v
+          }
+          delete params.media
+        }
         const data: PipelineNodeData = {
           kind: 'builtin',
           builtin,
@@ -4168,6 +4200,26 @@ function PipelineEditor() {
       }
       if (outputs.length > 0 && !edges.some((e) => e.source === n.id)) {
         issues.push(t('validate.missingOutput', { label: n.data.label }))
+      }
+      // §5.6：file_gate 静态校验（与后端 validate() 同语义）——
+      // 扩展名白/黑名单、大小界、文件名正则、media 条件至少配置一项
+      if (n.data.kind === 'builtin' && n.data.builtin === 'file_gate') {
+        const p = n.data.params
+        const hasCondition =
+          (Array.isArray(p.extensions) && p.extensions.some((s) => s.trim() !== '')) ||
+          (Array.isArray(p.extensions_exclude) && p.extensions_exclude.some((s) => s.trim() !== '')) ||
+          (typeof p.filename_regex === 'string' && p.filename_regex.trim() !== '') ||
+          [
+            p.min_size_bytes,
+            p.max_size_bytes,
+            p.media_min_duration_secs,
+            p.media_max_duration_secs,
+            p.media_min_width,
+            p.media_min_height,
+          ].some((v) => typeof v === 'number' && Number.isFinite(v) && v > 0)
+        if (!hasCondition) {
+          issues.push(t('validate.fileGateNoCondition', { label: n.data.label }))
+        }
       }
     }
     return issues

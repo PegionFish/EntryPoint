@@ -99,6 +99,10 @@ pub struct PipelineRunnerImpl {
     /// 超时触发时同样 `abort()` 执行任务（缺陷 #5：不只是标记失败任请求
     /// 挂到自然结束，在飞 HTTP 连接立即断开、子进程立即终止）。
     default_node_timeout: Option<std::time::Duration>,
+    /// 任务级 inputs（触发器注入的保留键上下文，如 `_meta.rule`，§5.4/§5.5）：
+    /// `execute_async` 时传入 [`PipelineTask::inputs`]（executor.rs），供
+    /// file_archive 的 `{rule}` 占位符渲染；`None` = 普通手动任务。
+    pub(crate) task_inputs: Option<serde_json::Value>,
 }
 
 /// 取消标志轮询间隔（毫秒）：在飞节点中断的检测粒度。
@@ -128,7 +132,16 @@ impl PipelineRunnerImpl {
             on_node_error: None,
             cancel_flag: None,
             default_node_timeout: None,
+            task_inputs: None,
         }
+    }
+
+    /// 注入任务级 inputs（触发器上下文，§5.4/§5.5）
+    ///
+    /// 由触发器执行链路（ep-daemon Wave 1）调用：`file_archive` 节点经
+    /// `PipelineTask.inputs` 读取保留键 `_meta.rule` 渲染 `{rule}` 占位符。
+    pub fn set_task_inputs(&mut self, inputs: Option<serde_json::Value>) {
+        self.task_inputs = inputs;
     }
 
     /// 注册模块服务端口
@@ -219,7 +232,13 @@ impl PipelineRunnerImpl {
                     NodeState::Failed { error, .. } => {
                         ("failed".to_string(), Some(error.clone()))
                     }
-                    NodeState::Skipped => ("skipped".to_string(), None),
+                    // §5.6：gate 无匹配输出传播置 Skipped 的节点附带原因文案
+                    //（任务详情标记「无匹配输出」的最小实现）；其余 Skipped
+                    //（上游失败传播等）保持 error=None，与既有契约一致。
+                    NodeState::Skipped => (
+                        "skipped".to_string(),
+                        task.skip_reasons.get(node_id).cloned(),
+                    ),
                 };
                 NodeDetail {
                     node_id: node_id.clone(),
@@ -246,6 +265,8 @@ impl PipelineRunnerImpl {
         work_dir: &Path,
     ) -> anyhow::Result<()> {
         let mut task = PipelineTask::new(pipeline, work_dir.to_path_buf());
+        // 任务级 inputs（触发器上下文，§5.4/§5.5）：file_archive `{rule}` 数据源
+        task.inputs = self.task_inputs.clone();
         let layers = pipeline
             .topological_layers()
             .map_err(|_| anyhow::anyhow!("pipeline contains a cycle"))?;
@@ -267,10 +288,46 @@ impl PipelineRunnerImpl {
             // 其余在飞兄弟（abort），语义对齐旧串行行为的「失败即停层」。
             // 共享 PipelineTask 不跨线程可变：各在飞任务只读上游状态，
             // 成败标记由本驱动循环按完成序统一落账。
-            let runnable: Vec<&String> = layer
+            let mut runnable: Vec<&String> = layer
                 .iter()
                 .filter(|id| matches!(task.node_state(id), Some(NodeState::Running)))
                 .collect();
+
+            // ── Artifact::None 传播（§5.6 引擎增强）────────────────────────
+            // 本层节点收到的**全部输入**均为 `Artifact::None`（file_gate 无匹配
+            // 输出）或上游已因该传播置 Skipped → 置 Skipped（原因注明 gate 无
+            // 匹配输出），不 spawn、不发开始/失败回调，继续层推进；任务终态
+            // 保持 Completed（Skipped 不计入失败）。
+            // 不破坏既有语义：失败→下游 Skipped（mark_failed_with_pipeline）、
+            // 取消（批前检查点紧随其后，被传播节点不再发取消回调）、同层兄弟
+            // 并行（逐节点独立判定）、fail-fast（layer_failure 分支不变）。
+            // 必须把 Skipped 纳入判定：传播链 gate(None)→B(Skipped)→C 才能到达。
+            runnable.retain(|id| {
+                let upstream_nodes: Vec<&String> = pipeline
+                    .edges
+                    .iter()
+                    .filter(|e| e.to.0 == **id)
+                    .map(|e| &e.from.0)
+                    .collect();
+                if upstream_nodes.is_empty() {
+                    return true; // 无入边（根节点）：不适用传播
+                }
+                let all_none = upstream_nodes.iter().all(|up| {
+                    matches!(
+                        task.node_state(up),
+                        Some(NodeState::Completed {
+                            artifact: Some(Artifact::None),
+                        })
+                            | Some(NodeState::Skipped)
+                    )
+                });
+                if all_none {
+                    task.mark_skipped_no_output(id);
+                    false
+                } else {
+                    true
+                }
+            });
 
             // 批前取消检查点：置位 → 整层不启动，任务终结 Cancelled
             if !runnable.is_empty()
@@ -493,6 +550,7 @@ impl PipelineRunnerImpl {
             if cancelled_in_flight {
                 // P0：同层剩余 Running 兄弟一并置 Skipped，避免任务永久 Running
                 task.skip_layer_remaining(layer);
+                task.skip_all_pending();
                 task.status = TaskStatus::Cancelled;
                 self.finish_task(task);
                 return Err(anyhow::anyhow!("pipeline execution cancelled"));
@@ -501,6 +559,9 @@ impl PipelineRunnerImpl {
                 // P0：同层剩余 Running 兄弟一并置 Skipped；check_completion
                 // 随之在全部节点终结时置 Failed，任务终态正确传播
                 task.skip_layer_remaining(layer);
+                // 兄弟节点的下游不在失败闭包内也不在当前层，一并收尾，
+                // 否则永久 Pending → is_complete 恒 false → 误报成功
+                task.skip_all_pending();
                 break; // 停止后续层（fail-fast）
             }
         }
@@ -550,6 +611,7 @@ impl PipelineRunner for PipelineRunnerImpl {
                     on_node_error: on_error,
                     cancel_flag,
                     default_node_timeout,
+                    task_inputs: self.task_inputs.clone(),
                 };
 
                 let (result, returned_runner) =
@@ -1657,6 +1719,95 @@ to = ["good", "input"]
         cleanup_dir(&work_dir);
     }
 
+    /// fail-fast 专项回归：同层健康兄弟的下游节点必须收尾。
+    ///
+    /// 图：input → bad（必败）与 input → mid → out。bad 失败 → mid 被
+    /// skip_layer_remaining 置 Skipped，但 out 既不在 bad 的传递闭包内、
+    /// 也不在第 1 层——修复前永久 Pending，is_complete 恒 false，任务
+    /// 卡 Running 且 execute 误报 Ok。
+    #[tokio::test]
+    async fn test_fail_fast_sibling_downstream_not_pending_leak() {
+        let work_dir = temp_work_dir("sibling-downstream");
+        let input_file = work_dir.join("source.txt");
+        std::fs::write(&input_file, "sibling downstream data").unwrap();
+        let mid_file = work_dir.join("mid.txt");
+        let out_file = work_dir.join("out.txt");
+
+        let toml_str = format!(
+            r#"
+[pipeline]
+id = "test-sibling-downstream"
+name = "Sibling Downstream Test"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = {{ path = "{}" }}
+
+[[nodes]]
+id = "bad"
+kind = "module"
+module_id = "nonexistent"
+capability = "do_thing"
+
+[[nodes]]
+id = "mid"
+kind = "builtin"
+builtin = "file_output"
+params = {{ path = "{}" }}
+
+[[nodes]]
+id = "out"
+kind = "builtin"
+builtin = "file_output"
+params = {{ path = "{}" }}
+
+[[edges]]
+from = ["input", "output"]
+to = ["bad", "input"]
+
+[[edges]]
+from = ["input", "output"]
+to = ["mid", "input"]
+
+[[edges]]
+from = ["mid", "output"]
+to = ["out", "input"]
+"#,
+            input_file.to_string_lossy().replace('\\', "/"),
+            mid_file.to_string_lossy().replace('\\', "/"),
+            out_file.to_string_lossy().replace('\\', "/"),
+        );
+        let pipeline = Pipeline::from_toml_str(&toml_str).unwrap();
+        let mut runner = PipelineRunnerImpl::new(work_dir.clone());
+
+        let result = runner.execute_async(&pipeline, &work_dir).await;
+        assert!(result.is_err(), "fail-fast 后执行必须返回 Err");
+        assert!(matches!(runner.task_status(), TaskStatus::Failed(_)));
+
+        let detail = runner.get_task_detail(&runner.list_tasks()[0].id).unwrap();
+        assert!(
+            detail.nodes.iter().all(|n| n.state != "pending" && n.state != "running"),
+            "不允许残留 Pending/Running 节点: {:?}",
+            detail.nodes
+        );
+        assert!(matches!(runner.node_status("bad"), Some(NodeState::Failed { .. })));
+        // mid 可能赶在 bad 失败前完成（并行竞态），否则被收尾为 Skipped
+        let mid = runner.node_status("mid").expect("mid 节点存在");
+        assert!(
+            matches!(mid, NodeState::Completed { .. } | NodeState::Skipped),
+            "mid 应为 Skipped 或 Completed（实际: {mid:?}）"
+        );
+        assert!(
+            matches!(runner.node_status("out"), Some(NodeState::Skipped)),
+            "兄弟下游 out 必须被收尾为 Skipped（fail-fast 后第 2 层不再执行，实际: {:?}）",
+            runner.node_status("out")
+        );
+
+        cleanup_dir(&work_dir);
+    }
+
     // ─── P3：协作取消标志终结后清位 ────────────────────────────────────────
 
     /// 取消标志复用回归（P3）：预置取消 → 首次任务 Cancelled 且标志被清位；
@@ -1773,6 +1924,486 @@ to = ["output", "input"]
             .expect("应含 output 产物");
         assert!(input_art.1.is_file(), "input 产物文件应存在");
         assert!(output_art.1.is_file(), "output 产物文件应存在");
+
+        cleanup_dir(&work_dir);
+    }
+
+    // ── §5.6 专项回归：Artifact::None 传播（gate 跳过/fail/取消叠加/多分支） ──
+
+    /// 写一个最小管线源文件
+    fn write_source(work_dir: &Path) -> PathBuf {
+        let input_file = work_dir.join("source.txt");
+        std::fs::write(&input_file, "gate me").unwrap();
+        input_file
+    }
+
+    /// gate 跳过传播：gate 不满足(on_mismatch=skip) → Artifact::None →
+    /// 下游全部输入 None → Skipped（原因注明无匹配输出），任务终态 Completed。
+    #[tokio::test]
+    async fn test_gate_skip_propagates_and_task_completes() {
+        let work_dir = temp_work_dir("gate-skip");
+        let input_file = write_source(&work_dir);
+        let output_file = work_dir.join("out.txt");
+        let toml_str = format!(
+            r#"
+[pipeline]
+id = "gate-skip"
+name = "Gate Skip Propagation"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = {{ path = "{}" }}
+
+[[nodes]]
+id = "gate"
+kind = "builtin"
+builtin = "file_gate"
+params = {{ extensions = ["md"] }}
+
+[[nodes]]
+id = "down"
+kind = "builtin"
+builtin = "file_output"
+params = {{ path = "{}" }}
+
+[[edges]]
+from = ["input", "output"]
+to = ["gate", "input"]
+
+[[edges]]
+from = ["gate", "output"]
+to = ["down", "input"]
+"#,
+            input_file.to_string_lossy().replace('\\', "/"),
+            output_file.to_string_lossy().replace('\\', "/"),
+        );
+        let pipeline = Pipeline::from_toml_str(&toml_str).unwrap();
+        let mut runner = PipelineRunnerImpl::new(work_dir.clone());
+
+        let result = runner.execute_async(&pipeline, &work_dir).await;
+        assert!(result.is_ok(), "gate skip 不是错误: {result:?}");
+        assert_eq!(
+            *runner.task_status(),
+            TaskStatus::Completed,
+            "Skipped 不计入失败"
+        );
+
+        // gate 正常完成且产物为 Artifact::None
+        let task = runner.task.as_ref().expect("task stored");
+        assert_eq!(
+            task.node_state("gate"),
+            Some(&NodeState::Completed {
+                artifact: Some(Artifact::None),
+            })
+        );
+        assert!(task.skip_reasons.contains_key("down"));
+
+        // 详情：下游 skipped + 原因文案（「无匹配输出」最小标记）
+        let detail = runner
+            .get_task_detail(runner.list_tasks()[0].id.as_str())
+            .unwrap();
+        let node_of = |id: &str| {
+            detail
+                .nodes
+                .iter()
+                .find(|n| n.node_id == id)
+                .unwrap_or_else(|| panic!("node {id} in detail"))
+        };
+        assert_eq!(node_of("gate").state, "completed");
+        assert_eq!(node_of("down").state, "skipped");
+        let reason = node_of("down").error.as_deref().unwrap_or_default();
+        assert!(reason.contains("no matching output"), "got: {reason}");
+        assert!(!output_file.exists(), "下游被跳过，不应产生输出");
+
+        cleanup_dir(&work_dir);
+    }
+
+    /// gate fail 模式：不满足 → 节点 Failed → 任务 Failed，下游 Skipped
+    ///（走既有失败→下游 Skipped 语义，与 skip 传播互不影响）。
+    #[tokio::test]
+    async fn test_gate_fail_mode_fails_task() {
+        let work_dir = temp_work_dir("gate-fail");
+        let input_file = write_source(&work_dir);
+        let toml_str = format!(
+            r#"
+[pipeline]
+id = "gate-fail"
+name = "Gate Fail Mode"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = {{ path = "{}" }}
+
+[[nodes]]
+id = "gate"
+kind = "builtin"
+builtin = "file_gate"
+params = {{ extensions = ["md"], on_mismatch = "fail" }}
+
+[[nodes]]
+id = "down"
+kind = "builtin"
+builtin = "file_output"
+params = {{}}
+
+[[edges]]
+from = ["input", "output"]
+to = ["gate", "input"]
+
+[[edges]]
+from = ["gate", "output"]
+to = ["down", "input"]
+"#,
+            input_file.to_string_lossy().replace('\\', "/"),
+        );
+        let pipeline = Pipeline::from_toml_str(&toml_str).unwrap();
+        let mut runner = PipelineRunnerImpl::new(work_dir.clone());
+
+        let result = runner.execute_async(&pipeline, &work_dir).await;
+        assert!(result.is_err(), "fail 模式应返回错误");
+        assert!(matches!(runner.task_status(), TaskStatus::Failed(_)));
+
+        let detail = runner
+            .get_task_detail(runner.list_tasks()[0].id.as_str())
+            .unwrap();
+        let node_of = |id: &str| {
+            detail
+                .nodes
+                .iter()
+                .find(|n| n.node_id == id)
+                .unwrap_or_else(|| panic!("node {id} in detail"))
+        };
+        assert_eq!(node_of("gate").state, "failed");
+        assert!(node_of("gate")
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("condition mismatch"));
+        assert_eq!(node_of("down").state, "skipped");
+        // 既有失败传播不在 skip_reasons 表内（保持 error=None）
+        assert!(node_of("down").error.is_none());
+
+        cleanup_dir(&work_dir);
+    }
+
+    /// 取消叠加 gate：L2 两个 gate 完成后置位取消标志 → L3 中 gate-skip
+    /// 分支节点先被 None 传播置 Skipped（不发取消回调），正常分支节点走
+    /// 批前取消检查 → 任务终态 Cancelled。
+    #[tokio::test]
+    async fn test_gate_skip_with_cancel_flag() {
+        let work_dir = temp_work_dir("gate-cancel");
+        let input_file = write_source(&work_dir);
+        let toml_str = format!(
+            r#"
+[pipeline]
+id = "gate-cancel"
+name = "Gate Cancel"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = {{ path = "{}" }}
+
+[[nodes]]
+id = "gate_bad"
+kind = "builtin"
+builtin = "file_gate"
+params = {{ extensions = ["md"] }}
+
+[[nodes]]
+id = "gate_ok"
+kind = "builtin"
+builtin = "file_gate"
+params = {{ extensions = ["txt"] }}
+
+[[nodes]]
+id = "a"
+kind = "builtin"
+builtin = "file_output"
+params = {{}}
+
+[[nodes]]
+id = "b"
+kind = "builtin"
+builtin = "file_output"
+params = {{}}
+
+[[edges]]
+from = ["input", "output"]
+to = ["gate_bad", "input"]
+
+[[edges]]
+from = ["input", "output"]
+to = ["gate_ok", "input"]
+
+[[edges]]
+from = ["gate_bad", "output"]
+to = ["a", "input"]
+
+[[edges]]
+from = ["gate_ok", "output"]
+to = ["b", "input"]
+"#,
+            input_file.to_string_lossy().replace('\\', "/"),
+        );
+        let pipeline = Pipeline::from_toml_str(&toml_str).unwrap();
+        let mut runner = PipelineRunnerImpl::new(work_dir.clone());
+
+        // 第 3 个节点完成（input + 两个 gate）后置位取消标志
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag2 = flag.clone();
+        let done = Arc::new(AtomicUsize::new(0));
+        let done2 = done.clone();
+        runner.on_node_complete = Some(Arc::new(move |_node_id, _artifact| {
+            if done2.fetch_add(1, Ordering::SeqCst) + 1 == 3 {
+                flag2.store(true, Ordering::SeqCst);
+            }
+        }));
+        runner.set_cancel_flag(flag.clone());
+
+        let result = runner.execute_async(&pipeline, &work_dir).await;
+        assert!(result.is_err(), "取消应返回错误");
+        assert_eq!(*runner.task_status(), TaskStatus::Cancelled);
+
+        let detail = runner
+            .get_task_detail(runner.list_tasks()[0].id.as_str())
+            .unwrap();
+        let node_of = |id: &str| {
+            detail
+                .nodes
+                .iter()
+                .find(|n| n.node_id == id)
+                .unwrap_or_else(|| panic!("node {id} in detail"))
+        };
+        // a：先被 None 传播置 Skipped（不是 failed/cancelled）
+        assert_eq!(node_of("a").state, "skipped");
+        let reason = node_of("a").error.as_deref().unwrap_or_default();
+        assert!(reason.contains("no matching output"), "got: {reason}");
+        // b：正常分支走批前取消检查 → failed(cancelled)
+        assert_eq!(node_of("b").state, "failed");
+        assert!(node_of("b")
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("task cancelled"));
+
+        cleanup_dir(&work_dir);
+    }
+
+    /// 多分支部分满足：gate_bad → down（全部输入 None → Skipped），
+    /// gate_ok → arch（file_archive 正常落盘）；混合扇入 mixed（None+File）
+    /// 不被传播、正常执行取首个 File。
+    #[tokio::test]
+    async fn test_gate_multibranch_partial_match() {
+        let work_dir = temp_work_dir("gate-multi");
+        let input_file = write_source(&work_dir);
+        let dest_dir = work_dir.join("dest");
+        let down_file = work_dir.join("down.txt");
+        let mixed_file = work_dir.join("mixed.txt");
+        let toml_str = format!(
+            r#"
+[pipeline]
+id = "gate-multi"
+name = "Gate Multibranch"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = {{ path = "{}" }}
+
+[[nodes]]
+id = "gate_bad"
+kind = "builtin"
+builtin = "file_gate"
+params = {{ extensions = ["md"] }}
+
+[[nodes]]
+id = "gate_ok"
+kind = "builtin"
+builtin = "file_gate"
+params = {{ extensions = ["txt"] }}
+
+[[nodes]]
+id = "arch"
+kind = "builtin"
+builtin = "file_archive"
+params = {{ dest_dir = "{}", name_template = "arch-{{name}}.{{ext}}" }}
+
+[[nodes]]
+id = "down"
+kind = "builtin"
+builtin = "file_output"
+params = {{ path = "{}" }}
+
+[[nodes]]
+id = "mixed"
+kind = "builtin"
+builtin = "file_output"
+params = {{ path = "{}" }}
+
+[[edges]]
+from = ["input", "output"]
+to = ["gate_bad", "input"]
+
+[[edges]]
+from = ["input", "output"]
+to = ["gate_ok", "input"]
+
+[[edges]]
+from = ["gate_ok", "output"]
+to = ["arch", "input"]
+
+[[edges]]
+from = ["gate_bad", "output"]
+to = ["down", "input"]
+
+[[edges]]
+from = ["gate_bad", "output"]
+to = ["mixed", "input"]
+
+[[edges]]
+from = ["gate_ok", "output"]
+to = ["mixed", "input"]
+"#,
+            input_file.to_string_lossy().replace('\\', "/"),
+            dest_dir.to_string_lossy().replace('\\', "/"),
+            down_file.to_string_lossy().replace('\\', "/"),
+            mixed_file.to_string_lossy().replace('\\', "/"),
+        );
+        let pipeline = Pipeline::from_toml_str(&toml_str).unwrap();
+        let mut runner = PipelineRunnerImpl::new(work_dir.clone());
+
+        let result = runner.execute_async(&pipeline, &work_dir).await;
+        assert!(result.is_ok(), "部分满足分支应正常完成: {result:?}");
+        assert_eq!(*runner.task_status(), TaskStatus::Completed);
+
+        let detail = runner
+            .get_task_detail(runner.list_tasks()[0].id.as_str())
+            .unwrap();
+        let node_of = |id: &str| {
+            detail
+                .nodes
+                .iter()
+                .find(|n| n.node_id == id)
+                .unwrap_or_else(|| panic!("node {id} in detail"))
+        };
+        assert_eq!(node_of("arch").state, "completed");
+        assert_eq!(node_of("down").state, "skipped");
+        assert!(node_of("down")
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no matching output"));
+        assert_eq!(node_of("mixed").state, "completed", "混合扇入取首个 File");
+
+        assert!(dest_dir.join("arch-source.txt").is_file());
+        assert!(!down_file.exists(), "down 被传播跳过");
+        assert!(mixed_file.exists(), "mixed 正常落盘");
+
+        cleanup_dir(&work_dir);
+    }
+
+    /// `{rule}` 占位符：task_inputs 保留键 `_meta.rule` 经 PipelineTask.inputs
+    /// 渲染（execute_async 直连路径）；无 inputs 时 {rule} 为空串。
+    #[tokio::test]
+    async fn test_archive_rule_placeholder_via_task_inputs() {
+        let work_dir = temp_work_dir("gate-rule");
+        let input_file = write_source(&work_dir);
+        let dest_dir = work_dir.join("dest");
+        let dest_dir2 = work_dir.join("dest2");
+        let toml_str = format!(
+            r#"
+[pipeline]
+id = "gate-rule"
+name = "Gate Rule"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = {{ path = "{}" }}
+
+[[nodes]]
+id = "arch"
+kind = "builtin"
+builtin = "file_archive"
+params = {{ dest_dir = "{}", name_template = "{{rule}}-{{name}}.{{ext}}" }}
+
+[[edges]]
+from = ["input", "output"]
+to = ["arch", "input"]
+"#,
+            input_file.to_string_lossy().replace('\\', "/"),
+            dest_dir.to_string_lossy().replace('\\', "/"),
+        );
+        let pipeline = Pipeline::from_toml_str(&toml_str).unwrap();
+
+        // 有 inputs：{rule} = demo-rule
+        let mut runner = PipelineRunnerImpl::new(work_dir.clone());
+        runner
+            .set_task_inputs(Some(serde_json::json!({"_meta": {"rule": "demo-rule"}})));
+        runner
+            .execute_async(&pipeline, &work_dir)
+            .await
+            .expect("rule 渲染应成功");
+        assert!(dest_dir.join("demo-rule-source.txt").is_file());
+
+        // 无 inputs：{rule} 渲染为空串（手动任务）
+        let mut runner2 = PipelineRunnerImpl::new(work_dir.join("w2"));
+        let toml2 = toml_str.replace(&dest_dir.to_string_lossy().replace('\\', "/"), &dest_dir2.to_string_lossy().replace('\\', "/"));
+        let pipeline2 = Pipeline::from_toml_str(&toml2).unwrap();
+        runner2
+            .execute_async(&pipeline2, &work_dir)
+            .await
+            .expect("空 rule 应成功");
+        assert!(dest_dir2.join("-source.txt").is_file());
+
+        cleanup_dir(&work_dir);
+    }
+
+    /// execute() 桥接路径：temp_runner 重建复制 task_inputs，{rule} 同样生效。
+    #[tokio::test]
+    async fn test_archive_rule_via_execute_bridge() {
+        let work_dir = temp_work_dir("gate-rule-bridge");
+        let input_file = write_source(&work_dir);
+        let dest_dir = work_dir.join("dest");
+        let toml_str = format!(
+            r#"
+[pipeline]
+id = "gate-rule-bridge"
+name = "Gate Rule Bridge"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = {{ path = "{}" }}
+
+[[nodes]]
+id = "arch"
+kind = "builtin"
+builtin = "file_archive"
+params = {{ dest_dir = "{}", name_template = "{{rule}}-{{name}}.{{ext}}" }}
+
+[[edges]]
+from = ["input", "output"]
+to = ["arch", "input"]
+"#,
+            input_file.to_string_lossy().replace('\\', "/"),
+            dest_dir.to_string_lossy().replace('\\', "/"),
+        );
+        let pipeline = Pipeline::from_toml_str(&toml_str).unwrap();
+        let mut runner = PipelineRunnerImpl::new(work_dir.clone());
+        runner
+            .set_task_inputs(Some(serde_json::json!({"_meta": {"rule": "bridge-rule"}})));
+        runner.execute(&pipeline, &work_dir).expect("桥接路径应成功");
+        assert!(dest_dir.join("bridge-rule-source.txt").is_file());
 
         cleanup_dir(&work_dir);
     }

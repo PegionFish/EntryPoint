@@ -60,6 +60,15 @@ pub struct PipelineTask {
     pub started_at: DateTime<Utc>,
     /// 任务完成时间（所有节点终结时设置）
     pub finished_at: Option<DateTime<Utc>>,
+    /// 任务级 inputs（触发器注入的保留键上下文，如 `_meta.rule` 规则名，
+    /// 供 file_archive 的 `{rule}` 占位符渲染，§5.5）。
+    /// `None` = 普通手动任务（`{rule}` 渲染为空串）。
+    pub inputs: Option<serde_json::Value>,
+    /// 因「全部上游输入均为 `Artifact::None`」（gate 无匹配输出传播）而被
+    /// 置 Skipped 的节点 → 原因文案（§5.6）。仅供 `TaskDetail` 展示
+    /// 「无匹配输出」，不参与状态机判定；其余 Skipped（上游失败传播等）
+    /// 不在本表内，展示行为与既有契约一致。
+    pub skip_reasons: HashMap<String, String>,
 }
 
 impl PipelineTask {
@@ -81,6 +90,8 @@ impl PipelineTask {
             work_dir,
             started_at: Utc::now(),
             finished_at: None,
+            inputs: None,
+            skip_reasons: HashMap::new(),
         }
     }
 
@@ -160,6 +171,26 @@ impl PipelineTask {
         self.node_states.values().all(|s| s.is_terminal())
     }
 
+    /// Artifact::None 传播（§5.6 引擎增强）：下游节点收到的全部输入均为
+    /// `Artifact::None`（file_gate 无匹配输出）→ 置 `NodeState::Skipped`
+    /// 并记录原因（供 TaskDetail 展示「无匹配输出」），继续层推进；
+    /// 任务终态保持 Completed（Skipped 不计入失败）。
+    pub fn mark_skipped_no_output(&mut self, node_id: &str) {
+        if let Some(state) = self.node_states.get_mut(node_id) {
+            if matches!(state, NodeState::Pending | NodeState::Running) {
+                *state = NodeState::Skipped;
+                self.skip_reasons
+                    .entry(node_id.to_string())
+                    .or_insert_with(|| {
+                        "no matching output: all upstream inputs produced nothing \
+                         (file gate mismatch propagated)"
+                            .to_string()
+                    });
+            }
+        }
+        self.check_completion();
+    }
+
     /// 获取指定节点的状态
     pub fn node_state(&self, node_id: &str) -> Option<&NodeState> {
         self.node_states.get(node_id)
@@ -183,6 +214,20 @@ impl PipelineTask {
                 if *state == NodeState::Running {
                     *state = NodeState::Skipped;
                 }
+            }
+        }
+        self.check_completion();
+    }
+
+    /// fail-fast / 取消收尾：全部 Pending 节点置 Skipped。
+    ///
+    /// 同层健康兄弟被 `skip_layer_remaining` 置 Skipped 后，其下游节点
+    /// 既不在失败节点的传递闭包内、也不在当前层，会永久 Pending，
+    /// `is_complete()` 恒 false、任务卡在 Running 且外层误报成功。
+    pub(crate) fn skip_all_pending(&mut self) {
+        for state in self.node_states.values_mut() {
+            if *state == NodeState::Pending {
+                *state = NodeState::Skipped;
             }
         }
         self.check_completion();
@@ -2145,6 +2190,399 @@ to = ["output", "input"]
             "params.port must be ignored when registry has the module"
         );
     }
+
+    // ── §5.5/§5.6：file_archive / file_gate / Artifact::None 状态机 ───────────
+
+    fn archive_gate_node(builtin: &str, params: serde_json::Value) -> PipelineNode {
+        PipelineNode {
+            id: "n".to_string(),
+            kind: NodeKind::Builtin {
+                builtin: builtin.to_string(),
+            },
+            label: String::new(),
+            params,
+            position: None,
+            timeout_secs: None,
+            retry_count: None,
+        }
+    }
+
+    /// mark_skipped_no_output：Pending/Running → Skipped + 原因记录；已终结
+    /// 节点不动；全部节点 Skipped 后任务终态 Completed（Skipped 不计失败）。
+    #[test]
+    fn test_mark_skipped_no_output_state_machine() {
+        let pipeline = test_pipeline();
+        let mut task = PipelineTask::new(&pipeline, std::env::temp_dir());
+        task.mark_skipped_no_output("input");
+        assert!(matches!(task.node_state("input"), Some(NodeState::Skipped)));
+        assert!(task.skip_reasons.contains_key("input"));
+
+        task.mark_completed("process", Artifact::Text("t".into()));
+        task.mark_skipped_no_output("process");
+        assert!(matches!(
+            task.node_state("process"),
+            Some(NodeState::Completed { .. })
+        ));
+
+        task.mark_skipped_no_output("save");
+        assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(task.skip_reasons.len(), 2, "input/save 入表，process 不入");
+    }
+
+    /// file_archive：`{rule}` 渲染（task.inputs._meta.rule）、默认模板、
+    /// suffix/overwrite/skip 三策略、`{seq}` 序号、缺/相对 dest_dir 报错。
+    #[tokio::test]
+    async fn test_file_archive_conflict_and_template() {
+        let dir = std::env::temp_dir().join(format!("ep_arch_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest_dir = dir.join("dest");
+        let src = dir.join("src.txt");
+        std::fs::write(&src, "v1").unwrap();
+
+        let mk_task = |rule: Option<&str>| PipelineTask {
+            id: "t".into(),
+            pipeline_id: "p".into(),
+            status: TaskStatus::Pending,
+            node_states: HashMap::new(),
+            work_dir: dir.clone(),
+            started_at: Utc::now(),
+            finished_at: None,
+            inputs: rule.map(|r| serde_json::json!({"_meta": {"rule": r}})),
+            skip_reasons: HashMap::new(),
+        };
+        let file_of = |out: &Artifact| match out {
+            Artifact::File(p) => p.file_name().unwrap().to_string_lossy().into_owned(),
+            other => panic!("expected file artifact, got {other:?}"),
+        };
+
+        // 1) `{rule}` ← task.inputs._meta.rule（§5.5）
+        let task = mk_task(Some("demo-rule"));
+        let node = archive_gate_node(
+            "file_archive",
+            serde_json::json!({
+                "dest_dir": dest_dir.to_string_lossy(),
+                "name_template": "{rule}-{name}.{ext}"
+            }),
+        );
+        let out =
+            execute_builtin_file_archive(&node, &[Artifact::File(src.clone())], &task)
+                .await
+                .unwrap();
+        assert_eq!(file_of(&out), "demo-rule-src.txt");
+        assert!(dest_dir.join("demo-rule-src.txt").is_file());
+
+        // 2) 默认模板 `{name}.{ext}`
+        let task = mk_task(None);
+        let node = archive_gate_node(
+            "file_archive",
+            serde_json::json!({"dest_dir": dest_dir.to_string_lossy()}),
+        );
+        let out =
+            execute_builtin_file_archive(&node, &[Artifact::File(src.clone())], &task)
+                .await
+                .unwrap();
+        assert_eq!(file_of(&out), "src.txt");
+
+        // 3) suffix：与 2) 冲突 → src-1.txt
+        let out =
+            execute_builtin_file_archive(&node, &[Artifact::File(src.clone())], &task)
+                .await
+                .unwrap();
+        assert_eq!(file_of(&out), "src-1.txt");
+
+        // 4) overwrite：覆盖已存在目标
+        let node_over = archive_gate_node(
+            "file_archive",
+            serde_json::json!({
+                "dest_dir": dest_dir.to_string_lossy(),
+                "on_conflict": "overwrite"
+            }),
+        );
+        std::fs::write(&src, "v2").unwrap();
+        let out =
+            execute_builtin_file_archive(&node_over, &[Artifact::File(src.clone())], &task)
+                .await
+                .unwrap();
+        assert_eq!(file_of(&out), "src.txt");
+        assert_eq!(std::fs::read_to_string(dest_dir.join("src.txt")).unwrap(), "v2");
+
+        // 5) skip 命中：正常完成返回源文件，目标内容不变（不视为错误）
+        let node_skip = archive_gate_node(
+            "file_archive",
+            serde_json::json!({
+                "dest_dir": dest_dir.to_string_lossy(),
+                "on_conflict": "skip"
+            }),
+        );
+        std::fs::write(&src, "v3").unwrap();
+        let out =
+            execute_builtin_file_archive(&node_skip, &[Artifact::File(src.clone())], &task)
+                .await
+                .unwrap();
+        assert_eq!(out, Artifact::File(src.clone()), "skip 命中返回源文件");
+        assert_eq!(std::fs::read_to_string(dest_dir.join("src.txt")).unwrap(), "v2");
+
+        // 6) `{seq}`：首个空闲序号（dest 已有 src.txt/src-1.txt，不冲突）
+        let node_seq = archive_gate_node(
+            "file_archive",
+            serde_json::json!({
+                "dest_dir": dest_dir.to_string_lossy(),
+                "name_template": "{name}-{seq}.{ext}"
+            }),
+        );
+        let out =
+            execute_builtin_file_archive(&node_seq, &[Artifact::File(src.clone())], &task)
+                .await
+                .unwrap();
+        assert_eq!(file_of(&out), "src-0.txt");
+
+        // 7) 缺 dest_dir / 相对路径 → 报错
+        let bad = archive_gate_node("file_archive", serde_json::json!({}));
+        assert!(
+            execute_builtin_file_archive(&bad, &[Artifact::File(src.clone())], &task)
+                .await
+                .is_err()
+        );
+        let rel = archive_gate_node(
+            "file_archive",
+            serde_json::json!({"dest_dir": "relative/dir"}),
+        );
+        assert!(
+            execute_builtin_file_archive(&rel, &[Artifact::File(src.clone())], &task)
+                .await
+                .is_err()
+        );
+
+        // 8) 子目录模板：`sub/{name}.{ext}` → 自动建产物父目录并落盘
+        let node_sub = archive_gate_node(
+            "file_archive",
+            serde_json::json!({
+                "dest_dir": dest_dir.to_string_lossy(),
+                "name_template": "sub/{name}.{ext}"
+            }),
+        );
+        let out =
+            execute_builtin_file_archive(&node_sub, &[Artifact::File(src.clone())], &task)
+                .await
+                .unwrap();
+        assert_eq!(file_of(&out), "src.txt");
+        assert!(
+            dest_dir.join("sub").join("src.txt").is_file(),
+            "子目录模板应自动创建产物父目录"
+        );
+
+        // 9) 路径穿越：模板渲染出 `..` → 报错且不落盘
+        let node_dotdot = archive_gate_node(
+            "file_archive",
+            serde_json::json!({
+                "dest_dir": dest_dir.join("sub2").to_string_lossy(),
+                "name_template": "../{name}-escape.{ext}"
+            }),
+        );
+        assert!(
+            execute_builtin_file_archive(&node_dotdot, &[Artifact::File(src.clone())], &task)
+                .await
+                .is_err(),
+            "`..` 穿越应被拒绝"
+        );
+        assert!(
+            !dest_dir.join("src-escape.txt").exists(),
+            "穿越产物不得落盘"
+        );
+
+        // 10) 绝对路径渲染：Path::join 整体替换脱离 dest_dir → 拒绝且不落盘
+        let node_abs = archive_gate_node(
+            "file_archive",
+            serde_json::json!({
+                "dest_dir": dest_dir.to_string_lossy(),
+                "name_template": "/tmp/ep_arch_escape.{ext}"
+            }),
+        );
+        assert!(
+            execute_builtin_file_archive(&node_abs, &[Artifact::File(src.clone())], &task)
+                .await
+                .is_err(),
+            "绝对路径渲染应被拒绝"
+        );
+        assert!(!Path::new("/tmp/ep_arch_escape.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// file_gate：白/黑名单、大小界、filename_regex、on_mismatch=skip/fail、
+    /// media 探测失败按不满足、混合 None/File 取首个 File。
+    #[tokio::test]
+    async fn test_file_gate_conditions_and_mismatch() {
+        let dir = std::env::temp_dir().join(format!("ep_gate_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.txt");
+        std::fs::write(&src, "hello").unwrap(); // 5 bytes
+        let upstream = [Artifact::File(src.clone())];
+
+        let run = |params: serde_json::Value| {
+            let node = archive_gate_node("file_gate", params);
+            let upstream: &[Artifact] = &upstream;
+            async move { execute_builtin_file_gate(&node, upstream).await }
+        };
+
+        // 白名单（大小写/点号归一）→ 透传
+        let out = run(serde_json::json!({"extensions": [".TXT"]}))
+            .await
+            .unwrap();
+        assert_eq!(out, Artifact::File(src.clone()));
+        // 白名单不满足 + 默认 skip → Artifact::None
+        let out = run(serde_json::json!({"extensions": ["md"]})).await.unwrap();
+        assert_eq!(out, Artifact::None);
+        // fail 模式 → Err（走既有 失败→下游 Skipped 语义）
+        let err = run(serde_json::json!({"extensions": ["md"], "on_mismatch": "fail"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("condition mismatch"), "got: {err}");
+        // 非法 on_mismatch → 参数错误
+        assert!(run(serde_json::json!({"on_mismatch": "boom"})).await.is_err());
+
+        // 大小界（文件 5 字节）
+        let out = run(serde_json::json!({"min_size_bytes": 1})).await.unwrap();
+        assert_eq!(out, Artifact::File(src.clone()));
+        let out = run(serde_json::json!({"min_size_bytes": 100})).await.unwrap();
+        assert_eq!(out, Artifact::None);
+        let out = run(serde_json::json!({"max_size_bytes": 4})).await.unwrap();
+        assert_eq!(out, Artifact::None);
+        let out = run(serde_json::json!({"max_size_bytes": 5})).await.unwrap();
+        assert_eq!(out, Artifact::File(src.clone()));
+
+        // 黑名单命中 → 不满足
+        let out =
+            run(serde_json::json!({"extensions_exclude": ["txt"]})).await.unwrap();
+        assert_eq!(out, Artifact::None);
+
+        // filename_regex：满足 / 不满足 / 编译失败按不满足
+        let out =
+            run(serde_json::json!({"filename_regex": "^src\\.txt$"})).await.unwrap();
+        assert_eq!(out, Artifact::File(src.clone()));
+        let out = run(serde_json::json!({"filename_regex": "^bar"})).await.unwrap();
+        assert_eq!(out, Artifact::None);
+        let out =
+            run(serde_json::json!({"filename_regex": "[unclosed"})).await.unwrap();
+        assert_eq!(out, Artifact::None, "编译失败按不满足");
+
+        // media：非媒体文件 → ffprobe 解析失败/缺失 → 按不满足（best-effort）
+        let out = run(serde_json::json!({"media": {"min_duration_secs": 1.0}}))
+            .await
+            .unwrap();
+        assert_eq!(out, Artifact::None);
+
+        // 混合 None/File 输入：取首个 File
+        let node = archive_gate_node(
+            "file_gate",
+            serde_json::json!({"extensions": ["txt"]}),
+        );
+        let out = execute_builtin_file_gate(
+            &node,
+            &[Artifact::None, Artifact::File(src.clone())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, Artifact::File(src.clone()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TinyRegex 受限引擎：字面量/./量词/字符类取反/分组分支/预定义类/锚点；
+    /// 不支持语法 → 编译失败（gate 按「不满足」处理，绝源 panic）。
+    #[test]
+    fn test_tiny_regex_engine() {
+        let r = TinyRegex::compile("^src_[0-9]+\\.txt$").unwrap();
+        assert!(r.is_match("src_12.txt"));
+        assert!(!r.is_match("src_12.doc"));
+        assert!(!r.is_match("xsrc_12.txt"), "^ 锚定开头");
+
+        let r = TinyRegex::compile("^(a|b)+c$").unwrap();
+        assert!(r.is_match("abc"));
+        assert!(r.is_match("bc"));
+        assert!(!r.is_match("acx"));
+
+        let r = TinyRegex::compile("^colou?r$").unwrap();
+        assert!(r.is_match("color"));
+        assert!(r.is_match("colour"));
+        assert!(!r.is_match("colouur"));
+
+        // 字符类取反 + {m,n} 量词
+        let r = TinyRegex::compile("^[^0-9]{2,3}$").unwrap();
+        assert!(r.is_match("ab"));
+        assert!(r.is_match("abc"));
+        assert!(!r.is_match("ab1"));
+        assert!(!r.is_match("abcd"));
+
+        // 无锚定子串匹配
+        assert!(TinyRegex::compile("b+c").unwrap().is_match("xabcy"));
+
+        // 预定义类 \d \w
+        assert!(TinyRegex::compile("^\\w+\\d$").unwrap().is_match("ab_9"));
+        assert!(!TinyRegex::compile("^\\d$").unwrap().is_match("a"));
+
+        // 不支持语法 → 编译失败
+        assert!(TinyRegex::compile("[a").is_err(), "未闭合字符类");
+        assert!(TinyRegex::compile("a{2,1}").is_err(), "min > max");
+    }
+
+    /// parse_gate_params：扩展名归一化（去点/小写）、数值界、正则原样保留、
+    /// on_mismatch 默认 skip。
+    #[test]
+    fn test_parse_gate_params_normalization() {
+        let node = archive_gate_node(
+            "file_gate",
+            serde_json::json!({
+                "extensions": [".TXT", "mp4"],
+                "extensions_exclude": [".AVI"],
+                "min_size_bytes": 12,
+                "max_size_bytes": 34,
+                "filename_regex": "^a",
+                "media": {"min_width": 640}
+            }),
+        );
+        let p = parse_gate_params(&node).unwrap();
+        assert_eq!(p.extensions, vec!["txt".to_string(), "mp4".to_string()]);
+        assert_eq!(p.extensions_exclude, vec!["avi".to_string()]);
+        assert_eq!(p.min_size_bytes, Some(12));
+        assert_eq!(p.max_size_bytes, Some(34));
+        assert_eq!(p.filename_regex.as_deref(), Some("^a"));
+        assert!(p.media.is_some());
+        assert!(!p.fail_on_mismatch, "默认 skip");
+
+        let node = archive_gate_node(
+            "file_gate",
+            serde_json::json!({"on_mismatch": "fail"}),
+        );
+        assert!(parse_gate_params(&node).unwrap().fail_on_mismatch);
+    }
+
+    /// parse_ffprobe_output：format.duration、video 流宽高、"N/A" 回退、非法 JSON。
+    #[test]
+    fn test_parse_ffprobe_output() {
+        let json = serde_json::json!({
+            "streams": [
+                {"codec_type": "audio", "duration": "3.5"},
+                {"codec_type": "video", "width": 640, "height": 360}
+            ],
+            "format": {"duration": "3.500000"}
+        })
+        .to_string();
+        let probe = parse_ffprobe_output(&json).unwrap();
+        assert_eq!(probe.duration_secs, Some(3.5));
+        assert_eq!(probe.width, Some(640));
+        assert_eq!(probe.height, Some(360));
+
+        // duration "N/A" → 解析失败 → 回退流 duration（无 → None）
+        let json = r#"{"streams":[{"codec_type":"video","width":1,"height":2}],"format":{"duration":"N/A"}}"#;
+        let probe = parse_ffprobe_output(json).unwrap();
+        assert_eq!(probe.duration_secs, None);
+        assert_eq!(probe.width, Some(1));
+
+        // 非法 JSON / 空 → None
+        assert!(parse_ffprobe_output("not json").is_none());
+        assert!(parse_ffprobe_output("").is_none());
+    }
 }
 
     #[test]
@@ -2270,6 +2708,10 @@ async fn execute_builtin_node(
     match builtin {
         "file_input" => execute_builtin_file_input(node, work_dir).await,
         "file_output" => execute_builtin_file_output(node, upstream, work_dir).await,
+        // §5.5：产物归档（命名模板 + 冲突策略），模板展开/冲突处理纯函数见 archive.rs
+        "file_archive" => execute_builtin_file_archive(node, upstream, task).await,
+        // §5.6：条件门禁（不满足且 on_mismatch=skip → Artifact::None）
+        "file_gate" => execute_builtin_file_gate(node, upstream).await,
         "ffmpeg" => {
             let with_nodes = collect_upstream_artifacts_with_nodes(&node.id, pipeline, task);
             execute_builtin_ffmpeg(node, upstream, &with_nodes, work_dir).await
@@ -2367,6 +2809,864 @@ async fn execute_builtin_file_output(
     std::fs::copy(&source_file, &dest_path)?;
 
     Ok(Artifact::File(dest_path))
+}
+
+// ─── file_archive（§5.5）：产物归档（命名模板 + 冲突策略） ────────────────────
+
+/// file_archive：取上游首个 `Artifact::File` → 渲染命名模板 → 冲突策略 →
+/// 复制落盘 → 返回 `Artifact::File(dest)`。
+///
+/// - `{rule}` ← 任务 inputs 保留键 `_meta.rule`（普通手动任务空串，§5.5）
+/// - 源文件无扩展名时模板中的 `.{ext}` 预清理（避免渲染出尾点文件名）
+/// - `on_conflict=skip` 命中：正常完成（不视为错误），返回源文件产物
+async fn execute_builtin_file_archive(
+    node: &PipelineNode,
+    upstream: &[Artifact],
+    task: &PipelineTask,
+) -> anyhow::Result<Artifact> {
+    use crate::archive::{
+        ensure_within_dest, expand_name_template, resolve_conflict, split_name_ext,
+        ConflictPolicy, ConflictResolution,
+    };
+
+    let source = upstream
+        .iter()
+        .find_map(|a| match a {
+            Artifact::File(p) => Some(p.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "file_archive node '{}' has no file input from upstream",
+                node.id
+            )
+        })?;
+
+    // dest_dir：必填且绝对路径
+    let dest_dir_str = node
+        .params
+        .get("dest_dir")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "file_archive node '{}' missing required 'dest_dir' param",
+                node.id
+            )
+        })?;
+    let dest_dir = PathBuf::from(dest_dir_str);
+    if !dest_dir.is_absolute() {
+        return Err(anyhow::anyhow!(
+            "file_archive node '{}': dest_dir must be an absolute path, got `{}`",
+            node.id,
+            dest_dir_str
+        ));
+    }
+
+    let template_raw = node
+        .params
+        .get("name_template")
+        .and_then(|v| v.as_str())
+        .unwrap_or("{name}.{ext}");
+    if template_raw.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "file_archive node '{}': name_template must not be empty",
+            node.id
+        ));
+    }
+    let policy = match node.params.get("on_conflict").and_then(|v| v.as_str()) {
+        None | Some("") => ConflictPolicy::Suffix, // 缺省 suffix（§5.5）
+        Some(s) => ConflictPolicy::parse(s)?,
+    };
+
+    // {rule} ← 任务 inputs 保留键 `_meta.rule`（最小通路：PipelineTask.inputs）
+    let rule = task
+        .inputs
+        .as_ref()
+        .and_then(|v| v.get("_meta"))
+        .and_then(|m| m.get("rule"))
+        .and_then(|r| r.as_str())
+        .unwrap_or("");
+
+    let file_name = source
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+    let (name, ext) = split_name_ext(file_name);
+    // 无扩展名：清理模板中的 ".{ext}"（含点形式），其余 {ext} 展开为空串
+    let template = if ext.is_empty() {
+        template_raw.replace(".{ext}", "")
+    } else {
+        template_raw.to_string()
+    };
+
+    let now = chrono::Local::now();
+    let render = |seq: u32| expand_name_template(&template, &name, &ext, rule, seq, now);
+
+    let resolution = if template.contains("{seq}") {
+        // {seq} 显式参与命名：seq 递增探测首个空闲名（Suffix），
+        // Skip 以 seq=0 判定（存在即放弃），Overwrite 直接取 seq=0
+        let mut found: Option<PathBuf> = None;
+        let mut skip_hit = false;
+        for seq in 0..=999u32 {
+            let candidate = dest_dir.join(render(seq));
+            if !candidate.exists() {
+                found = Some(candidate);
+                break;
+            }
+            match policy {
+                ConflictPolicy::Overwrite => {
+                    found = Some(candidate);
+                    break;
+                }
+                ConflictPolicy::Skip => {
+                    skip_hit = true;
+                    break;
+                }
+                ConflictPolicy::Suffix => continue,
+            }
+        }
+        match (found, skip_hit) {
+            (Some(p), _) => Ok(ConflictResolution::Target(p)),
+            (None, true) => Ok(ConflictResolution::SkipHit),
+            (None, false) => Err(anyhow::anyhow!(
+                "file_archive node '{}': no free name after 999 seq attempts",
+                node.id
+            )),
+        }
+    } else {
+        resolve_conflict(&dest_dir, &render(0), policy)
+    };
+
+    match resolution? {
+        ConflictResolution::Target(dest) => {
+            // 评审修复①：路径穿越防护——模板渲染出 `..`/绝对路径时产物可能落出
+            // dest_dir（Path::join 遇绝对路径整体替换）。落盘前校验最终路径仍在
+            // dest_dir 之内，否则报错不写盘。
+            ensure_within_dest(&dest_dir, &dest)
+                .map_err(|e| anyhow::anyhow!("file_archive node '{}': {e}", node.id))?;
+            // 评审修复②：子目录模板（如 `{date}/{name}.{ext}`）→ 创建产物父目录
+            //（无子目录时父目录即 dest_dir 本身，行为不变）
+            let parent = dest.parent().unwrap_or(&dest_dir);
+            std::fs::create_dir_all(parent)?;
+            std::fs::copy(&source, &dest)?;
+            Ok(Artifact::File(dest))
+        }
+        ConflictResolution::SkipHit => {
+            // skip 命中：正常完成（不视为错误），透传源文件产物
+            tracing::info!(
+                node_id = %node.id,
+                source = %source.display(),
+                "file_archive skipped: destination already exists (on_conflict=skip)"
+            );
+            Ok(Artifact::File(source))
+        }
+    }
+}
+
+// ─── file_gate（§5.6）：条件门禁（单一节点收敛全部过滤语义） ────────────────────
+
+/// file_gate media 探测条件（`media` 对象子键，§5.6）
+#[derive(Debug, Clone, Default, PartialEq)]
+struct GateMediaConditions {
+    min_duration_secs: Option<f64>,
+    max_duration_secs: Option<f64>,
+    min_width: Option<u32>,
+    min_height: Option<u32>,
+}
+
+/// file_gate 参数（§5.6：全部可选；静态校验要求至少一项条件）
+#[derive(Debug, Clone)]
+struct GateParams {
+    /// 扩展名白名单（小写无点；空 = 不启用）
+    extensions: Vec<String>,
+    /// 扩展名黑名单（小写无点；空 = 不启用）
+    extensions_exclude: Vec<String>,
+    min_size_bytes: Option<u64>,
+    max_size_bytes: Option<u64>,
+    /// 文件名正则（受限子集，见 [`TinyRegex`]；编译失败按不满足）
+    filename_regex: Option<String>,
+    media: Option<GateMediaConditions>,
+    /// on_mismatch：skip（默认）→ false；fail → true
+    fail_on_mismatch: bool,
+}
+
+/// 解析 file_gate 节点参数（非法 on_mismatch 显式报错，不静默回退）
+fn parse_gate_params(node: &PipelineNode) -> anyhow::Result<GateParams> {
+    let p = &node.params;
+    let norm_exts = |key: &str| -> Vec<String> {
+        p.get(key)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let media = p
+        .get("media")
+        .and_then(|v| v.as_object())
+        .map(|m| GateMediaConditions {
+            min_duration_secs: m.get("min_duration_secs").and_then(|v| v.as_f64()),
+            max_duration_secs: m.get("max_duration_secs").and_then(|v| v.as_f64()),
+            min_width: m.get("min_width").and_then(|v| v.as_u64()).map(|v| v as u32),
+            min_height: m.get("min_height").and_then(|v| v.as_u64()).map(|v| v as u32),
+        });
+    let fail_on_mismatch = match p.get("on_mismatch").and_then(|v| v.as_str()) {
+        None | Some("") | Some("skip") => false,
+        Some("fail") => true,
+        Some(other) => {
+            return Err(anyhow::anyhow!(
+                "file_gate node '{}': unknown on_mismatch `{other}` (expected `skip` / `fail`)",
+                node.id
+            ))
+        }
+    };
+    Ok(GateParams {
+        extensions: norm_exts("extensions"),
+        extensions_exclude: norm_exts("extensions_exclude"),
+        min_size_bytes: p.get("min_size_bytes").and_then(|v| v.as_u64()),
+        max_size_bytes: p.get("max_size_bytes").and_then(|v| v.as_u64()),
+        filename_regex: p
+            .get("filename_regex")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        media,
+        fail_on_mismatch,
+    })
+}
+
+/// gate 判定（§5.6）：全部已配置条件逐一 AND，通过 → true。
+/// media 条件探测失败（`probe=None`）按「不满足」处理。
+fn gate_matches(file: &Path, params: &GateParams, probe: Option<&MediaProbe>) -> bool {
+    let ext = file
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !params.extensions.is_empty() && !params.extensions.contains(&ext) {
+        return false;
+    }
+    if !params.extensions_exclude.is_empty() && params.extensions_exclude.contains(&ext) {
+        return false;
+    }
+    if params.min_size_bytes.is_some() || params.max_size_bytes.is_some() {
+        let Ok(meta) = std::fs::metadata(file) else {
+            return false;
+        };
+        if let Some(min) = params.min_size_bytes {
+            if meta.len() < min {
+                return false;
+            }
+        }
+        if let Some(max) = params.max_size_bytes {
+            if meta.len() > max {
+                return false;
+            }
+        }
+    }
+    if let Some(re_str) = &params.filename_regex {
+        // 编译失败（含不支持语法）按不满足处理（§5.6 契约）
+        match TinyRegex::compile(re_str) {
+            Ok(re) => {
+                let name = file
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if !re.is_match(&name) {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    if let Some(mc) = &params.media {
+        let Some(probe) = probe else {
+            return false; // ffprobe 缺失/超时/解析失败 → 不满足
+        };
+        if let Some(min) = mc.min_duration_secs {
+            match probe.duration_secs {
+                Some(d) if d >= min => {}
+                _ => return false,
+            }
+        }
+        if let Some(max) = mc.max_duration_secs {
+            match probe.duration_secs {
+                Some(d) if d <= max => {}
+                _ => return false,
+            }
+        }
+        if let Some(min) = mc.min_width {
+            match probe.width {
+                Some(w) if w >= min => {}
+                _ => return false,
+            }
+        }
+        if let Some(min) = mc.min_height {
+            match probe.height {
+                Some(h) if h >= min => {}
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
+/// file_gate：满足 → 透传上游首个文件；不满足 →
+/// `on_mismatch=skip`（默认）返回 [`Artifact::None`]（引擎增强传播），
+/// `on_mismatch=fail` 返回错误（走既有 失败→下游 Skipped 语义）。
+async fn execute_builtin_file_gate(
+    node: &PipelineNode,
+    upstream: &[Artifact],
+) -> anyhow::Result<Artifact> {
+    let params = parse_gate_params(node)?;
+    let source = upstream
+        .iter()
+        .find_map(|a| match a {
+            Artifact::File(p) => Some(p.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "file_gate node '{}' has no file input from upstream",
+                node.id
+            )
+        })?;
+
+    // media 条件按需探测（best-effort：ffprobe 缺失/超时/解析失败 → None → 不满足）
+    let probe = if params.media.is_some() {
+        probe_media(&source).await
+    } else {
+        None
+    };
+
+    if gate_matches(&source, &params, probe.as_ref()) {
+        Ok(Artifact::File(source))
+    } else if params.fail_on_mismatch {
+        Err(anyhow::anyhow!(
+            "file_gate node '{}' rejected file `{}` (condition mismatch, on_mismatch=fail)",
+            node.id,
+            source.display()
+        ))
+    } else {
+        tracing::info!(
+            node_id = %node.id,
+            file = %source.display(),
+            "file_gate mismatch: passing Artifact::None downstream (on_mismatch=skip)"
+        );
+        Ok(Artifact::None)
+    }
+}
+
+// ─── ffprobe 媒体探测（file_gate media 条件，best-effort 绝不 panic） ─────────
+
+/// ffprobe 探测超时（超时按「不满足」处理，绝不拖垮管线）
+const FFPROBE_TIMEOUT_SECS: u64 = 30;
+
+/// ffprobe 探测归一化结果
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct MediaProbe {
+    pub duration_secs: Option<f64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+/// 解析 ffprobe 可执行文件路径：ffmpeg 同目录优先，否则交给 PATH 解析
+pub(crate) fn resolve_ffprobe_path() -> PathBuf {
+    let ffmpeg = resolve_ffmpeg_path();
+    // ffmpeg 解析为具体路径（含目录分隔）时，优先同目录的 ffprobe；
+    // 裸名回退（依赖 PATH）时 ffprobe 同样交给 PATH
+    if ffmpeg.components().count() > 1 {
+        if let Some(dir) = ffmpeg.parent() {
+            let name = if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" };
+            let candidate = dir.join(name);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from("ffprobe")
+}
+
+/// 解析 ffprobe JSON 输出（`-print_format json`）：
+/// duration 优先取 `format.duration`（ffprobe 输出为字符串，"N/A" 解析失败
+/// → None），回退任一流 `duration`；width/height 取首个视频流。
+pub(crate) fn parse_ffprobe_output(stdout: &str) -> Option<MediaProbe> {
+    let v: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    let mut probe = MediaProbe::default();
+    if let Some(d) = v
+        .get("format")
+        .and_then(|f| f.get("duration"))
+        .and_then(|d| d.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
+    {
+        probe.duration_secs = Some(d);
+    }
+    if let Some(streams) = v.get("streams").and_then(|s| s.as_array()) {
+        if probe.duration_secs.is_none() {
+            probe.duration_secs = streams.iter().find_map(|s| {
+                s.get("duration")
+                    .and_then(|d| d.as_str())
+                    .and_then(|x| x.parse::<f64>().ok())
+            });
+        }
+        if let Some(video) = streams
+            .iter()
+            .find(|s| s.get("codec_type").and_then(|t| t.as_str()) == Some("video"))
+        {
+            probe.width = video.get("width").and_then(|w| w.as_u64()).map(|w| w as u32);
+            probe.height = video.get("height").and_then(|h| h.as_u64()).map(|h| h as u32);
+        }
+    }
+    Some(probe)
+}
+
+/// 运行 ffprobe 探测（`-v error -print_format json -show_format -show_streams`，§5.6）。
+/// 任何失败（二进制缺失/超时/非零退出/解析失败）→ None（「不满足」语义）。
+async fn probe_media(path: &Path) -> Option<MediaProbe> {
+    let bin = resolve_ffprobe_path();
+    let path = path.to_path_buf();
+    let args: Vec<String> = vec![
+        "-v".into(),
+        "error".into(),
+        "-print_format".into(),
+        "json".into(),
+        "-show_format".into(),
+        "-show_streams".into(),
+        path.to_string_lossy().into_owned(),
+    ];
+    // run_tool 为阻塞轮询实现 → 移入阻塞线程池，避免卡死异步 worker
+    tokio::task::spawn_blocking(move || {
+        crate::compute::run_tool(
+            &bin.to_string_lossy(),
+            &args.iter().map(String::as_str).collect::<Vec<_>>(),
+            std::time::Duration::from_secs(FFPROBE_TIMEOUT_SECS),
+        )
+        .and_then(|out| parse_ffprobe_output(&out))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+// ─── 受限正则子集引擎（file_gate filename_regex 专用，零新依赖） ─────────────
+//
+// 本期铁律零新 Cargo 依赖（Cargo.lock 不变），无法引入 regex crate；
+// filename_regex 契约（Rust regex 语法，编译失败按不满足）由此处以手写
+// 回溯引擎覆盖常用文件名过滤语法：
+//   字面量 / `.` / `*` / `+` / `?` / `{m}` `{m,}` `{m,n}`（含非贪婪后缀，忽略）
+//   `[...]`（含范围 `a-z`、取反 `^`）/ `(...)` 分组 / 顶层与组内 `|` 分支 /
+//   `\` 转义（含 `\d \D \w \W \s \S` 类缩写）/ 首尾 `^` `$` 锚点。
+// 不支持的语法（中间锚点、前瞻等）在编译期报错 → gate 判定「不满足」
+//（与契约「编译失败按不满足」一致）。匹配语义与 regex::Regex::is_match 一致：
+// 任意子串命中即 true。
+
+/// 单个原子（量词作用对象）
+#[derive(Debug, Clone)]
+enum TinyAtom {
+    Literal(char),
+    AnyChar,
+    Class {
+        negated: bool,
+        items: Vec<TinyClassItem>,
+    },
+    Group(Vec<Vec<TinyPiece>>),
+}
+
+#[derive(Debug, Clone)]
+enum TinyClassItem {
+    Single(char),
+    Range(char, char),
+}
+
+/// 原子 + 量词
+#[derive(Debug, Clone)]
+struct TinyPiece {
+    atom: TinyAtom,
+    min: u32,
+    /// None = 无上限（`*` / `+` / `{m,}`）
+    max: Option<u32>,
+}
+
+/// 编译后的受限正则（顶层 alternation 分支列表 + 锚点标志）
+#[derive(Debug, Clone)]
+pub(crate) struct TinyRegex {
+    branches: Vec<Vec<TinyPiece>>,
+    anchored_start: bool,
+    anchored_end: bool,
+}
+
+impl TinyRegex {
+    /// 编译模式；不支持语法 → Err（gate 判定按「不满足」处理）
+    pub(crate) fn compile(pattern: &str) -> Result<Self, String> {
+        let mut s = pattern;
+        let anchored_start = s.starts_with('^');
+        if anchored_start {
+            s = &s[1..];
+        }
+        let anchored_end = s.ends_with('$');
+        if anchored_end {
+            s = &s[..s.len() - 1];
+        }
+        let mut parser = TinyParser {
+            chars: s.chars().collect(),
+            pos: 0,
+        };
+        let branches = parser.parse_pattern()?;
+        if parser.pos != parser.chars.len() {
+            return Err(format!(
+                "unexpected `{}` at position {}",
+                parser.chars[parser.pos], parser.pos
+            ));
+        }
+        Ok(Self {
+            branches,
+            anchored_start,
+            anchored_end,
+        })
+    }
+
+    /// 搜索语义：任意起点匹配（anchored_start 则仅起点 0），
+    /// anchored_end 时要求命中终点为文本末尾
+    pub(crate) fn is_match(&self, text: &str) -> bool {
+        let chars: Vec<char> = text.chars().collect();
+        let starts: Vec<usize> = if self.anchored_start {
+            vec![0]
+        } else {
+            (0..=chars.len()).collect()
+        };
+        for branch in &self.branches {
+            for &s in &starts {
+                let found = self.match_pieces(branch, &chars, s, &mut |end| {
+                    !self.anchored_end || end == chars.len()
+                });
+                if found {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// 依序匹配 piece 序列；`k` 为续接回调（收集所有可能的结束位置），
+    /// 返回 true 表示某条路径已满足整体（短路）
+    fn match_pieces(
+        &self,
+        pieces: &[TinyPiece],
+        text: &[char],
+        pos: usize,
+        k: &mut dyn FnMut(usize) -> bool,
+    ) -> bool {
+        match pieces.split_first() {
+            None => k(pos),
+            Some((first, rest)) => self.match_piece_repeat(first, 0, rest, text, pos, k),
+        }
+    }
+
+    /// 贪心回溯：先尽量多重复当前 piece，失败则回退进入 rest
+    fn match_piece_repeat(
+        &self,
+        piece: &TinyPiece,
+        count: u32,
+        rest: &[TinyPiece],
+        text: &[char],
+        pos: usize,
+        k: &mut dyn FnMut(usize) -> bool,
+    ) -> bool {
+        let max = piece.max.unwrap_or(u32::MAX);
+        if count < max {
+            for end in self.match_atom(&piece.atom, text, pos) {
+                if end == pos {
+                    continue; // 空匹配不再重复（防死循环）
+                }
+                if self.match_piece_repeat(piece, count + 1, rest, text, end, k) {
+                    return true;
+                }
+            }
+        }
+        if count >= piece.min {
+            self.match_pieces(rest, text, pos, k)
+        } else {
+            false
+        }
+    }
+
+    /// 单次原子匹配：返回所有可能的结束位置
+    fn match_atom(&self, atom: &TinyAtom, text: &[char], pos: usize) -> Vec<usize> {
+        match atom {
+            TinyAtom::Literal(c) => {
+                if text.get(pos) == Some(c) {
+                    vec![pos + 1]
+                } else {
+                    Vec::new()
+                }
+            }
+            TinyAtom::AnyChar => match text.get(pos) {
+                Some(&c) if c != '\n' => vec![pos + 1],
+                _ => Vec::new(),
+            },
+            TinyAtom::Class { negated, items } => match text.get(pos) {
+                Some(&c) => {
+                    let hit = items.iter().any(|it| match it {
+                        TinyClassItem::Single(x) => *x == c,
+                        TinyClassItem::Range(a, b) => *a <= c && c <= *b,
+                    });
+                    if hit != *negated {
+                        vec![pos + 1]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                None => Vec::new(),
+            },
+            TinyAtom::Group(branches) => {
+                let mut ends = Vec::new();
+                for b in branches {
+                    // 回调恒返 false：仅收集全部结束位置
+                    self.match_pieces(b, text, pos, &mut |e| {
+                        ends.push(e);
+                        false
+                    });
+                }
+                ends
+            }
+        }
+    }
+}
+
+/// 手写递归下降解析器
+struct TinyParser {
+    chars: Vec<char>,
+    pos: usize,
+}
+
+impl TinyParser {
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
+    }
+
+    fn next(&mut self) -> Option<char> {
+        let c = self.peek();
+        if c.is_some() {
+            self.pos += 1;
+        }
+        c
+    }
+
+    fn eat(&mut self, c: char) -> bool {
+        if self.peek() == Some(c) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// pattern := branch ('|' branch)*
+    fn parse_pattern(&mut self) -> Result<Vec<Vec<TinyPiece>>, String> {
+        let mut branches = vec![self.parse_branch()?];
+        while self.eat('|') {
+            branches.push(self.parse_branch()?);
+        }
+        Ok(branches)
+    }
+
+    /// branch := piece*（遇 `|` / `)` / 裸 `^` `$` 停止）
+    fn parse_branch(&mut self) -> Result<Vec<TinyPiece>, String> {
+        let mut pieces = Vec::new();
+        while let Some(c) = self.peek() {
+            match c {
+                '|' | ')' => break,
+                '^' | '$' => {
+                    return Err("mid-pattern anchors are not supported".to_string())
+                }
+                _ => {
+                    let atom = self.parse_atom()?;
+                    let (min, max) = self.parse_quantifier()?;
+                    pieces.push(TinyPiece { atom, min, max });
+                }
+            }
+        }
+        Ok(pieces)
+    }
+
+    fn parse_atom(&mut self) -> Result<TinyAtom, String> {
+        match self.next() {
+            Some('.') => Ok(TinyAtom::AnyChar),
+            Some('(') => {
+                let branches = self.parse_pattern()?;
+                if !self.eat(')') {
+                    return Err("unterminated group".to_string());
+                }
+                Ok(TinyAtom::Group(branches))
+            }
+            Some('[') => self.parse_class(),
+            Some('\\') => {
+                let c = self.next().ok_or("trailing backslash")?;
+                Ok(match c {
+                    'd' => TinyAtom::Class {
+                        negated: false,
+                        items: vec![TinyClassItem::Range('0', '9')],
+                    },
+                    'D' => TinyAtom::Class {
+                        negated: true,
+                        items: vec![TinyClassItem::Range('0', '9')],
+                    },
+                    'w' => TinyAtom::Class {
+                        negated: false,
+                        items: vec![
+                            TinyClassItem::Range('a', 'z'),
+                            TinyClassItem::Range('A', 'Z'),
+                            TinyClassItem::Range('0', '9'),
+                            TinyClassItem::Single('_'),
+                        ],
+                    },
+                    'W' => TinyAtom::Class {
+                        negated: true,
+                        items: vec![
+                            TinyClassItem::Range('a', 'z'),
+                            TinyClassItem::Range('A', 'Z'),
+                            TinyClassItem::Range('0', '9'),
+                            TinyClassItem::Single('_'),
+                        ],
+                    },
+                    's' => TinyAtom::Class {
+                        negated: false,
+                        items: vec![
+                            TinyClassItem::Single(' '),
+                            TinyClassItem::Single('\t'),
+                            TinyClassItem::Single('\n'),
+                            TinyClassItem::Single('\r'),
+                        ],
+                    },
+                    'S' => TinyAtom::Class {
+                        negated: true,
+                        items: vec![
+                            TinyClassItem::Single(' '),
+                            TinyClassItem::Single('\t'),
+                            TinyClassItem::Single('\n'),
+                            TinyClassItem::Single('\r'),
+                        ],
+                    },
+                    other => TinyAtom::Literal(other),
+                })
+            }
+            Some(c) => Ok(TinyAtom::Literal(c)),
+            None => Err("unexpected end of pattern".to_string()),
+        }
+    }
+
+    /// 字符类：`[` `^`? items `]`；`]` 在首位按字面量，`-` 在末尾按字面量
+    fn parse_class(&mut self) -> Result<TinyAtom, String> {
+        let negated = self.eat('^');
+        let mut items = Vec::new();
+        let mut first = true;
+        loop {
+            let Some(c) = self.next() else {
+                return Err("unterminated character class".to_string());
+            };
+            if c == ']' && !first {
+                break;
+            }
+            first = false;
+            // 范围探测：a-z（`-` 后有非 `]` 字符才算范围）
+            if self.peek() == Some('-') {
+                let after = self.chars.get(self.pos + 1).copied();
+                if let Some(end) = after {
+                    if end != ']' {
+                        self.pos += 1; // 消费 '-'
+                        self.pos += 1; // 消费范围终点（next 已知）
+                        items.push(TinyClassItem::Range(c, end));
+                        continue;
+                    }
+                }
+            }
+            items.push(TinyClassItem::Single(c));
+        }
+        Ok(TinyAtom::Class { negated, items })
+    }
+
+    /// 量词：`*` `+` `?` `{m}` `{m,}` `{m,n}`（可选非贪婪后缀 `?`，忽略）
+    fn parse_quantifier(&mut self) -> Result<(u32, Option<u32>), String> {
+        let (min, max) = match self.peek() {
+            Some('*') => {
+                self.pos += 1;
+                (0, None)
+            }
+            Some('+') => {
+                self.pos += 1;
+                (1, None)
+            }
+            Some('?') => {
+                self.pos += 1;
+                (0, Some(1))
+            }
+            Some('{') => {
+                // 尝试 {m}/{m,}/{m,n}；不符合格式则回退为字面量 '{'
+                let save = self.pos;
+                self.pos += 1;
+                let m = self.parse_number();
+                match m {
+                    Some(m) => {
+                        if self.eat('}') {
+                            (m, Some(m))
+                        } else if self.eat(',') {
+                            if self.eat('}') {
+                                (m, None)
+                            } else {
+                                match self.parse_number() {
+                                    Some(n) if self.eat('}') => {
+                                        if m > n {
+                            return Err(format!(
+                                                    "invalid repetition quantifier: min {m} > max {n}"
+                                                ));
+                                        }
+                                        (m, Some(n))
+                                    }
+                                    _ => {
+                                        self.pos = save;
+                                        (1, Some(1))
+                                    }
+                                }
+                            }
+                        } else {
+                            self.pos = save;
+                            (1, Some(1))
+                        }
+                    }
+                    None => {
+                        self.pos = save;
+                        (1, Some(1))
+                    }
+                }
+            }
+            _ => (1, Some(1)),
+        };
+        // 非贪婪后缀（如 `*?`）：is_match 存在性语义下与贪婪等价，接受并忽略
+        if min == 0 && max.is_none() || max != Some(1) || min == 0 {
+            self.eat('?');
+        }
+        Ok((min, max))
+    }
+
+    fn parse_number(&mut self) -> Option<u32> {
+        let start = self.pos;
+        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            self.pos += 1;
+        }
+        if self.pos == start {
+            return None;
+        }
+        self.chars[start..self.pos]
+            .iter()
+            .collect::<String>()
+            .parse()
+            .ok()
+    }
 }
 
 /// 解析 ffmpeg 可执行文件路径
@@ -2991,6 +4291,9 @@ async fn send_module_request(
                         serde_json::Value::String(p.to_string_lossy().to_string()),
                     );
                 }
+                // `None`（§5.6 gate skip 哨兵）：无可投递输入，跳过
+                // （混合 None/File 时 File 臂仍会覆盖 input，取首个文件语义不变）
+                Artifact::None => {}
             }
         }
 
@@ -3140,6 +4443,7 @@ struct PreparedLlmCall {
 /// - `Text` → 原样
 /// - `Json` → JSON 字符串取内部文本，否则紧凑序列化
 /// - `File` → 文本类扩展名读取文件内容（大小上限 [`LLM_MAX_INPUT_BYTES`]），否则报错
+/// - `None` → 空串（§5.6 gate skip 哨兵，等价无上游输入）
 /// - 无上游产物 → 空串（纯模板驱动场景）
 fn llm_input_text(upstream: &[Artifact], node_id: &str) -> anyhow::Result<String> {
     let Some(artifact) = upstream.first() else {
@@ -3177,6 +4481,7 @@ fn llm_input_text(upstream: &[Artifact], node_id: &str) -> anyhow::Result<String
                 )
             })
         }
+        Artifact::None => Ok(String::new()),
     }
 }
 

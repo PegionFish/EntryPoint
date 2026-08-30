@@ -1,6 +1,7 @@
 import { NavLink } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import {
+  BellRing,
   GitBranch,
   LayoutDashboard,
   ListTodo,
@@ -13,8 +14,13 @@ import { cn } from '@/lib/utils'
 
 interface NavItem {
   to: string
-  /** components 命名空间下的标签键 */
+  /** 标签键（扁平键） */
   labelKey: string
+  /**
+   * 标签键所在命名空间；缺省 components。允许个别项使用自己的
+   * 命名空间（如 triggers 页的 sidebar.nav.triggers 归 triggers.json）。
+   */
+  ns?: string
   icon: LucideIcon
   end?: boolean
 }
@@ -23,6 +29,7 @@ const NAV_ITEMS: NavItem[] = [
   { to: '/', labelKey: 'sidebar.nav.dashboard', icon: LayoutDashboard, end: true },
   { to: '/run', labelKey: 'sidebar.nav.quickrun', icon: Zap },
   { to: '/pipeline', labelKey: 'sidebar.nav.pipeline', icon: GitBranch },
+  { to: '/triggers', labelKey: 'sidebar.nav.triggers', ns: 'triggers', icon: BellRing },
   { to: '/tasks', labelKey: 'sidebar.nav.tasks', icon: ListTodo },
   { to: '/modules', labelKey: 'sidebar.nav.modules', icon: Puzzle },
   { to: '/settings', labelKey: 'sidebar.nav.settings', icon: Settings },
@@ -64,7 +71,10 @@ export function SidebarNav({ onNavigate, className }: SidebarNavProps) {
                 />
               )}
               <item.icon className="h-4 w-4 shrink-0" />
-              <span>{t(item.labelKey)}</span>
+              {/* 命名空间限定键（ns:key 形式）；缺省走 components */}
+              <span>
+                {item.ns ? t(`${item.ns}:${item.labelKey}`) : t(item.labelKey)}
+              </span>
             </>
           )}
         </NavLink>

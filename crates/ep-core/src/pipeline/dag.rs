@@ -51,6 +51,10 @@ pub enum ValidationError {
         to_port: String,
         to_type: PortType,
     },
+
+    /// §5.6：file_gate 至少配置一项过滤条件，否则静态校验报错
+    #[error("file_gate node `{0}` must configure at least one filter condition (§5.6)")]
+    GateNoConditions(String),
 }
 
 // ─── 端口数据类型（PIPELINE_SPEC §7.1 / §7.2） ──────────────────────────────
@@ -138,6 +142,11 @@ fn builtin_port_type(
         "file_output" if !is_output && port == "input" => Some(PortType::File),
         "ffmpeg" if !is_output && port == "input" => Some(PortType::File),
         "ffmpeg" if is_output && port == "output" => Some(PortType::File),
+        // §5.5/§5.6：file_archive / file_gate 均为 文件入 → 文件出
+        "file_archive" if !is_output && port == "input" => Some(PortType::File),
+        "file_archive" if is_output && port == "output" => Some(PortType::File),
+        "file_gate" if !is_output && port == "input" => Some(PortType::File),
+        "file_gate" if is_output && port == "output" => Some(PortType::File),
         // §6.7：llm input_type=text；output_format=json 时输出 Json
         "llm" | "external_api" if !is_output && port == "input" => Some(PortType::Text),
         "llm" | "external_api" if is_output && port == "output" => {
@@ -159,6 +168,48 @@ fn endpoint_port_type(node: &PipelineNode, port: &str, is_output: bool) -> Optio
         // module / 遗留 external_api kind：类型在模块清单/运行期才可见，跳过
         _ => None,
     }
+}
+
+/// file_gate 是否至少配置了一项过滤条件（§5.6 静态校验，纯函数可测）。
+///
+/// 计入的条件：`extensions` / `extensions_exclude` 非空数组、
+/// `min_size_bytes` / `max_size_bytes` 存在、`filename_regex` 非空字符串、
+/// `media` 对象含至少一个已知子键（`min_duration_secs` / `max_duration_secs` /
+/// `min_width` / `min_height`）。空对象 `media: {}` 不计入（无实际判定语义）。
+fn file_gate_has_any_condition(params: &serde_json::Value) -> bool {
+    let ext_list_nonempty = |key: &str| {
+        params
+            .get(key)
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty())
+    };
+    if ext_list_nonempty("extensions") || ext_list_nonempty("extensions_exclude") {
+        return true;
+    }
+    let has_size_bound = |key: &str| {
+        params
+            .get(key)
+            .is_some_and(|v| !v.is_null())
+    };
+    if has_size_bound("min_size_bytes") || has_size_bound("max_size_bytes") {
+        return true;
+    }
+    if params
+        .get("filename_regex")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        return true;
+    }
+    if let Some(media) = params.get("media").and_then(|v| v.as_object()) {
+        return media.keys().any(|k| {
+            matches!(
+                k.as_str(),
+                "min_duration_secs" | "max_duration_secs" | "min_width" | "min_height"
+            )
+        });
+    }
+    false
 }
 
 // ─── 节点类型 ────────────────────────────────────────────────────────────────
@@ -458,6 +509,16 @@ impl Pipeline {
                     to_port: edge.to.1.clone(),
                     to_type,
                 });
+            }
+        }
+
+        // 8. file_gate 条件配置校验（§5.6）：至少配置一项过滤条件，
+        //    否则节点永远无判定依据（全部透传语义无意义且易误配）
+        for node in &self.nodes {
+            if matches!(&node.kind, NodeKind::Builtin { builtin } if builtin == "file_gate")
+                && !file_gate_has_any_condition(&node.params)
+            {
+                errors.push(ValidationError::GateNoConditions(node.id.clone()));
             }
         }
 
@@ -1737,5 +1798,98 @@ position = { x = 240.5, y = -80.0 }
             direct_output_extension(&dirty, None, Path::new("/data/in.wav")),
             Some("srt".to_string())
         );
+    }
+
+    // ── §5.5/§5.6：file_archive / file_gate 端口与静态校验 ──────────────
+
+    #[test]
+    fn test_file_gate_has_any_condition() {
+        // 无任何条件 / 空 media 对象 → false
+        assert!(!file_gate_has_any_condition(&serde_json::json!({})));
+        assert!(!file_gate_has_any_condition(&serde_json::json!({"media": {}})));
+        // 空数组不算条件
+        assert!(!file_gate_has_any_condition(&serde_json::json!({
+            "extensions": []
+        })));
+        // 各类条件成立
+        assert!(file_gate_has_any_condition(&serde_json::json!({
+            "extensions": ["txt"]
+        })));
+        assert!(file_gate_has_any_condition(&serde_json::json!({
+            "extensions_exclude": ["tmp"]
+        })));
+        assert!(file_gate_has_any_condition(&serde_json::json!({
+            "min_size_bytes": 1
+        })));
+        assert!(file_gate_has_any_condition(&serde_json::json!({
+            "max_size_bytes": 100
+        })));
+        assert!(file_gate_has_any_condition(&serde_json::json!({
+            "filename_regex": "^a"
+        })));
+        assert!(file_gate_has_any_condition(&serde_json::json!({
+            "media": {"min_width": 10}
+        })));
+        // filename_regex 空白串不算条件
+        assert!(!file_gate_has_any_condition(&serde_json::json!({
+            "filename_regex": "   "
+        })));
+    }
+
+    /// file_gate 零条件件 → GateNoConditions 校验错误；file→file 边合法。
+    #[test]
+    fn test_file_gate_validation_requires_condition() {
+        let bad = r#"
+[pipeline]
+id = "gate-bad"
+name = "Gate No Conditions"
+
+[[nodes]]
+id = "in"
+kind = "builtin"
+builtin = "file_input"
+
+[[nodes]]
+id = "gate"
+kind = "builtin"
+builtin = "file_gate"
+params = {}
+
+[[edges]]
+from = ["in", "output"]
+to = ["gate", "input"]
+"#;
+        let pipeline = Pipeline::from_toml_str(bad).unwrap();
+        let errs = pipeline.validate().unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.to_string().contains(
+                "must configure at least one filter condition"
+            )),
+            "expected GateNoConditions, got: {errs:?}"
+        );
+
+        // 至少一项条件 + file→file 边 → 校验通过
+        let ok = r#"
+[pipeline]
+id = "gate-ok"
+name = "Gate With Conditions"
+
+[[nodes]]
+id = "in"
+kind = "builtin"
+builtin = "file_input"
+
+[[nodes]]
+id = "gate"
+kind = "builtin"
+builtin = "file_gate"
+params = { extensions = ["txt"] }
+
+[[edges]]
+from = ["in", "output"]
+to = ["gate", "input"]
+"#;
+        let pipeline = Pipeline::from_toml_str(ok).unwrap();
+        assert!(pipeline.validate().is_ok());
     }
 }
