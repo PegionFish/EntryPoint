@@ -34,6 +34,9 @@ import type {
   UploadInputResponse,
   VramBudgetRequest,
   VramBudgetResponse,
+  UnifiedEvent,
+  WatchRule,
+  WatchRuleInput,
 } from './types'
 
 /** apiFetch 默认超时（毫秒）：防挂死请求（如慢响应下的轮询堆积） */
@@ -424,4 +427,45 @@ export const api = {
 
   // Dependencies
   deps: () => apiFetch<DepReport>('/deps'),
+
+  // 触发器（PLAN_TRIGGER_UNIFIED_LOG §5.3）
+  /** 全部触发规则列表（含 recent 速览；兼容裸数组 / {watchers:[…]} 两种信封） */
+  listWatchers: async () => {
+    const resp = await apiFetch<WatchRule[] | { watchers?: WatchRule[] }>(
+      '/watchers',
+    )
+    return Array.isArray(resp) ? resp : (resp.watchers ?? [])
+  },
+  /** 创建规则（body 不含 id，服务端生成 8 位十六进制），返回 {ok, id} */
+  createWatcher: (body: WatchRuleInput) =>
+    apiFetch<{ ok: boolean; id: string }>('/watchers', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  /** 单条规则详情（未配置 → 404 apiCore.watcher.notFound） */
+  getWatcher: (id: string) =>
+    apiFetch<WatchRule>(`/watchers/${encodeURIComponent(id)}`),
+  /** 全量更新（校验同 POST） */
+  updateWatcher: (id: string, body: WatchRuleInput) =>
+    apiFetch<{ ok: boolean }>(`/watchers/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    }),
+  /** 删除规则 */
+  deleteWatcher: (id: string) =>
+    apiFetch<{ ok: boolean }>(`/watchers/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+
+  // 统一事件日志（§5.7；倒序，最新在前）
+  events: (query?: { rule?: string; type?: string; limit?: number }) => {
+    const qs = new URLSearchParams()
+    if (query?.rule) qs.set('rule', query.rule)
+    if (query?.type) qs.set('type', query.type)
+    if (query?.limit !== undefined) qs.set('limit', String(query.limit))
+    const suffix = qs.toString()
+    return apiFetch<{ events: UnifiedEvent[] }>(
+      `/events${suffix ? `?${suffix}` : ''}`,
+    )
+  },
 }

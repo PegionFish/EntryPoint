@@ -609,6 +609,20 @@ export function SettingsPage() {
                 patchSection('general', { check_updates: v })
               }
             />
+            {/* §5.7：统一事件日志保留天数（清理巡检按 mtime 删除超期日志文件） */}
+            <Field
+              label={t('logRetention.label')}
+              description={t('logRetention.description')}
+            >
+              <NumberField
+                value={config.general.log_retention_days ?? 90}
+                onValueChange={(v) =>
+                  patchSection('general', { log_retention_days: v })
+                }
+                min={0}
+                max={3650}
+              />
+            </Field>
           </Section>
 
           {/* ── 计算 ── */}

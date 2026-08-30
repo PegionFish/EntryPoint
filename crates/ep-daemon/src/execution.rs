@@ -1276,6 +1276,18 @@ async fn finalize_task(
         fire_callback(task_id, &url);
     }
 
+    // 统一事件日志（PLAN_TRIGGER_UNIFIED_LOG §5.7）：task_terminal 单点接入。
+    // finalize_task 经 CAS 为唯一赢家出口，completed/failed/cancelled 三条
+    // 终态路径在此各产生一条事件；错误摘要取注册表终态记录（Engine 失败
+    // / 超时看门狗均已写入）；写失败仅告警，不阻断终态上报。
+    crate::eventlog::write_task_terminal(
+        &state.root,
+        task_id,
+        pipeline_id,
+        terminal.as_str(),
+        snapshot(task_id).and_then(|r| r.error).as_deref(),
+    );
+
     match terminal {
         TaskState::Completed => info!(task_id, "pipeline task finished"),
         TaskState::Cancelled => info!(task_id, "pipeline task cancelled"),
@@ -1327,18 +1339,35 @@ pub async fn request_cancel(state: &Arc<AppState>, task_id: &str) -> CancelOutco
             .and_then(|t| t.callback_url);
         let persisted = {
             let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
-            reg.update(task_id, |r| {
+            let pipeline_id = reg.get(task_id).map(|r| r.pipeline_id.clone());
+            let persisted = reg.update(task_id, |r| {
                 if !r.status.is_terminal() {
                     r.status = TaskState::Cancelled;
                     r.finished_at = Some(Utc::now());
                 }
                 r.queue_position = None;
-            })
+            });
+            (pipeline_id, persisted)
         };
         match persisted {
-            Some(Ok(())) => {}
-            Some(Err(e)) => warn!(task_id, error = %e, "failed to persist cancelled state"),
-            None => return CancelOutcome::NotFound,
+            (_, Some(Err(e))) => warn!(task_id, error = %e, "failed to persist cancelled state"),
+            (_, None) => return CancelOutcome::NotFound,
+            // update 返回 Ok ⇒ 记录必在，pipeline_id 必为 Some（同源读取）
+            (pipeline_id, Some(Ok(()))) => {
+                // 评审修复：queued 分支直接改注册表、绕过 finalize 收尾——此处
+                // 自行补 task_terminal 事件（与 finalize 路径同形状：status
+                // ="cancelled"、error 缺省；写失败仅告警）。事件先于回调，
+                // 与 finalize 顺序一致。
+                if let Some(pid) = pipeline_id {
+                    crate::eventlog::write_task_terminal(
+                        &state.root,
+                        task_id,
+                        &pid,
+                        TaskState::Cancelled.as_str(),
+                        None,
+                    );
+                }
+            }
         }
         info!(task_id, "queued task cancelled");
         if let Some(url) = callback_url {
@@ -1903,6 +1932,9 @@ fn run_task(
                         );
                     }
                 }
+                // W0-A 兼容臂（ep-core Artifact::None 新变体，§5.6）：gate 无匹配
+                // 输出的哨兵产物，不物化任何文件；仅维持 match 穷尽性，不改逻辑。
+                Artifact::None => {}
             }
         }));
     }
@@ -2882,6 +2914,17 @@ builtin = "file_output"
             CancelOutcome::NotFound
         );
 
+        // 评审修复：queued 取消绕过 finalize 收尾，也须补写 task_terminal 事件
+        //（与 finalize 路径同形状：status="cancelled"）
+        let events = crate::eventlog::read_events(&root, None, Some("task_terminal"), 100);
+        let term = events
+            .iter()
+            .find(|e| e["task_id"] == t2.as_str())
+            .expect("queued 取消应写 task_terminal 事件");
+        assert_eq!(term["type"], "task_terminal");
+        assert_eq!(term["status"], "cancelled");
+        assert_eq!(term["pipeline_id"], "cq-2");
+
         // 释放首个任务；被取消的 t2 绝不应执行
         RELEASE.store(true, Ordering::SeqCst);
         wait_terminal(&t1).await.expect("任务应终结");
@@ -3670,5 +3713,721 @@ output_type = "json"
                 .running_count,
             0
         );
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 直调物化（W1-D ｜ PLAN_TRIGGER_UNIFIED_LOG §5.4）——触发规则 direct 模式提交
+//
+// 触发器巡检循环（W1-E）命中文件后按规则模式提交：
+// - 仅归档（Archive）：物化两节点退化 DAG `file_input → file_archive`；
+// - 模块直调（Module）：先 `ensure_module_running`，再物化三节点退化 DAG
+//   `file_input → module → file_archive`。
+//
+// 两者均走 [`submit_pipeline_full`]（与手动任务同一闸门/注册表/WS/产物通路），
+// 任务 `pipeline_id = "watcher/<rule_id>"`，规则名经命名模板 `{rule}` 占位符
+// 参与归档命名（§5.5）。
+//
+// **实现偏差声明（`_meta.rule` 注入）**：§5.4 约定经任务 inputs 保留键
+// `_meta.rule` 注入规则名；但既有 `submit_pipeline_full` → `apply_inputs`
+// 将 inputs 键一律按节点 id 解析（`_meta` 会触发 `UnknownInputNode`），
+// 且 `run_task` 链路尚无 `runner.set_task_inputs` 通路——二者均属既有函数，
+// 本区段无权修改。故规则名在**物化期**预渲染进 `name_template`
+// （[`inject_rule_into_template`]），执行期 `expand_name_template` 以空
+// rule 展开，其余占位符语义不变。规则名含 `{`/`}` 的极端输入被守卫跳过
+// （避免二次展开，`{rule}` 届时渲染为空串）；含路径分隔符 `/`/`\` 或 `..`
+// 的输入被**拒绝**（评审修复：否则经 `{rule}` 渲染出子目录/穿越路径）。
+// 若后续任务补齐 task_inputs 通路，本预渲染与之叠加仍然正确（模板已不含
+// `{rule}`）。
+// ════════════════════════════════════════════════════════════════════════════
+
+/// 触发规则归档输出配置快照（§5.1 `OutputConfig` 的字段直传）。
+///
+/// 刻意以独立结构承载而非引用 watcher 模块的 `OutputConfig` 类型：
+/// watcher.rs 归 W0-C 所有，本区段与之零类型耦合，W1-E 提交时按字段映射。
+/// 缺省语义（§5.5）：`name_template` 空 → `{name}.{ext}`；
+/// `on_conflict` 空 → `suffix`（归一在 [`WatchArchiveOutput::render_params`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchArchiveOutput {
+    /// 归档目标目录（必填，绝对路径）
+    pub dest_dir: String,
+    /// 命名模板（`{name}/{ext}/{date}/{datetime}/{rule}/{seq}`）
+    pub name_template: String,
+    /// 冲突策略（`suffix`/`overwrite`/`skip`）
+    pub on_conflict: String,
+}
+
+/// 规则名预渲染：物化期将 `{rule}` 替换为规则名（见区段头偏差声明）。
+///
+/// 返回 `Err(原因)` 的守卫输入（提交期拒绝，不落任务）：
+/// - 含 `{`/`}`：会在执行期被二次展开（违反「占位符值不二次展开」裁决）；
+/// - 含路径分隔符 `/`/`\` 或 `..` 组件：经 `{rule}` 渲染出子目录/穿越路径
+///   （评审修复）。
+fn inject_rule_into_template(template: &str, rule_name: &str) -> Result<String, String> {
+    if rule_name.contains('{') || rule_name.contains('}') {
+        Err(format!(
+            "rule name contains `{{`/`}}` (would be re-expanded): `{rule_name}`"
+        ))
+    } else if rule_name.contains('/') || rule_name.contains('\\') {
+        Err(format!(
+            "rule name contains path separator: `{rule_name}`"
+        ))
+    } else if rule_name == ".." {
+        // 分隔符已被上一分支拒绝，此处拦截剩余的唯一穿越形状：规则名本身为 `..`
+        Err(format!("rule name is `..` path component: `{rule_name}`"))
+    } else {
+        Ok(template.replace("{rule}", rule_name))
+    }
+}
+
+/// 渲染 `file_archive` 节点 params（§5.5）：缺省归一 + 绝对路径/策略快校验。
+///
+/// 快速失败（提交期即拒，不占闸门不建任务目录）；`on_conflict` 复用
+/// ep-core [`ep_core::archive::ConflictPolicy::parse`]（非法值报错不静默回退）。
+fn watch_archive_params(output: &WatchArchiveOutput, rule_name: &str) -> Result<Value, SubmitError> {
+    let dest_dir = output.dest_dir.trim();
+    if dest_dir.is_empty() {
+        return Err(SubmitError::InvalidPipeline(
+            "watcher output.dest_dir is required".to_string(),
+        ));
+    }
+    if !Path::new(dest_dir).is_absolute() {
+        return Err(SubmitError::InvalidPipeline(format!(
+            "watcher output.dest_dir must be an absolute path, got `{dest_dir}`"
+        )));
+    }
+    let template = if output.name_template.trim().is_empty() {
+        "{name}.{ext}"
+    } else {
+        output.name_template.trim()
+    };
+    let on_conflict = if output.on_conflict.trim().is_empty() {
+        "suffix"
+    } else {
+        output.on_conflict.trim()
+    };
+    ep_core::archive::ConflictPolicy::parse(on_conflict).map_err(|e| {
+        SubmitError::InvalidPipeline(format!("watcher output.on_conflict: {e}"))
+    })?;
+    // 规则名守卫（花括号/路径分隔符/`..`）→ 提交期拒绝，不落任务
+    let name_template = inject_rule_into_template(template, rule_name)
+        .map_err(SubmitError::InvalidPipeline)?;
+    Ok(json!({
+        "dest_dir": dest_dir,
+        "name_template": name_template,
+        "on_conflict": on_conflict,
+    }))
+}
+
+/// 物化仅归档退化 DAG：`input(file_input) → archive(file_archive)`（§5.4）。
+///
+/// `pipeline_id = "watcher/<rule_id>"`；file_archive params 由规则 output 渲染。
+pub fn build_watch_archive_pipeline(
+    rule_id: &str,
+    rule_name: &str,
+    input_path: &Path,
+    output: &WatchArchiveOutput,
+) -> Result<Pipeline, SubmitError> {
+    let archive_params = watch_archive_params(output, rule_name)?;
+    Ok(Pipeline {
+        id: format!("watcher/{rule_id}"),
+        name: format!("触发归档 {rule_name}"),
+        description: "触发规则直调-仅归档（§5.4 退化两节点 DAG）".to_string(),
+        nodes: vec![
+            PipelineNode {
+                id: "input".to_string(),
+                kind: NodeKind::Builtin {
+                    builtin: "file_input".to_string(),
+                },
+                label: "输入文件".to_string(),
+                params: json!({ "path": input_path.display().to_string() }),
+                position: None,
+                timeout_secs: None,
+                retry_count: None,
+            },
+            PipelineNode {
+                id: "archive".to_string(),
+                kind: NodeKind::Builtin {
+                    builtin: "file_archive".to_string(),
+                },
+                label: "归档输出".to_string(),
+                params: archive_params,
+                position: None,
+                timeout_secs: None,
+                retry_count: None,
+            },
+        ],
+        edges: vec![ep_core::pipeline::dag::Edge {
+            from: ("input".to_string(), "output".to_string()),
+            to: ("archive".to_string(), "input".to_string()),
+        }],
+        max_instances: None,
+        node_timeout_secs: None,
+    })
+}
+
+/// 物化模块直调退化 DAG：`input(file_input) → run(module) → archive(file_archive)`
+/// （§5.4；仿 [`build_direct_pipeline`]，末端 file_output 换为 file_archive）。
+///
+/// module 节点 params 直传规则 `DirectAction.params`（null/非对象归一为 `{}`）；
+/// 归档末端同 [`build_watch_archive_pipeline`]。
+pub fn build_watch_module_pipeline(
+    rule_id: &str,
+    rule_name: &str,
+    module_id: &str,
+    capability: &str,
+    params: Value,
+    input_path: &Path,
+    output: &WatchArchiveOutput,
+) -> Result<Pipeline, SubmitError> {
+    let archive_params = watch_archive_params(output, rule_name)?;
+    let module_params = if params.is_object() {
+        params
+    } else {
+        json!({})
+    };
+    Ok(Pipeline {
+        id: format!("watcher/{rule_id}"),
+        name: format!("触发直调 {rule_name}"),
+        description: "触发规则直调-模块（§5.4 退化三节点 DAG）".to_string(),
+        nodes: vec![
+            PipelineNode {
+                id: "input".to_string(),
+                kind: NodeKind::Builtin {
+                    builtin: "file_input".to_string(),
+                },
+                label: "输入文件".to_string(),
+                params: json!({ "path": input_path.display().to_string() }),
+                position: None,
+                timeout_secs: None,
+                retry_count: None,
+            },
+            PipelineNode {
+                id: "run".to_string(),
+                kind: NodeKind::Module {
+                    module_id: module_id.to_string(),
+                    capability: capability.to_string(),
+                    model_id: None,
+                    device: None,
+                },
+                label: "模块执行".to_string(),
+                params: module_params,
+                position: None,
+                timeout_secs: None,
+                retry_count: None,
+            },
+            PipelineNode {
+                id: "archive".to_string(),
+                kind: NodeKind::Builtin {
+                    builtin: "file_archive".to_string(),
+                },
+                label: "归档输出".to_string(),
+                params: archive_params,
+                position: None,
+                timeout_secs: None,
+                retry_count: None,
+            },
+        ],
+        edges: vec![
+            ep_core::pipeline::dag::Edge {
+                from: ("input".to_string(), "output".to_string()),
+                to: ("run".to_string(), "input".to_string()),
+            },
+            ep_core::pipeline::dag::Edge {
+                from: ("run".to_string(), "output".to_string()),
+                to: ("archive".to_string(), "input".to_string()),
+            },
+        ],
+        max_instances: None,
+        node_timeout_secs: None,
+    })
+}
+
+/// 触发规则直调-仅归档提交（§5.4）。
+///
+/// 输入文件存在性快检 → 物化两节点退化 DAG → [`submit_pipeline_full`]
+/// （默认异步模式：任务入队即返回，归档在后台执行）。
+/// 任务 `pipeline_id = "watcher/<rule_id>"`；返回 task_id 供规则
+/// `last_task_id`/`recent` 回写与 `watcher_trigger` 事件记录。
+pub async fn submit_direct_archive(
+    state: &Arc<AppState>,
+    rule_id: &str,
+    rule_name: &str,
+    input_path: PathBuf,
+    output: &WatchArchiveOutput,
+) -> Result<String, SubmitError> {
+    if !input_path.is_file() {
+        return Err(SubmitError::InputMissing(input_path));
+    }
+    let pipeline = build_watch_archive_pipeline(rule_id, rule_name, &input_path, output)?;
+    submit_pipeline_full(state, pipeline, None, SubmitOptions::default())
+        .await
+        .map(|outcome| outcome.task_id)
+}
+
+/// 模块拉起钩子（可注入）：拉起失败返回 `Err(detail)` → [`SubmitError::ModuleStartFailed`]。
+///
+/// 生产实现为 [`ensure_module_running_default`]（api/autostart 权威实现）；
+/// 测试注入 mock 以绕开真实模块进程拉起。
+pub type EnsureRunningFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(), String>> + Send>,
+>;
+
+/// [`submit_direct_module`] 的注入式版本（测试桩入口）。
+///
+/// `ensure_running(state, module_id)` 在物化**之前**调用（§5.4 仿
+/// `execute_single`：先保证模块 Running）；失败即拒绝提交，不物化任务。
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_direct_module_with(
+    state: Arc<AppState>,
+    rule_id: String,
+    rule_name: String,
+    module_id: String,
+    capability: String,
+    params: Value,
+    input_path: PathBuf,
+    output: WatchArchiveOutput,
+    ensure_running: impl FnOnce(Arc<AppState>, String) -> EnsureRunningFuture,
+) -> Result<String, SubmitError> {
+    if !input_path.is_file() {
+        return Err(SubmitError::InputMissing(input_path));
+    }
+    ensure_running(state.clone(), module_id.clone())
+        .await
+        .map_err(SubmitError::ModuleStartFailed)?;
+    let pipeline = build_watch_module_pipeline(
+        &rule_id,
+        &rule_name,
+        &module_id,
+        &capability,
+        params,
+        &input_path,
+        &output,
+    )?;
+    submit_pipeline_full(&state, pipeline, None, SubmitOptions::default())
+        .await
+        .map(|outcome| outcome.task_id)
+}
+
+/// 生产模块拉起：直通 api/autostart 权威实现（错误串化进
+/// [`SubmitError::ModuleStartFailed`]，语义对齐 §5.4「拉起失败 → rejected」）。
+async fn ensure_module_running_default(
+    state: Arc<AppState>,
+    module_id: String,
+) -> Result<(), String> {
+    crate::api::autostart::ensure_module_running(&state, &module_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 触发规则直调-模块提交（§5.4）。
+///
+/// 流程：输入文件存在性快检 → `ensure_module_running`（模块 Running、
+/// 端口就绪；失败即 `ModuleStartFailed`，不物化任务）→ 物化三节点退化 DAG
+/// → [`submit_pipeline_full`]。任务 `pipeline_id = "watcher/<rule_id>"`。
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_direct_module(
+    state: &Arc<AppState>,
+    rule_id: &str,
+    rule_name: &str,
+    module_id: &str,
+    capability: &str,
+    params: Value,
+    input_path: PathBuf,
+    output: &WatchArchiveOutput,
+) -> Result<String, SubmitError> {
+    submit_direct_module_with(
+        state.clone(),
+        rule_id.to_string(),
+        rule_name.to_string(),
+        module_id.to_string(),
+        capability.to_string(),
+        params,
+        input_path,
+        output.clone(),
+        |state, module_id| Box::pin(ensure_module_running_default(state, module_id)),
+    )
+    .await
+}
+
+// ─── 直调物化单测（退化 DAG 结构断言 + 提交路径；§5.4 完成标准） ─────────────
+
+#[cfg(test)]
+mod watcher_direct_tests {
+    #![allow(clippy::await_holding_lock)]
+
+    use super::*;
+    use ep_core::config::AppConfig;
+    use ep_core::port::PortManager;
+
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    fn unique_root(tag: &str) -> PathBuf {
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!(
+            "ep-exec-wdirect-{tag}-{}-{seq}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn wtest_state(root: PathBuf) -> Arc<AppState> {
+        Arc::new(AppState::new(
+            root,
+            AppConfig::default(),
+            vec![],
+            vec![],
+            PortManager::new(18000, 19000),
+        ))
+    }
+
+    fn woutput(dest_dir: &Path) -> WatchArchiveOutput {
+        WatchArchiveOutput {
+            dest_dir: dest_dir.display().to_string(),
+            name_template: "{rule}-{name}.{ext}".to_string(),
+            on_conflict: "suffix".to_string(),
+        }
+    }
+
+    /// 轮询等待任务终结（completed/failed/cancelled；30s 上限）
+    async fn wait_terminal(task_id: &str) -> Option<TaskRecord> {
+        for _ in 0..600 {
+            if let Some(record) = snapshot(task_id) {
+                if record.status.is_terminal() {
+                    return Some(record);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        None
+    }
+
+    // ── 1. 仅归档退化 DAG：节点数 / 边 / params 渲染 / pipeline_id ──────────
+
+    #[test]
+    fn test_watch_archive_pipeline_structure() {
+        let root = unique_root("arch-struct");
+        let input = root.join("clip.mp4");
+        let output = woutput(&root.join("dest"));
+        let p = build_watch_archive_pipeline("abc12345", "bt-watch", &input, &output).unwrap();
+
+        assert_eq!(p.id, "watcher/abc12345");
+        assert_eq!(p.nodes.len(), 2);
+        assert_eq!(p.edges.len(), 1);
+        assert_eq!(p.nodes[0].id, "input");
+        assert_eq!(
+            p.nodes[0].kind,
+            NodeKind::Builtin {
+                builtin: "file_input".to_string()
+            }
+        );
+        assert_eq!(
+            p.nodes[0].params,
+            json!({ "path": input.display().to_string() })
+        );
+        assert_eq!(p.nodes[1].id, "archive");
+        assert_eq!(
+            p.nodes[1].kind,
+            NodeKind::Builtin {
+                builtin: "file_archive".to_string()
+            }
+        );
+        // {rule} 物化期预渲染（区段头偏差声明）
+        assert_eq!(
+            p.nodes[1].params,
+            json!({
+                "dest_dir": root.join("dest").display().to_string(),
+                "name_template": "bt-watch-{name}.{ext}",
+                "on_conflict": "suffix",
+            })
+        );
+        assert_eq!(p.edges[0].from, ("input".to_string(), "output".to_string()));
+        assert_eq!(
+            p.edges[0].to,
+            ("archive".to_string(), "input".to_string())
+        );
+        // 物化 DAG 必须通过 P2-11 静态校验（提交路径同款）
+        assert!(p.validate().is_ok(), "{:?}", p.validate());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── 2. 模块直调退化 DAG：三节点 / 两边 / module 节点形状 ────────────────
+
+    #[test]
+    fn test_watch_module_pipeline_structure() {
+        let root = unique_root("mod-struct");
+        let input = root.join("a.wav");
+        let output = woutput(&root.join("dest"));
+        let p = build_watch_module_pipeline(
+            "deadbeef",
+            "asr-watch",
+            "faster-whisper",
+            "transcribe",
+            json!({ "language": "zh" }),
+            &input,
+            &output,
+        )
+        .unwrap();
+
+        assert_eq!(p.id, "watcher/deadbeef");
+        assert_eq!(p.nodes.len(), 3);
+        assert_eq!(p.edges.len(), 2);
+        assert_eq!(p.nodes[0].id, "input");
+        assert_eq!(p.nodes[1].id, "run");
+        assert_eq!(
+            p.nodes[1].kind,
+            NodeKind::Module {
+                module_id: "faster-whisper".to_string(),
+                capability: "transcribe".to_string(),
+                model_id: None,
+                device: None,
+            }
+        );
+        assert_eq!(p.nodes[1].params, json!({ "language": "zh" }));
+        assert_eq!(p.nodes[2].id, "archive");
+        assert_eq!(
+            p.nodes[2].kind,
+            NodeKind::Builtin {
+                builtin: "file_archive".to_string()
+            }
+        );
+        assert_eq!(p.edges[0].from, ("input".to_string(), "output".to_string()));
+        assert_eq!(p.edges[0].to, ("run".to_string(), "input".to_string()));
+        assert_eq!(p.edges[1].from, ("run".to_string(), "output".to_string()));
+        assert_eq!(
+            p.edges[1].to,
+            ("archive".to_string(), "input".to_string())
+        );
+        assert!(p.validate().is_ok(), "{:?}", p.validate());
+        // 非对象 params 归一为 {}
+        let p2 = build_watch_module_pipeline(
+            "deadbeef",
+            "asr-watch",
+            "m",
+            "c",
+            Value::Null,
+            &input,
+            &output,
+        )
+        .unwrap();
+        assert_eq!(p2.nodes[1].params, json!({}));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── 3. output 渲染：缺省归一 / 非法值快速失败 / 花括号守卫 ──────────────
+
+    #[test]
+    fn test_watch_archive_params_defaults_and_validation() {
+        let root = unique_root("params");
+        let input = root.join("x.txt");
+        // 空模板/空策略 → §5.5 缺省
+        let out = WatchArchiveOutput {
+            dest_dir: root.join("dest").display().to_string(),
+            name_template: String::new(),
+            on_conflict: String::new(),
+        };
+        let p = build_watch_archive_pipeline("r1", "rule-a", &input, &out).unwrap();
+        assert_eq!(
+            p.nodes[1].params,
+            json!({
+                "dest_dir": root.join("dest").display().to_string(),
+                "name_template": "{name}.{ext}",
+                "on_conflict": "suffix",
+            })
+        );
+        // 非绝对 dest_dir → 提交期拒绝
+        let rel = WatchArchiveOutput {
+            dest_dir: "relative/dest".to_string(),
+            name_template: String::new(),
+            on_conflict: String::new(),
+        };
+        assert!(matches!(
+            build_watch_archive_pipeline("r1", "rule-a", &input, &rel),
+            Err(SubmitError::InvalidPipeline(_))
+        ));
+        // 空 dest_dir → 提交期拒绝
+        let empty = WatchArchiveOutput {
+            dest_dir: "  ".to_string(),
+            name_template: String::new(),
+            on_conflict: String::new(),
+        };
+        assert!(matches!(
+            build_watch_archive_pipeline("r1", "rule-a", &input, &empty),
+            Err(SubmitError::InvalidPipeline(_))
+        ));
+        // 非法 on_conflict → 提交期拒绝（复用 ep-core 解析语义）
+        let bad = WatchArchiveOutput {
+            dest_dir: root.join("dest").display().to_string(),
+            name_template: String::new(),
+            on_conflict: "replace".to_string(),
+        };
+        assert!(matches!(
+            build_watch_archive_pipeline("r1", "rule-a", &input, &bad),
+            Err(SubmitError::InvalidPipeline(_))
+        ));
+        // 规则名含花括号 → 提交期拒绝（会经 {rule} 二次展开）
+        let brace_out = WatchArchiveOutput {
+            dest_dir: root.join("dest").display().to_string(),
+            name_template: "{rule}-{name}.{ext}".to_string(),
+            on_conflict: String::new(),
+        };
+        assert!(matches!(
+            build_watch_archive_pipeline("r1", "{da}te", &input, &brace_out),
+            Err(SubmitError::InvalidPipeline(_))
+        ));
+        // 规则名含路径分隔符 / 或 \ → 提交期拒绝（评审修复：防子目录/穿越渲染）
+        assert!(matches!(
+            build_watch_archive_pipeline("r1", "bt/watch", &input, &brace_out),
+            Err(SubmitError::InvalidPipeline(_))
+        ));
+        assert!(matches!(
+            build_watch_archive_pipeline("r1", "bt\\watch", &input, &brace_out),
+            Err(SubmitError::InvalidPipeline(_))
+        ));
+        // 规则名本身为 `..` → 提交期拒绝
+        assert!(matches!(
+            build_watch_archive_pipeline("r1", "..", &input, &brace_out),
+            Err(SubmitError::InvalidPipeline(_))
+        ));
+        // 正常规则名 → 正常渲染进模板
+        let p2 = build_watch_archive_pipeline("r1", "bt-watch", &input, &brace_out).unwrap();
+        assert_eq!(p2.nodes[1].params["name_template"], "bt-watch-{name}.{ext}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── 4. 仅归档提交端到端（真实执行：file_input → file_archive） ─────────
+
+    #[tokio::test]
+    async fn test_submit_direct_archive_runs_to_completion() {
+        let _guard = lock_for_tests();
+        let root = unique_root("arch-submit");
+        reset_and_bind_for_tests(&root);
+        let state = wtest_state(root.clone());
+
+        let input = root.join("movie.mp4");
+        std::fs::write(&input, "archive me").unwrap();
+        let dest_dir = root.join("archived");
+        let output = WatchArchiveOutput {
+            dest_dir: dest_dir.display().to_string(),
+            name_template: "{rule}-{name}.{ext}".to_string(),
+            on_conflict: "suffix".to_string(),
+        };
+
+        let task_id = submit_direct_archive(&state, "abc12345", "bt-watch", input.clone(), &output)
+            .await
+            .expect("仅归档提交应成功");
+        let record = wait_terminal(&task_id).await.expect("任务应在超时前终结");
+        assert_eq!(record.pipeline_id, "watcher/abc12345");
+        assert_eq!(record.status, TaskState::Completed, "{:?}", record.nodes);
+        assert_eq!(record.nodes.len(), 2);
+        assert_eq!(record.nodes["input"].state, "completed");
+        assert_eq!(record.nodes["archive"].state, "completed");
+        // {rule} → 规则名；{name}.{ext} → 上游文件名
+        let dest = dest_dir.join("bt-watch-movie.mp4");
+        assert!(dest.is_file(), "归档产物应落盘：{}", dest.display());
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "archive me");
+        // 输入文件保持原位（复制语义）
+        assert!(input.is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── 5. 仅归档提交：输入文件缺失 → 提交期拒绝 ────────────────────────────
+
+    #[tokio::test]
+    async fn test_submit_direct_archive_missing_input_rejected() {
+        let _guard = lock_for_tests();
+        let root = unique_root("arch-missing");
+        reset_and_bind_for_tests(&root);
+        let state = wtest_state(root.clone());
+        let output = woutput(&root.join("dest"));
+        let err = submit_direct_archive(&state, "abc12345", "r", root.join("ghost.mp4"), &output)
+            .await
+            .expect_err("缺失输入应被拒绝");
+        assert!(matches!(err, SubmitError::InputMissing(_)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── 6. 模块直调：ensure 拉起失败 → ModuleStartFailed，不物化任务 ────────
+
+    #[tokio::test]
+    async fn test_submit_direct_module_ensure_failure_rejects() {
+        let _guard = lock_for_tests();
+        let root = unique_root("mod-ensure-fail");
+        reset_and_bind_for_tests(&root);
+        let state = wtest_state(root.clone());
+
+        let input = root.join("a.wav");
+        std::fs::write(&input, "x").unwrap();
+        let output = woutput(&root.join("dest"));
+        // ghost 模块未注册 → 真实 ensure 路径拉起失败
+        let err = submit_direct_module(
+            &state,
+            "abc12345",
+            "r",
+            "ghost-mod",
+            "transcribe",
+            json!({}),
+            input,
+            &output,
+        )
+        .await
+        .expect_err("未注册模块应拉起失败");
+        assert!(matches!(err, SubmitError::ModuleStartFailed(_)));
+        // 未物化任务（注册表无记录）
+        assert!(snapshot_all().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── 7. 模块直调（mock ensure）：三节点物化 + watcher 命名空间 ───────────
+
+    #[tokio::test]
+    async fn test_submit_direct_module_with_mock_ensure_submits() {
+        let _guard = lock_for_tests();
+        let root = unique_root("mod-mock");
+        reset_and_bind_for_tests(&root);
+        let state = wtest_state(root.clone());
+
+        let input = root.join("a.wav");
+        std::fs::write(&input, "x").unwrap();
+        let dest_dir = root.join("dest");
+        let output = WatchArchiveOutput {
+            dest_dir: dest_dir.display().to_string(),
+            name_template: "{rule}-{name}.{ext}".to_string(),
+            on_conflict: "suffix".to_string(),
+        };
+
+        // Arc：EnsureRunningFuture 要求 'static，桩内标志以 Arc 共享
+        let ensured = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ensured_flag = Arc::clone(&ensured);
+        let task_id = submit_direct_module_with(
+            state.clone(),
+            "feedc0de".to_string(),
+            "asr-watch".to_string(),
+            "fake-mod".to_string(),
+            "transcribe".to_string(),
+            json!({}),
+            input,
+            output,
+            |_state, module_id| {
+                // 注入桩：绕开真实模块拉起，但验证确实被调用
+                let ensured = Arc::clone(&ensured_flag);
+                Box::pin(async move {
+                    ensured.store(true, Ordering::SeqCst);
+                    assert_eq!(module_id, "fake-mod");
+                    Ok(())
+                })
+            },
+        )
+        .await
+        .expect("mock ensure 下提交应成功");
+        assert!(ensured.load(Ordering::SeqCst), "拉起钩子应先于物化调用");
+
+        let record = wait_terminal(&task_id).await.expect("任务应在超时前终结");
+        assert_eq!(record.pipeline_id, "watcher/feedc0de");
+        // 三节点退化 DAG 形状（fake 模块无端口 → 任务失败，但结构已物化）
+        assert_eq!(record.node_order, vec!["input", "run", "archive"]);
+        assert_eq!(record.nodes.len(), 3);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

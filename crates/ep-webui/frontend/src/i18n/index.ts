@@ -13,6 +13,7 @@ import zhRun from '@i18n/locales/zh-CN/run.json'
 import zhTasks from '@i18n/locales/zh-CN/tasks.json'
 import zhSettings from '@i18n/locales/zh-CN/settings.json'
 import zhComponents from '@i18n/locales/zh-CN/components.json'
+import zhTriggers from '@i18n/locales/zh-CN/triggers.json'
 import enCommon from '@i18n/locales/en/common.json'
 import enDashboard from '@i18n/locales/en/dashboard.json'
 import enModules from '@i18n/locales/en/modules.json'
@@ -23,6 +24,7 @@ import enRun from '@i18n/locales/en/run.json'
 import enTasks from '@i18n/locales/en/tasks.json'
 import enSettings from '@i18n/locales/en/settings.json'
 import enComponents from '@i18n/locales/en/components.json'
+import enTriggers from '@i18n/locales/en/triggers.json'
 
 /** 前端支持的语言码 */
 export type AppLanguage = 'zh-CN' | 'en'
@@ -47,6 +49,7 @@ const resources = {
     tasks: zhTasks,
     settings: zhSettings,
     components: zhComponents,
+    triggers: zhTriggers,
   },
   en: {
     common: enCommon,
@@ -59,6 +62,7 @@ const resources = {
     tasks: enTasks,
     settings: enSettings,
     components: enComponents,
+    triggers: enTriggers,
   },
 } as const
 

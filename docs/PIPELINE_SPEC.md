@@ -4,7 +4,10 @@
 > 2026-08-13 桌面端退役作废（WebUI 为唯一 UI）；**规范本体（DAG 管线格式与
 > 执行语义）是现役管线引擎的唯一规范，持续有效并维护**（退役背景见 README.md）。
 
-> 版本：1.1 | 适用于 EntryPoint v0.x
+> 版本：1.2 | 适用于 EntryPoint v0.x
+>
+> v1.2 变更：新增 `file_archive`（§5.8）与 `file_gate`（§5.9）内置节点；
+> 验证规则补 `file_gate` 条件检查（§10 规则 11）。
 >
 > v1.1 变更：新增「节点开发指南」章节（§11，决策 5：module/builtin 两条路径全面文档化）；
 > `external_api` 节点更名 `llm`（builtin，旧名保留为别名，§5.7/§11.4，决策 4）；
@@ -183,7 +186,8 @@ to = ["denoise", "input"]
 ## 5. 内置节点参考
 
 > **实现状态**：当前执行器实现的 builtin 节点为 `file_input` / `file_output` /
-> `ffmpeg` / `llm`（§5.7，`external_api` 为其可执行别名）；其余
+> `ffmpeg` / `llm`（§5.7，`external_api` 为其可执行别名）/ `file_archive`（§5.8）/
+> `file_gate`（§5.9）；其余
 > （`text_concat` / `json_transform` / `delay`）为规范预留形状，**尚未实现**——
 > 加载含这些节点的管线会在执行时报 `unknown builtin node type`。
 > 字幕导出等需求请用模块节点的产物协议替代（MODULE_SPEC.md §5，
@@ -318,6 +322,130 @@ timeout_secs = 120
 
 输入端口：`input`（text）
 输出端口：`output`（text）
+
+### 5.8 `file_archive` — 产物归档（命名模板 + 冲突策略）
+
+无人值守场景的产物命名/存储规范节点：取上游文件，按命名模板复制到归档目录
+（模板展开与冲突处理为独立纯函数模块 `crates/ep-core/src/archive.rs`，与触发器
+直接模式的产物投递共用同一套逻辑，AUTOMATION.md §4.2）。
+
+```toml
+[[nodes]]
+id = "archive"
+kind = "builtin"
+builtin = "file_archive"
+label = "归档产物"
+params = { dest_dir = "/data/archive", name_template = "{name}-{date}.{ext}", on_conflict = "suffix" }
+```
+
+| 参数 | 类型 | 必须 | 默认 | 说明 |
+|---|---|---|---|---|
+| `dest_dir` | string | ✅ | — | 归档目标目录，**必须绝对路径**（相对路径执行报错）；目录不存在时落盘前自动创建 |
+| `name_template` | string | ❌ | `"{name}.{ext}"` | 命名模板（占位符见下表）；空串报错；**未知占位符原样保留**（笔误不静默吞字，便于排查） |
+| `on_conflict` | string | ❌ | `"suffix"` | 目标已存在时：`suffix`（扩展名前追加 `-1`…`-999`，全部占用报错）/ `overwrite`（直接覆盖）/ `skip`（放弃归档） |
+
+**命名模板占位符：**
+
+| 占位符 | 含义 | 来源 |
+|---|---|---|
+| `{name}` | 无扩展名文件名（`a.b.c` → `a.b`；`.bashrc` 视为无扩展名） | 上游文件名 |
+| `{ext}` | 小写扩展名（无点） | 上游文件名 |
+| `{date}` | `YYYYMMDD`（本地时区） | 当前时间 |
+| `{datetime}` | `YYYYMMDD-HHMMSS`（本地时区） | 当前时间 |
+| `{rule}` | 触发规则名；普通手动任务为空串 | 触发器直调提交时由 daemon 在物化期预渲染进 `name_template`（手动/schedule 任务的 `{rule}` 恒为空串） |
+| `{seq}` | 冲突序号（无冲突 = 0） | 冲突解析 |
+
+行为要点：
+
+- 取上游**首个**文件产物 → 渲染模板 → 冲突策略 → 复制落盘，返回归档路径产物（文件入 → 文件出）；
+- 源文件无扩展名时，模板中的字面 `.{ext}` 整段移除（避免渲染出尾点文件名），其余位置的 `{ext}` 展开为空串；
+- 模板含 `{seq}` 时按序号递增探测首个空闲名（`suffix`）；`skip` 以 seq=0 判定（存在即放弃）；`overwrite` 直接取 seq=0；
+- `on_conflict = "skip"` 命中时**正常完成**（不视为错误，记日志），透传源文件产物；
+- 模板渲染结果应为相对 `dest_dir` 的**扁平文件名**——执行器只创建 `dest_dir` 本身，不自动创建模板派生的中间子目录。
+
+输入端口：`input`（file）
+输出端口：`output`（file）
+
+**示例（触发器自动化范式 `file_input → file_gate → file_archive`）：**
+
+```toml
+[pipeline]
+id = "watch-archive"
+name = "归档新视频"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+# path 参数缺省：触发器管线模式注入（AUTOMATION.md §4.2）
+
+[[nodes]]
+id = "gate"
+kind = "builtin"
+builtin = "file_gate"
+label = "仅大视频"
+params = { extensions = ["mkv", "mp4"], min_size_bytes = 1048576 }
+
+[[nodes]]
+id = "archive"
+kind = "builtin"
+builtin = "file_archive"
+label = "按日期归档"
+params = { dest_dir = "/data/archive", name_template = "{name}-{date}.{ext}", on_conflict = "suffix" }
+
+[[edges]]
+from = ["input", "output"]
+to = ["gate", "input"]
+
+[[edges]]
+from = ["gate", "output"]
+to = ["archive", "input"]
+```
+
+### 5.9 `file_gate` — 条件门禁
+
+单一节点收敛全部文件过滤语义（扩展名 / 大小 / 文件名 / 媒体属性），不再新增
+杂项文件操作类内置节点。满足条件 → 透传上游文件；不满足 → 按 `on_mismatch`
+跳过或失败。**静态校验要求至少配置一项过滤条件**，否则加载/保存报错
+（`GateNoConditions`）。
+
+```toml
+[[nodes]]
+id = "gate"
+kind = "builtin"
+builtin = "file_gate"
+label = "过滤长视频"
+params = { extensions = ["mp4", "mkv"], min_size_bytes = 1048576, media = { min_duration_secs = 60 }, on_mismatch = "skip" }
+```
+
+| 参数 | 类型 | 必须 | 默认 | 说明 |
+|---|---|---|---|---|
+| `extensions` | string[] | ❌ | — | 扩展名**白**名单（自动去点、转小写；空 = 不启用） |
+| `extensions_exclude` | string[] | ❌ | — | 扩展名**黑**名单（同上；命中即不满足） |
+| `min_size_bytes` | integer | ❌ | — | 文件大小下界（字节，含） |
+| `max_size_bytes` | integer | ❌ | — | 文件大小上界（字节，含） |
+| `filename_regex` | string | ❌ | — | 文件名正则；**受限子集语法**（见下）；编译失败按「不满足」处理 |
+| `media` | table | ❌ | — | 媒体探测条件：`min_duration_secs` / `max_duration_secs`（秒）/ `min_width` / `min_height`（像素）。经 `ffprobe -v error -print_format json -show_format -show_streams` 探测（30s 超时）；ffprobe 缺失/超时/解析失败一律按「不满足」处理 |
+| `on_mismatch` | string | ❌ | `"skip"` | 不满足时：`skip`（跳过）/ `fail`（节点报错）。非法值显式报错 |
+
+所有已配置条件**逐一 AND**；文件元数据读取失败（大小条件）同样按「不满足」。
+
+**`filename_regex` 受限子集**（零新依赖的手写引擎，匹配语义与
+`regex::Regex::is_match` 一致：任意子串命中即满足）：字面量、`.`、`*`、`+`、`?`、
+`{m}` / `{m,}` / `{m,n}`（非贪婪后缀被忽略）、`[...]`（含范围 `a-z` 与取反 `^`）、
+`(...)` 分组、顶层与组内 `|` 分支、`\` 转义（含 `\d` `\D` `\w` `\W` `\s` `\S`）、
+首尾 `^` `$` 锚点。不支持的语法（中间锚点、前瞻等）编译期报错 → 按不满足处理。
+
+**不满足语义：**
+
+- `on_mismatch = "fail"`：节点返回错误，走既有「失败 → 下游 Skipped」语义；
+- `on_mismatch = "skip"`（默认）：返回空产物（`Artifact::None`）——下游节点若
+  **全部输入**均为空产物则置 Skipped（原因注明「无匹配输出」），任务终态仍为
+  Completed（Skipped 不计入失败）；多分支场景中仅空输入的分支被跳过，其余分支
+  正常执行。取消 / 失败 / 同层兄弟节点的既有语义不受影响。
+
+输入端口：`input`（file）
+输出端口：`output`（file）
 
 ---
 
@@ -668,6 +796,7 @@ to = ["save", "input"]
 | 8 | module 节点的模型已下载 | Warning |
 | 9 | external_api 节点的 API Key 已配置 | Warning |
 | 10 | 无孤立节点（无边连接） | Warning |
+| 11 | `file_gate` 节点至少配置一项过滤条件（§5.9） | Error |
 
 Error = 阻止保存/运行；Warning = 允许保存但运行时可能失败。
 
@@ -690,7 +819,7 @@ Error = 阻止保存/运行；Warning = 允许保存但运行时可能失败。
 | 引擎改动 | **零**（能力声明驱动） | 四处清单（§11.3） |
 | 进入编辑器方式 | 自动（`/api/modules` 返回 capabilities，节点库数据驱动渲染） | 手工注册（前端 BUILTIN_DEFS） |
 | 分发 | 模块目录随整合包/仓库分发 | 随 EntryPoint 版本发布 |
-| 典型例子 | faster-whisper `transcribe`、deep-filter `denoise` | `file_input` / `file_output` / `ffmpeg` / `llm` |
+| 典型例子 | faster-whisper `transcribe`、deep-filter `denoise` | `file_input` / `file_output` / `ffmpeg` / `llm` / `file_archive` / `file_gate` |
 
 ### 11.2 module 节点路径（扩展正路）
 

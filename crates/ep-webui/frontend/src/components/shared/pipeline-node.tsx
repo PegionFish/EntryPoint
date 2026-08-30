@@ -1,12 +1,14 @@
 import { Handle, Position } from '@xyflow/react'
 import type { Node, NodeProps, NodeTypes } from '@xyflow/react'
 import {
+  Archive,
   AudioLines,
   Brain,
   FileInput,
   FileOutput,
   FileVideo,
   Film,
+  Filter,
   Globe,
   Image as ImageIcon,
   Languages,
@@ -373,7 +375,13 @@ export function moduleCapability(_category: string): CapabilityDef {
 // 内置节点定义
 // ============================================================
 
-export type BuiltinKind = 'file_input' | 'file_output' | 'ffmpeg' | 'llm'
+export type BuiltinKind =
+  | 'file_input'
+  | 'file_output'
+  | 'ffmpeg'
+  | 'llm'
+  | 'file_archive'
+  | 'file_gate'
 
 export interface BuiltinDef {
   kind: BuiltinKind
@@ -518,11 +526,135 @@ export const BUILTIN_DEFS: Record<BuiltinKind, BuiltinDef> = {
       },
     ],
   },
+  // §5.5：file_archive —— 产物归档（命名模板 + 冲突策略），文件入 → 文件出
+  file_archive: {
+    kind: 'file_archive',
+    get label() { return t('pipeline:nodes.fileArchive.label') },
+    get description() { return t('pipeline:nodes.fileArchive.description') },
+    icon: Archive,
+    accent: 'bg-node-file-output/15 text-node-file-output',
+    inputs: [{ id: 'in', get label() { return t('components:pipeline.port.input') }, dataType: 'file' }],
+    outputs: [{ id: 'out', get label() { return t('components:pipeline.port.output') }, dataType: 'file' }],
+    params: [
+      {
+        name: 'dest_dir',
+        get label() { return t('pipeline:nodes.fileArchive.param.destDir') },
+        type: 'string',
+        required: true,
+        placeholder: '/workspace/archive',
+        get hint() { return t('pipeline:nodes.fileArchive.param.destDir.hint') },
+      },
+      {
+        name: 'name_template',
+        get label() { return t('pipeline:nodes.fileArchive.param.nameTemplate') },
+        type: 'string',
+        defaultValue: '{name}.{ext}',
+        placeholder: '{name}-{date}.{ext}',
+        get hint() { return t('pipeline:nodes.fileArchive.param.nameTemplate.hint') },
+      },
+      {
+        name: 'on_conflict',
+        get label() { return t('pipeline:nodes.fileArchive.param.onConflict') },
+        type: 'select',
+        options: ['suffix', 'overwrite', 'skip'],
+        defaultValue: 'suffix',
+        get hint() { return t('pipeline:nodes.fileArchive.param.onConflict.hint') },
+      },
+    ],
+  },
+  // §5.6：file_gate —— 条件门禁（全部过滤语义收敛于单一节点），文件入 → 文件出。
+  // media 条件在 UI 以平铺键（media_*）编辑，保存时由 toSpec 收敛为
+  // 后端契约的嵌套 media 对象（pipeline.tsx），加载时反向还原。
+  file_gate: {
+    kind: 'file_gate',
+    get label() { return t('pipeline:nodes.fileGate.label') },
+    get description() { return t('pipeline:nodes.fileGate.description') },
+    icon: Filter,
+    accent: 'bg-node-external/15 text-node-external',
+    inputs: [{ id: 'in', get label() { return t('components:pipeline.port.input') }, dataType: 'file' }],
+    outputs: [{ id: 'out', get label() { return t('components:pipeline.port.output') }, dataType: 'file' }],
+    params: [
+      {
+        name: 'extensions',
+        get label() { return t('pipeline:nodes.fileGate.param.extensions') },
+        type: 'string_array',
+        placeholder: 'mp4',
+        get hint() { return t('pipeline:nodes.fileGate.param.extensions.hint') },
+      },
+      {
+        name: 'extensions_exclude',
+        get label() { return t('pipeline:nodes.fileGate.param.extensionsExclude') },
+        type: 'string_array',
+        placeholder: 'jpg',
+        get hint() { return t('pipeline:nodes.fileGate.param.extensionsExclude.hint') },
+      },
+      {
+        name: 'min_size_bytes',
+        get label() { return t('pipeline:nodes.fileGate.param.minSizeBytes') },
+        type: 'number',
+        min: 0,
+        step: 1,
+      },
+      {
+        name: 'max_size_bytes',
+        get label() { return t('pipeline:nodes.fileGate.param.maxSizeBytes') },
+        type: 'number',
+        min: 0,
+        step: 1,
+      },
+      {
+        name: 'filename_regex',
+        get label() { return t('pipeline:nodes.fileGate.param.filenameRegex') },
+        type: 'string',
+        placeholder: '^episode_\\d+\\.mp4$',
+        get hint() { return t('pipeline:nodes.fileGate.param.filenameRegex.hint') },
+      },
+      {
+        name: 'media_min_duration_secs',
+        get label() { return t('pipeline:nodes.fileGate.param.mediaMinDurationSecs') },
+        type: 'number',
+        min: 0,
+        step: 0.1,
+        get hint() { return t('pipeline:nodes.fileGate.param.media.hint') },
+      },
+      {
+        name: 'media_max_duration_secs',
+        get label() { return t('pipeline:nodes.fileGate.param.mediaMaxDurationSecs') },
+        type: 'number',
+        min: 0,
+        step: 0.1,
+      },
+      {
+        name: 'media_min_width',
+        get label() { return t('pipeline:nodes.fileGate.param.mediaMinWidth') },
+        type: 'number',
+        min: 0,
+        step: 1,
+      },
+      {
+        name: 'media_min_height',
+        get label() { return t('pipeline:nodes.fileGate.param.mediaMinHeight') },
+        type: 'number',
+        min: 0,
+        step: 1,
+      },
+      {
+        name: 'on_mismatch',
+        get label() { return t('pipeline:nodes.fileGate.param.onMismatch') },
+        type: 'select',
+        options: ['skip', 'fail'],
+        defaultValue: 'skip',
+        get hint() { return t('pipeline:nodes.fileGate.param.onMismatch.hint') },
+      },
+    ],
+  },
 }
 
 export const BUILTIN_LIST: BuiltinDef[] = [
   BUILTIN_DEFS.file_input,
   BUILTIN_DEFS.file_output,
+  BUILTIN_DEFS.file_archive,
+  BUILTIN_DEFS.file_gate,
   BUILTIN_DEFS.ffmpeg,
   BUILTIN_DEFS.llm,
 ]
@@ -1398,7 +1530,7 @@ export function ModuleNode({ data, selected }: NodeProps<ModuleFlowNode>) {
   )
 }
 
-/** 内置节点：file_input / file_output / ffmpeg / llm */
+/** 内置节点：file_input / file_output / file_archive / file_gate / ffmpeg / llm */
 export function BuiltinNode({ data, selected }: NodeProps<BuiltinFlowNode>) {
   const def = BUILTIN_DEFS[data.builtin]
   const Icon = def.icon
@@ -1409,6 +1541,16 @@ export function BuiltinNode({ data, selected }: NodeProps<BuiltinFlowNode>) {
     preview = args.length > 0 ? args.join(' ') : null
   } else if (data.builtin === 'llm') {
     preview = typeof data.params.model === 'string' && data.params.model ? data.params.model : null
+  } else if (data.builtin === 'file_archive') {
+    preview =
+      typeof data.params.dest_dir === 'string' && data.params.dest_dir ? data.params.dest_dir : null
+  } else if (data.builtin === 'file_gate') {
+    const exts = normalizeStringArrayParam(data.params.extensions)
+    const regex =
+      typeof data.params.filename_regex === 'string' && data.params.filename_regex
+        ? data.params.filename_regex
+        : ''
+    preview = exts.length > 0 ? exts.join(', ') : regex || null
   } else {
     preview = typeof data.params.path === 'string' && data.params.path ? data.params.path : null
   }

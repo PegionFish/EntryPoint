@@ -2,6 +2,7 @@ pub mod autostart;
 pub mod config;
 pub mod deps;
 pub mod devices;
+pub mod events;
 pub mod execute;
 pub mod health;
 pub mod inference;
@@ -13,6 +14,7 @@ pub mod packs;
 pub mod pipelines;
 pub mod tasks;
 pub mod upload;
+pub mod watchers;
 
 use std::sync::Arc;
 
@@ -35,6 +37,7 @@ pub fn api_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
         .merge(health::router())
         .merge(devices::router())
+        .merge(events::router())
         .merge(modules::router())
         // 模块标准档案导入/导出（HETERO_DIST_PLAN §2.2/§2.3，WS-A-api）
         .merge(module_import::router())
@@ -47,6 +50,8 @@ pub fn api_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .merge(deps::router())
         .merge(packs::router())
         .merge(module_proxy::router())
+        // 触发规则（PLAN_TRIGGER_UNIFIED_LOG §5.3；巡检循环由 main.rs 驱动）
+        .merge(watchers::router())
         // 统一推理 API v1 门面（/v1/*，外部稳定契约；token 中间件仅作用其子路由）
         .merge(inference::router(state))
         // 未匹配的 /api/* → 404 + JSON，避免落入 SPA 的 HTML fallback

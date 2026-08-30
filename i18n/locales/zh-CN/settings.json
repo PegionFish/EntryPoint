@@ -105,5 +105,7 @@
   "modulesLifecycle.title": "模块生命周期",
   "modulesLifecycle.description": "模型按需加载、空闲自动释放，控制内存/显存占用与功耗；下次任务自动重载。",
   "modulesLifecycle.idleTimeout": "空闲自动释放（秒）",
-  "modulesLifecycle.idleTimeoutDescription": "运行中模块持续无任务触达超过该时长即自动停止并释放资源；0 = 停用（常驻）。缺省 1800（30 分钟）。"
+  "modulesLifecycle.idleTimeoutDescription": "运行中模块持续无任务触达超过该时长即自动停止并释放资源；0 = 停用（常驻）。缺省 1800（30 分钟）。",
+  "logRetention.label": "日志保留天数",
+  "logRetention.description": "统一事件日志与模块日志文件超过该天数后由每小时巡检清理；0 = 永久保留（不清理）。缺省 90。"
 }

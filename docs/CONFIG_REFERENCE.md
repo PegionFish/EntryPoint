@@ -1,6 +1,11 @@
 # 配置参考 (Configuration Reference)
 
-> 版本：1.2 | 适用于 EntryPoint v0.x（更新于 2026-08-05）
+> 版本：1.3 | 适用于 EntryPoint v0.x
+>
+> v1.3 变更（PLAN_TRIGGER_UNIFIED_LOG §5.7）：新增 `[general].log_retention_days`
+> （`runtime/logs/` 下事件日志与模块日志的保留天数，0 = 永久）；目录结构总览
+> 补 `runtime/logs/`（模块日志 + 统一事件日志）、`runtime/tasks/`（任务注册表）、
+> `runtime/watchers.json`（触发规则注册表），并修订「不产生 logs/ 目录」的过时注释。
 >
 > v1.2 变更（PACK_UNIFY_PLAN §3/§8.3）：新增 `[python].uv_cache_dir` /
 > `[python].constraints`、`[compute].cuda_libs_dir`、`[packs].staging_dir`、
@@ -21,6 +26,7 @@
 | `theme` | string | `"dark"` | 主题（`dark` / `light`） |
 | `log_level` | string | `"info"` | 日志级别（`trace` / `debug` / `info` / `warn` / `error`） |
 | `check_updates` | bool | `true` | 启动时检查模块更新 |
+| `log_retention_days` | u64 | `90` | 统一日志保留天数：`runtime/logs/` 下**统一事件日志**（`events-YYYY-MM.jsonl`）与**模块日志**（`*.log`）按文件 mtime 清理巡检（daemon 每小时一轮）的保留窗口。**`0` = 永久保留**（跳过清理）。daemon 自身运行日志不落盘（控制台 / journal），不受此项影响 |
 
 ```toml
 [general]
@@ -28,6 +34,7 @@ language = "zh-CN"
 theme = "dark"
 log_level = "info"
 check_updates = true
+log_retention_days = 90   # 0 = 永久保留
 ```
 
 ### 1.2 `[compute]` — 计算设备
@@ -298,6 +305,7 @@ language = "zh-CN"
 theme = "dark"
 log_level = "info"
 check_updates = true
+log_retention_days = 90
 
 [compute]
 strategy = "least_memory"
@@ -543,7 +551,13 @@ EntryPoint/                        ← 应用根目录
 │   │       └── ... (venv 内容)
 │   ├── .uv-cache/                 ← uv 缓存（[python].uv_cache_dir，硬链接去重源）
 │   ├── cuda-libs/                 ← 共享 CUDA 库（[compute].cuda_libs_dir）
-│   └── packs/                     ← 已装整合包注册表（<pack-id>.json）
+│   ├── packs/                     ← 已装整合包注册表（<pack-id>.json）
+│   ├── tasks/                     ← 任务注册表（原子落盘；重启后非终态任务改判 failed）
+│   ├── watchers.json              ← 触发器规则注册表（原子落盘；WebUI 触发器页 CRUD）
+│   └── logs/                      ← 模块日志（<module>*.log）+ 统一事件日志
+│       ├── <module>*.log          ←   daemon 捕获的模块子进程输出（WebUI 日志抽屉展示）
+│       └── events-YYYY-MM.jsonl   ←   统一事件日志（watcher_trigger / task_terminal，
+│                                        单行 JSON 追加、按月滚动；log_retention_days 清理）
 ├── .pack-staging/                 ← 整合包导入/构建暂存（[packs].staging_dir，随用随清）
 ├── workspace/                     ← 管线任务工作目录
 │   └── <task-id>/
@@ -553,9 +567,6 @@ EntryPoint/                        ← 应用根目录
     ├── PIPELINE_SPEC.md
     ├── CONFIG_REFERENCE.md
     └── WEBUI_GUIDE.md
-
-# 注：当前不产生 logs/ 目录——daemon 日志走控制台 / systemd journal，
-# 模块日志由 daemon 捕获后在 WEBUI_GUIDE.md §4.1 日志抽屉展示。
 
 <model_cache_dir>/                 ← 模型缓存（用户可指定位置）
 ├── faster-whisper-large-v3/

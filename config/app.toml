@@ -8,6 +8,7 @@ language = "zh-CN"
 theme = "dark"
 log_level = "info"
 check_updates = true
+log_retention_days = 90
 
 [compute]
 strategy = "least_memory"

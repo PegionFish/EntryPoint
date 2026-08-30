@@ -10,5 +10,15 @@
   "module.notRunning": "模块未在运行：{{id}}",
   "module.stopFailed": "停止模块失败：{{detail}}",
   "config.saveFailed": "保存配置失败：{{detail}}",
-  "config.invalidPatch": "配置补丁无效：{{detail}}"
+  "config.invalidPatch": "配置补丁无效：{{detail}}",
+  "watcher.nameRequired": "规则名称不能为空",
+  "watcher.watchDirRequired": "监控目录不能为空",
+  "watcher.watchDirNotAbsolute": "监控目录必须为绝对路径",
+  "watcher.actionRequired": "必须配置动作：直接模式或管线模式二选一",
+  "watcher.actionConflict": "直接模式与管线模式互斥，只能配置其一",
+  "watcher.inputNodeInvalid": "注入节点在所选管线中不存在",
+  "watcher.capabilityInvalid": "模块或能力不存在：{{detail}}",
+  "watcher.outputRequired": "直接模式必须配置输出，且目标目录须为绝对路径",
+  "watcher.notFound": "触发规则不存在：{{id}}",
+  "watcher.saveFailed": "保存触发规则失败：{{detail}}"
 }

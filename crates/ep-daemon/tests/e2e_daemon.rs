@@ -45,6 +45,17 @@ mod ws;
 mod logging;
 #[path = "../src/schedule.rs"]
 mod schedule;
+// W0-B 统一事件日志：api/events.rs 与 execution.rs 终态收尾引用
+// `crate::eventlog`（W1-E 补挂；allow(dead_code)——清理/写入辅助仅 main.rs
+// 循环消费，本集成测试二进制不可达）
+#[allow(dead_code)]
+#[path = "../src/eventlog.rs"]
+mod eventlog;
+// W0-C watcher 核心：api/watchers.rs 引用 `crate::watcher`（W1-E 补挂；
+// 扫描引擎单测随本集成测试再跑一遍，TESTLOCK 不适用但均为纯函数/临时目录隔离）
+#[allow(dead_code)]
+#[path = "../src/watcher.rs"]
+mod watcher;
 
 // ─── 公共 harness ────────────────────────────────────────────────────────────
 
@@ -1673,6 +1684,32 @@ mod e2e_gate_cancel {
             "排队中取消的任务从未进入 running"
         );
         assert!(!dest_b.exists(), "B 的输出文件不应产生");
+
+        // 排队取消也须落 task_terminal 事件（评审修复：queued 分支绕过
+        // finalize，事件在 request_cancel 内补写；eventlog 为 crate 内部，
+        // 此处直读 runtime/logs/events-*.jsonl）
+        {
+            let logs_dir = root.join("runtime").join("logs");
+            let mut found: Option<serde_json::Value> = None;
+            for entry in std::fs::read_dir(&logs_dir).expect("logs 目录应存在") {
+                let path = entry.unwrap().path();
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if !(name.starts_with("events-") && name.ends_with(".jsonl")) {
+                    continue;
+                }
+                let content = std::fs::read_to_string(&path).unwrap();
+                for line in content.lines() {
+                    if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) {
+                        if ev["type"] == "task_terminal" && ev["task_id"] == task_b {
+                            found = Some(ev);
+                        }
+                    }
+                }
+            }
+            let ev = found.expect("排队取消应写 task_terminal 事件");
+            assert_eq!(ev["status"], "cancelled", "{ev}");
+            assert_eq!(ev["pipeline_id"], "cq-b", "{ev}");
+        }
 
         // 重复取消终态任务 → 409
         let resp = oneshot(
