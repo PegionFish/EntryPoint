@@ -158,6 +158,7 @@ sync_module() { # $1=module_id
   log "$(printf '%-18s -> %s%s' "$mid" "$target" "$([[ $multi -eq 1 ]] && echo "/adapters/$mid")")"
   rsync -a --delete --exclude='.git' --exclude='__pycache__' --exclude='README.md' \
         --exclude='ADAPTER.md' --exclude='upstream.json' \
+        --exclude='nunif' \
         "$EP_ROOT/modules/$mid/" "$dest/"
 
   # README / ADAPTER.md / upstream.json 的独立维护
