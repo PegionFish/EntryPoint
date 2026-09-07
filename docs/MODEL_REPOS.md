@@ -21,6 +21,7 @@ EntryPoint 的每个推理模块（`modules/<module_id>/`）本质上是**对某
 | `realesr` | [xinntao/Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) | [EntryPoint_Real-ESRGAN/adapters/realesr](https://github.com/PegionFish/EntryPoint_Real-ESRGAN) | realesr-animevideov3-* |
 | `rembg` | [danielgatis/rembg](https://github.com/danielgatis/rembg) | [EntryPoint_rembg](https://github.com/PegionFish/EntryPoint_rembg) | u2net, u2netp, isnet-anime, u2net_human_seg, u2net_cloth_seg 等 |
 | `rife` | [nihui/rife-ncnn-vulkan](https://github.com/nihui/rife-ncnn-vulkan) | [EntryPoint_rife-ncnn-vulkan](https://github.com/PegionFish/EntryPoint_rife-ncnn-vulkan) | rife-v46-ncnn |
+| `waifu2x` | [nagadomi/nunif](https://github.com/nagadomi/nunif) | `EntryPoint_waifu2x`（本地反向同步，尚未发布 GitHub） | waifu2x 图像/视频超分降噪（swin_unet，MIT） |
 
 ## 目录位置与结构
 

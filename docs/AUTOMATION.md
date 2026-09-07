@@ -1,6 +1,7 @@
 # 自动化集成指南 (Automation Guide)
 
 > 适用于 EntryPoint v0.x | 契约依据：PACK_UNIFY_PLAN §6.5（管线即 API）与决策 6（watcher 示例）
+> 端点遵循 [docs/API_DESIGN.md](API_DESIGN.md) canonical 表（v0.2）
 
 本文档面向**外部系统集成方**：如何用 HTTP API 把 EntryPoint 当作无人值守的
 媒体/模型处理后端——提交执行、跟踪任务、接收回调，以及内建触发器与外部
@@ -13,7 +14,7 @@ watcher 的接入模式。
 ```
 外部系统（watcher / 定时任务 / 业务后端）
    │  ① 发现新素材（文件系统事件 / 业务触发）
-   │  ② POST /api/pipelines/execute（或 /api/execute/single）
+   │  ② POST /api/pipelines/{pipeline_id}/runs（或单能力直跑 /api/modules/{module_id}/runs）
    ▼
 EntryPoint daemon（/api，默认 :9800）
    │  ③ 模块未运行 → 自动拉起并等健康
@@ -26,20 +27,29 @@ EntryPoint daemon（/api，默认 :9800）
 
 | 能力 | 契约 |
 |---|---|
-| **模块自动拉起** | execute/single 提交时引用模块未运行 → 自动启动并等健康；超时计入任务错误 |
-| **同步模式** | execute 请求可选 `wait: true` → 阻塞至终态，响应直接带 status + artifacts |
+| **模块自动拉起** | 提交执行（管线 run 或单能力直跑）时引用模块未运行 → 自动启动并等健康；超时计入任务错误 |
+| **同步模式** | 提交请求可选 `wait: true` → 阻塞至终态，响应直接带 status + artifacts |
 | **完成回调** | 可选 `callback_url` → 终态时 `POST {task_id, status, artifacts}`（best-effort，失败仅 warn） |
 
 ---
 
 ## 2. 提交执行
 
-### 2.1 `POST /api/pipelines/execute` — 管线执行
+### 2.1 管线执行 — `POST /api/pipelines/{pipeline_id}/runs` 与 `POST /api/pipelines/runs`
+
+「执行一次 = 建 run 资源」，canonical 按场景分流：
+
+- **按 id 执行已落盘管线** → `POST /api/pipelines/{pipeline_id}/runs`
+  （路径指名：body 缺省 `pipeline_id` 时自路径注入，同传时路径优先）；
+- **内联 spec 跑未落盘管线** → 集合级创建 `POST /api/pipelines/runs`
+  （body 带 `pipeline_id` 或前端画布形状的 `spec`，二选一）。
+
+> 旧路径 `POST /api/pipelines/execute` 为弃用别名（行为完全一致，仍可用）。
+
+请求体字段：
 
 ```jsonc
 {
-  "pipeline_id": "video-to-srt",          // 二选一：config/pipelines/ 下已保存管线
-  // "spec": { ... },                     // 二选一：前端画布形状的管线 spec
   "inputs": {                              // 可选：按节点覆盖 params
     "input": { "path": "D:/Videos/new/ep-001.mp4" }
   },
@@ -48,7 +58,8 @@ EntryPoint daemon（/api，默认 :9800）
 }
 ```
 
-- `pipeline_id` 与 `spec` **二选一**（同时给/同时缺 → 400）；
+- 集合级形态下 `pipeline_id` 与 `spec` **二选一**（同时给/同时缺 → 400）；
+  路径指名形态下 `pipeline_id` 自路径携带；
 - `inputs`：`node_id → 参数对象`，覆盖管线节点 params（最常用：覆盖
   `file_input` 节点的 `path`）；引用未知节点 → 400；
 - 默认异步：`202 {"task_id": "..."}`，进度走 WS / 轮询；
@@ -58,32 +69,38 @@ EntryPoint daemon（/api，默认 :9800）
   `POST {task_id, status, artifacts}`；回调失败只记 warn，不影响任务本身；
 - 提交路径自动接入**模块自动拉起**：管线引用的模块未运行 → 先启动并等健康。
 
-### 2.2 `POST /api/execute/single` — 单能力直跑
+### 2.2 `POST /api/modules/{module_id}/runs` — 单能力直跑
 
-免开管线，直接执行模块的一个 capability（内部编译为退化三节点 DAG：
-file_input → module → file_output，任务/产物链路完全复用）：
+免开管线，直接执行模块的一个 capability（`module_id` 自路径携带；内部编译为
+退化三节点 DAG：file_input → module → file_output，任务/产物链路完全复用）：
 
 ```jsonc
+// POST /api/modules/faster-whisper/runs
 {
-  "module_id": "faster-whisper",
   "capability": "transcribe",
   "params": { "language": "zh", "timestamps": true },   // 可选，按 capability schema 校验
   "input_path": "D:/Audio/meeting.wav"                  // 服务器本地文件
 }
 ```
 
+> 旧路径 `POST /api/execute/single`（`module_id` 放 body）为弃用别名
+> （行为完全一致，仍可用）。
+
 - 响应 `202 {"task_id": "..."}`；
 - `params` 按模块 manifest 的 capability schema 校验：必填缺失 / 类型不符 /
   枚举越界 → 400（错误文案见 `apiPipelines.single.*` i18n 键）；缺省参数自动
   注入 schema default；
 - `input_path` 必须是 daemon 可见的**服务器本地路径**；浏览器侧可先经
-  `POST /api/upload/input` 落盘再引用返回路径；
+  `POST /api/files` 落盘再引用返回路径；
 - 模块未运行 → 自动拉起并等健康（超时 → `apiPipelines.single.autostartTimeout`）。
 
-### 2.3 `POST /api/upload/input` — 直跑输入上传
+### 2.3 `POST /api/files` — 直跑输入上传
 
 multipart 单文件（字段名 `file`）→ 暂存 `workspace/uploads`，响应
-`{"path": "..."}`。把返回路径填给 `/api/execute/single` 的 `input_path` 即可。
+`{"path": "..."}`。把返回路径填给 `POST /api/modules/{module_id}/runs` 的
+`input_path` 即可。
+
+> 旧路径 `POST /api/upload/input` 为弃用别名（行为完全一致，仍可用）。
 
 ---
 
@@ -98,7 +115,7 @@ multipart 单文件（字段名 `file`）→ 暂存 `workspace/uploads`，响应
 | `GET /api/tasks/{task_id}/artifacts` | 产物清单 |
 | `GET /api/tasks/{task_id}/artifacts/{node_id}` | 下载指定节点产物 |
 | `POST /api/tasks/{task_id}/cancel` | 取消任务（已终结 → 409） |
-| `GET /api/pipelines/{id}/tasks?status=&limit=` | 某管线的执行历史/在跑任务（含 queued/队列位置） |
+| `GET /api/pipelines/{pipeline_id}/runs?status=&limit=` | 某管线的 run 历史/在跑任务（含 queued/队列位置；旧路径 `GET /api/pipelines/{id}/tasks` 为弃用别名） |
 
 任务状态机要点：`queued`（等待全局 `max_parallel` 或管线级 `max_instances`
 闸门）→ `running` → `completed` / `failed` / `cancelled`。并发提交自动排队，
@@ -150,7 +167,7 @@ file_input → file_gate →（ffmpeg / 模块）→ file_archive
 内建触发器覆盖同机目录监控的绝大多数场景；以下情形仍推荐**外部 watcher 进程**
 （它只做两件事：发现素材 → 调 API 提交，提交方式见 §2）：
 
-- **跨机器**：素材位于 daemon 不可见的文件系统上（先 `POST /api/upload/input`
+- **跨机器**：素材位于 daemon 不可见的文件系统上（先 `POST /api/files`
   上传或挂载共享目录）；
 - **低延迟**：inotify / FileSystemWatcher 事件驱动的毫秒级响应，优于内建 10s 轮询。
 
@@ -159,9 +176,8 @@ file_input → file_gate →（ffmpeg / 模块）→ file_archive
 ```
 [watcher]  监听目录（inotify / FileSystemWatcher）
    │  新文件落盘（建议：按扩展名过滤 + 短暂静默防半截文件）
-   │  POST /api/pipelines/execute
-   │     { "pipeline_id": "video-to-srt",
-   │       "inputs": {"input": {"path": "<新文件绝对路径>"}},
+   │  POST /api/pipelines/video-to-srt/runs
+   │     { "inputs": {"input": {"path": "<新文件绝对路径>"}},
    │       "callback_url": "http://localhost:<watcher>/done" }   （可选）
    ▼
 [watcher]  收到回调/轮询到 completed → 取产物 → 后处理（归档/通知/入库）
@@ -205,16 +221,17 @@ Windows PowerShell + FileSystemWatcher 双版本，含提交与回调接收骨�
 ## 6. 快速上手（curl 示例）
 
 ```bash
-# 1) 已保存管线 + 覆盖输入路径（异步）
-curl -X POST http://localhost:9800/api/pipelines/execute \
+# 1) 已保存管线 + 覆盖输入路径（异步；按 id 执行 = 路径指名）
+curl -X POST http://localhost:9800/api/pipelines/video-to-srt/runs \
   -H 'Content-Type: application/json' \
-  -d '{"pipeline_id":"video-to-srt","inputs":{"input":{"path":"D:/Videos/a.mp4"}}}'
+  -d '{"inputs":{"input":{"path":"D:/Videos/a.mp4"}}}'
 # → 202 {"task_id":"..."}
+# （等价的集合级形态：POST /api/pipelines/runs，body 带 "pipeline_id":"video-to-srt"）
 
 # 2) 单能力直跑
-curl -X POST http://localhost:9800/api/execute/single \
+curl -X POST http://localhost:9800/api/modules/faster-whisper/runs \
   -H 'Content-Type: application/json' \
-  -d '{"module_id":"faster-whisper","capability":"transcribe","params":{"language":"zh"},"input_path":"D:/Audio/a.wav"}'
+  -d '{"capability":"transcribe","params":{"language":"zh"},"input_path":"D:/Audio/a.wav"}'
 
 # 3) 轮询任务与产物
 curl http://localhost:9800/api/tasks/<task_id>

@@ -16,7 +16,10 @@ WebUI 内部端点分离：本文件描述的请求/响应形状与错误码属�
 |---|---|---|
 | `GET` | `/api/v1/capabilities` | 能力目录：聚合所有已安装模块 manifest 的 capability 声明（纯只读，永不调用模块进程） |
 | `POST` | `/api/v1/inference/{module_id}/{capability}` | 提交推理（multipart 文件或 JSON 两种形态） |
-| `GET` | `/api/v1/inference/result/{task_id}` | 查询任务状态与产物（轮询用） |
+| `GET` | `/api/v1/tasks` | 任务列表（`task_id` + `status` 最小稳定面） |
+| `GET` | `/api/v1/tasks/{task_id}` | 任务状态与产物查询（轮询用） |
+| `POST` | `/api/v1/tasks/{task_id}/cancel` | 取消任务（排队中立即终结；运行中置 `cancelled`） |
+| `GET` | `/api/v1/inference/result/{task_id}` | **弃用别名**（v0.2 起 → `GET /api/v1/tasks/{task_id}`，行为完全一致） |
 
 ### 1.1 `GET /v1/capabilities`
 
@@ -67,13 +70,14 @@ WebUI 内部端点分离：本文件描述的请求/响应形状与错误码属�
 ```
 
 `input_text` 与 `input_path` **互斥**：双缺或同传均返回 `400 INPUT_INVALID`
-（对齐 `POST /api/execute/single` 双字段 400 口径）。JSON 请求体上限
+（对齐内部 `POST /api/modules/{module_id}/runs`（旧别名
+`POST /api/execute/single`）的双字段 400 口径）。JSON 请求体上限
 8MB（推理提交的文本/params 为 KB 量级，超限即错，防无上限缓冲）。
 
 安全约束：`input_path` 经服务端 canonicalize 后必须位于 workspace/uploads
 之内（防符号链接 / `..` 穿越），**绝不透传任意服务器绝对路径**；越权返回
 `400 INPUT_INVALID`。跨机器输入一律走 multipart 上传或先调
-`POST /api/upload/input`。
+`POST /api/files`（旧别名 `POST /api/upload/input`）。
 
 **响应**：
 
@@ -99,11 +103,31 @@ WebUI 内部端点分离：本文件描述的请求/响应形状与错误码属�
   `output_url` 为**相对下载 URL**（302 到文件流通道），绝不返回服务器
   绝对路径；output 节点产物优先。
 
-服务端执行序列（对齐 `POST /api/execute/single`）：manifest/capability
+服务端执行序列（对齐内部 `POST /api/modules/{module_id}/runs`（旧别名
+`POST /api/execute/single`））：manifest/capability
 存在性 → 参数 schema 校验与默认值注入 → 输入文件存在性 → 模块自动拉起
 （未运行则启动并等健康）→ 提交执行引擎。
 
-### 1.3 `GET /v1/inference/result/{task_id}`
+### 1.3 `GET /v1/tasks` — 任务列表
+
+全局任务中心（Replicate `GET /v1/predictions` 模式），新任务在前。形状保持
+最小稳定面——仅 `task_id` + `status`；详情/产物走 `GET /v1/tasks/{task_id}`：
+
+```json
+{
+  "tasks": [
+    { "task_id": "task-...", "status": "running" },
+    { "task_id": "task-...", "status": "completed" }
+  ]
+}
+```
+
+无任务时返回 `{"tasks": []}`（200，不报错）。
+
+### 1.4 `GET /v1/tasks/{task_id}` — 任务详情（轮询用）
+
+> 弃用别名：`GET /v1/inference/result/{task_id}`（行为完全一致，仍可用；
+> v0.2 起由本端点取代）。
 
 ```json
 {
@@ -120,6 +144,20 @@ WebUI 内部端点分离：本文件描述的请求/响应形状与错误码属�
 `outputs` 一律相对下载 URL；`queue_position` 仅排队时实时携带。未知
 task → `404 TASK_NOT_FOUND`。
 
+### 1.5 `POST /v1/tasks/{task_id}/cancel` — 取消任务
+
+排队中 → 立即终结不执行；运行中 → 置逻辑终态 `cancelled`。成功（200）：
+
+```json
+{ "task_id": "task-...", "status": "cancelled" }
+```
+
+错误：
+
+- `409 TASK_ALREADY_TERMINAL` — 任务已处于终态（completed/failed/cancelled），
+  不可再取消；
+- `404 TASK_NOT_FOUND` — 任务不存在。
+
 ---
 
 ## 2. 错误契约
@@ -135,7 +173,8 @@ task → `404 TASK_NOT_FOUND`。
 | `UNAUTHORIZED` | 401 | token 缺失或不匹配（配置了 `[api].token` 时） |
 | `MODULE_NOT_FOUND` | 404 | 模块未安装/未发现 |
 | `CAPABILITY_NOT_FOUND` | 404 | 模块无此 capability |
-| `TASK_NOT_FOUND` | 404 | 结果查询的任务不存在 |
+| `TASK_NOT_FOUND` | 404 | 任务不存在（详情查询/取消） |
+| `TASK_ALREADY_TERMINAL` | 409 | 任务已处于终态（completed/failed/cancelled），不可取消 |
 | `PARAM_INVALID` | 400 | 参数缺失/类型不符/枚举越界 |
 | `INPUT_INVALID` | 400 | 输入缺失、`input_path` 越权、multipart/JSON 形态非法；亦含 `input_text`/`input_path` 同传（互斥）、输入文件超出 `max_file_size_mb` 声明上限、multipart 文本字段超 1MB、JSON 请求体超 8MB |
 | `MODEL_NOT_READY` | 409 | 激活变体模型未下载就绪 |
@@ -162,7 +201,8 @@ task → `404 TASK_NOT_FOUND`。
 
 - **短任务**（秒级，如小图处理/短文本）：`wait=true` 一次往返拿结果；
   v1 推理**提交**端点已豁免 daemon 300s 请求超时，阻塞上限由任务引擎
-  管理；结果查询端点（`GET /v1/inference/result/{task_id}`）为快速读，
+  管理；结果查询端点（`GET /v1/tasks/{task_id}`，弃用别名
+  `GET /v1/inference/result/{task_id}`）为快速读，
   不豁免，仍受 300s 兜底约束。
 - **长任务**（分钟级，如视频转写）：**异步 + `callback_url`** 或轮询
   result 端点。`wait=true` 会占住一个 HTTP 连接直到终态，长任务下代理/
@@ -195,10 +235,12 @@ curl -X POST $BASE/api/v1/inference/faster-whisper/transcribe \
   -F 'file=@./audio.wav' -F 'wait=true'
 # → 200 {"task_id":"...","status":"completed","output_url":"/api/tasks/.../artifacts/output"}
 
-# 4) 异步轮询结果
-curl $BASE/api/v1/inference/result/<task_id>
+# 4) 异步轮询结果（canonical；旧别名 GET /v1/inference/result/<task_id> 行为一致）
+curl $BASE/api/v1/tasks/<task_id>
 # 产物下载（相对 URL → 302 → 文件流）：
 curl -OJ $BASE/api/tasks/<task_id>/artifacts/output
+# 取消任务（已终态 → 409 TASK_ALREADY_TERMINAL；不存在 → 404 TASK_NOT_FOUND）
+curl -X POST $BASE/api/v1/tasks/<task_id>/cancel
 
 # 5) 异步 + 完成回调
 curl -X POST $BASE/api/v1/inference/faster-whisper/transcribe \
@@ -235,8 +277,8 @@ token = "长随机串"      # 缺省不设 = 直通（与历史行为一致）
 
 ## 7. 演进路线
 
-本期（一期）交付：能力目录 + 双形态提交 + 结果查询 + 可选 token 鉴权 +
-稳定错误契约。以下为已规划但**尚未实现**的后续方向（契约面保持兼容）：
+本期（一期）交付：能力目录 + 双形态提交 + 任务列表/查询/取消 + 可选 token
+鉴权 + 稳定错误契约。以下为已规划但**尚未实现**的后续方向（契约面保持兼容）：
 
 - **二期**：模块闸门（推理级并发准入）、keep_warm（模块常驻）、任务 TTL
   （结果与产物过期清理）；

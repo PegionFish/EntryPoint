@@ -44,7 +44,8 @@ adapter **不得**硬编码 `0.0.0.0` 或其它非回环地址。
 | `EP_MODELS_ROOT` | **模型缓存根目录**（`models/` 本身的绝对路径），含所有变体子目录，与激活变体无关 |
 
 **变体覆盖行为（`params.model`）**：`EP_MODEL_DIR` 恒指激活变体，端到端
-切换激活变体仍走 `PUT /api/models/{module}/{model}/variant` + 重启模块。
+切换激活变体仍走 `PUT /api/modules/{module_id}/models/{model_id}/variant`
+（旧路径 `PUT /api/models/{module}/{model}/variant` 为弃用别名）+ 重启模块。
 但当请求参数以 `params.model` 临时覆盖为其它变体时，支持此行为的 adapter
 应从 `EP_MODELS_ROOT` 下按 `module.toml [[models]]` 的 `model_id → target_dir`
 约定解析对应变体子目录，命中本地权重则直接使用（参照实现：rembg adapter）。
@@ -682,7 +683,7 @@ base_url     = { type = "string", description = "覆盖 COMFYUI_URL（远程实�
 | 进度 | 可选异步模式（§4.2） | 轮询估算 `EP-PROGRESS:NN%`（粗粒度，无需引擎改动） |
 | 超时 | per-node 超时 | per-node 超时**必须放宽**（长任务建议 `timeout_secs = 1800`） |
 | 工作内部逻辑 | adapter 自身实现 | 平台不校验（黑盒提交，仅注入前校验映射键存在性） |
-| 扩展端点 | 通常无 | 可附带领域端点（如工作流上传/列表/删除），经 daemon 模块代理 `/api/modules/{module_id}/extra/{*path}` 供 WebUI 调用 |
+| 扩展端点 | 通常无 | 可附带领域端点（如工作流上传/列表/删除），经 daemon 模块代理 `/api/modules/{module_id}/proxy/{*path}` 供 WebUI 调用（旧 `/api/modules/{module_id}/extra/{*path}` 为弃用别名） |
 
 共性约束不变：adapter 仍须实现 §2 标准端点形状、文件类输出仍须返回
 `output_type = "file"` + `result` 为绝对路径字符串（§2.3 result 规则）、
