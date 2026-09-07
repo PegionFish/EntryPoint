@@ -453,6 +453,19 @@ EOF
 unit_extra_env() {
     local uv_bin uv_dir
     uv_bin="$(command -v uv || true)"
+    # sudo 重执行场景：PATH/HOME 随 sudo 切换，astral installer 装到调用方
+    # 用户家目录的 uv 探测不到 → 补充候选位置，避免 unit 缺 PATH 导致
+    # daemon 无法派生 uv 创建模块 venv。
+    if [[ -z "$uv_bin" && -x "${HOME}/.local/bin/uv" ]]; then
+        uv_bin="${HOME}/.local/bin/uv"
+    fi
+    if [[ -z "$uv_bin" && -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+        local sudo_home
+        sudo_home="$(getent passwd "${SUDO_USER}" | cut -d: -f6)"
+        if [[ -x "${sudo_home}/.local/bin/uv" ]]; then
+            uv_bin="${sudo_home}/.local/bin/uv"
+        fi
+    fi
     [[ -n "$uv_bin" ]] || return 0
     uv_dir="$(dirname "$uv_bin")"
     case "$uv_dir" in
