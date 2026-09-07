@@ -1,6 +1,10 @@
 # PLAN_WAIFU2X_MODULE — waifu2x 模块接入执行计划
 
-> 状态：执行中 · 负责人：主代理（可开子代理）
+> 状态：✅ 已完成（2026-09-08）· 负责人：主代理（3 子代理并行开发）
+> 结果：模块全链路可用——v1 直调/模块 runs/管线 runs 三条执行链真机（RTX 5090 D,
+> torch 2.11.0+cu130）实测通过；图片 400×300→800×600、视频 320×240→640×480 h264；
+> 27 mock 测试 + 373 daemon 测试全绿；外部 repo 同步 traced 至主仓 HEAD。
+> 实机发现的 3 处缺陷均已修复并带回归测试（见 §6 后补记）。
 > 上游：https://github.com/nagadomi/nunif （waifu2x 子项目，MIT）
 > 目标：新增 `waifu2x` 模块（图像/视频超分+降噪），落位主仓
 > `modules/waifu2x/`，反向同步到 `/home/bob/EntryPoint_Models/EntryPoint_waifu2x`
@@ -197,11 +201,19 @@ default = true
 | CLI tqdm 进度解析不稳定 | 进度仅是增强信息；解析失败降级为阶段日志，不影响结果 |
 | 首次克隆+装依赖超出 ready_timeout | ready_timeout_secs=600；克隆幂等可重入 |
 
+## 6.1 真机实测缺陷补记（W3 发现 → 修复 → 回归测试）
+
+| # | 缺陷 | 根因 | 修复 |
+|---|---|---|---|
+| 1 | /health 恒 503 unavailable | 平台 url 下载落位为「目录内含 zip」而非「EP_MODEL_DIR 即 zip」，解压触发条件永不命中 | peek/_kick 统一经 `find_model_archive` 定位（目录内单 zip 即触发） |
+| 2 | 解压完成后仍卡 starting | 上游 zip 内层多一级 `pretrained_models/`，swin_unet 距 EP_MODEL_DIR 两层深，health 浅层探测不可见 | 浅层失败后补一次深层 rglob 确认 |
+| 3 | v1 提交 422（staging_dir）/ 视频链 422（start_time=""） | 执行器注入平台保留键；平台「无 default 即必填」语义注入声明默认 | adapter 平台保留键白名单 + 空串哨兵跳过 pattern；manifest 补 tile_size/batch_size/start_time/end_time 默认 |
+
 ## 7. 验收清单（DoD）
 
-- [ ] 主仓 `modules/waifu2x/` 完整（manifest/adapter/runner/requirements/tests/README）
-- [ ] pytest mock 全绿；cargo test -p ep-daemon 全绿
-- [ ] 外部 repo `/home/bob/EntryPoint_Models/EntryPoint_waifu2x` 存在且与主仓同步（sync 脚本输出 + git log 证据）
-- [ ] daemon 实测：模块发现→启动→健康→推理→产物闭环全通（W3 §5.3 全项）
-- [ ] 文档：MODEL_REPOS 矩阵、AUTOMATION/INFERENCE_API/ADAPTER_API 路径更新完成
-- [ ] 全部变更按波次逐步 commit，`git log` 可逐段回退
+- [x] 主仓 `modules/waifu2x/` 完整（manifest/adapter/runner/requirements/tests/README）
+- [x] pytest mock 全绿（27 例）；cargo test -p ep-daemon 全绿（373 例）
+- [x] 外部 repo `/home/bob/EntryPoint_Models/EntryPoint_waifu2x` 存在且与主仓同步（sync 脚本输出 + git log 证据）
+- [x] daemon 实测：模块发现→启动→健康→推理→产物闭环全通（W3 §5.3 全项，19/19）
+- [x] 文档：MODEL_REPOS 矩阵、AUTOMATION/INFERENCE_API/ADAPTER_API 路径更新完成
+- [x] 全部变更按波次逐步 commit，`git log` 可逐段回退
