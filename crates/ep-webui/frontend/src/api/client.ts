@@ -88,7 +88,7 @@ export function uploadModelWithProgress(
   }
   return new Promise<{ ok: boolean }>((resolve, reject) => {
     const xhr = new XMLHttpRequest()
-    xhr.open('POST', `/api/models/${moduleId}/upload`)
+    xhr.open('POST', `/api/modules/${moduleId}/models/upload`)
     xhr.upload.addEventListener('progress', (e) => {
       if (!e.lengthComputable) return
       onProgress({
@@ -179,18 +179,18 @@ export const api = {
     apiFetch<ModuleActionResult>(`/modules/${id}/stop`, { method: 'POST' }),
 
   /**
-   * 模块扩展端点代理（COMFYUI_BRIDGE_PLAN §3.5/§3.6）：daemon 把
-   * /api/modules/{id}/extra/{*path} 原样转发给运行中适配器（模块未运行
-   * 返回 409），支持 GET / POST(FormData) / DELETE。path 按段做 URI 编码
-   * （如工作流文件名），调用方传原始字符串即可。
+   * 模块扩展端点代理（COMFYUI_BRIDGE_PLAN §3.5/§3.6；canonical /proxy，
+   * 旧 /extra 为后端弃用别名）：daemon 把 /api/modules/{id}/proxy/{*path}
+   * 原样转发给运行中适配器（模块未运行返回 409），支持 GET / POST(FormData)
+   * / DELETE。path 按段做 URI 编码（如工作流文件名），调用方传原始字符串即可。
    */
-  moduleExtra: <T>(
+  moduleProxy: <T>(
     moduleId: string,
     path: string,
     init?: ApiFetchOptions,
   ) =>
     apiFetch<T>(
-      `/modules/${encodeURIComponent(moduleId)}/extra/${path
+      `/modules/${encodeURIComponent(moduleId)}/proxy/${path
         .split('/')
         .map(encodeURIComponent)
         .join('/')}`,
@@ -203,9 +203,9 @@ export const api = {
   // Models
   models: () => apiFetch<ModelListResponse>('/models'),
   moduleModels: (id: string) =>
-    apiFetch<ModelDetailResponse>(`/models/${id}`),
+    apiFetch<ModelDetailResponse>(`/modules/${id}/models`),
   importModel: (moduleId: string, req: ImportRequest) =>
-    apiFetch<ImportResponse>(`/models/${moduleId}/import`, {
+    apiFetch<ImportResponse>(`/modules/${moduleId}/models/import`, {
       method: 'POST',
       body: JSON.stringify(req),
     }),
@@ -226,7 +226,7 @@ export const api = {
     if (paths) {
       for (const p of paths) form.append('paths', p)
     }
-    return apiFetch<{ ok: boolean }>(`/models/${moduleId}/upload`, {
+    return apiFetch<{ ok: boolean }>(`/modules/${moduleId}/models/upload`, {
       method: 'POST',
       body: form,
     })
@@ -236,7 +236,7 @@ export const api = {
   downloadModel: (    moduleId: string,
     body: { model_id: string; source?: ModelSource },
   ) =>
-    apiFetch<{ ok: boolean }>(`/models/${moduleId}/download`, {
+    apiFetch<{ ok: boolean }>(`/modules/${moduleId}/models/download`, {
       method: 'POST',
       body: JSON.stringify(body),
     }),
@@ -248,28 +248,28 @@ export const api = {
   /** 删除已下载的模型 */
   deleteModel: (moduleId: string, modelId: string) =>
     apiFetch<{ ok: boolean }>(
-      `/models/${moduleId}/${encodeURIComponent(modelId)}`,
+      `/modules/${moduleId}/models/${encodeURIComponent(modelId)}`,
       { method: 'DELETE' },
     ),
 
   /** 检查模型是否有可用更新 */
   checkModelUpdate: (moduleId: string, modelId: string) =>
     apiFetch<{ available: boolean; reason: string }>(
-      `/models/${moduleId}/${encodeURIComponent(modelId)}/check-update`,
+      `/modules/${moduleId}/models/${encodeURIComponent(modelId)}/check-update`,
       { method: 'POST' },
     ),
 
   /** 更新模型用户 tag（§5.1 / §8.1；tag 存 meta，随整合包流转） */
   setModelTags: (moduleId: string, modelId: string, body: ModelTagsRequest) =>
     apiFetch<{ ok: boolean }>(
-      `/models/${moduleId}/${encodeURIComponent(modelId)}/tags`,
+      `/modules/${moduleId}/models/${encodeURIComponent(modelId)}/tags`,
       { method: 'PUT', body: JSON.stringify(body) },
     ),
 
   /** 取消进行中的模型下载（§8.1，修 P2-6；409 = 无可取消的下载） */
   cancelModelDownload: (moduleId: string, modelId: string) =>
     apiFetch<{ ok: boolean }>(
-      `/models/${moduleId}/${encodeURIComponent(modelId)}/cancel-download`,
+      `/modules/${moduleId}/models/${encodeURIComponent(modelId)}/cancel-download`,
       { method: 'POST' },
     ),
 
@@ -280,7 +280,7 @@ export const api = {
     body: ModelVariantRequest,
   ) =>
     apiFetch<ModelVariantResponse>(
-      `/models/${moduleId}/${encodeURIComponent(modelId)}/variant`,
+      `/modules/${moduleId}/models/${encodeURIComponent(modelId)}/variant`,
       { method: 'PUT', body: JSON.stringify(body) },
     ),
 
@@ -343,9 +343,30 @@ export const api = {
     apiFetch<{ ok: boolean }>(`/pipelines/${encodeURIComponent(id)}/schedule`, {
       method: 'DELETE',
     }),
-  executePipeline: (body: ExecutePipelineRequest) =>
-    // wait 同步模式请求在服务端阻塞至终态（可数分钟），不走默认 30s 超时
-    apiFetch<ExecutePipelineResponse>('/pipelines/execute', {
+  /**
+   * 执行已落盘管线（run 资源化 canonical：POST /pipelines/{id}/runs，
+   * docs/API_DESIGN.md §运行资源）。wait 同步模式请求在服务端阻塞至终态
+   * （可数分钟），不走默认 30s 超时。
+   */
+  executePipeline: (
+    pipelineId: string,
+    body: Omit<ExecutePipelineRequest, 'pipeline_id' | 'spec'>,
+  ) =>
+    apiFetch<ExecutePipelineResponse>(
+      `/pipelines/${encodeURIComponent(pipelineId)}/runs`,
+      {
+        method: 'POST',
+        body: JSON.stringify(body),
+        timeoutMs: 0,
+      },
+    ),
+
+  /**
+   * 执行未落盘管线（内联 spec）：集合级 run 创建 POST /pipelines/runs，
+   * body 携带 spec（与 pipeline_id 二选一，同传 400）。
+   */
+  executePipelineRun: (body: ExecutePipelineRequest) =>
+    apiFetch<ExecutePipelineResponse>('/pipelines/runs', {
       method: 'POST',
       body: JSON.stringify(body),
       timeoutMs: 0,
@@ -358,7 +379,7 @@ export const api = {
     if (query?.limit !== undefined) qs.set('limit', String(query.limit))
     const suffix = qs.toString()
     return apiFetch<TaskSummary[]>(
-      `/pipelines/${encodeURIComponent(id)}/tasks${suffix ? `?${suffix}` : ''}`,
+      `/pipelines/${encodeURIComponent(id)}/runs${suffix ? `?${suffix}` : ''}`,
     )
   },
 
@@ -415,11 +436,15 @@ export const api = {
   // 提交走 hooks/use-direct-exec.ts 的 postExecuteSingle（需 AbortController
   // 长超时语义，不复用 apiFetch）；此处仅保留输入文件上传。
 
-  /** 上传输入文件到 workspace/uploads（浏览器端直跑输入；multipart 单文件） */
+  /**
+   * 上传输入文件到 workspace/uploads（浏览器端直跑输入；multipart 单文件）。
+   * canonical POST /files（Stripe files 模式：上传换引用），旧 /upload/input
+   * 为后端弃用别名。
+   */
   uploadInput: (file: File) => {
     const form = new FormData()
     form.append('file', file)
-    return apiFetch<UploadInputResponse>('/upload/input', {
+    return apiFetch<UploadInputResponse>('/files', {
       method: 'POST',
       body: form,
     })

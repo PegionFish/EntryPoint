@@ -11,9 +11,10 @@ import type {
 /**
  * 直跑（§5.3）提交的 fetch 超时（毫秒）。
  *
- * 后端 `/api/execute/single` 同步等待模块自动拉起并健康
- * （ready_timeout 默认 30s；首次运行还需准备 venv，可能数分钟），
- * 故给足超时余量，UI 侧同时展示「正在启动模块…」提示。
+ * 后端 `/api/modules/{module_id}/runs`（run 资源化 canonical，docs/
+ * API_DESIGN.md）同步等待模块自动拉起并健康（ready_timeout 默认 30s；
+ * 首次运行还需准备 venv，可能数分钟），故给足超时余量，UI 侧同时展示
+ * 「正在启动模块…」提示。
  */
 export const DIRECT_EXEC_SUBMIT_TIMEOUT_MS = 300_000
 
@@ -44,7 +45,9 @@ export async function postExecuteSingle(
     DIRECT_EXEC_SUBMIT_TIMEOUT_MS,
   )
   try {
-    const resp = await fetch('/api/execute/single', {
+    const resp = await fetch(
+      `/api/modules/${encodeURIComponent(body.module_id)}/runs`,
+      {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),

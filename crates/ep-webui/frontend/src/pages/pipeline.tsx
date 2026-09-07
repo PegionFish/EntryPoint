@@ -4364,7 +4364,11 @@ function PipelineEditor() {
           setExecuting(true)
         }
 
-        const resp = await api.executePipeline(body)
+        // run 资源化（docs/API_DESIGN.md）：按 id → POST /pipelines/{id}/runs；
+        // 内联 spec（画布未落盘）→ 集合级 POST /pipelines/runs
+        const resp = sendById
+          ? await api.executePipeline(currentId!, body)
+          : await api.executePipelineRun(body)
         setExecDialogOpen(false)
 
         if (opts.wait) {

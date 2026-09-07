@@ -483,7 +483,7 @@ export interface PackBuildResponse {
 
 // ===== 直跑（§5.3 / §8.1）=====
 
-/** POST /api/execute/single 请求（QUICK_RUN_PLAN §5.1：仅增可选字段，向后兼容） */
+/** POST /api/modules/{module_id}/runs 请求（QUICK_RUN_PLAN §5.1：仅增可选字段，向后兼容；旧 /api/execute/single 为弃用别名） */
 export interface DirectExecRequest {
   module_id: string
   /** 能力裸名（来自 manifest capabilities，修 P0-1 命名失配） */
@@ -500,12 +500,12 @@ export interface DirectExecRequest {
   device?: string
 }
 
-/** POST /api/execute/single 202 响应 */
+/** POST /api/modules/{module_id}/runs 202 响应 */
 export interface DirectExecResponse {
   task_id: string
 }
 
-/** POST /api/upload/input 响应（workspace/uploads 暂存路径） */
+/** POST /api/files 响应（workspace/uploads 暂存路径；旧 /api/upload/input 为弃用别名） */
 export interface UploadInputResponse {
   path: string
 }

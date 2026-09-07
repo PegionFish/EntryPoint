@@ -260,7 +260,7 @@ function ComfyWorkflowsCard({
     let cancelled = false
     setLoading(true)
     api
-      .moduleExtra<ComfyWorkflowEntry[]>(module.id, 'workflows')
+      .moduleProxy<ComfyWorkflowEntry[]>(module.id, 'workflows')
       .then((list) => {
         if (!cancelled) setWorkflows(Array.isArray(list) ? list : [])
       })
@@ -289,7 +289,7 @@ function ComfyWorkflowsCard({
     try {
       const form = new FormData()
       form.append('file', file)
-      const resp = await api.moduleExtra<{ name: string; replaced: boolean }>(
+      const resp = await api.moduleProxy<{ name: string; replaced: boolean }>(
         module.id,
         'workflows',
         { method: 'POST', body: form },
@@ -319,7 +319,7 @@ function ComfyWorkflowsCard({
     })
     if (!ok) return
     try {
-      await api.moduleExtra<{ ok: boolean }>(
+      await api.moduleProxy<{ ok: boolean }>(
         module.id,
         `workflows/${name}`,
         { method: 'DELETE' },
