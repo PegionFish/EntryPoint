@@ -106,17 +106,30 @@ fn find_spec_file(dir: &Path, id: &str) -> Option<(PathBuf, PipelineSpec)> {
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/pipelines", get(list_pipelines))
-        .route("/pipelines/{id}", get(get_pipeline))
-        .route("/pipelines/{id}", put(update_pipeline))
-        .route("/pipelines/{id}", delete(delete_pipeline))
-        .route("/pipelines/{id}/status", get(pipeline_status))
+        .route("/pipelines/{pipeline_id}", get(get_pipeline))
+        .route("/pipelines/{pipeline_id}", put(update_pipeline))
+        .route("/pipelines/{pipeline_id}", delete(delete_pipeline))
+        .route("/pipelines/{pipeline_id}/status", get(pipeline_status))
         // JSON 导入/导出/分享（管线描述符自包含文件即分享载体）
-        .route("/pipelines/{id}/export", get(export_pipeline))
+        .route("/pipelines/{pipeline_id}/export", get(export_pipeline))
         .route("/pipelines/import", post(import_pipeline))
         // 定时调度（cron）：注册/查看/删除；触发由 daemon 巡检循环驱动
-        .route("/pipelines/{id}/schedule", put(put_schedule).get(get_schedule).delete(delete_schedule))
-        // §6.8 管线级任务视图（P1-5：替代坏掉的 {id}/status 的运维面）
-        .route("/pipelines/{id}/tasks", get(pipeline_tasks))
+        .route(
+            "/pipelines/{pipeline_id}/schedule",
+            put(put_schedule).get(get_schedule).delete(delete_schedule),
+        )
+        // 运行资源（docs/API_DESIGN.md §运行资源）：POST 建 run、GET 列 run。
+        // 集合级创建 POST /pipelines/runs（body 带 pipeline_id 或内联 spec）
+        // 与旧别名 POST /pipelines/execute 由 execute.rs router 注册（handler
+        // 所有权在本文件之外）；本文件只注册路径指名的 /{pipeline_id}/runs。
+        // 取消统一走 /tasks 命名空间（见下方 cancel 路由归属说明）。
+        .route(
+            "/pipelines/{pipeline_id}/runs",
+            post(crate::api::execute::execute_pipeline_run).get(pipeline_tasks),
+        )
+        // 弃用别名（v0.2 起 → /runs）：管线级任务列表 §6.8（P1-5）；
+        // 执行入口旧路径 POST /pipelines/execute 由 execute.rs router 注册
+        .route("/pipelines/{pipeline_id}/tasks", get(pipeline_tasks))
         // §6.3 VRAM 预算（编辑器实时计算，S2 前端形状，仲裁 #3）
         .route("/pipelines/vram-budget", post(vram_budget))
         // P1-11 任务取消（TaskStatus::Cancelled 产生路径）。

@@ -18,7 +18,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use axum::{Router, extract::State, http::StatusCode, routing::post, Json};
+use axum::{
+    Router,
+    extract::{Path as AxumPath, State},
+    http::StatusCode,
+    routing::post,
+    Json,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{info, warn};
@@ -33,15 +39,24 @@ use crate::api::pipelines::pipeline_bridge::{spec_to_pipeline, PipelineSpec};
 use crate::api::upload::{staging_id, store_input_file, UploadError};
 use crate::state::AppState;
 
+/// 路由（docs/API_DESIGN.md §运行资源）：
+/// - `POST /pipelines/runs` — canonical 集合级 run 创建（body 带 pipeline_id
+///   或内联 spec，跑未落盘管线）；`POST /pipelines/{pipeline_id}/runs`（路径
+///   指名糖）在 pipelines.rs 注册；
+/// - `POST /pipelines/execute`、`POST /execute/single` — 弃用别名（前者 =
+///   集合级创建的旧名，后者 canonical 为 `POST /modules/{module_id}/runs`，
+///   在 modules.rs 注册）。
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/pipelines/runs", post(execute_pipeline))
         .route("/pipelines/execute", post(execute_pipeline))
         .route("/execute/single", post(execute_single))
 }
 
-/// POST /api/pipelines/execute 请求体（前端 ExecutePipelineRequest 契约）
+/// POST /api/pipelines/execute 请求体（前端 ExecutePipelineRequest 契约）；
+/// pub(crate) 供 run 资源化包装器 [`execute_pipeline_run`] 复用
 #[derive(Debug, Deserialize)]
-struct ExecuteRequest {
+pub(crate) struct ExecuteRequest {
     #[serde(default)]
     pipeline_id: Option<String>,
     #[serde(default)]
@@ -54,6 +69,23 @@ struct ExecuteRequest {
     /// §6.5 完成回调：终态时 POST {task_id, status, artifacts}（best-effort）
     #[serde(default)]
     callback_url: Option<String>,
+}
+
+/// POST /api/pipelines/{pipeline_id}/runs — 提交管线执行（run 资源化端点，
+/// docs/API_DESIGN.md §运行资源；Airflow `POST /dags/{id}/dagRuns` 同型）。
+///
+/// `pipeline_id` 自路径注入：请求体缺省 `pipeline_id` 时自动补齐，同传时以
+/// 路径为准（宽容旧客户端把旧字段一并带上）。请求体仍可内联 `spec` 跑未落盘
+/// 管线？不允许——路径已指名管线，与内联 spec 并存沿用 both-given 400 语义。
+/// 其余行为与弃用别名 `POST /api/pipelines/execute` 完全一致：202 +
+/// `{"task_id"}`，`wait=true` 同步阻塞至终态，`callback_url` 终态回调。
+pub(crate) async fn execute_pipeline_run(
+    State(state): State<Arc<AppState>>,
+    AxumPath(pipeline_id): AxumPath<String>,
+    Json(mut req): Json<ExecuteRequest>,
+) -> (StatusCode, Json<Value>) {
+    req.pipeline_id = Some(pipeline_id);
+    execute_pipeline(State(state), Json(req)).await
 }
 
 /// POST /api/pipelines/execute — 提交管线执行
@@ -451,6 +483,20 @@ pub(crate) async fn find_module_manifest(state: &AppState, module_id: &str) -> O
                 .unwrap_or(false)
         })
         .and_then(|m| m.manifest.clone())
+}
+
+/// POST /api/modules/{module_id}/runs — 单模型直跑（run 资源化端点，
+/// docs/API_DESIGN.md §运行资源）。`module_id` 自路径注入：请求体缺省时
+/// 补齐，同传时以路径为准。其余请求体字段与语义和弃用别名
+/// `POST /api/execute/single` 完全一致。
+pub(crate) async fn execute_single_run(
+    State(state): State<Arc<AppState>>,
+    AxumPath(module_id): AxumPath<String>,
+    body: Option<Json<Value>>,
+) -> (StatusCode, Json<Value>) {
+    let mut v = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
+    v["module_id"] = json!(module_id);
+    execute_single(State(state), Some(Json(v))).await
 }
 
 /// POST /api/execute/single — 单模型直跑（§5.3）
