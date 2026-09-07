@@ -60,9 +60,10 @@ step "v1 未知任务 → 404 + 机读码"
 CODE=$(req GET /api/v1/tasks/__no_such_task__ | jq_get "d['error']['code']")
 [[ "$CODE" == "TASK_NOT_FOUND" ]] && ok "error.code=TASK_NOT_FOUND" || die "got $CODE"
 
-step "旧路径别名抽查（/api/models/{id} → 200/4xx 非 404-fallback）"
-S=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" "${BASE}/api/models/__probe__")
-[[ "$S" != "404" ]] && ok "HTTP $S（别名命中 handler）" || die "别名疑似丢失（404）"
+step "旧路径别名抽查（/api/models/{真实模块id} → 200，弃用别名仍路由）"
+REAL_MOD=$(curl -s "${AUTH[@]}" "${BASE}/api/modules" | jq_get "([m['id'] for m in (d if isinstance(d,list) else d.get('modules',[]))])[0]")
+S=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" "${BASE}/api/models/${REAL_MOD}")
+[[ "$S" == "200" ]] && ok "GET /api/models/${REAL_MOD} → 200（别名命中）" || die "别名疑似丢失（HTTP $S）"
 
 # ── run 资源语义（集合级创建的 400 校验路径） ────────────────────────────────
 
@@ -118,11 +119,12 @@ if [[ -n "$MODULE" ]]; then
         done
         [[ "$ST" == "completed" ]] && ok "completed" || die "终态=$ST: $R"
 
-        step "产物下载"
-        URL=$(echo "$R" | jq_get "d['outputs'][0]['url']")
+        step "产物下载（末节点产物；artifacts 端点 302 → 流式通道，-L 跟随）"
+        URL=$(echo "$R" | jq_get "d['outputs'][-1]['url']")
         OUT="/tmp/ep-verify-artifact-$(basename "$URL")"
-        curl -sS -o "$OUT" "${BASE}${URL}"
+        curl -sSL -o "$OUT" "${BASE}${URL}"
         [[ -s "$OUT" ]] && ok "产物 $(wc -c < "$OUT") 字节 → $OUT" || die "下载失败"
+        file "$OUT" | grep -qiE 'image|bitmap' && ok "产物为图片: $(file -b "$OUT" | head -c 60)" || die "产物非图片: $(file -b "$OUT")"
 
         step "POST /api/v1/tasks/$TASK/cancel（已终态 → 409）"
         S=$(curl -s -o /dev/null -w '%{http_code}' -X POST "${AUTH[@]}" "${BASE}/api/v1/tasks/$TASK/cancel")

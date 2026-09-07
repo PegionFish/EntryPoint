@@ -1,0 +1,56 @@
+# waifu2x 演示管线 — 图片超分/降噪
+#
+# 节点链：file_input → waifu2x.upscale_image → file_output
+#
+# 运行（canonical run 资源端点，docs/API_DESIGN.md §3）：
+#   curl -X POST http://127.0.0.1:9800/api/pipelines/waifu2x-demo/runs \
+#        -H 'Content-Type: application/json' \
+#        -d '{"inputs": {"input": {"path": "/abs/path/input.png"}}}'
+# 或带参数覆盖（docs/PLAN_WAIFU2X_MODULE.md §2 冻结参数表）：
+#   -d '{"inputs": {"input": {"path": "..."}},
+#        "params": {"generate": {"method": "noise_scale", "noise_level": 1, "style": "art"}}}'
+#
+# 节点 timeout_secs = 3600：swin_unet 4x / 大图 / TTA 耗时长，显式放宽
+# 节点默认 300s 硬超时。
+
+[pipeline]
+id = "waifu2x-demo"
+name = "waifu2x 图片超分"
+description = "上传图片 → waifu2x 超分降噪（nunif/swin_unet，CUDA）→ 落盘放大结果"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+label = "输入图片"
+
+[[nodes]]
+id = "generate"
+kind = "module"
+module_id = "waifu2x"
+capability = "upscale_image"
+label = "waifu2x 2x 超分"
+timeout_secs = 3600
+
+[nodes.params]
+method = "noise_scale"
+noise_level = 1
+style = "art"
+format = "png"
+
+[[nodes]]
+id = "output"
+kind = "builtin"
+builtin = "file_output"
+label = "输出图片"
+
+[nodes.params]
+extension = "png"
+
+[[edges]]
+from = ["input", "output"]
+to = ["generate", "input"]
+
+[[edges]]
+from = ["generate", "output"]
+to = ["output", "input"]
