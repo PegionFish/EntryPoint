@@ -88,7 +88,10 @@ const EXPORT_EXCLUDED_FILES: &[&str] = &[".DS_Store"];
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/modules/import", post(import_module))
-        .route("/modules/export/{id}", get(export_module))
+        // 导出与导入对称（docs/API_DESIGN.md）：canonical
+        // /modules/{module_id}/export；旧 /modules/export/{module_id} 弃用别名
+        .route("/modules/{module_id}/export", get(export_module))
+        .route("/modules/export/{module_id}", get(export_module))
         // 模块包可能含多平台原生二进制：关闭 axum 默认 2MB body 上限
         // （main.rs 的请求总时长超时中间件已对本路径豁免）
         .layer(DefaultBodyLimit::disable())

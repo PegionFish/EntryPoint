@@ -34,11 +34,38 @@ use ep_core::module::manifest::{ModelDecl, ModelSource, ModuleManifest};
 use super::err_response;
 use crate::state::{AppState, DownloadEntry, WsMessage};
 
+/// 路由层级（docs/API_DESIGN.md §层级）：模型是模块的子资源，管理端点
+/// canonical 形态为 `/modules/{module_id}/models/...`；`GET /models` 仅保留
+/// 聚合目录语义（跨模块只读，OpenAI `GET /v1/models` 式）。旧
+/// `/models/{module_id}/...` 管理路径保留为弃用别名（v0.2 起弃用，迁移表见
+/// docs/API_DESIGN.md），移除前两类路径行为完全一致。
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
+        // ── 聚合目录（跨模块只读视图） ──
         .route("/models", get(list_models))
         // 静态段 downloads 优先于 {module_id} 通配段（matchit 规则），无冲突
         .route("/models/downloads", get(list_downloads))
+        // ── 模块域内模型管理（canonical） ──
+        .route("/modules/{module_id}/models", get(module_models))
+        .route("/modules/{module_id}/models/import", post(import_model))
+        .route("/modules/{module_id}/models/download", post(download_model))
+        .route(
+            "/modules/{module_id}/models/{model_id}/check-update",
+            post(check_model_update),
+        )
+        .route(
+            "/modules/{module_id}/models/{model_id}/tags",
+            put(set_model_tags),
+        )
+        .route(
+            "/modules/{module_id}/models/{model_id}/cancel-download",
+            post(cancel_model_download),
+        )
+        .route(
+            "/modules/{module_id}/models/{model_id}",
+            delete(delete_model),
+        )
+        // ── 弃用别名（旧 /models/{module_id}/... 管理路径） ──
         .route("/models/{module_id}", get(module_models))
         .route("/models/{module_id}/import", post(import_model))
         .route("/models/{module_id}/download", post(download_model))

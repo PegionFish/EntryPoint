@@ -35,8 +35,15 @@ use crate::state::AppState;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
+        // 模型文件上传：canonical /modules/{module_id}/models/upload（模型层级
+        // 归位，docs/API_DESIGN.md）；旧 /models/{module_id}/upload 弃用别名
+        .route("/modules/{module_id}/models/upload", post(upload_model))
         .route("/models/{module_id}/upload", post(upload_model))
-        // 直跑输入上传（§8.1）：输入文件同样可能很大（音视频），同享 body 上限豁免
+        // 直跑输入上传（§8.1）：canonical POST /files（Stripe/OpenAI files
+        // 模式——multipart 上传换取 staging 引用，供 runs 提交引用）；
+        // 旧 /upload/input 弃用别名。输入文件同样可能很大（音视频），
+        // 同享 body 上限豁免
+        .route("/files", post(upload_input))
         .route("/upload/input", post(upload_input))
         // 模型文件可达数 GB：仅对本文件路由关闭默认 2MB body 上限
         .layer(DefaultBodyLimit::disable())

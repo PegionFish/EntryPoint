@@ -8,7 +8,11 @@
 //! 端点（挂 `/api` 前缀下）：
 //! - `GET  /v1/capabilities`                        — 能力目录聚合（纯只读）
 //! - `POST /v1/inference/{module_id}/{capability}`  — 提交推理（multipart / JSON）
-//! - `GET  /v1/inference/result/{task_id}`          — 任务状态与产物查询
+//! - `GET  /v1/tasks`                               — 任务列表（task_id + status）
+//! - `GET  /v1/tasks/{task_id}`                     — 任务状态与产物查询（轮询用；
+//!                                                    旧 `/v1/inference/result/{task_id}`
+//!                                                    为弃用别名，形状不变）
+//! - `POST /v1/tasks/{task_id}/cancel`              — 取消任务
 //!
 //! 错误契约：`{"error": {"code": <MACHINE_CODE>, "message": <可读文案>}}`。
 //!
@@ -292,6 +296,12 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .layer(DefaultBodyLimit::disable());
     Router::new()
         .route("/v1/capabilities", get(list_capabilities))
+        // 任务资源闭环（Replicate predictions 模式，docs/API_DESIGN.md §v1）：
+        // GET 列表 / GET 单个=状态+产物（与旧 result 端点同形状）/ POST 取消
+        .route("/v1/tasks", get(v1_list_tasks))
+        .route("/v1/tasks/{task_id}", get(get_result))
+        .route("/v1/tasks/{task_id}/cancel", post(v1_cancel_task))
+        // 弃用别名：旧 result 查询路径（v0.2 起由 GET /v1/tasks/{task_id} 取代）
         .route("/v1/inference/result/{task_id}", get(get_result))
         .merge(inference_route)
         .layer(middleware::from_fn_with_state(state, require_token))
@@ -870,6 +880,53 @@ async fn get_result(
         body["error"] = json!(err);
     }
     (StatusCode::OK, Json(body))
+}
+
+// ─── GET /v1/tasks ──────────────────────────────────────────────────────────
+
+/// 任务列表（Replicate `GET /v1/predictions` 模式）：新任务在前，形状保持
+/// 最小稳定面——仅 `task_id` + `status`；详情/产物走 `GET /v1/tasks/{task_id}`。
+async fn v1_list_tasks() -> (StatusCode, Json<Value>) {
+    let tasks: Vec<Value> = execution::snapshot_all()
+        .iter()
+        .map(|r| {
+            json!({
+                "task_id": r.id.clone(),
+                "status": r.status.as_str(),
+            })
+        })
+        .collect();
+    (StatusCode::OK, Json(json!({ "tasks": tasks })))
+}
+
+// ─── POST /v1/tasks/{task_id}/cancel ────────────────────────────────────────
+
+/// 取消任务：排队中 → 立即终结不执行；运行中 → 逻辑终态 `cancelled`。
+/// 与内部 `/api/tasks/{task_id}/cancel` 同一执行语义
+/// （`execution::request_cancel`），错误走 v1 机读码契约（不走 i18n）。
+async fn v1_cancel_task(
+    State(state): State<Arc<AppState>>,
+    UrlPath(task_id): UrlPath<String>,
+) -> (StatusCode, Json<Value>) {
+    match execution::request_cancel(&state, &task_id).await {
+        execution::CancelOutcome::Cancelled => (
+            StatusCode::OK,
+            Json(json!({ "task_id": task_id, "status": "cancelled" })),
+        ),
+        execution::CancelOutcome::AlreadyTerminal(status) => v1_error(
+            StatusCode::CONFLICT,
+            "TASK_ALREADY_TERMINAL",
+            format!(
+                "task `{task_id}` is already terminal (status: {})",
+                status.as_str()
+            ),
+        ),
+        execution::CancelOutcome::NotFound => v1_error(
+            StatusCode::NOT_FOUND,
+            "TASK_NOT_FOUND",
+            format!("task `{task_id}` not found"),
+        ),
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

@@ -296,12 +296,17 @@ pub(crate) async fn ensure_module_venv_ready(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static SEQ: AtomicUsize = AtomicUsize::new(0);
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
 
     fn test_state(language: &str) -> Arc<AppState> {
         let seq = SEQ.fetch_add(1, Ordering::SeqCst);
@@ -362,6 +367,103 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body.0["error"], "apiCore.notThereYet");
+    }
+
+    // ── API_DESIGN.md 路由迁移：canonical 新路径 + 旧别名均不得落入
+    //    /api fallback（404 apiNotFound）。各请求选择的是"路由命中但业务
+    //    校验失败"的确定性非 404 形态（400 校验错 / 409 模块未运行 /
+    //    v1 404 带 code 字段），与 fallback 的 i18n 文案 404 可判别。 ─────
+    mod route_compat {
+        use super::*;
+
+        fn post_json(uri: &str, body: &str) -> Request<Body> {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        }
+
+        fn get(uri: &str) -> Request<Body> {
+            Request::builder().uri(uri).body(Body::empty()).unwrap()
+        }
+
+        async fn route_status(state: &Arc<AppState>, req: Request<Body>) -> u16 {
+            let app = super::super::api_router(state.clone()).with_state(state.clone());
+            let resp = app.oneshot(req).await.unwrap();
+            resp.status().as_u16()
+        }
+
+        async fn route_status_get(state: &Arc<AppState>, uri: &str) -> u16 {
+            route_status(state, get(uri)).await
+        }
+
+        async fn route_status_post(
+            state: &Arc<AppState>,
+            uri: &str,
+            body: &str,
+        ) -> u16 {
+            route_status(state, post_json(uri, body)).await
+        }
+
+        #[tokio::test]
+        async fn canonical_run_file_proxy_routes_registered() {
+            let state = test_state("en");
+            // run 资源端点：路由命中后业务校验失败 → 4xx（非 404）
+            let s = route_status_post(&state, "/modules/m1/runs", "{}").await;
+            assert_ne!(s, 404, "POST /modules/{{module_id}}/runs 应已注册");
+            // JSON 反序列化失败 → Json rejection 4xx，同样可证明路由命中
+            let s = route_status_post(&state, "/pipelines/p1/runs", "not-json").await;
+            assert_ne!(s, 404, "POST /pipelines/{{pipeline_id}}/runs 应已注册");
+            // 集合级 run 创建（内联 spec 场景）：{} 双缺 → 400
+            let s = route_status_post(&state, "/pipelines/runs", "{}").await;
+            assert_ne!(s, 404, "POST /pipelines/runs 应已注册");
+            // /files：非 multipart → 400
+            let s = route_status_post(&state, "/files", "").await;
+            assert_ne!(s, 404, "POST /files 应已注册");
+            // 代理子资源：模块未运行 → 409
+            let s = route_status_get(&state, "/modules/m1/proxy/workflows").await;
+            assert_eq!(s, 409, "GET /modules/{{id}}/proxy/* 应命中 409 分支");
+            // v1 任务闭环：列表 200；未知任务 404 且 error 为 {code,message} 对象
+            let s = route_status_get(&state, "/v1/tasks").await;
+            assert_eq!(s, 200, "GET /v1/tasks 应已注册（token 未配置时直通）");
+            let app = super::super::api_router(state.clone()).with_state(state.clone());
+            let resp = app.oneshot(get("/v1/tasks/no-such")).await.unwrap();
+            assert_eq!(resp.status(), 404);
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(v["error"]["code"], "TASK_NOT_FOUND");
+        }
+
+        #[tokio::test]
+        async fn deprecated_alias_routes_registered() {
+            let state = test_state("en");
+            // 旧执行入口（execute.rs router）
+            let s = route_status_post(&state, "/execute/single", "{}").await;
+            assert_ne!(s, 404, "旧 POST /execute/single 别名应保留");
+            let s = route_status_post(&state, "/pipelines/execute", "{}").await;
+            assert_ne!(s, 404, "旧 POST /pipelines/execute 别名应保留");
+            // 旧模型管理前缀（models.rs 别名）
+            let s = route_status_post(&state, "/models/m1/upload", "").await;
+            assert_ne!(s, 404, "旧 POST /models/{{module_id}}/upload 别名应保留");
+            // 旧输入上传（upload.rs 别名）
+            let s = route_status_post(&state, "/upload/input", "").await;
+            assert_ne!(s, 404, "旧 POST /upload/input 别名应保留");
+            // 旧代理前缀（module_proxy.rs 别名）
+            let s = route_status_get(&state, "/modules/m1/extra/workflows").await;
+            assert_eq!(s, 409, "旧 GET /modules/{{id}}/extra/* 别名应保留");
+            // 旧 v1 结果查询（inference.rs 别名）
+            let app = super::super::api_router(state.clone()).with_state(state.clone());
+            let resp = app
+                .oneshot(get("/v1/inference/result/no-such"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 404);
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(v["error"]["code"], "TASK_NOT_FOUND", "旧 result 路径应映射到 v1 任务查询");
+        }
     }
 
     // ── D-4：select_module_device（启动路径设备选择共享助手） ──────────────

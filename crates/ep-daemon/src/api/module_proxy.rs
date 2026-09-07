@@ -1,6 +1,6 @@
 //! daemon 模块代理端点（COMFYUI_BRIDGE_PLAN §3.5，代号 E）。
 //!
-//! `GET|POST|DELETE /api/modules/{module_id}/extra/{*path}`：把 WebUI 对模块
+//! `GET|POST|DELETE /api/modules/{module_id}/proxy/{*path}`：把 WebUI 对模块
 //! 自有扩展端点（如 ComfyUI 桥接 adapter 的 `/workflows` 工作流管理）的请求
 //! 原样转发给**运行中**适配器：
 //!
@@ -11,7 +11,8 @@
 //!    i18n `apiCore.moduleNotRunning`（键缺失时回退显示键本身，预期行为）。
 //!
 //! 路由挂载于 `/api` nest 内部（`api_router()`），完整前端路径形如
-//! `GET|POST|DELETE /api/modules/{module_id}/extra/{*path}`。
+//! `GET|POST|DELETE /api/modules/{module_id}/proxy/{*path}`；旧 `/extra`
+//! 前缀保留为弃用别名（docs/API_DESIGN.md 迁移表）。
 //! 2. 原样转发 method / headers / body（multipart 透传，Content-Type 原样携带
 //!    boundary；hop-by-hop 头与 host/content-length 由转发方重建，不透传）到
 //!    `http://127.0.0.1:{port}/{path}`（含 query string）。
@@ -20,7 +21,7 @@
 //! 4. 转发目标仅限 127.0.0.1 适配器（与既有模块端口同一信任域）；路径不含
 //!    `../` 穿越（`{*path}` 由 axum 通配段保证）。
 //!
-//! 前端调用形如 `/api/modules/comfyui-bridge/extra/workflows`。
+//! 前端调用形如 `/api/modules/comfyui-bridge/proxy/workflows`。
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -64,10 +65,17 @@ fn proxy_client() -> &'static reqwest::Client {
 }
 
 pub fn router() -> Router<Arc<AppState>> {
-    Router::new().route(
-        "/modules/{module_id}/extra/{*path}",
-        get(proxy_extra).post(proxy_extra).delete(proxy_extra),
-    )
+    Router::new()
+        // canonical：/proxy（K8s proxy 子资源惯例）
+        .route(
+            "/modules/{module_id}/proxy/{*path}",
+            get(proxy_extra).post(proxy_extra).delete(proxy_extra),
+        )
+        // 弃用别名：旧 /extra 前缀（COMFYUI_BRIDGE_PLAN §3.5 时代路径）
+        .route(
+            "/modules/{module_id}/extra/{*path}",
+            get(proxy_extra).post(proxy_extra).delete(proxy_extra),
+        )
 }
 
 /// 查模块端口注册表：仅运行中（Running）且端口已注册的实例可代理。

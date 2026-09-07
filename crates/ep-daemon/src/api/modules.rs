@@ -22,12 +22,27 @@ use crate::state::AppState;
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/modules", get(list_modules))
-        .route("/modules/{id}/start", post(start_module))
-        .route("/modules/{id}/stop", post(stop_module))
-        .route("/modules/{id}/status", get(module_status))
-        .route("/modules/{id}/logs", get(module_logs))
-        // §8.1 激活变体切换（版本单槽位 §5.2）：路径前缀 /models 与模型 API 对齐，
-        // handler 归属 modules.rs（模块激活状态写入 config.active_models）
+        .route("/modules/{module_id}/start", post(start_module))
+        .route("/modules/{module_id}/stop", post(stop_module))
+        .route("/modules/{module_id}/status", get(module_status))
+        .route("/modules/{module_id}/logs", get(module_logs))
+        // §5.3 直跑 run 资源（docs/API_DESIGN.md §运行资源）：路径携带
+        // module_id，替代旧动词端点 POST /execute/single（弃用别名）
+        .route(
+            "/modules/{module_id}/runs",
+            post(crate::api::execute::execute_single_run),
+        )
+        // 模块标准档案导出（与 module_import.rs 的 POST /modules/import 对称；
+        // 旧 /modules/export/{module_id} 保留为弃用别名）—— 路由与 handler 同在
+        // module_import.rs，本文件不重复注册。
+        // §8.1 激活变体切换（版本单槽位 §5.2）：模型层级归位后 canonical 为
+        // /modules/{module_id}/models/{model_id}/variant；handler 归属
+        // modules.rs（模块激活状态写入 config.active_models）。
+        .route(
+            "/modules/{module_id}/models/{model_id}/variant",
+            put(set_model_variant),
+        )
+        // 弃用别名（旧 /models 前缀，v0.2 起弃用）
         .route(
             "/models/{module_id}/{model_id}/variant",
             put(set_model_variant),
