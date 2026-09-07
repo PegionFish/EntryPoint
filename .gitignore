@@ -57,3 +57,6 @@ __pycache__/
 # 本地测试媒体（真机 E2E 用，不入库）
 *.mkv
 *.ass
+
+# waifu2x 模块：nunif 上游运行时克隆（pin d23721f1，adapter 启动时惰性同步）
+modules/waifu2x/nunif/

@@ -41,6 +41,7 @@ declare -A MOD_TO_REPO=(
   [realesr]="EntryPoint_Real-ESRGAN|https://github.com/xinntao/Real-ESRGAN|RealESR 视频超分"
   [rembg]="EntryPoint_rembg|https://github.com/danielgatis/rembg|RemBG 智能去背景"
   [rife]="EntryPoint_rife-ncnn-vulkan|https://github.com/nihui/rife-ncnn-vulkan|RIFE 视频插帧"
+  [waifu2x]="EntryPoint_waifu2x|https://github.com/nagadomi/nunif|waifu2x 图像/视频超分降噪"
 )
 
 log() { printf '[sync] %s\n' "$*"; }
