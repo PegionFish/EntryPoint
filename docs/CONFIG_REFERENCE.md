@@ -235,7 +235,7 @@ staging_dir = ".pack-staging"
 **单槽位语义**（PACK_UNIFY_PLAN §5.2）：每模块同一时间一个激活变体。
 daemon 启动模块时按三级回退选择模型：`[active_models]` 配置 → manifest
 `default = true` → 首个变体。变体切换端点
-（`PUT /api/models/{m}/{mid}/variant`）写入本表并落盘；激活变体与管线节点
+（`PUT /api/modules/{m}/models/{mid}/variant`，旧 `/api/models/{m}/{mid}/variant` 为弃用别名）写入本表并落盘；激活变体与管线节点
 `model` pin 不一致时执行前报错并引导切换（不静默热切换）。
 
 ```toml

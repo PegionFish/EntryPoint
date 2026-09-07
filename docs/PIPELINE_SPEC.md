@@ -207,7 +207,7 @@ params = { path = "C:/Videos/input.mp4" }
 
 | 参数 | 类型 | 必须 | 说明 |
 |---|---|---|---|
-| `path` | string | ✅ | 服务器本地输入文件路径；`POST /api/pipelines/execute` 的 `inputs` 可按节点覆盖（见 AUTOMATION.md） |
+| `path` | string | ✅ | 服务器本地输入文件路径；`POST /api/pipelines/{pipeline_id}/runs` 的 `inputs` 可按节点覆盖（见 AUTOMATION.md） |
 
 输出端口：`output`（文件路径）
 
@@ -587,7 +587,7 @@ kind = "builtin"
 builtin = "file_input"
 label = "输入视频"
 position = [50, 200]
-# path 参数缺省：WebUI 运行对话框 / POST /api/pipelines/execute 的 inputs 提供（§5.1）
+# path 参数缺省：WebUI 运行对话框 / POST /api/pipelines/{pipeline_id}/runs 的 inputs 提供（§5.1）
 
 [[nodes]]
 id = "extract"
