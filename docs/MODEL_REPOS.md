@@ -21,8 +21,8 @@ EntryPoint 的每个推理模块（`modules/<module_id>/`）本质上是**对某
 | `realesr` | [xinntao/Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) | [EntryPoint_Real-ESRGAN/adapters/realesr](https://github.com/PegionFish/EntryPoint_Real-ESRGAN) | realesr-animevideov3-* |
 | `rembg` | [danielgatis/rembg](https://github.com/danielgatis/rembg) | [EntryPoint_rembg](https://github.com/PegionFish/EntryPoint_rembg) | u2net, u2netp, isnet-anime, u2net_human_seg, u2net_cloth_seg 等 |
 | `rife` | [nihui/rife-ncnn-vulkan](https://github.com/nihui/rife-ncnn-vulkan) | [EntryPoint_rife-ncnn-vulkan](https://github.com/PegionFish/EntryPoint_rife-ncnn-vulkan) | rife-v46-ncnn |
-| `waifu2x` | [nagadomi/nunif](https://github.com/nagadomi/nunif) | `EntryPoint_waifu2x`（本地反向同步，尚未发布 GitHub） | waifu2x 图像/视频超分降噪（swin_unet，MIT） |
-| `waifu2x-unlimited` | [nagadomi/nunif](https://github.com/nagadomi/nunif) | `EntryPoint_waifu2x-unlimited`（本地反向同步，尚未发布 GitHub） | waifu2x-unlimited ONNX 本地推理（unlimited 演示同款，MIT） |
+| `waifu2x` | [nagadomi/nunif](https://github.com/nagadomi/nunif) | [EntryPoint_waifu2x](https://github.com/PegionFish/EntryPoint_waifu2x) | waifu2x 图像/视频超分降噪（swin_unet，MIT） |
+| `waifu2x-unlimited` | [nagadomi/nunif](https://github.com/nagadomi/nunif) | [EntryPoint_waifu2x-unlimited](https://github.com/PegionFish/EntryPoint_waifu2x-unlimited) | waifu2x-unlimited ONNX 本地推理（unlimited 演示同款，MIT） |
 
 ## 主线不携带适配层（2026-09-09 起）
 
@@ -62,7 +62,7 @@ EntryPoint 的每个推理模块（`modules/<module_id>/`）本质上是**对某
 
 ## 已发布 GitHub 位置
 
-全部 10 个插件 repo 已用 `gh repo create ... --public` 创建并推送（重复执行无副作用；改名用 `gh repo rename`）：
+全部 12 个插件 repo 已用 `gh repo create ... --public` 创建并推送（重复执行无副作用；改名用 `gh repo rename`）：
 
 ```bash
 gh repo create PegionFish/EntryPoint_<模型> --public --description "EntryPoint 适配层：..."
@@ -83,15 +83,12 @@ gh repo create PegionFish/EntryPoint_<模型> --public --description "EntryPoint
 ./scripts/sync-model-repos.sh --push
 ```
 
-等价手动流程：
-
-```bash
-rm -rf /home/bob/EntryPoint_Models/EntryPoint_faster-whisper/*
-cp -r modules/faster-whisper/. /home/bob/EntryPoint_Models/EntryPoint_faster-whisper/
-cd /home/bob/EntryPoint_Models/EntryPoint_faster-whisper
-git add -A && git commit -m "sync(adapter): $(date +%Y-%m-%d) from EntryPoint main"
-git push origin main
-```
+> **⚠ 不要手动 cp/rsync 同步**：裸 `cp -r modules/<id>/. <repo>/` 会把 `nunif/`
+> 等上游运行时克隆与模型文件带进插件 repo——2026-09-08/09 已因此发生过两次
+> （EntryPoint_waifu2x 两次混入 511 文件的 nunif 克隆，均需重写历史强推清除）。
+> 同步一律走 `sync-model-repos.sh`（rsync 排除 `nunif/` 等非分发内容），
+> 各插件 repo 亦有 `.gitignore` 兜底。**模型权重（`models/` 下一切内容）任何
+> 情况下都不入库、不上 GitHub**——`module.toml [[models]]` 只声明下载源。
 
 ## 反向约束（设计约定）
 
@@ -103,6 +100,9 @@ git push origin main
 4. **改名需三处一致**：`modules/<id>/` 目录名、`module.toml [module].id`、反向 repo 名（`EntryPoint_<模型>`）。
 5. **许可证兼容**：每个反向 repo 的 `LICENSE` 取上游原文（与上游 SPDX 一致：MIT / Apache-2.0 / BSD-3-Clause），
    `module.toml [module].license` 与之对齐。
+6. **分发内容白名单**：repo 只含适配层本体（adapter/manifest/requirements/tests/README/
+   ADAPTER.md/upstream.json）。上游运行时克隆（如 `nunif/`）、模型权重、数据集
+   一律不入 repo——由 adapter 运行时自取或经 `models/` 下载。
 
 ## 常见问题
 
