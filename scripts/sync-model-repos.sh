@@ -42,6 +42,7 @@ declare -A MOD_TO_REPO=(
   [rembg]="EntryPoint_rembg|https://github.com/danielgatis/rembg|RemBG 智能去背景"
   [rife]="EntryPoint_rife-ncnn-vulkan|https://github.com/nihui/rife-ncnn-vulkan|RIFE 视频插帧"
   [waifu2x]="EntryPoint_waifu2x|https://github.com/nagadomi/nunif|waifu2x 图像/视频超分降噪"
+  [waifu2x-unlimited]="EntryPoint_waifu2x-unlimited|https://github.com/nagadomi/nunif|waifu2x-unlimited ONNX 本地推理"
 )
 
 log() { printf '[sync] %s\n' "$*"; }

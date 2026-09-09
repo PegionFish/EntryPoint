@@ -22,6 +22,20 @@ EntryPoint 的每个推理模块（`modules/<module_id>/`）本质上是**对某
 | `rembg` | [danielgatis/rembg](https://github.com/danielgatis/rembg) | [EntryPoint_rembg](https://github.com/PegionFish/EntryPoint_rembg) | u2net, u2netp, isnet-anime, u2net_human_seg, u2net_cloth_seg 等 |
 | `rife` | [nihui/rife-ncnn-vulkan](https://github.com/nihui/rife-ncnn-vulkan) | [EntryPoint_rife-ncnn-vulkan](https://github.com/PegionFish/EntryPoint_rife-ncnn-vulkan) | rife-v46-ncnn |
 | `waifu2x` | [nagadomi/nunif](https://github.com/nagadomi/nunif) | `EntryPoint_waifu2x`（本地反向同步，尚未发布 GitHub） | waifu2x 图像/视频超分降噪（swin_unet，MIT） |
+| `waifu2x-unlimited` | [nagadomi/nunif](https://github.com/nagadomi/nunif) | `EntryPoint_waifu2x-unlimited`（本地反向同步，尚未发布 GitHub） | waifu2x-unlimited ONNX 本地推理（unlimited 演示同款，MIT） |
+
+## 主线不携带适配层（2026-09-09 起）
+
+主线仓库只携带**调度引擎与内置节点**；`modules/` 下所有适配层不入 git
+（根 `.gitignore`：`modules/*`，仅保留本说明 `modules/README.md`），全部经
+**插件 repo 外部导入**：
+
+- **fresh clone / 新部署机**：`./scripts/import-modules.sh`（来源优先本地
+  `EntryPoint_Models/`，缺失则从 `PegionFish/EntryPoint_<模型>` 浅克隆）。
+- **日常开发**：仍在 `modules/<id>/` 内改（daemon 只扫描该目录），完成后
+  `./scripts/sync-model-repos.sh --only <id>` 反向同步出 repo；适配层改动
+  **不要**提交进主线。
+- 适配矩阵的"反向同步 repo"列即适配层的归属与发布位置。
 
 ## 目录位置与结构
 
@@ -75,31 +89,6 @@ gh repo create PegionFish/EntryPoint_<模型> --public --description "EntryPoint
 rm -rf /home/bob/EntryPoint_Models/EntryPoint_faster-whisper/*
 cp -r modules/faster-whisper/. /home/bob/EntryPoint_Models/EntryPoint_faster-whisper/
 cd /home/bob/EntryPoint_Models/EntryPoint_faster-whisper
-git add -A && git commit -m "sync(adapter): $(date +%Y-%m-%d) from EntryPoint main"
-git push origin main
-```
-
-## 一次性同步工作流
-
-复用脚本 `scripts/sync-model-repos.sh`：
-
-```bash
-# 全量：把当前主仓库所有 modules/ 反向刷新到 EntryPoint_Models/ 并提交
-./scripts/sync-model-repos.sh
-
-# 单个 repo：只刷新 faster-whisper
-./scripts/sync-model-repos.sh --only faster-whisper
-
-# 连同 GitHub 一起推送（需 origin 已配置）
-./scripts/sync-model-repos.sh --push
-```
-
-等价手动流程：
-
-```bash
-rm -rf /home/bob/EntryPoint_Models/faster-whisper/*
-cp -r modules/faster-whisper/. /home/bob/EntryPoint_Models/faster-whisper/
-cd /home/bob/EntryPoint_Models/faster-whisper
 git add -A && git commit -m "sync(adapter): $(date +%Y-%m-%d) from EntryPoint main"
 git push origin main
 ```

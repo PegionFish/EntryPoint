@@ -58,5 +58,9 @@ __pycache__/
 *.mkv
 *.ass
 
-# waifu2x 模块：nunif 上游运行时克隆（pin d23721f1，adapter 启动时惰性同步）
-modules/waifu2x/nunif/
+# 模型适配层（2026-09-09 起全部外部导入，不入主线：主仓只携带调度引擎与
+# 内置节点）。modules/ 下各适配层由插件 repo（EntryPoint_Models/EntryPoint_<模型>，
+# GitHub: PegionFish/EntryPoint_<模型>）经 scripts/import-modules.sh 导入；
+# 开发流：改 modules/<id>/ → scripts/sync-model-repos.sh 反向同步出 repo。
+modules/*
+!modules/README.md
