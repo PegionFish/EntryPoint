@@ -66,6 +66,7 @@ FLAG_USER=""
 FLAG_NO_FIREWALL=0
 FLAG_SKIP_SELINUX=0
 FLAG_PURGE=0
+FLAG_PYPI_MIRROR=""
 LOGS_ARGS=()
 
 # ── 4. 交互提问函数 ───────────────────────────────────────────────────────────
@@ -427,7 +428,8 @@ Type=simple
 User=${user}
 Environment=EP_ROOT=${EP_ROOT}
 Environment=RUST_LOG=info
-${extra_env}WorkingDirectory=${EP_ROOT}
+${extra_env}
+WorkingDirectory=${EP_ROOT}
 ExecStart=${EP_ROOT}/bin/ep-daemon
 Restart=on-failure
 RestartSec=5
@@ -469,9 +471,137 @@ unit_extra_env() {
     [[ -n "$uv_bin" ]] || return 0
     uv_dir="$(dirname "$uv_bin")"
     case "$uv_dir" in
-        /usr/local/sbin|/usr/local/bin|/usr/sbin|/usr/bin|/sbin|/bin) return 0 ;;
+        /usr/local/sbin|/usr/local/bin|/usr/sbin|/usr/bin|/sbin|/bin) ;;
         *) printf 'Environment=PATH=%s:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n' "$uv_dir" ;;
     esac
+    if [[ -n "${UV_DEFAULT_INDEX_CFG:-}" ]]; then
+        printf 'Environment=UV_DEFAULT_INDEX=%s\n' "$UV_DEFAULT_INDEX_CFG"
+    fi
+    return 0
+}
+
+# ── 运行环境自适应（PyPI 镜像 / 模块内联索引 / torch 代次）───────────────────
+# 设计动机：打包分发假设开发机网络（PyPI CDN / pytorch.org 可直连、GPU 为
+# 新代次）。实际部署机可能处于 PyPI 数据面被限速/掐断的网络、GPU 可能是
+# torch 2.11(cu130,最低 sm_75)不覆盖的旧代卡。此组函数在 install 时探测
+# 宿主环境并就地适配部署树，使一次 install 免手工调参。
+
+# 数据面探测：真实拉取 1MB 计速。仅 TCP 握手成功而数据被掐断的网络
+# （典型：对境外 CDN 的 TLS 放行、数据限速）在此现形。
+probe_data_plane() {
+    local url="$1" speed
+    speed="$(curl -sL -m 25 -r 0-1048575 -o /dev/null -w '%{speed_download}' "$url" 2>/dev/null || echo 0)"
+    [[ "${speed:-0}" -ge 65536 ]]   # ≥ 64 KB/s
+}
+
+# 从 simple 索引解析某包一个可下载 URL（取最后一个 wheel/tar 项）。
+resolve_first_pkg_url() {
+    local idx="$1" pkg="$2" href
+    href="$(curl -s -m 20 "${idx}/${pkg}/" 2>/dev/null | grep -oE 'href="[^"]+"' | tail -1 | sed 's/^href="//;s/"$//')" || return 1
+    [[ -n "$href" ]] || return 1
+    case "$href" in
+        http*)  printf '%s' "$href" ;;
+        ../*)   printf '%s/%s' "${idx%/simple}" "${href#../../}" ;;
+        /*)     printf '%s%s'  "${idx%/simple}" "$href" ;;
+        *)      printf '%s/%s' "${idx%/}" "$href" ;;
+    esac
+}
+
+# PyPI 镜像自适应：官方 wheel CDN 数据面不可用 → 依次探测预置镜像并启用。
+# 启用结果落在 UV_DEFAULT_INDEX_CFG（unit_extra_env 透传进 systemd unit，
+# daemon 派生的 uv 因此继承），同时 export 供本次脚本内 uv 调用使用。
+adapt_pypi_mirror() {
+    step "网络自适应: PyPI wheel CDN 数据面探测"
+    if [[ -n "$FLAG_PYPI_MIRROR" ]]; then
+        UV_DEFAULT_INDEX_CFG="${FLAG_PYPI_MIRROR%/}"
+        export UV_DEFAULT_INDEX="$UV_DEFAULT_INDEX_CFG"
+        ok "使用 --pypi-mirror 指定镜像: $UV_DEFAULT_INDEX_CFG"
+        return 0
+    fi
+    local url
+    url="$(resolve_first_pkg_url "https://pypi.org/simple" six || true)"
+    if [[ -n "$url" ]] && probe_data_plane "$url"; then
+        ok "PyPI 官方源数据面可用，不启用镜像"
+        return 0
+    fi
+    local m
+    for m in "https://mirrors.aliyun.com/pypi/simple" "https://pypi.tuna.tsinghua.edu.cn/simple"; do
+        url="$(resolve_first_pkg_url "$m" six || true)"
+        if [[ -n "$url" ]] && probe_data_plane "$url"; then
+            UV_DEFAULT_INDEX_CFG="$m"
+            export UV_DEFAULT_INDEX="$m"
+            ok "官方源数据面不可用，已启用镜像: $m（unit 环境同步注入）"
+            return 0
+        fi
+    done
+    warn "PyPI 官方源与预置镜像数据面均不可用，保持默认（模块 venv 准备可能失败）"
+}
+
+# 模块 requirements 内联的 pytorch.org cu130 索引仅 Blackwell(sm_120)需要；
+# 其数据面不通时 uv 解析长时间悬挂（TLS 握手成功、数据停滞）。探测失败
+# 则就地注释中和（幂等；保留原文便于回溯）。
+adapt_module_indexes() {
+    local f url="" mod
+    for f in "${EP_ROOT}"/modules/*/requirements*.txt; do
+        [[ -f "$f" ]] || continue
+        grep -qE '^\s*--extra-index-url\s+https://download\.pytorch\.org' "$f" || continue
+        mod="$(basename "$(dirname "$f")")"
+        if [[ -z "$url" ]]; then
+            url="https://download.pytorch.org/whl/cu126/torch-2.7.1-cp312-cp312-manylinux_2_28_x86_64.whl"
+        fi
+        if probe_data_plane "$url"; then
+            ok "$mod: pytorch.org 索引数据面可用，保留"
+        else
+            sed -i -E 's|^(\s*--extra-index-url\s+https://download\.pytorch\.org)|# DEPLOY-OFF \1|' "$f"
+            warn "$mod: pytorch.org 索引数据面不可用，已注释中和（仅 Blackwell 需要该索引）"
+        fi
+    done
+}
+
+# GPU 感知的 torch 代次适配。constraints 的 torch==2.11.0 选型面向
+# Blackwell/cu130（最低含 sm_75 内核，见 constraints 内注释）；宿主最强 GPU
+# 的 compute capability < 7.5 时该构建无可用内核（报 "no kernel image"），
+# 自动降级全家桶 pins 到 2.7.1 系（cu126：sm_50/60 SASS + PTX，旧卡可用；
+# Tesla P4 实证 CUDA 矩阵乘可跑）。torchvision/torchaudio 按官方配对版本
+# 同步改写。venv 依赖哈希随之变化，daemon 会在模块下次启动时自动重建。
+adapt_torch_for_gpu() {
+    step "GPU 自适应: torch 版本代次探测"
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        info "未检出 NVIDIA GPU，跳过 torch 代次适配"
+        return 0
+    fi
+    local cap
+    cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr -d ' ' | sort -n | head -1)"
+    if [[ -z "$cap" ]]; then
+        info "nvidia-smi 未返回 compute capability（驱动未就绪？），跳过"
+        return 0
+    fi
+    local major="${cap%%.*}" minor="${cap#*.}"
+    info "宿主 GPU compute capability（最低）: ${cap}"
+    if (( major > 7 || (major == 7 && minor >= 5) )); then
+        ok "GPU ≥ sm_75，constraints 的 torch==2.11.0（cu130）适用，不改写"
+        return 0
+    fi
+    local f changed=0
+    for f in "${EP_ROOT}/config/constraints.txt" "${EP_ROOT}"/modules/*/requirements*.txt; do
+        [[ -f "$f" ]] || continue
+        if grep -qE 'torch==2\.11\.0|torchaudio==2\.11\.0|torchvision==0\.26\.0' "$f"; then
+            sed -i -E 's/torch==2\.11\.0/torch==2.7.1/g; s/torchaudio==2\.11\.0/torchaudio==2.7.1/g; s/torchvision==0\.26\.0/torchvision==0.22.1/g' "$f"
+            changed=1
+        fi
+    done
+    if [[ "$changed" == "1" ]]; then
+        ok "GPU ${cap}(<7.5): torch 全家桶已降级 2.11.0→2.7.1 / 0.26.0→0.22.1（cu126，含旧代内核）"
+        warn "相关模块 venv 将在下次启动时自动重建（依赖哈希已变化）"
+    else
+        info "部署树未检出 2.11.0 系 pins，无需降级"
+    fi
+}
+
+adapt_runtime_environment() {
+    adapt_pypi_mirror
+    adapt_module_indexes
+    adapt_torch_for_gpu
 }
 
 wait_for_health() {
@@ -654,6 +784,9 @@ cmd_install() {
     else
         install_system_deps
     fi
+
+    # 2b) 运行环境自适应（PyPI 镜像 / 模块内联索引 / torch 代次——就地适配部署树）
+    adapt_runtime_environment
 
     # 3) 配置向导
     run_config_wizard
@@ -962,6 +1095,7 @@ main() {
             --distro)         FLAG_DISTRO="${2:?--distro 需要参数}"; shift 2 ;;
             --skip-deps)      FLAG_SKIP_DEPS=1; shift ;;
             --ffmpeg-source)  FLAG_FFMPEG_SOURCE="${2:?--ffmpeg-source 需要参数}"; shift 2 ;;
+            --pypi-mirror)    FLAG_PYPI_MIRROR="${2:?--pypi-mirror 需要参数}"; shift 2 ;;
             --host)           FLAG_HOST="${2:?--host 需要参数}"; shift 2 ;;
             --port)           FLAG_PORT="${2:?--port 需要参数}"; shift 2 ;;
             --allow-public)   FLAG_ALLOW_PUBLIC="true"; shift ;;
