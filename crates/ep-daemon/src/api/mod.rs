@@ -1,4 +1,5 @@
 pub mod autostart;
+pub mod batches;
 pub mod config;
 pub mod deps;
 pub mod devices;

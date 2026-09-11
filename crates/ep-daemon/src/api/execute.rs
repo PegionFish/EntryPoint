@@ -147,6 +147,7 @@ async fn execute_pipeline(
     let options = execution::SubmitOptions {
         wait: req.wait.unwrap_or(false),
         callback_url: req.callback_url,
+        group: None,
     };
     match execution::submit_pipeline_full(&state, pipeline, req.inputs, options).await {
         Ok(outcome) => {

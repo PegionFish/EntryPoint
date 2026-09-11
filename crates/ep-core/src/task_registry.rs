@@ -132,6 +132,11 @@ pub struct TaskRecord {
     /// 被排队/运行中任务引用的模块。旧 JSON 缺省为空。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub module_ids: Vec<String>,
+    /// 所属任务组 id（外部批量接入：同一次 batch 提交的逐文件任务共享；
+    /// 组详情/聚合展示经组 id 聚拢，单个任务仍按自身 task_id 寻址）。
+    /// 旧 JSON 缺省为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 impl TaskRecord {
@@ -139,6 +144,86 @@ impl TaskRecord {
     pub fn is_active(&self) -> bool {
         matches!(self.status, TaskState::Queued | TaskState::Running)
     }
+}
+
+// ─── 任务组聚合（外部批量接入的部分失败语义） ────────────────────────────────
+
+/// 任务组滚动状态（**组级**聚合词表，非单任务状态）：
+///
+/// - `queued` / `running`：组内仍有非终态成员（全部排队 → queued，否则 running）
+/// - `completed`：全部成员成功
+/// - `failed`：全部成员失败
+/// - `cancelled`：全部成员被取消
+/// - `partial`：**部分失败**——终态混杂（既有成功也有失败/取消，或失败与
+///   取消并存）。接入方契约：partial ≠ 整组失败，逐成员结果以
+///   `tasks[]` 明细为准。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupStatus {
+    Queued,
+    Running,
+    Completed,
+    Partial,
+    Failed,
+    Cancelled,
+}
+
+impl GroupStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// 组聚合结果：滚动状态 + 各状态成员计数
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupRollup {
+    pub status: GroupStatus,
+    pub total: usize,
+    pub queued: usize,
+    pub running: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub cancelled: usize,
+}
+
+/// 把同组任务记录滚动为组状态与计数（空切片 → 全零 completed，调用方保证非空）
+pub fn rollup_group(records: &[&TaskRecord]) -> GroupRollup {
+    let mut r = GroupRollup {
+        status: GroupStatus::Completed,
+        total: records.len(),
+        queued: 0,
+        running: 0,
+        completed: 0,
+        failed: 0,
+        cancelled: 0,
+    };
+    for rec in records {
+        match rec.status {
+            TaskState::Queued => r.queued += 1,
+            TaskState::Running => r.running += 1,
+            TaskState::Completed => r.completed += 1,
+            TaskState::Failed => r.failed += 1,
+            TaskState::Cancelled => r.cancelled += 1,
+        }
+    }
+    r.status = if r.queued > 0 || r.running > 0 {
+        if r.running > 0 { GroupStatus::Running } else { GroupStatus::Queued }
+    } else if r.completed == r.total {
+        GroupStatus::Completed
+    } else if r.failed == r.total {
+        GroupStatus::Failed
+    } else if r.cancelled == r.total {
+        GroupStatus::Cancelled
+    } else {
+        GroupStatus::Partial
+    };
+    r
 }
 
 // ─── 注册表 ──────────────────────────────────────────────────────────────────
@@ -361,6 +446,7 @@ mod tests {
             work_dir: PathBuf::from(format!("/tmp/tasks/{id}")),
             staging_dir: None,
             module_ids: Vec::new(),
+            group: None,
         }
     }
 
@@ -598,5 +684,74 @@ mod tests {
         assert_eq!(reg.enable_persistence(&dir).unwrap(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 组滚动语义（外部批量接入的部分失败契约） ─────────────────────────────
+
+    use super::{rollup_group, GroupStatus};
+
+    fn rollup_of(statuses: &[TaskState]) -> super::GroupRollup {
+        let records: Vec<TaskRecord> = statuses
+            .iter()
+            .enumerate()
+            .map(|(i, s)| record(&format!("t{i}"), "p", *s))
+            .collect();
+        let refs: Vec<&TaskRecord> = records.iter().collect();
+        rollup_group(&refs)
+    }
+
+    #[test]
+    fn rollup_active_group_wins_over_terminal_states() {
+        assert_eq!(rollup_of(&[]).status, GroupStatus::Completed, "空组兜底 completed");
+        assert_eq!(rollup_of(&[TaskState::Queued]).status, GroupStatus::Queued);
+        assert_eq!(rollup_of(&[TaskState::Queued, TaskState::Running]).status, GroupStatus::Running);
+        // 仍有活跃成员时终态混杂不影响滚动：组未完成
+        assert_eq!(
+            rollup_of(&[TaskState::Completed, TaskState::Failed, TaskState::Running]).status,
+            GroupStatus::Running
+        );
+    }
+
+    #[test]
+    fn rollup_terminal_uniform_groups() {
+        assert_eq!(rollup_of(&[TaskState::Completed; 3]).status, GroupStatus::Completed);
+        assert_eq!(rollup_of(&[TaskState::Failed; 2]).status, GroupStatus::Failed);
+        assert_eq!(rollup_of(&[TaskState::Cancelled; 2]).status, GroupStatus::Cancelled);
+    }
+
+    #[test]
+    fn rollup_mixed_terminal_is_partial() {
+        // 成功 + 失败 → partial（部分失败）
+        assert_eq!(
+            rollup_of(&[TaskState::Completed, TaskState::Failed]).status,
+            GroupStatus::Partial
+        );
+        // 成功 + 取消 → partial
+        assert_eq!(
+            rollup_of(&[TaskState::Completed, TaskState::Cancelled]).status,
+            GroupStatus::Partial
+        );
+        // 失败 + 取消并存（无成功）→ partial（既非全失败也非全取消）
+        assert_eq!(
+            rollup_of(&[TaskState::Failed, TaskState::Cancelled]).status,
+            GroupStatus::Partial
+        );
+    }
+
+    #[test]
+    fn rollup_counts_match_member_states() {
+        let r = rollup_of(&[
+            TaskState::Completed,
+            TaskState::Completed,
+            TaskState::Failed,
+            TaskState::Running,
+            TaskState::Queued,
+        ]);
+        assert_eq!(r.total, 5);
+        assert_eq!(r.completed, 2);
+        assert_eq!(r.failed, 1);
+        assert_eq!(r.running, 1);
+        assert_eq!(r.queued, 1);
+        assert_eq!(r.cancelled, 0);
     }
 }

@@ -443,6 +443,11 @@ pub struct ApiConfig {
     /// 可选 Bearer token；None = 不启用鉴权
     #[serde(default)]
     pub token: Option<String>,
+    /// 批量端点（POST /api/v1/batches）的 folder 准入范围：
+    /// false（缺省）= 仅限 workspace/uploads 内（与 input_path 同一信任域）；
+    /// true = 允许任意服务器可读目录（单机/可信局域网部署的便捷开关）
+    #[serde(default)]
+    pub batches_allow_external_folders: bool,
 }
 
 impl Default for ApiConfig {
@@ -450,6 +455,7 @@ impl Default for ApiConfig {
         Self {
             enabled: true,
             token: None,
+            batches_allow_external_folders: false,
         }
     }
 }

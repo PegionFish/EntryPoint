@@ -118,6 +118,14 @@ struct TaskSummaryOut {
     finished_at: Option<String>,
     node_count: usize,
     completed_nodes: usize,
+    /// 任务↔管线身份（§6.8；直跑为 `direct/{module_id}`、批量组为
+    /// `batch/{module_id}`）。历史任务字段缺失时省略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pipeline_id: Option<String>,
+    /// 聚合条目类型：`"group"` = 外部批量任务组（同组子任务折叠为一条）；
+    /// 普通任务省略。前端据此渲染批量徽章并隐藏产物下载入口。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -159,6 +167,38 @@ fn summary_out(record: &TaskRecord) -> TaskSummaryOut {
             .values()
             .filter(|n| n.state == "completed")
             .count(),
+        pipeline_id: Some(record.pipeline_id.clone()),
+        kind: None,
+    }
+}
+
+/// 任务组聚合条目（外部批量接入）：同组成员折叠为一条，
+/// 进度 = 子任务完成数 / 总数，状态 = 组滚动语义（partial = 部分失败）
+fn group_summary_out(group_id: &str, members: &[TaskRecord]) -> TaskSummaryOut {
+    use ep_core::task_registry::rollup_group;
+    let rollup = rollup_group(&members.iter().collect::<Vec<_>>());
+    let (module_id, _) = crate::api::batches::group_display(members);
+    let started_at = members
+        .iter()
+        .map(|m| m.started_at)
+        .min()
+        .expect("group members are non-empty");
+    let finished_at = if members.iter().all(|m| m.status.is_terminal()) {
+        members.iter().filter_map(|m| m.finished_at).max()
+    } else {
+        None
+    };
+    TaskSummaryOut {
+        id: group_id.to_string(),
+        pipeline_name: module_id.clone(),
+        status: rollup.status.as_str().to_string(),
+        started_at: started_at.to_rfc3339(),
+        finished_at: finished_at.map(|t| t.to_rfc3339()),
+        node_count: rollup.total,
+        completed_nodes: rollup.completed,
+        // 前端直跑判别用 pipeline_id 前缀；批量组统一 `batch/` 命名空间
+        pipeline_id: Some(format!("batch/{module_id}")),
+        kind: Some("group"),
     }
 }
 
@@ -180,36 +220,82 @@ fn detail_out(record: &TaskRecord) -> TaskDetailOut {
     }
 }
 
+/// 任务组详情：成员任务映射为节点形状（node_id = 子任务 id），
+/// 展开视图零前端契约改动即可逐成员展示状态与错误
+fn group_detail_out(group_id: &str, members: &[TaskRecord]) -> TaskDetailOut {
+    let nodes = members
+        .iter()
+        .map(|m| NodeDetailOut {
+            node_id: m.id.clone(),
+            state: m.status.as_str().to_string(),
+            error: m.error.clone(),
+        })
+        .collect();
+    TaskDetailOut {
+        summary: group_summary_out(group_id, members),
+        nodes,
+    }
+}
+
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
 /// GET /api/tasks — 任务列表（新任务在前）
+///
+/// 外部批量任务组折叠为一条聚合条目（`kind: "group"`），成员子任务不再
+/// 单独出现；普通任务逐条透出。组内成员仍可经 `GET /api/tasks/{group_id}`
+/// 展开，或走 v1 逐条契约。
 async fn list_tasks() -> Json<Vec<TaskSummaryOut>> {
-    Json(execution::snapshot_all().iter().map(summary_out).collect())
+    let all = execution::snapshot_all();
+    let mut grouped: std::collections::BTreeMap<String, Vec<&TaskRecord>> =
+        std::collections::BTreeMap::new();
+    let mut plain: Vec<TaskSummaryOut> = Vec::with_capacity(all.len());
+    for record in &all {
+        match &record.group {
+            Some(g) => grouped.entry(g.clone()).or_default().push(record),
+            None => plain.push(summary_out(record)),
+        }
+    }
+    let mut group_entries: Vec<TaskSummaryOut> = grouped
+        .into_iter()
+        .map(|(id, members)| {
+            let owned: Vec<TaskRecord> = members.into_iter().cloned().collect();
+            group_summary_out(&id, &owned)
+        })
+        .collect();
+    let mut out = plain;
+    out.append(&mut group_entries);
+    out.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    Json(out)
 }
 
-/// GET /api/tasks/:task_id — 任务详情（含各节点状态），404 若不存在
+/// GET /api/tasks/:task_id — 任务详情（含各节点状态），404 若不存在。
+///
+/// task_id 命中任务组（外部批量）时返回组详情：成员任务以节点形状
+/// （node_id = 子任务 id）逐条展示状态与错误。
 async fn get_task(
     State(state): State<Arc<AppState>>,
     Path(task_id): Path<String>,
 ) -> (StatusCode, Json<Value>) {
-    match execution::snapshot(&task_id) {
-        Some(record) => (
-            StatusCode::OK,
-            Json(
-                serde_json::to_value(detail_out(&record))
-                    .expect("TaskDetailOut serialization cannot fail"),
-            ),
-        ),
+    let payload = match execution::snapshot(&task_id) {
+        Some(record) => serde_json::to_value(detail_out(&record))
+            .expect("TaskDetailOut serialization cannot fail"),
         None => {
-            err_response(
-                &state,
-                StatusCode::NOT_FOUND,
-                "apiPipelines.tasks.taskNotFound",
-                &[("taskId", task_id)],
-            )
-            .await
+            // 组 id 兜底：成员存在 → 组详情；否则 404
+            let members = execution::snapshot_group(&task_id);
+            if members.is_empty() {
+                return err_response(
+                    &state,
+                    StatusCode::NOT_FOUND,
+                    "apiPipelines.tasks.taskNotFound",
+                    &[("taskId", task_id)],
+                )
+                .await;
+            }
+            serde_json::to_value(group_detail_out(&task_id, &members))
+                .expect("TaskDetailOut serialization cannot fail")
         }
-    }
+    };
+    (StatusCode::OK, Json(payload))
 }
 
 /// GET /api/tasks/:task_id/artifacts — 产物列表，无产物返回空数组
@@ -378,7 +464,7 @@ mod tests {
     use ep_core::pipeline::dag::Pipeline;
     use ep_core::port::PortManager;
 
-    use crate::api::execute::execution::{self, lock_for_tests};
+    use crate::api::execute::execution::{self, lock_for_tests, SubmitOptions};
 
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -816,5 +902,172 @@ params = { path = "/nonexistent/missing-dl.txt" }
     fn test_task_files_router_builds() {
         let router = task_files_router();
         let _ = router; // 能构造即通过（ServeDir 根目录不存在也不报错）
+    }
+
+    // ── 9. 任务组聚合（外部批量接入）：同组子任务折叠为一条 kind=group 条目，
+    //      组详情以节点形状逐成员展示 ────────────────────────────────────────
+
+    /// file_input→file_output 拷贝管线 TOML（指定管线 id）
+    fn copy_toml(pipeline_id: &str, src: &std::path::Path, dest: &std::path::Path) -> String {
+        format!(
+            r#"
+[pipeline]
+id = "{pipeline_id}"
+name = "组聚合测试"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = {{ path = "{}" }}
+
+[[nodes]]
+id = "output"
+kind = "builtin"
+builtin = "file_output"
+params = {{ path = "{}" }}
+
+[[edges]]
+from = ["input", "output"]
+to = ["output", "input"]
+"#,
+            toml_path(src),
+            toml_path(dest),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_group_tasks_fold_into_single_entry() {
+        let _guard = lock_for_tests();
+        execution::clear_registry_for_tests();
+
+        let root = unique_root("group");
+        let state = test_state(root.clone());
+        let src = root.join("grp-in.txt");
+        std::fs::write(&src, "group-body").unwrap();
+        let dest = root.join("grp-out.txt");
+
+        // 同组提交两条拷贝任务（组 A：completed ×2）+ 一条游离任务
+        let group_id = execution::new_group_id();
+        let mut member_ids = Vec::new();
+        for pid in ["grp-pipe-a", "grp-pipe-b"] {
+            let pipeline = Pipeline::from_toml_str(&copy_toml(pid, &src, &dest)).unwrap();
+            let options = SubmitOptions {
+                group: Some(group_id.clone()),
+                ..Default::default()
+            };
+            member_ids.push(
+                execution::submit_pipeline_full(&state, pipeline, None, options)
+                    .await
+                    .unwrap()
+                    .task_id,
+            );
+        }
+        let solo_pipeline = Pipeline::from_toml_str(&copy_toml("solo-pipe", &src, &dest)).unwrap();
+        let solo_id = execution::submit_pipeline(&state, solo_pipeline, None)
+            .await
+            .unwrap();
+
+        // 等待全部终结
+        for _ in 0..300 {
+            let all_terminal = [member_ids.as_slice(), &[solo_id.clone()]].concat();
+            let done = all_terminal.iter().all(|id| {
+                execution::snapshot(id).map(|r| r.status.is_terminal()).unwrap_or(false)
+            });
+            if done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // 列表：3 条物理任务折叠为 2 条（1 条 group + 1 条游离），无成员泄漏
+        let list = serde_json::to_value(&list_tasks().await.0).unwrap();
+        let arr = list.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "同组成员应折叠为一条: {list}");
+        let group_entry = arr
+            .iter()
+            .find(|e| e["kind"] == "group")
+            .expect("应有 group 条目");
+        assert_eq!(group_entry["id"], group_id);
+        assert_eq!(group_entry["status"], "completed");
+        assert_eq!(group_entry["node_count"], 2);
+        assert_eq!(group_entry["completed_nodes"], 2);
+        assert!(
+            group_entry["pipeline_id"].as_str().unwrap().starts_with("batch/"),
+            "组条目 pipeline_id 应为 batch/ 命名空间"
+        );
+        assert!(
+            arr.iter().all(|e| e["id"] != json!(member_ids[0]) && e["id"] != json!(member_ids[1])),
+            "成员子任务不得单独出现在列表"
+        );
+
+        // 游离任务条目不带 kind，pipeline_id 透出（直跑/管线判别数据源）
+        let solo_entry = arr.iter().find(|e| e["id"] == json!(solo_id)).unwrap();
+        assert!(solo_entry.get("kind").is_none());
+        assert_eq!(solo_entry["pipeline_id"], "solo-pipe");
+
+        // 组详情：成员以节点形状逐条展示（node_id = 子任务 id）
+        let (status, detail) =
+            get_task(State(state), Path(group_id.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail.0["kind"], "group");
+        assert_eq!(detail.0["status"], "completed");
+        let nodes = detail.0["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 2);
+        let node_ids: Vec<&str> = nodes.iter().map(|n| n["node_id"].as_str().unwrap()).collect();
+        assert!(node_ids.contains(&member_ids[0].as_str()));
+        assert!(node_ids.contains(&member_ids[1].as_str()));
+        assert!(nodes.iter().all(|n| n["state"] == "completed"));
+    }
+
+    // ── 10. 部分失败组：completed + failed → 组状态 partial ─────────────────
+
+    #[tokio::test]
+    async fn test_group_partial_failure_rollup() {
+        let _guard = lock_for_tests();
+        execution::clear_registry_for_tests();
+
+        let root = unique_root("group-partial");
+        let state = test_state(root.clone());
+        let src = root.join("grp-partial-in.txt");
+        std::fs::write(&src, "partial").unwrap();
+        let dest = root.join("grp-partial-out.txt");
+        let group_id = execution::new_group_id();
+
+        // 成员 1：正常拷贝（completed）
+        let pipeline = Pipeline::from_toml_str(&copy_toml("partial-ok", &src, &dest)).unwrap();
+        let options = SubmitOptions {
+            group: Some(group_id.clone()),
+            ..Default::default()
+        };
+        execution::submit_pipeline_full(&state, pipeline, None, options)
+            .await
+            .unwrap();
+        // 成员 2：输入缺失（failed）
+        let pipeline =
+            Pipeline::from_toml_str(&copy_toml("partial-bad", std::path::Path::new("/nonexistent/x"), &dest))
+                .unwrap();
+        let options = SubmitOptions {
+            group: Some(group_id.clone()),
+            ..Default::default()
+        };
+        execution::submit_pipeline_full(&state, pipeline, None, options)
+            .await
+            .unwrap();
+
+        for _ in 0..300 {
+            let members = execution::snapshot_group(&group_id);
+            if members.len() == 2 && members.iter().all(|m| m.status.is_terminal()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let list = serde_json::to_value(&list_tasks().await.0).unwrap();
+        let arr = list.as_array().unwrap();
+        let group_entry = arr.iter().find(|e| e["kind"] == "group").unwrap();
+        assert_eq!(group_entry["status"], "partial", "completed+failed 应滚动为 partial");
+        assert_eq!(group_entry["node_count"], 2);
+        assert_eq!(group_entry["completed_nodes"], 1);
     }
 }

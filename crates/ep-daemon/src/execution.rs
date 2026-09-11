@@ -360,6 +360,118 @@ pub fn snapshot_by_pipeline(pipeline_id: &str) -> Vec<TaskRecord> {
     list
 }
 
+// ─── 任务组（外部批量接入）：组 id 生成 / 成员查询 / 组取消 ─────────────────
+
+/// 组 id 序列（与任务 id 序列独立，前缀区分）
+static GROUP_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// 新组 id：`grp-{timestamp}-{seq}`（形状与 new_task_id 同款，前缀区分用途）
+pub fn new_group_id() -> String {
+    let seq = GROUP_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("grp-{}-{seq:04}", Utc::now().format("%Y%m%d-%H%M%S"))
+}
+
+/// 组成员快照（按提交顺序），供组聚合展示与 v1 组查询。
+/// 组不存在（无成员）返回空 Vec。
+pub fn snapshot_group(group_id: &str) -> Vec<TaskRecord> {
+    let mut members: Vec<TaskRecord> = registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .all()
+        .into_iter()
+        .filter(|r| r.group.as_deref() == Some(group_id))
+        .collect();
+    members.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+    members
+}
+
+/// 全部组 id（按组内最早任务时间倒序），供组列表
+pub fn group_ids() -> Vec<String> {
+    let all = registry().lock().unwrap_or_else(|e| e.into_inner()).all();
+    let mut groups: Vec<(String, chrono::DateTime<Utc>)> = Vec::new();
+    for r in all {
+        if let Some(g) = &r.group {
+            let entry = groups.iter_mut().find(|(id, _)| id == g);
+            match entry {
+                Some((_, earliest)) => {
+                    if r.started_at < *earliest {
+                        *earliest = r.started_at;
+                    }
+                }
+                None => groups.push((g.clone(), r.started_at)),
+            }
+        }
+    }
+    groups.sort_by(|a, b| b.1.cmp(&a.1));
+    groups.into_iter().map(|(id, _)| id).collect()
+}
+
+/// 组取消结果
+pub enum GroupCancelOutcome {
+    /// 组不存在（无任何成员）
+    NotFound,
+    /// `cancelled` = 受理取消的成员数；`already_terminal` = 终态成员数
+    Cancelled { cancelled: usize, already_terminal: usize },
+}
+
+/// 组取消：对全部非终态成员逐一发起 [`request_cancel`]（终态成员跳过）。
+/// 逐成员独立受理——部分成员可能已终结，`cancelled`/`already_terminal`
+/// 如实分开计数。
+pub async fn cancel_group(state: &Arc<AppState>, group_id: &str) -> GroupCancelOutcome {
+    let members = snapshot_group(group_id);
+    if members.is_empty() {
+        return GroupCancelOutcome::NotFound;
+    }
+    let mut cancelled = 0usize;
+    let mut already_terminal = 0usize;
+    for member in &members {
+        if member.status.is_terminal() {
+            already_terminal += 1;
+            continue;
+        }
+        if matches!(
+            request_cancel(state, &member.id).await,
+            CancelOutcome::Cancelled
+        ) {
+            cancelled += 1;
+        } else {
+            already_terminal += 1;
+        }
+    }
+    GroupCancelOutcome::Cancelled { cancelled, already_terminal }
+}
+
+/// 注册表持久化目录（组元数据文件落位 `{dir}/groups/`；未启用持久化 → None）
+pub fn persistence_dir() -> Option<std::path::PathBuf> {
+    registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .persist_dir()
+        .map(|p| p.to_path_buf())
+}
+
+/// 在途容量上限（排队 + 运行中）的只读访问器（批量端点预检用）
+pub fn max_inflight_tasks() -> usize {
+    MAX_INFLIGHT_TASKS
+}
+
+/// 当前在途任务数（FIFO 队列长度 + 运行中计数；与提交路径的
+/// 容量检查同源），供批量端点整批入队预检
+pub fn inflight_count() -> usize {
+    let sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
+    sched.queue.len() + sched.running_count
+}
+
+/// 仅测试：直接设定运行中计数（跨模块模拟队列满载；execution 模块内
+/// 测试可直接经 `scheduler()` 改写，无需本助手）
+#[cfg(test)]
+pub fn set_running_count_for_tests(n: usize) {
+    scheduler()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .running_count = n;
+}
+
 fn live_queue_position(task_id: &str) -> Option<usize> {
     scheduler()
         .lock()
@@ -565,6 +677,9 @@ pub struct SubmitOptions {
     pub wait: bool,
     /// 完成回调：终态时 POST `{task_id, status, artifacts}`（best-effort）
     pub callback_url: Option<String>,
+    /// 所属任务组（外部批量接入）：同组任务共享组 id，任务中心折叠为
+    /// 一条聚合展示，单个任务仍按 task_id 独立寻址
+    pub group: Option<String>,
 }
 
 /// 提交结果
@@ -710,6 +825,7 @@ pub async fn submit_pipeline_full(
         work_dir: task_dir.clone(),
         staging_dir: Some(staging_dir.to_string_lossy().to_string()),
         module_ids: task_module_ids,
+        group: options.group.clone(),
     };
     registry()
         .lock()
@@ -1471,6 +1587,7 @@ async fn wait_until_terminal(state: &Arc<AppState>, task_id: &str) -> TaskRecord
                     work_dir: PathBuf::new(),
                     staging_dir: None,
                     module_ids: Vec::new(),
+                    group: None,
                 });
             }
         }
@@ -2436,6 +2553,7 @@ to = ["output", "input"]
             work_dir: PathBuf::new(),
             staging_dir: None,
             module_ids: Vec::new(),
+        group: None,
         };
         registry()
             .lock()
@@ -3060,7 +3178,8 @@ builtin = "file_output"
             SubmitOptions {
                 wait: true,
                 callback_url: None,
-            },
+                group: None,
+                },
         )
         .await
         .unwrap();
@@ -3136,7 +3255,8 @@ builtin = "file_output"
             SubmitOptions {
                 wait: true,
                 callback_url: Some(format!("http://{addr}/cb")),
-            },
+                group: None,
+                },
         )
         .await
         .unwrap();
@@ -3452,7 +3572,8 @@ output_type = "json"
             SubmitOptions {
                 wait: true,
                 callback_url: None,
-            },
+                group: None,
+                },
         )
         .await
         .unwrap();
@@ -3549,6 +3670,7 @@ output_type = "json"
             work_dir: PathBuf::new(),
             staging_dir: None,
             module_ids: Vec::new(),
+        group: None,
         }
     }
 
@@ -3589,6 +3711,7 @@ output_type = "json"
             work_dir: PathBuf::new(),
             staging_dir: None,
             module_ids: Vec::new(),
+        group: None,
         };
         registry()
             .lock()

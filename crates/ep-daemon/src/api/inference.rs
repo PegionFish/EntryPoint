@@ -50,7 +50,7 @@ use crate::state::AppState;
 // ─── 错误契约（稳定机读码；不走 i18n，不改动 err_response） ─────────────────
 
 /// v1 稳定错误响应：`{"error": {"code": <MACHINE_CODE>, "message": <文案>}}`
-fn v1_error(status: StatusCode, code: &str, message: impl Into<String>) -> (StatusCode, Json<Value>) {
+pub(crate) fn v1_error(status: StatusCode, code: &str, message: impl Into<String>) -> (StatusCode, Json<Value>) {
     (
         status,
         Json(json!({ "error": { "code": code, "message": message.into() } })),
@@ -58,18 +58,18 @@ fn v1_error(status: StatusCode, code: &str, message: impl Into<String>) -> (Stat
 }
 
 /// 参数校验失败 → 400 PARAM_INVALID（携带具体原因）
-fn param_error(detail: impl Into<String>) -> (StatusCode, Json<Value>) {
+pub(crate) fn param_error(detail: impl Into<String>) -> (StatusCode, Json<Value>) {
     v1_error(StatusCode::BAD_REQUEST, "PARAM_INVALID", detail)
 }
 
 /// 输入非法（缺失/越权/形态错误）→ 400 INPUT_INVALID
-fn input_error(message: impl Into<String>) -> (StatusCode, Json<Value>) {
+pub(crate) fn input_error(message: impl Into<String>) -> (StatusCode, Json<Value>) {
     v1_error(StatusCode::BAD_REQUEST, "INPUT_INVALID", message)
 }
 
 /// manifest / capability 存在性解析（纯只读、无副作用，m5）：前移到输入
 /// 物化之前执行，避免非法请求（未知模块/capability）向 uploads 留垃圾文件。
-async fn resolve_capability(
+pub(crate) async fn resolve_capability(
     state: &Arc<AppState>,
     module_id: &str,
     capability: &str,
@@ -100,7 +100,7 @@ async fn resolve_capability(
 }
 
 /// `ParamError` → 400 PARAM_INVALID 映射（携带具体原因）
-fn map_param_error(e: ParamError) -> (StatusCode, Json<Value>) {
+pub(crate) fn map_param_error(e: ParamError) -> (StatusCode, Json<Value>) {
     match e {
         ParamError::Missing(name) => {
             param_error(format!("required parameter `{name}` is missing"))
@@ -127,7 +127,7 @@ fn store_failure_response(ue: crate::api::upload::UploadError) -> (StatusCode, J
 }
 
 /// `SubmitError` → v1 错误契约映射
-fn submit_error_response(e: SubmitError) -> (StatusCode, Json<Value>) {
+pub(crate) fn submit_error_response(e: SubmitError) -> (StatusCode, Json<Value>) {
     match e {
         SubmitError::ModuleNotFound(id) => v1_error(
             StatusCode::NOT_FOUND,
@@ -164,7 +164,7 @@ fn submit_error_response(e: SubmitError) -> (StatusCode, Json<Value>) {
 }
 
 /// `AutoStartError` → v1 错误契约映射（对齐 execute_single 的状态码语义）
-fn autostart_error_response(e: AutoStartError) -> (StatusCode, Json<Value>) {
+pub(crate) fn autostart_error_response(e: AutoStartError) -> (StatusCode, Json<Value>) {
     match e {
         AutoStartError::ModuleNotFound(id) => v1_error(
             StatusCode::NOT_FOUND,
@@ -303,6 +303,9 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/v1/tasks/{task_id}/cancel", post(v1_cancel_task))
         // 弃用别名：旧 result 查询路径（v0.2 起由 GET /v1/tasks/{task_id} 取代）
         .route("/v1/inference/result/{task_id}", get(get_result))
+        // 批量接入：文件夹批量提交 + 任务组查询/取消（batches.rs；
+        // 在 token 中间件之内合并，鉴权口径与 v1 其余端点一致）
+        .merge(crate::api::batches::router())
         .merge(inference_route)
         .layer(middleware::from_fn_with_state(state, require_token))
 }
@@ -764,7 +767,11 @@ async fn run_inference(
     }
 
     // 3. 提交（wait/callback 语义镜像 submit_pipeline_full）
-    let options = SubmitOptions { wait, callback_url };
+    let options = SubmitOptions {
+        wait,
+        callback_url,
+        group: None,
+    };
     match execution::submit_direct_full(
         state,
         module_id,
@@ -1016,6 +1023,7 @@ mod tests {
         config.api = ApiConfig {
             enabled: true,
             token: Some("s3cret-token".to_string()),
+            ..Default::default()
         };
         let state = test_state(unique_root("token-401"), config, vec![]);
         let resp = app(state).oneshot(get("/v1/capabilities")).await.unwrap();
@@ -1031,6 +1039,7 @@ mod tests {
         config.api = ApiConfig {
             enabled: true,
             token: Some("s3cret-token".to_string()),
+            ..Default::default()
         };
         let state = test_state(unique_root("bearer-ok"), config, vec![]);
         let resp = app(state)
@@ -1050,6 +1059,7 @@ mod tests {
         config.api = ApiConfig {
             enabled: true,
             token: Some("s3cret-token".to_string()),
+            ..Default::default()
         };
         let state = test_state(unique_root("bearer-bad"), config, vec![]);
         let resp = app(state)
@@ -1069,6 +1079,7 @@ mod tests {
         config.api = ApiConfig {
             enabled: true,
             token: Some("s3cret-token".to_string()),
+            ..Default::default()
         };
         let state = test_state(unique_root("apikey-ok"), config, vec![]);
         let resp = app(state)
@@ -1088,6 +1099,7 @@ mod tests {
         config.api = ApiConfig {
             enabled: true,
             token: Some("s3cret-token".to_string()),
+            ..Default::default()
         };
         let state = test_state(unique_root("bearer-lower"), config, vec![]);
         let resp = app(state)
@@ -1107,6 +1119,7 @@ mod tests {
         config.api = ApiConfig {
             enabled: true,
             token: Some("s3cret-token".to_string()),
+            ..Default::default()
         };
         let state = test_state(unique_root("basic-scheme"), config, vec![]);
         let resp = app(state)

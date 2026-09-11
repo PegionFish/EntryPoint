@@ -795,6 +795,24 @@ async fn cancel_task(
     State(state): State<Arc<AppState>>,
     AxumPath(task_id): AxumPath<String>,
 ) -> (StatusCode, Json<Value>) {
+    // 组 id 兼容：外部批量接入的任务组（grp-* 成员聚合）整组取消
+    if execution::snapshot_group(&task_id).len() > 0 {
+        return match execution::cancel_group(&state, &task_id).await {
+            execution::GroupCancelOutcome::NotFound => {
+                err_response(
+                    &state,
+                    StatusCode::NOT_FOUND,
+                    "apiPipelines.tasks.taskNotFound",
+                    &[("taskId", task_id)],
+                )
+                .await
+            }
+            execution::GroupCancelOutcome::Cancelled { .. } => (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "status": "cancelled" })),
+            ),
+        };
+    }
     match execution::request_cancel(&state, &task_id).await {
         execution::CancelOutcome::Cancelled => (
             StatusCode::OK,
