@@ -101,6 +101,13 @@ const TASK_STATE_META: Record<string, TaskStateMeta> = {
     bar: 'bg-muted-foreground',
     pulse: false,
   },
+  partial: {
+    labelKey: 'status.partial',
+    dot: 'bg-status-error',
+    badge: 'bg-status-error/10 text-status-error border-status-error/25',
+    bar: 'bg-status-error',
+    pulse: false,
+  },
 }
 
 function taskStateMeta(state: string | null | undefined): TaskStateMeta {
@@ -116,9 +123,9 @@ function taskStateMeta(state: string | null | undefined): TaskStateMeta {
   )
 }
 
-/** 终态任务不再变化（completed / failed / cancelled） */
+/** 终态任务不再变化（completed / failed / cancelled；partial 为组级终态） */
 function isTerminalStatus(status: string): boolean {
-  return ['completed', 'failed', 'cancelled'].includes(
+  return ['completed', 'failed', 'cancelled', 'partial'].includes(
     status.trim().toLowerCase(),
   )
 }
@@ -133,7 +140,7 @@ const TASK_FILTER_STORAGE_KEY = 'ep.tasks.statusFilter'
 const TASK_FILTER_STATES: Record<Exclude<TaskFilter, 'all'>, Set<string>> = {
   running: new Set(['pending', 'running', 'queued']),
   completed: new Set(['completed']),
-  failed: new Set(['failed']),
+  failed: new Set(['failed', 'partial']),
   cancelled: new Set(['cancelled']),
 }
 
@@ -147,13 +154,15 @@ function parseTaskFilter(raw: string | null): TaskFilter {
 }
 
 /** 任务类型筛选值（QUICK_RUN_PLAN D4：与状态筛选正交的客户端过滤） */
-type TaskTypeFilter = 'all' | 'pipeline' | 'direct'
+type TaskTypeFilter = 'all' | 'pipeline' | 'direct' | 'batch'
 
 /** 类型筛选会话保持键（与状态筛选同策略） */
 const TASK_TYPE_FILTER_STORAGE_KEY = 'ep.tasks.typeFilter'
 
 function parseTaskTypeFilter(raw: string | null): TaskTypeFilter {
-  return raw === 'pipeline' || raw === 'direct' ? raw : 'all'
+  return raw === 'pipeline' || raw === 'direct' || raw === 'batch'
+    ? raw
+    : 'all'
 }
 
 /** 直跑任务判别式：pipeline_id 以 direct/ 开头；历史任务字段缺失视为管线类 */
@@ -165,6 +174,26 @@ function isDirectRun(task: Pick<TaskSummary, 'pipeline_id'>): boolean {
 function directModuleId(task: Pick<TaskSummary, 'pipeline_id'>): string | null {
   return isDirectRun(task)
     ? task.pipeline_id!.slice(DIRECT_PIPELINE_PREFIX.length)
+    : null
+}
+
+/** 批量组 pipeline_id 前缀（外部批量接入：batch/<module_id>） */
+const BATCH_PIPELINE_PREFIX = 'batch/'
+
+/** 批量组判别式：后端聚合条目 kind="group"，或 pipeline_id 以 batch/ 开头 */
+function isBatchGroup(task: Pick<TaskSummary, 'kind' | 'pipeline_id'>): boolean {
+  return (
+    task.kind === 'group' ||
+    task.pipeline_id?.startsWith(BATCH_PIPELINE_PREFIX) === true
+  )
+}
+
+/** 批量组 → 所属模块 id（非批量返回 null） */
+function batchModuleId(
+  task: Pick<TaskSummary, 'kind' | 'pipeline_id'>,
+): string | null {
+  return isBatchGroup(task)
+    ? (task.pipeline_id!.slice(BATCH_PIPELINE_PREFIX.length) || null)
     : null
 }
 
@@ -352,14 +381,22 @@ function TaskCard({
 
   // 直跑任务：徽章 + 「直跑 · 模块名」；模块 join 不到时回退原始 pipeline_id
   const directModule = directModuleId(task)
+  // 批量组（外部接入）：徽章 + 「批量 · 模块名」；产物由接入方经 API 获取，
+  // 本页不提供下载
+  const batchModule = batchModuleId(task)
   const displayName =
-    directModule !== null
-      ? t('directName', {
-          defaultValue: 'Quick run · {{name}}',
-          name:
-            moduleNames.get(directModule) ?? (task.pipeline_id as string),
+    batchModule !== null
+      ? t('batchName', {
+          defaultValue: 'Batch · {{name}}',
+          name: moduleNames.get(batchModule) ?? batchModule,
         })
-      : (task.pipeline_name || task.id)
+      : directModule !== null
+        ? t('directName', {
+            defaultValue: 'Quick run · {{name}}',
+            name:
+              moduleNames.get(directModule) ?? (task.pipeline_id as string),
+          })
+        : (task.pipeline_name || task.id)
 
   /** 取消任务（排队中 → 立即终结；运行中 → 逻辑终态 cancelled） */
   async function handleCancel() {
@@ -424,9 +461,9 @@ function TaskCard({
     }
   }, [expanded, task.id, terminal, detailRetry, t])
 
-  // completed 任务拉取产物列表（状态转为 completed 或重试时触发）
+  // completed 任务拉取产物列表（批量组除外——产物由接入方经 API 处理）
   useEffect(() => {
-    if (!expanded || task.status !== 'completed') return
+    if (!expanded || task.status !== 'completed' || batchModule !== null) return
     let ignore = false
     api
       .listTaskArtifacts(task.id)
@@ -483,6 +520,14 @@ function TaskCard({
               !expanded && '-rotate-90',
             )}
           />
+          {batchModule !== null && (
+            <Badge
+              variant="outline"
+              className="shrink-0 border-status-preparing/40 bg-status-preparing/10 text-status-preparing"
+            >
+              {t('batchBadge', { defaultValue: 'API batch' })}
+            </Badge>
+          )}
           {directModule !== null && (
             <Badge
               variant="outline"
@@ -607,8 +652,18 @@ function TaskCard({
             </div>
           )}
 
-          {/* 产物下载：仅 completed 任务 */}
-          {task.status === 'completed' && (
+          {/* 批量组：外部接入说明替代产物下载面 */}
+          {batchModule !== null && (
+            <div className="border-t border-border/60 bg-muted/20 px-4 py-3 text-xs text-muted-foreground">
+              {t('batch.externalNote', {
+                defaultValue:
+                  'External batch task: results are consumed by the integrating app via API; downloads are not offered here.',
+              })}
+            </div>
+          )}
+
+          {/* 产物下载：仅 completed 任务（批量组除外） */}
+          {task.status === 'completed' && batchModule === null && (
             <div className="border-t border-border/60 bg-muted/20 pb-1">
               <div className="flex items-center gap-2 px-4 pb-1 pt-3 text-xs font-medium text-muted-foreground">
                 <FileBox className="size-3.5" />
@@ -794,7 +849,7 @@ export function TasksPage() {
       const s = task.status.trim().toLowerCase()
       if (TASK_FILTER_STATES.running.has(s)) counts.running += 1
       else if (s === 'completed') counts.completed += 1
-      else if (s === 'failed') counts.failed += 1
+      else if (TASK_FILTER_STATES.failed.has(s)) counts.failed += 1
       else if (s === 'cancelled') counts.cancelled += 1
     }
     return counts
@@ -804,11 +859,13 @@ export function TasksPage() {
   const typeCounts = useMemo(() => {
     let pipeline = 0
     let direct = 0
+    let batch = 0
     for (const task of tasks ?? []) {
-      if (isDirectRun(task)) direct += 1
+      if (isBatchGroup(task)) batch += 1
+      else if (isDirectRun(task)) direct += 1
       else pipeline += 1
     }
-    return { pipeline, direct }
+    return { pipeline, direct, batch }
   }, [tasks])
 
   // 模块 id → 显示名（复用页面已有的 GET /api/modules 数据，无需额外请求）
@@ -826,8 +883,11 @@ export function TasksPage() {
       ) {
         return false
       }
-      if (typeFilter === 'pipeline' && isDirectRun(task)) return false
-      if (typeFilter === 'direct' && !isDirectRun(task)) return false
+      if (typeFilter === 'pipeline' && (isDirectRun(task) || isBatchGroup(task)))
+        return false
+      if (typeFilter === 'direct' && (!isDirectRun(task) || isBatchGroup(task)))
+        return false
+      if (typeFilter === 'batch' && !isBatchGroup(task)) return false
       return true
     })
   }, [tasks, statusFilter, typeFilter])
@@ -922,6 +982,11 @@ export function TasksPage() {
       value: 'direct' as TaskTypeFilter,
       label: t('type.direct', { defaultValue: '直跑' }),
       count: typeCounts.direct,
+    },
+    {
+      value: 'batch' as TaskTypeFilter,
+      label: t('type.batch', { defaultValue: '批量' }),
+      count: typeCounts.batch,
     },
   ]
 

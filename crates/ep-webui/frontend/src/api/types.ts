@@ -325,6 +325,8 @@ export interface TaskSummary {
   started_running_at?: string
   /** 任务错误信息（failed 时存在） */
   error?: string
+  /** 聚合条目类型："group" = 外部批量任务组（同组子任务折叠为一条） */
+  kind?: 'group'
 }
 
 export interface TaskNodeState {
