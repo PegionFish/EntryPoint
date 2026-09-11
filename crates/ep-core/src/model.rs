@@ -1331,7 +1331,9 @@ impl ModelManager {
                 total_bytes += file_size;
 
                 // 每 10 个文件输出一次进度
-                if file_count.is_multiple_of(10) {
+                // （% 而非 is_multiple_of：后者 1.87 才转正，Debian 13 的
+                //   系统 rustc 1.85 需在服务器本地整仓编译）
+                if file_count % 10 == 0 {
                     info!(
                         files_copied = file_count,
                         total_bytes = total_bytes,
