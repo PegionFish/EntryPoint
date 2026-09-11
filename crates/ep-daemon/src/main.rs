@@ -326,27 +326,58 @@ async fn run_server(root: PathBuf, cfg: AppConfig) -> anyhow::Result<()> {
         });
     }
 
-    // 10. Spawn device refresh task — 周期性重新探测计算设备，更新 state.devices。
-    //     detect_all_devices 内部用阻塞的 std::process::Command 调 nvidia-smi 等，
-    //     故放入 spawn_blocking 执行，避免阻塞 async 运行时。
-    //     间隔取启动时 config.compute.refresh_interval_secs（不热跟随变更）。
+    // 10. Spawn device refresh task — 周期性刷新计算设备，更新 state.devices。
+    //     两级节奏（监控迟缓修复）：高频路径只对在册后端做指标快刷
+    //     （refresh_device_metrics，典型一轮仅一次 nvidia-smi 子进程）；
+    //     低频（60s）回归全量重检测捕获拓扑变化。detect_all_devices 内部
+    //     用阻塞的 std::process::Command 调 nvidia-smi 等，故均放入
+    //     spawn_blocking 执行，避免阻塞 async 运行时。
+    //     间隔实时读取 config.compute.refresh_interval_secs（热跟随变更）。
     {
         let state = state.clone();
         tokio::spawn(async move {
-            let interval_secs = {
-                let cfg = state.config.read().await;
-                u64::from(cfg.compute.refresh_interval_secs.max(1))
-            };
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             interval.tick().await; // 首个 tick 立即返回，跳过以避免与启动探测重复
+            let mut next_interval_secs: u64 = 0; // >0 时才到节拍（1s 心跳分频）
+            let mut last_full_detect = std::time::Instant::now();
+            const FULL_DETECT_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
             loop {
                 interval.tick().await;
+                next_interval_secs = next_interval_secs.saturating_sub(1);
+                if next_interval_secs > 0 {
+                    continue;
+                }
+                let interval_secs = {
+                    let cfg = state.config.read().await;
+                    u64::from(cfg.compute.refresh_interval_secs.max(1))
+                };
+                next_interval_secs = interval_secs;
+                let do_full_detect = last_full_detect.elapsed() >= FULL_DETECT_EVERY;
                 let disabled = {
                     let cfg = state.config.read().await;
                     cfg.compute.disabled_backends.clone()
                 };
-                match tokio::task::spawn_blocking(move || detect_all_devices(&disabled)).await {
+                // 快照在 async 侧取好（读锁仅覆盖 clone），重活交给 blocking 线程
+                let snapshot = if do_full_detect {
+                    Vec::new()
+                } else {
+                    state.devices.read().await.clone()
+                };
+                let result = tokio::task::spawn_blocking(move || {
+                    if do_full_detect {
+                        detect_all_devices(&disabled)
+                    } else {
+                        let mut devices = snapshot;
+                        ep_core::compute::refresh_device_metrics(&mut devices, &disabled);
+                        devices
+                    }
+                })
+                .await;
+                match result {
                     Ok(devices) => {
+                        if do_full_detect {
+                            last_full_detect = std::time::Instant::now();
+                        }
                         tracing::debug!(count = devices.len(), "devices refreshed");
                         *state.devices.write().await = devices;
                     }

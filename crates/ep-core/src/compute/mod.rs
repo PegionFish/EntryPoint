@@ -255,9 +255,57 @@ pub fn detect_all_devices(disabled: &[ComputeBackend]) -> Vec<ComputeDevice> {
 // `refresh_all_devices`（原仅桌面端常驻调度器消费）已随桌面端退役
 //（2026-08-13）删除：daemon 无调用方，检测器刷新由调用侧自行驱动。
 
+/// 指标快刷（轻量路径）：仅对**已在册**设备的后端调用各检测器的
+/// `refresh()`（SMI 类采样就地更新利用率/显存/温度），不做全量重检测。
+///
+/// 与 [`detect_all_devices`] 的分工：周期刷新的高频路径走这里——
+/// `detect()` 会重新枚举全部后端（含 spawn 慢速的 vulkaninfo 等身份探测，
+/// 单轮可达秒级），而设备拓扑几乎不变；本函数只 spawn 在册后端的采样
+/// 工具（无对应设备时零子进程），把周期刷新的典型成本压到一次
+/// nvidia-smi/rocm-smi 调用。拓扑变化（插拔设备/驱动重载）由调用方
+/// 低频回归 [`detect_all_devices`] 捕获。
+pub fn refresh_device_metrics(devices: &mut [ComputeDevice], disabled: &[ComputeBackend]) {
+    for detector in all_detectors() {
+        let backend = detector.backend();
+        if disabled.contains(&backend) {
+            continue;
+        }
+        let present = devices.iter().any(|d| d.backend == backend);
+        if !present {
+            continue;
+        }
+        detector.refresh(devices);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 指标快刷：无在册设备的后端不触发检测/新增，在册条目不丢失。
+    /// （CPU 刷新为纯进程内采样；CUDA/ROCm 无在册设备 → 零子进程）
+    #[test]
+    fn refresh_device_metrics_preserves_absent_backends() {
+        use crate::types::DeviceId;
+
+        let mut devices = vec![ComputeDevice {
+            id: DeviceId::Cpu,
+            backend: ComputeBackend::Cpu,
+            name: "Test CPU".into(),
+            total_memory_mb: Some(16384),
+            used_memory_mb: None,
+            utilization: None,
+            temperature: None,
+        }];
+        refresh_device_metrics(&mut devices, &[]);
+        assert_eq!(devices.len(), 1, "无其他后端在册 → 不得新增条目");
+        assert_eq!(devices[0].id, DeviceId::Cpu);
+
+        // disabled 剔除语义与全量检测一致：禁用后端即使有在册设备也跳过刷新
+        refresh_device_metrics(&mut devices, &[ComputeBackend::Cpu]);
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].backend, ComputeBackend::Cpu);
+    }
 
     #[test]
     fn test_registry_order_and_coverage() {
