@@ -63,6 +63,7 @@ EntryPoint 的对外稳定契约挂载于 **`/api/v1/*`**（token 鉴权仅作�
 | list（扩展） | `GET /api/v1/tasks` | `{"tasks":[{task_id,status}]}` 最小稳定面 |
 | cancel | `POST /api/v1/tasks/{task_id}/cancel` | 排队中立即终结；运行中置 `cancelled` |
 | upload | `POST /api/files` | multipart 单字段 `file` → `{"path": "<引用>"}`；引用传给 submit 的 `input_path` |
+| （批量扩展） | `POST /api/v1/batches` | 文件夹批量提交：返回 `group_id`，组状态/取消走 groups 端点；成员任务仍逐条 `task_id` 轮询（见 INFERENCE_API.md §1.6） |
 | （管线扩展） | `POST /api/pipelines/{pipeline_id}/runs` | 多节点 DAG 执行；同样返回 task_id，后续查询/取消复用 tasks 端点 |
 
 > 历史别名：`GET /api/v1/inference/result/{task_id}`（= `GET

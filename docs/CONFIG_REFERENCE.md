@@ -250,6 +250,7 @@ qwen3-tts = "default"
 |---|---|---|---|
 | `enabled` | bool | `true` | v1 门面总开关。`false` 时不强制鉴权（直通） |
 | `token` | string | 无（不启用鉴权） | 可选 Bearer token。配置后 `/api/v1/*` 端点要求 `Authorization: Bearer <token>` 或 `X-API-Key: <token>`，不匹配返回 `401` |
+| `batches_allow_external_folders` | bool | `false` | 批量端点（`POST /api/v1/batches`）的 folder 准入范围。`false` = 仅限 workspace/uploads 内；`true` = 允许任意服务器可读目录（单机/可信局域网部署的便捷开关） |
 
 仅保护 `/api/v1/*` 外部契约层；`/api` 其余 WebUI 内部端点不受影响。
 端点用法、错误码与演进路线详见 `docs/INFERENCE_API.md`。

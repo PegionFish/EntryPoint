@@ -20,6 +20,10 @@ WebUI 内部端点分离：本文件描述的请求/响应形状与错误码属�
 | `GET` | `/api/v1/tasks/{task_id}` | 任务状态与产物查询（轮询用） |
 | `POST` | `/api/v1/tasks/{task_id}/cancel` | 取消任务（排队中立即终结；运行中置 `cancelled`） |
 | `GET` | `/api/v1/inference/result/{task_id}` | **弃用别名**（v0.2 起 → `GET /api/v1/tasks/{task_id}`，行为完全一致） |
+| `POST` | `/api/v1/batches` | 文件夹批量提交：枚举目录内文件逐个提交，返回 `group_id` + `task_ids`（§1.6） |
+| `GET` | `/api/v1/groups` | 任务组列表（滚动状态 + 计数） |
+| `GET` | `/api/v1/groups/{group_id}` | 组详情（成员任务逐条状态） |
+| `POST` | `/api/v1/groups/{group_id}/cancel` | 组取消（非终态成员逐一受理） |
 
 ### 1.1 `GET /v1/capabilities`
 
@@ -157,6 +161,67 @@ task → `404 TASK_NOT_FOUND`。
 - `409 TASK_ALREADY_TERMINAL` — 任务已处于终态（completed/failed/cancelled），
   不可再取消；
 - `404 TASK_NOT_FOUND` — 任务不存在。
+
+### 1.6 `POST /v1/batches` — 文件夹批量提交（任务组）
+
+面向外部应用的批量处理场景：传入一个**服务器侧文件夹**，EP 自动枚举
+文件、逐文件提交指定模块能力，并以 `group_id` 聚成一组。
+
+请求（JSON）：
+
+```json
+{
+  "module_id": "waifu2x",
+  "capability": "image-upscale",
+  "folder": "/abs/path/to/folder",
+  "params": { "scale": 2 },
+  "recursive": false,
+  "extensions": [".png", ".jpg"],
+  "callback_url": "https://app.example/cb"
+}
+```
+
+- `params` 应用于全部文件（同一 schema 校验与默认值注入）；
+- `recursive` 缺省仅枚举一层；`extensions` 大小写不敏感，缺省不过滤；
+- `callback_url` 透传给每个成员任务（逐任务回调，与单任务提交一致）。
+
+响应 **202**：
+
+```json
+{
+  "group_id": "grp-20260910-...",
+  "submitted": 12,
+  "skipped": 1,
+  "task_ids": ["task-...", "..."]
+}
+```
+
+folder 准入与错误语义：
+
+- 缺省仅接受 `workspace/uploads` 内的目录（canonicalize 前缀校验，与
+  `input_path` 同一信任域）；越权 → **403 `FOLDER_NOT_ALLOWED`**。单机/
+  可信局域网部署可置 `[api] batches_allow_external_folders = true` 放开为
+  任意服务器可读目录；
+- folder 不存在/不可读/无匹配文件 → 400 `INPUT_INVALID`；
+- 单批文件数上限 512 → 400 `BATCH_TOO_LARGE`（请拆分目录）；
+- 整批超过队列在途容量 → **429 `BATCH_QUEUE_INSUFFICIENT`**（整批拒绝；
+  等队列排空后重试或拆分目录）。
+
+**聚合与寻址分离**（契约关键）：每个文件仍持独立 `task_id`，轮询/取消走
+既有 `GET /v1/tasks/{task_id}` 逐条契约，`GET /v1/tasks` 列表不做折叠；
+任务中心（WebUI）把同组任务折叠为一条聚合展示，不提供产物下载
+（结果由接入应用自行处理）。
+
+组查询与取消：
+
+- `GET /v1/groups` — `{"groups":[{"group_id","module_id","status","counts":{...}}]}`；
+- `GET /v1/groups/{group_id}` — 组详情，含 `tasks[]` 逐成员状态（权威明细）；
+- `POST /v1/groups/{group_id}/cancel` — 非终态成员逐一受理，返回
+  `cancelled_tasks` / `already_terminal` 计数；未知组 → 404 `GROUP_NOT_FOUND`。
+
+组状态词表（滚动语义）：`queued` / `running` / `completed` / `failed` /
+`cancelled` / **`partial`**（部分失败——终态混杂：既有成功也有失败/取消，
+或失败与取消并存）。`partial` ≠ 整组失败，逐成员结果以 `tasks[]` 为准。
 
 ---
 
