@@ -100,7 +100,7 @@ use ep_core::pipeline::runner::TaskDetail;
 use ep_core::pipeline::vram;
 use ep_core::pipeline::PipelineRunnerImpl;
 use ep_core::task_registry::TaskRegistry;
-use ep_core::types::{Artifact, DataType, PipelineRunner};
+use ep_core::types::{Artifact, DataType, DeviceId, PipelineRunner};
 
 use crate::state::{AppState, ProgressMessage};
 
@@ -219,7 +219,7 @@ pub fn bind_persistence(root: &Path) {
     }
 }
 
-/// 调度器：FIFO 队列 + 两级闸门计数（§6.8）
+/// 调度器：FIFO 队列 + 两级闸门计数（§6.8）+ 动态 VRAM 准入账本（§6.8b）
 #[derive(Debug, Default)]
 struct Scheduler {
     /// 等待闸门的任务（FIFO）
@@ -230,12 +230,21 @@ struct Scheduler {
     running_by_pipeline: HashMap<String, usize>,
     /// 每管线并发上限缓存（提交时从管线 TOML 解析刷新）
     pipeline_limits: HashMap<String, Option<u32>>,
+    /// 每模块运行中任务数（动态准入：≤ manifest `[compute] max_concurrent`，缺省 1）
+    running_by_module: HashMap<String, usize>,
+    /// 每设备已提交显存预算（动态准入账本，MB）：Σ 已准入任务的每实例预算；
+    /// 与实时占用取 max 消费——指标刷新（2s）滞后窗口内由账本兜住，防超发
+    vram_committed: HashMap<String, u32>,
+    /// 已准入任务的显存计划（task_id → [(device_key, cost_mb)]），终结时精确销账
+    vram_plans: HashMap<String, Vec<(String, u32)>>,
 }
 
 #[derive(Debug, Clone)]
 struct QueuedEntry {
     task_id: String,
     pipeline_id: String,
+    /// 任务引用的模块 id（去重；动态准入消费，提交时随载荷登记）
+    module_ids: Vec<String>,
 }
 
 static SCHEDULER: OnceLock<Mutex<Scheduler>> = OnceLock::new();
@@ -792,6 +801,7 @@ pub async fn submit_pipeline_full(
         }
     }
 
+    let record_module_ids = task_module_ids.clone();
     let pipeline_id = pipeline.id.clone();
     // §6.8：管线级并发上限（TOML `[pipeline] max_instances`，缺省跟随全局）
     let max_instances = resolve_max_instances(&state.root, &pipeline_id);
@@ -824,7 +834,7 @@ pub async fn submit_pipeline_full(
         served_artifacts: HashMap::new(),
         work_dir: task_dir.clone(),
         staging_dir: Some(staging_dir.to_string_lossy().to_string()),
-        module_ids: task_module_ids,
+        module_ids: record_module_ids,
         group: options.group.clone(),
     };
     registry()
@@ -837,9 +847,13 @@ pub async fn submit_pipeline_full(
     {
         let mut sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
         sched.pipeline_limits.insert(pipeline_id.clone(), max_instances);
+        let mut module_ids = task_module_ids.clone();
+        module_ids.sort();
+        module_ids.dedup();
         sched.queue.push_back(QueuedEntry {
             task_id: task_id.clone(),
             pipeline_id: pipeline_id.clone(),
+            module_ids,
         });
     }
     pending().lock().unwrap_or_else(|e| e.into_inner()).insert(
@@ -904,6 +918,158 @@ fn resolve_max_instances(root: &Path, pipeline_id: &str) -> Option<u32> {
 ///
 /// 公平性：按 FIFO 顺序取**第一个**可准入的任务（跳过管线闸门已满的，
 /// 避免队头阻塞）；循环准入直到无可准入任务或全局闸门满。
+// ─── 动态 VRAM 准入（§6.8b：按实时显存余额与模块声明自动安排并发） ──────────
+//
+// 静态两级闸（全局 max_parallel + 管线 max_instances）只回答"允许几个"，
+// 回答不了"现在还放得下几个"。本节在 FIFO 准入前补第三维判定：
+//
+// 1. **模块并发上限**：`[compute] max_concurrent`（缺省 1）——适配器自身
+//    支撑的并发数（如 waifu2x 常驻 worker 池），EP 对引用该模块的并发
+//    任务按此封顶，杜绝排队外的 503；
+// 2. **显存余额**：每实例预算 = `min_vram_mb`（缺省回退 `vram_estimate_mb`）；
+//    设备口径 = `max(实时占用, 账本已承诺)`——账本在准入瞬间记账（指标
+//    2s 刷新的滞后窗口内防超发），任务终结精确销账。实时占用低于声明值
+//    时（如 waifu2x 声明 6000 实测 ~1300）由账本一致性地约束，声明高于
+//    实际只会少并发不会超发；
+// 3. **fail-open**：设备无指标 / 模块无显存声明 / CPU 设备 → 不设显存限
+//    （start_task 路径自有设备选择与 overcommit 兜底）。
+
+/// 单设备准入账目（纯数据；快照判定可单测）
+#[derive(Debug, Default, Clone)]
+struct DeviceLedger {
+    total_mb: u32,
+    used_live_mb: u32,
+}
+
+/// 模块准入参数（纯数据）
+#[derive(Debug, Clone)]
+struct ModuleAdmission {
+    /// 模块运行/预测设备（None = CPU 或无法预测 → 不设显存限）
+    device: Option<String>,
+    /// 每实例显存预算（MB）：`min_vram_mb ?? vram_estimate_mb ?? 0`
+    cost_mb: u32,
+    /// 声明并发上限（缺省 1）
+    max_concurrent: u32,
+}
+
+/// 准入快照：`try_promote` 每轮在调度锁外重建（async 读 state），
+/// `admits()` 为纯函数消费
+#[derive(Debug, Default, Clone)]
+struct AdmissionSnapshot {
+    devices: HashMap<String, DeviceLedger>,
+    modules: HashMap<String, ModuleAdmission>,
+}
+
+impl AdmissionSnapshot {
+    /// 候选任务（去重模块表）是否可准入：
+    /// 1. 每个引用模块的已准入运行数 < `max_concurrent`；
+    /// 2. 每个涉足设备：`max(实时占用, 已承诺账本) + 本任务预算 ≤ 显存总量`。
+    fn admits(
+        &self,
+        module_ids: &[String],
+        running_by_module: &HashMap<String, usize>,
+        vram_committed: &HashMap<String, u32>,
+    ) -> bool {
+        // 并发上限（去重模块；缺一条目 = fail-open）
+        for mid in module_ids.iter().collect::<std::collections::BTreeSet<_>>() {
+            if let Some(m) = self.modules.get(mid) {
+                let running = running_by_module.get(mid).copied().unwrap_or(0);
+                if running >= m.max_concurrent as usize {
+                    return false;
+                }
+            }
+        }
+        // 显存余额（按设备归集本任务预算）
+        let mut need: HashMap<&str, u32> = HashMap::new();
+        for mid in module_ids {
+            if let Some(m) = self.modules.get(mid) {
+                if let (Some(dev), true) = (&m.device, m.cost_mb > 0) {
+                    *need.entry(dev.as_str()).or_insert(0) += m.cost_mb;
+                }
+            }
+        }
+        for (dev, cost) in need {
+            let Some(ledger) = self.devices.get(dev) else {
+                continue; // 设备无指标 → fail-open
+            };
+            let committed = vram_committed.get(dev).copied().unwrap_or(0);
+            let effective = ledger.used_live_mb.max(committed);
+            if effective.saturating_add(cost) > ledger.total_mb {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// 构建准入快照（async：读 devices / process_manager / modules / config）。
+async fn admission_snapshot(state: &Arc<AppState>) -> AdmissionSnapshot {
+    let devices_snap = state.devices.read().await.clone();
+    let instances: HashMap<String, DeviceId> = state
+        .process_manager
+        .read()
+        .await
+        .list_running()
+        .into_iter()
+        .filter_map(|i| i.device.clone().map(|d| (i.module_id.clone(), d)))
+        .collect();
+    let manifests: Vec<(String, ep_core::module::manifest::ModuleManifest)> = state
+        .modules
+        .read()
+        .await
+        .iter()
+        .filter_map(|m| {
+            m.manifest
+                .as_ref()
+                .map(|mf| (mf.module.id.clone(), mf.clone()))
+        })
+        .collect();
+
+    let mut snap = AdmissionSnapshot::default();
+    for d in &devices_snap {
+        // CPU 不做显存记账（total = 系统内存，语义不同）；无总量指标的
+        // 设备（vulkan/directml 常态）无法核算 → fail-open
+        if matches!(d.id, DeviceId::Cpu) || d.total_memory_mb.is_none() {
+            continue;
+        }
+        snap.devices.insert(
+            d.id.to_string(),
+            DeviceLedger {
+                total_mb: d.total_memory_mb.unwrap_or(0),
+                used_live_mb: d.used_memory_mb.unwrap_or(0),
+            },
+        );
+    }
+    for (mid, mf) in manifests {
+        let compute = &mf.compute;
+        let cost_mb = compute
+            .min_vram_mb
+            .or(compute.vram_estimate_mb)
+            .unwrap_or(0);
+        let device = if cost_mb > 0 {
+            match instances.get(&mid) {
+                Some(d) => Some(d.to_string()),
+                None => {
+                    // 未运行：与 start_task 同一选择逻辑预测落位设备
+                    let predicted = crate::api::select_module_device(state, &mf).await;
+                    (!matches!(predicted, DeviceId::Cpu)).then(|| predicted.to_string())
+                }
+            }
+        } else {
+            None
+        };
+        snap.modules.insert(
+            mid,
+            ModuleAdmission {
+                device,
+                cost_mb,
+                max_concurrent: compute.max_concurrent.unwrap_or(1).max(1),
+            },
+        );
+    }
+    snap
+}
+
 async fn try_promote(state: Arc<AppState>) {
     let (max_parallel, timeout_secs) = {
         let cfg = state.config.read().await;
@@ -914,6 +1080,9 @@ async fn try_promote(state: Arc<AppState>) {
     };
 
     loop {
+        // 准入快照在调度锁外构建（async 读 state devices/instances/manifests）；
+        // 判定为纯函数消费快照 + 调度器账本
+        let snapshot = admission_snapshot(&state).await;
         let admitted = {
             let mut sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
             if sched.running_count >= max_parallel {
@@ -932,7 +1101,15 @@ async fn try_promote(state: Arc<AppState>) {
                     .get(&entry.pipeline_id)
                     .copied()
                     .unwrap_or(0);
-                running < limit
+                if running >= limit {
+                    return false;
+                }
+                // §6.8b 动态准入：模块并发上限 + 设备显存余额
+                snapshot.admits(
+                    &entry.module_ids,
+                    &sched.running_by_module,
+                    &sched.vram_committed,
+                )
             });
             match pick {
                 Some(idx) => {
@@ -942,6 +1119,31 @@ async fn try_promote(state: Arc<AppState>) {
                         .running_by_pipeline
                         .entry(entry.pipeline_id.clone())
                         .or_insert(0) += 1;
+                    // 动态准入记账：模块并发计数 + 设备显存承诺（终结时销账）
+                    let mut plan: Vec<(String, u32)> = Vec::new();
+                    for mid in &entry.module_ids {
+                        *sched.running_by_module.entry(mid.clone()).or_insert(0) += 1;
+                    }
+                    for mid in &entry.module_ids {
+                        if let Some(m) = snapshot.modules.get(mid) {
+                            if let (Some(dev), true) = (&m.device, m.cost_mb > 0) {
+                                if let Some(slot) =
+                                    plan.iter_mut().find(|(d, _)| d == dev)
+                                {
+                                    slot.1 += m.cost_mb;
+                                } else {
+                                    plan.push((dev.clone(), m.cost_mb));
+                                }
+                            }
+                        }
+                    }
+                    for (dev, cost) in &plan {
+                        *sched.vram_committed.entry(dev.clone()).or_insert(0) +=
+                            *cost;
+                    }
+                    if !plan.is_empty() {
+                        sched.vram_plans.insert(entry.task_id.clone(), plan);
+                    }
                     Some(entry)
                 }
                 None => break,
@@ -1383,6 +1585,35 @@ async fn finalize_task(
         sched.running_count = sched.running_count.saturating_sub(1);
         if let Some(n) = sched.running_by_pipeline.get_mut(pipeline_id) {
             *n = n.saturating_sub(1);
+        }
+        // §6.8b 动态准入销账：显存承诺按准入时计划精确回冲；模块并发计数
+        // 按任务实际引用回冲（注册表终态记录仍携带 module_ids）
+        if let Some(plan) = sched.vram_plans.remove(task_id) {
+            for (dev, cost) in plan {
+                if let Some(c) = sched.vram_committed.get_mut(&dev) {
+                    *c = c.saturating_sub(cost);
+                    if *c == 0 {
+                        sched.vram_committed.remove(&dev);
+                    }
+                }
+            }
+        }
+        let module_ids = registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(task_id)
+            .map(|r| r.module_ids.clone())
+            .unwrap_or_default();
+        let mut seen = std::collections::BTreeSet::new();
+        for mid in module_ids {
+            if seen.insert(mid.clone()) {
+                if let Some(n) = sched.running_by_module.get_mut(&mid) {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        sched.running_by_module.remove(&mid);
+                    }
+                }
+            }
         }
     }
     try_promote(state.clone()).await;
@@ -4552,5 +4783,109 @@ mod watcher_direct_tests {
         assert_eq!(record.node_order, vec!["input", "run", "archive"]);
         assert_eq!(record.nodes.len(), 3);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── §6.8b 动态 VRAM 准入（纯函数判定） ─────────────────────────────────
+
+    use std::collections::HashMap as TestMap;
+
+    fn snapshot_with(waifu2x: crate::api::execute::execution::ModuleAdmission) -> super::AdmissionSnapshot {
+        let mut snap = super::AdmissionSnapshot::default();
+        snap.devices.insert(
+            "cuda:0".to_string(),
+            super::DeviceLedger { total_mb: 8192, used_live_mb: 500 },
+        );
+        snap.modules.insert("waifu2x".to_string(), waifu2x);
+        snap
+    }
+
+    fn admission(cost: u32, maxc: u32, device: Option<&str>) -> super::ModuleAdmission {
+        super::ModuleAdmission {
+            device: device.map(str::to_string),
+            cost_mb: cost,
+            max_concurrent: maxc,
+        }
+    }
+
+    #[test]
+    fn admission_vram_budget_blocks_overcommit() {
+        let snap = snapshot_with(admission(3000, 1, Some("cuda:0")));
+        let ledger: TestMap<String, usize> = TestMap::new();
+        let committed: TestMap<String, u32> = TestMap::new();
+        // 空闲 ~7692：第一实例放行
+        assert!(snap.admits(&["waifu2x".into()], &ledger, &committed));
+        // 已承诺 6000（两实例）后：max(500, 6000) + 3000 > 8192 → 拒绝
+        let mut committed2 = committed.clone();
+        committed2.insert("cuda:0".to_string(), 6000);
+        assert!(!snap.admits(&["waifu2x".into()], &ledger, &committed2));
+    }
+
+    #[test]
+    fn admission_uses_max_of_live_and_committed() {
+        // 实时占用 7000 > 承诺 3000：以实时为准 → 7000 + 3000 > 8192 拒绝
+        let mut snap = snapshot_with(admission(3000, 1, Some("cuda:0")));
+        snap.devices.get_mut("cuda:0").unwrap().used_live_mb = 7000;
+        let ledger: TestMap<String, usize> = TestMap::new();
+        let mut committed: TestMap<String, u32> = TestMap::new();
+        committed.insert("cuda:0".to_string(), 3000);
+        assert!(!snap.admits(&["waifu2x".into()], &ledger, &committed));
+        // 承诺 6000 > 实时 500（指标滞后窗口）：以账本为准 → 6000+3000 拒绝
+        snap.devices.get_mut("cuda:0").unwrap().used_live_mb = 500;
+        let mut committed: TestMap<String, u32> = TestMap::new();
+        committed.insert("cuda:0".to_string(), 6000);
+        assert!(!snap.admits(&["waifu2x".into()], &ledger, &committed));
+    }
+
+    #[test]
+    fn admission_module_concurrency_cap() {
+        let snap = snapshot_with(admission(3000, 2, Some("cuda:0")));
+        let committed: TestMap<String, u32> = TestMap::new();
+        let mut running: TestMap<String, usize> = TestMap::new();
+        running.insert("waifu2x".to_string(), 2);
+        assert!(!snap.admits(&["waifu2x".into()], &running, &committed),
+            "达到声明并发上限 → 即使显存富余也不准入");
+        running.insert("waifu2x".to_string(), 1);
+        assert!(snap.admits(&["waifu2x".into()], &running, &committed));
+    }
+
+    #[test]
+    fn admission_fail_open_without_metrics_or_declaration() {
+        // 设备无指标（total None 被剔除）→ fail-open
+        let mut snap = snapshot_with(admission(3000, 1, Some("cuda:0")));
+        snap.devices.clear();
+        let ledger: TestMap<String, usize> = TestMap::new();
+        let committed: TestMap<String, u32> = TestMap::new();
+        assert!(snap.admits(&["waifu2x".into()], &ledger, &committed));
+        // 模块无准入条目（未声明显存/CPU）→ 不设限
+        let snap = super::AdmissionSnapshot::default();
+        assert!(snap.admits(&["cpu-mod".into()], &ledger, &committed));
+    }
+
+    #[test]
+    fn admission_multi_device_task_requires_all_devices_fit() {
+        let mut snap = super::AdmissionSnapshot::default();
+        snap.devices.insert(
+            "cuda:0".to_string(),
+            super::DeviceLedger { total_mb: 8192, used_live_mb: 0 },
+        );
+        snap.devices.insert(
+            "cuda:1".to_string(),
+            super::DeviceLedger { total_mb: 4096, used_live_mb: 0 },
+        );
+        snap.modules.insert(
+            "mod-a".to_string(),
+            admission(3000, 1, Some("cuda:0")),
+        );
+        snap.modules.insert(
+            "mod-b".to_string(),
+            admission(3000, 1, Some("cuda:1")),
+        );
+        let ledger: TestMap<String, usize> = TestMap::new();
+        let committed: TestMap<String, u32> = TestMap::new();
+        assert!(snap.admits(&["mod-a".into(), "mod-b".into()], &ledger, &committed));
+        // cuda:1 挤占后跨设备任务整体拒绝
+        let mut committed2 = committed.clone();
+        committed2.insert("cuda:1".to_string(), 2000);
+        assert!(!snap.admits(&["mod-a".into(), "mod-b".into()], &ledger, &committed2));
     }
 }

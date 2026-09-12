@@ -1555,6 +1555,7 @@ mod tests {
                 default_backend: Some(ep_core::types::ComputeBackend::Cpu),
                 vram_estimate_mb: None,
                 min_vram_mb: None,
+                max_concurrent: None,
                 env: None,
             },
             models: vec![],

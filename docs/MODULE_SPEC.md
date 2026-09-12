@@ -149,7 +149,8 @@ linux-aarch64 = "bin/linux-aarch64/deep-filter"
 | `backends` | string[] | ✅ | — | 支持的后端列表，按优先级排序 |
 | `default_backend` | string | ❌ | `backends[0]` | 默认后端 |
 | `vram_estimate_mb` | u32 | ❌ | — | 预估显存/内存占用（MB），用于调度参考 |
-| `min_vram_mb` | u32 | ❌ | — | 最低显存要求（低于此值警告） |
+| `min_vram_mb` | u32 | ❌ | — | 最低显存要求（低于此值警告）；**动态准入的每实例显存预算**（缺省回退 `vram_estimate_mb`，见 §6.8b） |
+| `max_concurrent` | u32 | ❌ | — | 模块进程可同时处理的推理请求数（缺省 1 = 适配器串行）。EP 准入器对引用本模块的并发任务按此封顶；适配器必须自身支撑该并发（如 worker 池），声明与实现必须一致 |
 
 **backends 可选值：**
 

@@ -286,6 +286,7 @@ mod tests {
                 default_backend: None,
                 vram_estimate_mb: None,
                 min_vram_mb: None,
+                max_concurrent: None,
                 env: None,
             },
             models: if has_model {

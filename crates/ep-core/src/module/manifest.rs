@@ -95,6 +95,12 @@ pub struct ComputeConfig {
     pub default_backend: Option<ComputeBackend>,
     pub vram_estimate_mb: Option<u32>,
     pub min_vram_mb: Option<u32>,
+    /// 模块进程可同时处理的推理请求数（调度契约，§6.8 动态并发）：
+    /// EP 准入器对引用本模块的并发任务按此值封顶（缺省 1 = 适配器串行）。
+    /// 适配器必须自身支撑该并发（如 waifu2x 常驻 worker 池），否则会出现
+    /// 排队外的 503——声明与实现必须一致。
+    #[serde(default)]
+    pub max_concurrent: Option<u32>,
     #[serde(default)]
     pub env: Option<HashMap<String, HashMap<String, String>>>,
 }

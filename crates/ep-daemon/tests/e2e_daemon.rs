@@ -1962,6 +1962,7 @@ mod e2e_harness_teardown {
                 default_backend: Some(ComputeBackend::Cpu),
                 vram_estimate_mb: None,
                 min_vram_mb: None,
+                max_concurrent: None,
                 env: None,
             },
             models: vec![],
