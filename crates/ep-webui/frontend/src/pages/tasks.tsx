@@ -542,11 +542,20 @@ function TaskCard({
     })
       .then((resp) => {
         // 0 字节文件在部分实现下返回 416；按空内容处理
-        if (resp.status === 416) return ''
+        if (resp.status === 416) return { text: '', truncated: false }
         if (!resp.ok) throw new Error(`API ${resp.status}`)
-        return resp.text()
+        // Range 命中时 ServeDir 返回 206，正文只有前 1MiB；不能再用 text.length 判断截断
+        const rangeTotal = Number(
+          resp.headers.get('Content-Range')?.split('/').pop(),
+        )
+        // 有 Content-Range 时按总大小判断（Range 覆盖全文也可能返回 206）；
+        // 缺失时退回 206 判定，正文长度兜底在下一段
+        const truncated = Number.isFinite(rangeTotal)
+          ? rangeTotal > TEXT_PREVIEW_LIMIT
+          : resp.status === 206
+        return resp.text().then((text) => ({ text, truncated }))
       })
-      .then((text) => {
+      .then(({ text, truncated }) => {
         if (seq !== previewSeq.current) return
         setPreview((cur) =>
           cur === null
@@ -555,7 +564,7 @@ function TaskCard({
                 ...cur,
                 loading: false,
                 text: text.slice(0, TEXT_PREVIEW_LIMIT),
-                truncated: text.length > TEXT_PREVIEW_LIMIT,
+                truncated: truncated || text.length > TEXT_PREVIEW_LIMIT,
               },
         )
       })
