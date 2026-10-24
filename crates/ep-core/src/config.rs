@@ -560,6 +560,39 @@ pub struct TasksRetentionConfig {
     pub max_total_gb: u32,
 }
 
+// ─── CacheConfig ───────────────────────────────────────────────────────────
+
+/// 直跑结果缓存（`[cache]`，T-16）。
+///
+/// 仅缓存 `/execute/single` 等**直跑（`direct/`）**任务：命中时新任务直接
+/// 置 `completed`，产物从 `<workspace_dir>/cache/` 硬链接（跨盘/权限受限时
+/// 降级复制）到新任务 `files/` 下。管线整体结果不进入本缓存。
+///
+/// `max_gb = 0` 表示不限缓存总量（不执行 LRU 淘汰，磁盘占用由调用方自行
+/// 监控；生产环境建议保留正数上限）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheConfig {
+    /// 总开关；缺省 true = 直跑结果写入缓存并在命中时短路执行
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 缓存目录容量上限（GB）；0 = 不限（不执行 LRU 淘汰）
+    #[serde(default = "default_cache_max_gb")]
+    pub max_gb: u32,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            max_gb: default_cache_max_gb(),
+        }
+    }
+}
+
+fn default_cache_max_gb() -> u32 {
+    8
+}
+
 // ─── AppConfig ──────────────────────────────────────────────────────────────
 
 /// 整合包配置（§8.3）
@@ -638,6 +671,9 @@ pub struct AppConfig {
     /// 任务配置（产物保留策略，T-12）
     #[serde(default)]
     pub tasks: TasksConfig,
+    /// 直跑结果内容寻址缓存（`[cache]`，T-16）
+    #[serde(default)]
+    pub cache: CacheConfig,
     /// 每模块激活模型变体（单槽位语义 §5.2）：module_id → model_id；A6 消费
     #[serde(default)]
     pub active_models: std::collections::HashMap<String, String>,
@@ -1058,6 +1094,38 @@ mod tests {
         assert!(restored.tasks.retention.enabled);
         assert_eq!(restored.tasks.retention.max_age_days, 7);
         assert_eq!(restored.tasks.retention.max_total_gb, 50);
+    }
+
+    /// T-16：`[cache]` 缺省启用、容量上限 8GB；整节/字段省略按默认值解析
+    /// （旧配置兼容），显式值经 TOML 往返保持不变。
+    #[test]
+    fn cache_config_defaults_and_partial_parse() {
+        let defaults = AppConfig::default();
+        assert!(defaults.cache.enabled);
+        assert_eq!(defaults.cache.max_gb, 8);
+
+        // 旧配置整节省略 → serde 默认（启用 + 8GB）
+        let config: AppConfig = toml::from_str("[server]\nport = 9800\n").expect("parse legacy");
+        assert!(config.cache.enabled);
+        assert_eq!(config.cache.max_gb, 8);
+
+        // 只写 max_gb，enabled 省略 → true
+        let config: AppConfig = toml::from_str("[cache]\nmax_gb = 2\n").expect("parse partial");
+        assert!(config.cache.enabled);
+        assert_eq!(config.cache.max_gb, 2);
+
+        // 显式值往返不变（max_gb = 0 表示不限）
+        let config = AppConfig {
+            cache: CacheConfig {
+                enabled: false,
+                max_gb: 0,
+            },
+            ..AppConfig::default()
+        };
+        let toml_str = toml::to_string_pretty(&config).expect("serialize");
+        let restored: AppConfig = toml::from_str(&toml_str).expect("deserialize");
+        assert!(!restored.cache.enabled);
+        assert_eq!(restored.cache.max_gb, 0);
     }
 
     /// T-14：`[modules.auto_restart]` 缺省关闭；整节/字段省略均按默认值解析

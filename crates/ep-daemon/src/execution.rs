@@ -90,8 +90,9 @@ use std::time::Duration;
 use chrono::Utc;
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
+use ep_core::cache::{CacheKey, CacheMeta};
 use ep_core::module::manifest::CapabilityDecl;
 use ep_core::pipeline::dag::{
     direct_output_extension, NodeKind, Pipeline, PipelineNode, ValidationError,
@@ -274,6 +275,24 @@ static PENDING: OnceLock<Mutex<HashMap<String, PendingTask>>> = OnceLock::new();
 
 fn pending() -> &'static Mutex<HashMap<String, PendingTask>> {
     PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 直跑缓存写入上下文（T-16）：提交时算好键与元数据，仅在任务成功终态
+/// 落缓存；失败/取消任务只需从表中移除。
+#[derive(Debug, Clone)]
+struct CacheSubmission {
+    /// 内容寻址键（模块 + 能力 + 规范化参数 + 输入指纹）
+    key: CacheKey,
+    module_id: String,
+    capability: String,
+    /// 规范化参数快照（写缓存元信息用，便于人工排查键来源）
+    params: Value,
+}
+
+static CACHE_PENDING: OnceLock<Mutex<HashMap<String, CacheSubmission>>> = OnceLock::new();
+
+fn cache_pending() -> &'static Mutex<HashMap<String, CacheSubmission>> {
+    CACHE_PENDING.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// 运行中任务的协作标志与回调配置
@@ -750,6 +769,9 @@ pub struct SubmitOptions {
     /// 调度优先级（T-15，§6.8 排序扩展）：`None` = 默认 50；
     /// 0-49 高优先，同优先级保持入队 FIFO
     pub priority: Option<u8>,
+    /// 直跑缓存旁路（T-16）：true 时既不读缓存也不写缓存；
+    /// 仅直跑入口（`submit_direct_full`）消费，管线提交忽略
+    pub bypass_cache: bool,
 }
 
 /// 提交结果
@@ -790,9 +812,21 @@ pub async fn submit_pipeline(
 /// 入队 + 立即尝试准入 → wait 模式阻塞至终态。
 pub async fn submit_pipeline_full(
     state: &Arc<AppState>,
+    pipeline: Pipeline,
+    inputs: Option<HashMap<String, Value>>,
+    options: SubmitOptions,
+) -> Result<SubmitOutcome, SubmitError> {
+    submit_pipeline_full_inner(state, pipeline, inputs, options, None).await
+}
+
+/// [`submit_pipeline_full`] 的内部形态：`cache_submission` 由直跑缓存路径
+/// 传入（T-16），任务成功终态时由 [`finalize_task`] 落缓存；普通提交为 None。
+async fn submit_pipeline_full_inner(
+    state: &Arc<AppState>,
     mut pipeline: Pipeline,
     inputs: Option<HashMap<String, Value>>,
     options: SubmitOptions,
+    cache_submission: Option<CacheSubmission>,
 ) -> Result<SubmitOutcome, SubmitError> {
     if let Some(inputs) = inputs.as_ref() {
         apply_inputs(&mut pipeline, inputs)?;
@@ -901,6 +935,7 @@ pub async fn submit_pipeline_full(
         staging_dir: Some(staging_dir.to_string_lossy().to_string()),
         module_ids: record_module_ids,
         group: options.group.clone(),
+        cached_from: None,
     };
     // 落盘失败不拒绝提交：记录已保留在内存（TaskRegistry::insert 内存优先），
     // 任务继续执行；磁盘/权限异常仅告警，避免单点 IO 故障让整机提交不可用。
@@ -934,6 +969,14 @@ pub async fn submit_pipeline_full(
             callback_url: options.callback_url.clone(),
         },
     );
+
+    // T-16：直跑缓存上下文登记——任务成功终态时由 finalize_task 取出并落缓存
+    if let Some(submission) = cache_submission {
+        cache_pending()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(task_id.clone(), submission);
+    }
 
     // 立即尝试准入：闸门有空位时提升 running（快路径）。
     // spawn 化（QUICK_RUN_PLAN G4）：start_task 内的模块自动拉起会同步等待
@@ -1628,6 +1671,16 @@ async fn finalize_task(
         }
     }
 
+    // T-16：直跑成功终态 → 写入内容寻址缓存；失败/取消任务仅丢弃上下文。
+    if terminal == TaskState::Completed {
+        store_direct_cache_if_needed(state, task_id).await;
+    } else {
+        cache_pending()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(task_id);
+    }
+
     // keep_workspace=false → 清理任务工作目录的中间文件。
     // 产物已归集到 files/（硬链接/复制），files/ 保留供产物下载；
     // 其余中间产物（临时文件、解包目录等）一律删除。清理失败仅告警。
@@ -1916,6 +1969,7 @@ async fn wait_until_terminal(state: &Arc<AppState>, task_id: &str) -> TaskRecord
                     staging_dir: None,
                     module_ids: Vec::new(),
                     group: None,
+                    cached_from: None,
                 });
             }
         }
@@ -2129,6 +2183,23 @@ pub async fn submit_direct_full(
         return Err(SubmitError::InputMissing(input_path));
     }
 
+    // 2.5 直跑缓存（T-16，§6.8 快速调用加速）：键 = 模块 + 能力 + 规范化
+    //     参数 + 输入指纹（≤512MB 用内容 sha256，超限退化为 size+mtime）。
+    //     命中即构造 completed 任务并直接返回，不再占用执行闸门。
+    let cache_submission = match resolve_direct_cache(
+        state,
+        module_id,
+        capability,
+        &params,
+        &input_path,
+        &options,
+    )
+    .await
+    {
+        DirectCacheDecision::Hit(outcome) => return Ok(*outcome),
+        DirectCacheDecision::Miss(submission) => submission,
+    };
+
     // 3. 退化三节点 DAG → 同一提交路径（闸门/注册表/WS/产物全套复用）
     let pipeline = build_direct_pipeline(
         module_id,
@@ -2138,7 +2209,254 @@ pub async fn submit_direct_full(
         Some(&capability_decl),
         device_hint,
     );
-    submit_pipeline_full(state, pipeline, None, options).await
+    submit_pipeline_full_inner(state, pipeline, None, options, cache_submission).await
+}
+
+// ─── 直跑结果内容寻址缓存（T-16，§6.8 快速调用加速）───────────────────────
+
+/// 直跑缓存决策：命中直接返回完成态任务；未命中时携带写入上下文。
+enum DirectCacheDecision {
+    /// Box 包裹避免枚举因 `SubmitOutcome`（含完整 TaskRecord）过大而膨胀
+    Hit(Box<SubmitOutcome>),
+    Miss(Option<CacheSubmission>),
+}
+
+/// 解析直跑缓存：总开关/旁路/指纹/键 → 命中则构造完成态任务。
+///
+/// 指纹或缓存读取异常均降级为“未命中”（告警后照常执行），绝不让缓存
+/// 故障阻断提交。
+async fn resolve_direct_cache(
+    state: &Arc<AppState>,
+    module_id: &str,
+    capability: &str,
+    params: &Value,
+    input_path: &Path,
+    options: &SubmitOptions,
+) -> DirectCacheDecision {
+    let (enabled, workspace) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.cache.enabled,
+            cfg.resolve_workspace_dir(&state.root),
+        )
+    };
+    if !enabled || options.bypass_cache {
+        return DirectCacheDecision::Miss(None);
+    }
+
+    let fingerprint = match ep_core::cache::fingerprint_input(input_path) {
+        Ok(fingerprint) => fingerprint,
+        Err(err) => {
+            warn!(
+                module_id,
+                input = %input_path.display(),
+                error = %err,
+                "直跑缓存指纹计算失败，本次跳过缓存"
+            );
+            return DirectCacheDecision::Miss(None);
+        }
+    };
+    let key = ep_core::cache::cache_key(module_id, capability, params, &fingerprint);
+    let cache_root = workspace.join("cache");
+    if let Some(meta) = ep_core::cache::lookup(&cache_root, &key) {
+        if let Some(outcome) = build_cache_hit_outcome(
+            state, &workspace, &cache_root, &key, &meta, module_id, options,
+        )
+        .await
+        {
+            return DirectCacheDecision::Hit(Box::new(outcome));
+        }
+    }
+    DirectCacheDecision::Miss(Some(CacheSubmission {
+        key,
+        module_id: module_id.to_string(),
+        capability: capability.to_string(),
+        params: params.clone(),
+    }))
+}
+
+/// 缓存命中：构造 `completed` 任务（产物硬链接进任务 `files/`），写事件
+/// 日志并按需触发完成回调；恢复失败返回 None（调用方降级为真实执行）。
+async fn build_cache_hit_outcome(
+    state: &Arc<AppState>,
+    workspace: &Path,
+    cache_root: &Path,
+    key: &CacheKey,
+    meta: &CacheMeta,
+    module_id: &str,
+    options: &SubmitOptions,
+) -> Option<SubmitOutcome> {
+    let task_id = new_task_id();
+    let task_dir = workspace.join("tasks").join(&task_id);
+    let restored = match ep_core::cache::restore_into_task(cache_root, key, &task_dir) {
+        Ok(restored) => restored,
+        Err(err) => {
+            warn!(
+                task_id = %task_id,
+                error = %err,
+                "直跑缓存产物恢复失败，降级为真实执行"
+            );
+            return None;
+        }
+    };
+
+    let now = Utc::now();
+    let mut artifacts: HashMap<String, PathBuf> = HashMap::new();
+    let mut served_artifacts: HashMap<String, PathBuf> = HashMap::new();
+    for (node_id, path) in &restored {
+        artifacts.insert(node_id.clone(), path.clone());
+        served_artifacts.insert(node_id.clone(), path.clone());
+    }
+    let node_order = if meta.node_order.is_empty() {
+        restored
+            .iter()
+            .map(|(node_id, _)| node_id.clone())
+            .collect::<Vec<_>>()
+    } else {
+        meta.node_order.clone()
+    };
+    let nodes = node_order
+        .iter()
+        .map(|node_id| {
+            (
+                node_id.clone(),
+                NodeRecord {
+                    state: "completed".to_string(),
+                    error: None,
+                },
+            )
+        })
+        .collect();
+    let pipeline_id = format!("direct/{module_id}");
+
+    let record = TaskRecord {
+        id: task_id.clone(),
+        pipeline_id: pipeline_id.clone(),
+        status: TaskState::Completed,
+        error: None,
+        queue_position: None,
+        priority: options.priority.unwrap_or(DEFAULT_TASK_PRIORITY),
+        started_at: now,
+        started_running_at: Some(now),
+        finished_at: Some(now),
+        node_order,
+        nodes,
+        artifacts,
+        served_artifacts,
+        work_dir: task_dir,
+        staging_dir: None,
+        module_ids: vec![module_id.to_string()],
+        group: options.group.clone(),
+        cached_from: Some(meta.source_task_id.clone()),
+    };
+    // 落盘失败不阻断命中：产物已就位，记录保留在内存即可服务下载
+    if let Err(err) = registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(record)
+    {
+        warn!(task_id = %task_id, error = %err, "缓存命中任务记录落盘失败，仅保留内存副本");
+    }
+
+    crate::eventlog::write_task_terminal(
+        &state.root,
+        &task_id,
+        &pipeline_id,
+        TaskState::Completed.as_str(),
+        None,
+    );
+    if let Some(callback_url) = options.callback_url.as_deref() {
+        fire_callback(&task_id, callback_url);
+    }
+    info!(
+        task_id = %task_id,
+        module_id,
+        cached_from = %meta.source_task_id,
+        "直跑缓存命中：任务直接完成（复用历史产物）"
+    );
+
+    let record = if options.wait {
+        snapshot(&task_id)
+    } else {
+        None
+    };
+    Some(SubmitOutcome { task_id, record })
+}
+
+/// 任务成功终态后把直跑产物写入缓存（T-16）；旁路/总开关关闭/产物缺失
+/// 均静默跳过，任何异常只告警，不影响任务终态。
+async fn store_direct_cache_if_needed(state: &Arc<AppState>, task_id: &str) {
+    let Some(submission) = cache_pending()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(task_id)
+    else {
+        return;
+    };
+
+    let (enabled, max_gb, workspace) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.cache.enabled,
+            cfg.cache.max_gb,
+            cfg.resolve_workspace_dir(&state.root),
+        )
+    };
+    if !enabled {
+        return;
+    }
+
+    let Some(record) = snapshot(task_id) else {
+        warn!(task_id, "缓存写入跳过：任务记录缺失");
+        return;
+    };
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    for node_id in &record.node_order {
+        let path = record
+            .served_artifacts
+            .get(node_id)
+            .or_else(|| record.artifacts.get(node_id));
+        if let Some(path) = path {
+            let path = path.clone();
+            if path.is_file() {
+                files.push((node_id.clone(), path));
+            }
+        }
+    }
+    if files.is_empty() {
+        debug!(task_id, "缓存写入跳过：任务没有可复用产物");
+        return;
+    }
+
+    let cache_root = workspace.join("cache");
+    // max_gb = 0 → max_bytes = 0 → cache::store 内部按“不限”处理（仅告警）
+    let max_bytes = u64::from(max_gb) * 1024 * 1024 * 1024;
+    let node_order = record.node_order.clone();
+    let source_task_id = task_id.to_string();
+    let written = tokio::task::spawn_blocking(move || {
+        let request = ep_core::cache::StoreRequest {
+            key: &submission.key,
+            module_id: &submission.module_id,
+            capability: &submission.capability,
+            params: &submission.params,
+            source_task_id: &source_task_id,
+            node_order: &node_order,
+            files: &files,
+        };
+        ep_core::cache::store(&cache_root, &request, max_bytes)
+    })
+    .await;
+    match written {
+        Ok(Ok(meta)) => info!(
+            task_id,
+            cache_key = %meta.key,
+            files = meta.files.len(),
+            total_bytes = meta.total_bytes,
+            "直跑产物已写入缓存"
+        ),
+        Ok(Err(err)) => warn!(task_id, error = %err, "直跑缓存写入失败（任务结果不受影响）"),
+        Err(err) => warn!(task_id, error = %err, "直跑缓存写入任务异常（任务结果不受影响）"),
+    }
 }
 
 /// 编译直跑退化 DAG：`input(file_input) → run(module) → output(file_output)`。
@@ -2455,6 +2773,7 @@ pub fn clear_registry_for_tests() {
     *registry().lock().unwrap_or_else(|e| e.into_inner()) = TaskRegistry::new();
     *scheduler().lock().unwrap_or_else(|e| e.into_inner()) = Scheduler::default();
     pending().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    cache_pending().lock().unwrap_or_else(|e| e.into_inner()).clear();
     extras().lock().unwrap_or_else(|e| e.into_inner()).clear();
     finalized().lock().unwrap_or_else(|e| e.into_inner()).clear();
     set_test_run_hook(None);
@@ -2883,6 +3202,7 @@ to = ["output", "input"]
             staging_dir: None,
             module_ids: Vec::new(),
         group: None,
+        cached_from: None,
         };
         registry()
             .lock()
@@ -3285,6 +3605,7 @@ builtin = "file_output"
                 callback_url: None,
                 group: None,
                 priority: Some(10),
+                bypass_cache: false,
             },
         )
         .await
@@ -3355,6 +3676,7 @@ builtin = "file_output"
                     callback_url: None,
                     group: None,
                     priority: Some(priority),
+                    bypass_cache: false,
                 },
             )
             .await
@@ -3677,6 +3999,7 @@ builtin = "file_output"
                 callback_url: None,
                 group: None,
                 priority: None,
+                bypass_cache: false,
                 },
         )
         .await
@@ -3755,6 +4078,7 @@ builtin = "file_output"
                 callback_url: Some(format!("http://{addr}/cb")),
                 group: None,
                 priority: None,
+                bypass_cache: false,
                 },
         )
         .await
@@ -4073,6 +4397,7 @@ output_type = "json"
                 callback_url: None,
                 group: None,
                 priority: None,
+                bypass_cache: false,
                 },
         )
         .await
@@ -4099,6 +4424,203 @@ output_type = "json"
             .await
             .expect("任务应终结");
         assert!(record2.status.is_terminal());
+    }
+
+    // ── 19.2 直跑缓存（T-16）：命中 / bypass / disabled ─────────────────────
+
+    /// 构造 mock-asr 模块（无 venv：真实执行必失败；缓存命中路径无需执行）
+    fn mock_asr_module(root: &Path) -> ep_core::module::discovery::DiscoveredModule {
+        use ep_core::module::manifest::ModuleManifest;
+
+        let manifest: ModuleManifest = toml::from_str(
+            r#"
+[module]
+id = "mock-asr"
+name = "Mock ASR"
+version = "0.1.0"
+description = "test"
+category = "asr"
+genre = "test"
+license = "MIT"
+
+[runtime]
+type = "python"
+
+[compute]
+backends = ["cpu"]
+
+[interface]
+type = "http"
+
+[[interface.capabilities]]
+name = "transcribe"
+description = "转写"
+input_type = "audio"
+output_type = "json"
+"#,
+        )
+        .unwrap();
+        ep_core::module::discovery::DiscoveredModule {
+            manifest: Some(manifest),
+            path: root.join("modules/mock-asr"),
+            status: ep_core::module::discovery::DiscoveryStatus::Valid,
+        }
+    }
+
+    /// 预置一条“mock-asr/transcribe + 当前输入文件”的缓存条目
+    async fn seed_direct_cache(
+        state: &Arc<AppState>,
+        input: &Path,
+        params: &Value,
+    ) -> ep_core::cache::CacheKey {
+        let workspace = state
+            .config
+            .read()
+            .await
+            .resolve_workspace_dir(&state.root);
+        let cache_root = workspace.join("cache");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let artifact = workspace.join("cached-transcript.json");
+        std::fs::write(&artifact, r#"{"text":"cached-transcript"}"#).unwrap();
+        let fingerprint = ep_core::cache::fingerprint_input(input).unwrap();
+        let key = ep_core::cache::cache_key("mock-asr", "transcribe", params, &fingerprint);
+        let node_order = vec!["run".to_string()];
+        let files = vec![("run".to_string(), artifact)];
+        ep_core::cache::store(
+            &cache_root,
+            &ep_core::cache::StoreRequest {
+                key: &key,
+                module_id: "mock-asr",
+                capability: "transcribe",
+                params,
+                source_task_id: "task-origin",
+                node_order: &node_order,
+                files: &files,
+            },
+            0,
+        )
+        .unwrap();
+        key
+    }
+
+    #[tokio::test]
+    async fn direct_cache_hit_returns_completed_task_with_artifacts() {
+        let _guard = lock_for_tests();
+        clear_registry_for_tests();
+
+        let root = unique_root("cache-hit");
+        let module = mock_asr_module(&root);
+        let state = Arc::new(AppState::new(
+            root.clone(),
+            AppConfig::default(),
+            vec![],
+            vec![module],
+            PortManager::new(18000, 19000),
+        ));
+        let input = root.join("cache-hit-in.txt");
+        std::fs::write(&input, "cache hit input").unwrap();
+        let params = json!({});
+
+        seed_direct_cache(&state, &input, &params).await;
+
+        let outcome = submit_direct_full(
+            &state,
+            "mock-asr",
+            "transcribe",
+            params,
+            input,
+            None,
+            SubmitOptions {
+                wait: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let record = outcome.record.expect("wait 模式必须携带记录");
+        assert_eq!(record.status, TaskState::Completed, "缓存命中应直接完成");
+        assert_eq!(record.cached_from.as_deref(), Some("task-origin"));
+        assert!(record.pipeline_id.starts_with("direct/"));
+        let served = record
+            .served_artifacts
+            .get("run")
+            .expect("命中任务应登记 served artifact");
+        assert!(served.is_file(), "产物应硬链接进任务 files/");
+        assert!(
+            served.starts_with(record.work_dir.join("files")),
+            "产物必须落在任务可下载目录内"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_cache_bypass_and_disabled_skip_hit() {
+        let _guard = lock_for_tests();
+        clear_registry_for_tests();
+
+        let root = unique_root("cache-bypass");
+        let module = mock_asr_module(&root);
+        let state = Arc::new(AppState::new(
+            root.clone(),
+            AppConfig::default(),
+            vec![],
+            vec![module],
+            PortManager::new(18000, 19000),
+        ));
+        let input = root.join("cache-bypass-in.txt");
+        std::fs::write(&input, "cache bypass input").unwrap();
+        let params = json!({});
+        seed_direct_cache(&state, &input, &params).await;
+
+        // bypass_cache=true：跳过读取，真实执行（本环境必失败）且不写缓存
+        let outcome = submit_direct_full(
+            &state,
+            "mock-asr",
+            "transcribe",
+            params.clone(),
+            input.clone(),
+            None,
+            SubmitOptions {
+                wait: true,
+                bypass_cache: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let record = outcome.record.expect("wait 模式必须携带记录");
+        assert_ne!(record.status, TaskState::Completed, "旁路后不应命中缓存");
+        assert!(record.cached_from.is_none());
+        assert!(
+            cache_pending()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "旁路任务不应登记缓存写入上下文"
+        );
+
+        // 总开关关闭：即使缓存有条目也不得命中，且不登记写入上下文
+        state.config.write().await.cache.enabled = false;
+        let outcome = submit_direct_full(
+            &state,
+            "mock-asr",
+            "transcribe",
+            params,
+            input,
+            None,
+            SubmitOptions {
+                wait: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let record = outcome.record.expect("wait 模式必须携带记录");
+        assert_ne!(record.status, TaskState::Completed, "缓存关闭后不应命中");
+        assert!(record.cached_from.is_none());
+        assert!(cache_pending()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
     }
 
     // ── 20. snapshot_by_pipeline + 队列位置标注 ─────────────────────────────
@@ -4172,6 +4694,7 @@ output_type = "json"
             staging_dir: None,
             module_ids: Vec::new(),
         group: None,
+        cached_from: None,
         }
     }
 
@@ -4214,6 +4737,7 @@ output_type = "json"
             staging_dir: None,
             module_ids: Vec::new(),
         group: None,
+        cached_from: None,
         };
         registry()
             .lock()

@@ -17,6 +17,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { Switch } from '@/components/ui/switch'
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
@@ -77,6 +78,8 @@ export function RunWorkbench({
   /** 算力源选择：'' = auto（跟随计算策略）；否则为设备 id 字符串 */
   const [deviceSel, setDeviceSel] = useState('')
   const [switching, setSwitching] = useState(false)
+  /** T-16：本次直跑是否跳过结果缓存（不读不写） */
+  const [bypassCache, setBypassCache] = useState(false)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
 
   const capabilities = entry.capabilities
@@ -145,6 +148,7 @@ export function RunWorkbench({
     input_path?: string
     input_text?: string
     device?: string
+    bypass_cache?: boolean
   } {
     const textMode = isTextInput(cap.input_type)
     return {
@@ -154,6 +158,7 @@ export function RunWorkbench({
       lazy_start: true,
       ...(textMode ? { input_text: inputText } : { input_path: inputPath.trim() }),
       ...(deviceSel !== '' ? { device: deviceSel } : {}),
+      ...(bypassCache ? { bypass_cache: true } : {}),
     }
   }
 
@@ -417,6 +422,24 @@ export function RunWorkbench({
           ))}
         </div>
       )}
+
+      {/* 3.5 T-16：直跑结果缓存旁路（缺省参与内容寻址缓存） */}
+      <div className="flex items-start justify-between gap-3 rounded-lg border border-border bg-muted/20 px-3 py-2">
+        <div className="space-y-0.5">
+          <label htmlFor="bypass-cache" className="text-sm font-medium">
+            {t('cache.bypass')}
+          </label>
+          <p className="text-[11px] text-muted-foreground">
+            {t('cache.bypassHint')}
+          </p>
+        </div>
+        <Switch
+          id="bypass-cache"
+          checked={bypassCache}
+          onCheckedChange={setBypassCache}
+          disabled={submitting || switching}
+        />
+      </div>
 
       {/* 4. 执行（冲突态 = 停止并切换设备执行） */}
       <div className="space-y-2">

@@ -85,7 +85,19 @@ export interface ModuleActionResult {
 
 // ===== Config =====
 export interface AppConfig {
-  server: { host: string; port: number; allow_public: boolean }
+  server: {
+    host: string
+    port: number
+    allow_public: boolean
+    /** T-06 访问保护模式（缺省 none） */
+    access_protection?: 'none' | 'token'
+    /** T-06 共享访问令牌；GET/PUT /api/config 已脱敏，恒为空串 */
+    token?: string
+  }
+  /** T-16：GET/PUT /api/config 的凭据状态标记（响应中不返回令牌明文） */
+  server_token_set?: boolean
+  /** T-16：`api.token` 是否已配置（响应中不返回令牌明文） */
+  api_token_set?: boolean
   general: {
     language: string
     theme: string
@@ -500,6 +512,8 @@ export interface DirectExecRequest {
   lazy_start?: boolean
   /** 显式算力源（D-Device 完整版："cuda:0"/"rocm:0"/"cpu"…；缺省 auto 跟随策略） */
   device?: string
+  /** true = 本次直跑跳过结果缓存（既不读取也不写入；T-16） */
+  bypass_cache?: boolean
 }
 
 /** POST /api/modules/{module_id}/runs 202 响应 */

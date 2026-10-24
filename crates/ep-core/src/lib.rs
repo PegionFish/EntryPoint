@@ -23,6 +23,9 @@ pub mod archive;
 // Wave 2 B3：任务注册表下沉（daemon/桌面共用，P1-4）
 pub mod task_registry;
 
+// T-16：直跑结果内容寻址缓存（canonical 键 / 指纹 / LRU / 硬链接恢复）
+pub mod cache;
+
 // Wave 0+ modules (skeleton)
 pub mod health;
 pub mod deps;

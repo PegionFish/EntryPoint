@@ -161,6 +161,10 @@ pub struct TaskRecord {
     /// 旧 JSON 缺省为 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// 直跑缓存命中来源任务 id（T-16）：命中缓存的任务直接置 completed，
+    /// 本字段标注首次生成该结果的来源任务，便于任务详情追溯；正常执行缺省 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_from: Option<String>,
 }
 
 impl TaskRecord {
@@ -473,6 +477,7 @@ mod tests {
             staging_dir: None,
             module_ids: Vec::new(),
             group: None,
+            cached_from: None,
         }
     }
 
@@ -520,6 +525,28 @@ mod tests {
         assert_eq!(value["priority"], serde_json::json!(10));
         let back: TaskRecord = serde_json::from_value(value).unwrap();
         assert_eq!(back.priority, 10);
+    }
+
+    /// T-16：`cached_from` 对旧落盘 JSON 缺省 None；命中任务显式值随 JSON 往返
+    #[test]
+    fn task_record_cached_from_defaults_none_and_roundtrips() {
+        let mut value = serde_json::to_value(record("t1", "direct/m", TaskState::Completed)).unwrap();
+        value.as_object_mut().unwrap().remove("cached_from");
+        let parsed: TaskRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.cached_from, None);
+        assert!(
+            !serde_json::to_value(&parsed)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("cached_from"),
+            "None 时不应写出 cached_from 字段"
+        );
+
+        let mut rec = record("t2", "direct/m", TaskState::Completed);
+        rec.cached_from = Some("task-origin".to_string());
+        let back: TaskRecord = serde_json::from_value(serde_json::to_value(&rec).unwrap()).unwrap();
+        assert_eq!(back.cached_from.as_deref(), Some("task-origin"));
     }
 
     // ── 内存注册表基本操作 ───────────────────────────────────────────────────

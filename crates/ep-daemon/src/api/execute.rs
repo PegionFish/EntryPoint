@@ -72,6 +72,9 @@ pub(crate) struct ExecuteRequest {
     /// T-15 调度优先级（0-49 高优先，缺省 = 50；同优先级保持入队 FIFO）
     #[serde(default)]
     priority: Option<u8>,
+    /// T-16 直跑缓存旁路（仅 /execute/single 消费；管线执行忽略）
+    #[serde(default)]
+    bypass_cache: bool,
 }
 
 /// POST /api/pipelines/{pipeline_id}/runs — 提交管线执行（run 资源化端点，
@@ -152,6 +155,7 @@ async fn execute_pipeline(
         callback_url: req.callback_url,
         group: None,
         priority: req.priority,
+        bypass_cache: req.bypass_cache,
     };
     match execution::submit_pipeline_full(&state, pipeline, req.inputs, options).await {
         Ok(outcome) => {
@@ -599,6 +603,11 @@ async fn execute_single(
         .get("priority")
         .and_then(|v| v.as_u64())
         .and_then(|v| u8::try_from(v).ok());
+    // bypass_cache（T-16）：true 时跳过直跑缓存的读取与写入；缺省 false
+    let bypass_cache = body
+        .get("bypass_cache")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let request_params = match body.get("params") {
         None | Some(Value::Null) => json!({}),
         Some(p) if p.is_object() => p.clone(),
@@ -736,6 +745,7 @@ async fn execute_single(
         device_hint.as_deref(),
         execution::SubmitOptions {
             priority,
+            bypass_cache,
             ..Default::default()
         },
     )

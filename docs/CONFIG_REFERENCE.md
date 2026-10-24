@@ -330,7 +330,7 @@ max_total_gb = 50   # workspace/tasks 总容量上限 50 GiB；0 = 不限
 |---|---|---|---|
 | `enabled` | bool | `false` | 自愈总开关；`false` = 进程异常退出后不自动重启（旧行为） |
 | `max_backoff_secs` | u32 | `30` | 单次退避上限（秒）：连续失败重试按 2s、4s、8s… 翻倍，封顶该值；小于 2 时按 2 秒处理 |
-| `circuit_breaker_after` | u32 | `5` | 连续失败熔断阈值：达到后停止自动重启并写事件日志，需手动启动解除；`0` = 不熔断（持续退避重试） |
+| `circuit_breaker_after` | u32 | `5` | 连续失败熔断阈值：达到后停止自动重启并写事件日志，需手动启动解除；`0` = 不熔断（持续退避重试）；小于 2 时按 2 处理（至少保留一次自动重启机会） |
 
 **自愈机制：**
 
@@ -340,6 +340,12 @@ max_total_gb = 50   # workspace/tasks 总容量上限 50 GiB；0 = 不限
   重启未恢复（启动失败或 10 分钟内再次死亡）后按 **2s 起 ×2** 退避重试，
   封顶 `max_backoff_secs`
 - 模块**稳定运行 10 分钟**后失败计数与退避清零
+- **手动停止优先**：在模块页点「停止」（`POST /api/modules/:id/stop`）会取消该模块
+  待执行与在途的自愈重启，并清零失败计数/退避/熔断状态；迟到的重启结果按尝试序号
+  丢弃，不会再被拉起。拉起准备期间点「停止」同样生效（本次拉起被取消）
+- **结果校验**：自愈重启返回成功后会再核对本轮采样到的真实状态——模块若已再次退出
+  （未处于 Running），按失败计入退避/熔断，不会静默停在 Error；单次重启任务超过
+  300 秒未返回则按失败处理并释放调度（防止拉起入口卡死导致该模块永久不再自愈）
 - 连续失败达 `circuit_breaker_after` 次 → **熔断**：停止自动重启，模块保持退出/
   错误状态不再被拉起，需用户在模块页手动「启动」解除（观察到非自愈发起的启动即复位）
 - **事件日志**：每次重启尝试 / 结果写 `module_auto_restart`
@@ -354,6 +360,39 @@ max_total_gb = 50   # workspace/tasks 总容量上限 50 GiB；0 = 不限
 enabled = true
 max_backoff_secs = 30       # 退避上限 30 秒（2s 起、每次 ×2）
 circuit_breaker_after = 5   # 连续失败 5 次熔断；0 = 不熔断
+```
+
+### 1.15 `[cache]` — 直跑结果内容寻址缓存（T-16）
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `enabled` | bool | `true` | 直跑缓存总开关；`false` = 既不读缓存也不写缓存（旧行为） |
+| `max_gb` | u32 | `8` | 缓存目录 `workspace/cache/` 容量上限（GB，按 1024³ 字节换算）；`0` = 不限（不做 LRU 淘汰，需自行关注磁盘占用） |
+
+**缓存契约：**
+
+- **范围**：仅**直跑**任务（`POST /api/pipelines/execute/single`、
+  `/v1/inference/{module}/{capability}`，内部 `pipeline_id` 为 `direct/…`）。
+  管线任务（`/api/pipelines/execute`、`/pipelines/{id}/runs`）不参与缓存
+- **键**：`sha256(module_id + capability + 规范化参数 JSON + 输入指纹)`；规范化 =
+  对象键递归字典序、数组保持原序。输入文件 **≤ 512MB** 时用**内容 sha256**；
+  超过 512MB 退化为 `size + mtime` 弱键（`meta.json` 中 `weak: true` 标注——
+  同尺寸且同修改时间的不同内容会被视为同一输入）
+- **命中**：不占用执行闸门，直接生成 `completed` 任务，产物硬链接（失败降级为
+  复制并告警）到 `workspace/tasks/<new-task-id>/files/<node-id>/`，任务详情
+  `cached_from` 标出原任务 id；完成回调与事件日志（`task_terminal`）照常触发
+- **未命中**：照常执行；成功终态后把产物写入 `workspace/cache/<key>/`
+  （`meta.json` + `files/<node-id>/<name>`），并按 `max_gb` 做 LRU 淘汰
+  （按 `last_used_ms` 最旧优先，0 = 不淘汰）
+- **旁路**：请求体可选 `bypass_cache: bool`（默认 `false`）；multipart 形态用
+  文本字段 `bypass_cache=true|false`。旁路请求既不读也不写缓存
+- **异常降级**：指纹计算 / 缓存读写失败只写告警日志，不影响任务提交与结果
+- **生效时机**：每次直跑实时读取配置，`PUT /api/config` 修改后下一次请求即生效
+
+```toml
+[cache]
+enabled = true
+max_gb = 8          # 0 = 不限（不淘汰，注意磁盘占用）
 ```
 
 ---
@@ -428,6 +467,10 @@ circuit_breaker_after = 5
 enabled = false
 max_age_days = 0
 max_total_gb = 0
+
+[cache]
+enabled = true
+max_gb = 8
 
 [api]
 enabled = true

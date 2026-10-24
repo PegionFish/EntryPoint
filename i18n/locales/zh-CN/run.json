@@ -32,6 +32,8 @@
   "device.conflict": "模块正运行于 {{current}}；所选 {{target}} 需重启切换",
   "device.restartRun": "重启并在此设备执行",
   "device.switching": "正在停止模块…",
+  "cache.bypass": "跳过结果缓存",
+  "cache.bypassHint": "本次直接执行，不读取也不写入直跑结果缓存（同样的模块、参数与输入会复用历史产物）",
   "status.preparingModule": "正在启动模块（环境 / 权重加载）…",
   "status.queued": "排队中",
   "elapsed": "已运行",

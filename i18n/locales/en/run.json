@@ -32,6 +32,8 @@
   "device.conflict": "Module is running on {{current}}; target {{target}} requires a restart",
   "device.restartRun": "Restart & run here",
   "device.switching": "Stopping module…",
+  "cache.bypass": "Bypass result cache",
+  "cache.bypassHint": "Run this request directly without reading or writing the direct-run result cache (identical module, parameters and input reuse earlier artifacts)",
   "status.preparingModule": "Starting module (env & weights)…",
   "status.queued": "Queued",
   "elapsed": "Elapsed",

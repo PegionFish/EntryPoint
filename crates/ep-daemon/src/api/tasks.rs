@@ -195,6 +195,10 @@ struct TaskSummaryOut {
     /// 普通任务省略。前端据此渲染批量徽章并隐藏产物下载入口。
     #[serde(skip_serializing_if = "Option::is_none")]
     kind: Option<&'static str>,
+    /// 直跑缓存命中来源任务 id（T-16）：命中任务直接 completed，本字段用于
+    /// 任务详情标注“来自缓存”；正常执行/历史任务省略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cached_from: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -238,6 +242,7 @@ fn summary_out(record: &TaskRecord) -> TaskSummaryOut {
             .count(),
         pipeline_id: Some(record.pipeline_id.clone()),
         kind: None,
+        cached_from: record.cached_from.clone(),
     }
 }
 
@@ -268,6 +273,7 @@ fn group_summary_out(group_id: &str, members: &[TaskRecord]) -> TaskSummaryOut {
         // 前端直跑判别用 pipeline_id 前缀；批量组统一 `batch/` 命名空间
         pipeline_id: Some(format!("batch/{module_id}")),
         kind: Some("group"),
+        cached_from: None,
     }
 }
 

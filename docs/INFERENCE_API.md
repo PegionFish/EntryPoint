@@ -59,6 +59,7 @@ WebUI 内部端点分离：本文件描述的请求/响应形状与错误码属�
 | `params` | 否 | JSON 字符串（对象），模块参数；字段上限 1MB |
 | `wait` | 否 | `"true"` 同步等待终态；缺省异步；字段上限 1MB |
 | `priority` | 否 | 任务优先级 `0`–`255`（十进制字符串）：`0`–`49` 高于缺省、`50` 缺省、同优先级先入先出；字段上限 1MB |
+| `bypass_cache` | 否 | `"true"` 时本次直跑既**不读也不写**结果缓存（缺省参与缓存）；字段上限 1MB |
 
 重复 `file` 字段以最后一个为准（先前已接收的文件会被清理）。
 
@@ -71,6 +72,7 @@ WebUI 内部端点分离：本文件描述的请求/响应形状与错误码属�
   "params": {},
   "wait": false,
   "priority": 10,
+  "bypass_cache": false,
   "callback_url": "http://your-host/done"
 }
 ```
@@ -78,6 +80,12 @@ WebUI 内部端点分离：本文件描述的请求/响应形状与错误码属�
 `priority` 可省略（缺省 50）；数值越小越先出队，同等优先级按提交顺序
 派发。全局队列暂停/恢复见 `POST /api/queue/pause`、`POST /api/queue/resume`
 （暂停只阻止新任务派发，运行中任务不受影响，排队任务保留）。
+
+`bypass_cache` 可省略（缺省 `false`）。直跑结果默认按
+`sha256(module + capability + 规范化 params + 输入指纹)` 做内容寻址缓存：
+命中直接返回 `completed` 任务（详情 `cached_from` 指回原任务，产物硬链接复用），
+未命中执行成功后写入 `workspace/cache/` 并按 `[cache] max_gb` LRU 淘汰。
+`bypass_cache: true` 只旁路本次；全局开关见配置 `[cache] enabled`。
 
 `input_text` 与 `input_path` **互斥**：双缺或同传均返回 `400 INPUT_INVALID`
 （对齐内部 `POST /api/modules/{module_id}/runs`（旧别名

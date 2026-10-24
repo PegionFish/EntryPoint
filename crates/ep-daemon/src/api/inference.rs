@@ -353,6 +353,9 @@ struct InferenceJsonRequest {
     /// T-15 调度优先级（0-49 高优先，缺省 = 50；同优先级保持入队 FIFO）
     #[serde(default)]
     priority: Option<u8>,
+    /// T-16 缓存旁路：true 时跳过直跑结果缓存读取与写入
+    #[serde(default)]
+    bypass_cache: bool,
 }
 
 /// 提交推理（双形态）：按 Content-Type 分流。
@@ -455,6 +458,8 @@ async fn submit_multipart(
     let mut wait = false;
     // T-15：可选调度优先级；缺省 None（按默认 50 调度）
     let mut priority: Option<u8> = None;
+    // T-16：直跑缓存旁路开关；缺省 false（参与缓存）
+    let mut bypass_cache = false;
 
     loop {
         let field = match multipart.next_field().await {
@@ -571,6 +576,22 @@ async fn submit_multipart(
                     }
                 };
             }
+            "bypass_cache" => {
+                bypass_cache = match field.text().await {
+                    Ok(text) => matches!(
+                        text.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    ),
+                    Err(e) => {
+                        cleanup_staged(&file_staged).await;
+                        return multipart_field_error(
+                            "bypass_cache",
+                            &e,
+                            Some(TEXT_FIELD_LIMIT),
+                        );
+                    }
+                };
+            }
             _ => {} // 未知字段忽略（multer 自动丢弃未读内容）
         }
     }
@@ -600,6 +621,7 @@ async fn submit_multipart(
             wait,
             callback_url: None,
             priority,
+            bypass_cache,
         },
     )
     .await
@@ -754,16 +776,18 @@ async fn submit_json(
             wait: req.wait,
             callback_url: req.callback_url,
             priority: req.priority,
+            bypass_cache: req.bypass_cache,
         },
     )
     .await
 }
 
-/// 推理提交选项（T-15）：wait / callback / priority 一并透传给直跑执行器
+/// 推理提交选项（T-15/T-16）：wait / callback / priority / 缓存旁路一并透传给直跑执行器
 struct InferenceRunOptions {
     wait: bool,
     callback_url: Option<String>,
     priority: Option<u8>,
+    bypass_cache: bool,
 }
 
 /// 公共执行序列（对齐 execute_single 校验顺序）：参数 schema 校验与默认值
@@ -799,6 +823,7 @@ async fn run_inference(
         callback_url: options.callback_url,
         group: None,
         priority: options.priority,
+        bypass_cache: options.bypass_cache,
     };
     match execution::submit_direct_full(
         state,
