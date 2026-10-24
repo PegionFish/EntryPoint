@@ -22,7 +22,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     body::Body,
-    extract::{Path, State},
+    extract::{Path, RawQuery, State},
     http::{Request, StatusCode, header, HeaderValue},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -66,10 +66,48 @@ fn task_files_router() -> Router<Arc<AppState>> {
         .layer(middleware::from_fn(attachment_disposition))
 }
 
+/// 允许内联展示（浏览器直接看/播）的产物扩展名白名单（小写）。
+///
+/// 仅收录浏览器原生可渲染的图片/视频/音频容器；**不含 svg / html**
+/// ——这两类可携带脚本，内联到同源页面会形成 XSS 通道，必须保持下载语义。
+const INLINE_PREVIEW_EXTS: &[&str] = &[
+    // 图片
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "avif", //
+    // 视频
+    "mp4", "webm", "m4v", "mov", "mkv", //
+    // 音频
+    "wav", "mp3", "flac", "ogg", "m4a", "aac", "opus", "wma",
+];
+
+/// 判定 ServeDir 请求是否走内联预览：`inline=1` 且 URI 末段扩展名 ∈ 白名单。
+///
+/// 扩展名从 URI 末段（百分号编码前的 ASCII 文件名）取，大小写不敏感。
+/// 其余 query（含 `inline=0`、无 `inline`）一律按下载处理。
+fn wants_inline_preview(path: &str, query: Option<&str>) -> bool {
+    if !has_inline_flag(query) {
+        return false;
+    }
+    let file = path.rsplit('/').next().unwrap_or_default();
+    let Some((_, ext)) = file.rsplit_once('.') else {
+        return false;
+    };
+    INLINE_PREVIEW_EXTS.contains(&ext.to_ascii_lowercase().as_str())
+}
+
+/// query 串是否显式携带 `inline=1`（用于 302 透传，不做扩展名判断）。
+fn has_inline_flag(query: Option<&str>) -> bool {
+    query
+        .map(|q| q.split('&').any(|p| p == "inline=1"))
+        .unwrap_or(false)
+}
+
 /// 为 ServeDir 的成功响应补 `Content-Disposition: attachment; filename=...`
 ///
 /// ServeDir 本身只按 inline 语义提供文件；文件名取 URI 最后一段
 /// （百分号编码形态），按 RFC 5987 同时给出 `filename*`（UTF-8）。
+///
+/// 例外：`?inline=1` 且扩展名命中 [`INLINE_PREVIEW_EXTS`] 时**不加** attachment
+/// 头，保留 ServeDir 自带的 inline + MIME + Range 语义（产物在线预览）。
 async fn attachment_disposition(req: Request<Body>, next: Next) -> Response {
     let raw_name = req
         .uri()
@@ -78,8 +116,9 @@ async fn attachment_disposition(req: Request<Body>, next: Next) -> Response {
         .next()
         .unwrap_or_default()
         .to_string();
+    let inline_preview = wants_inline_preview(req.uri().path(), req.uri().query());
     let mut resp = next.run(req).await;
-    if resp.status().is_success() && !raw_name.is_empty() {
+    if resp.status().is_success() && !raw_name.is_empty() && !inline_preview {
         let decoded = percent_decode(&raw_name);
         let mut fallback: String = decoded
             .chars()
@@ -348,9 +387,13 @@ async fn list_task_artifacts(
 ///
 /// 校验通过后 302 到 `/api/task-files/...`（ServeDir 流式发送，支持大文件
 /// 与 Range）；任务/节点/产物不存在 → 404。
+///
+/// query 只透传 `inline=1`（供在线预览），其余参数在跳转时丢弃；是否真正
+/// 内联由静态文件中间件按扩展名白名单二次把关。
 async fn get_task_artifact(
     State(state): State<Arc<AppState>>,
     Path((task_id, node_id)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
 ) -> Response {
     let Some(record) = execution::snapshot(&task_id) else {
         return err_response(
@@ -395,13 +438,17 @@ async fn get_task_artifact(
     };
 
     // ServeDir 根内的归集布局：{task_id}/files/{node_id}/{filename}
-    let location = format!(
+    let mut location = format!(
         "/api/task-files/{}/{}/{}/{}",
         percent_encode(&task_id),
         "files",
         percent_encode(&node_id),
         percent_encode(&file_name.to_string_lossy()),
     );
+    // 仅透传 inline=1（预览开关）；是否真正内联由静态文件中间件按白名单把关
+    if has_inline_flag(query.as_deref()) {
+        location.push_str("?inline=1");
+    }
     (
         StatusCode::FOUND,
         [(header::LOCATION, location)],
@@ -799,6 +846,7 @@ params = { path = "/nonexistent/missing-art.txt" }
         let resp = get_task_artifact(
             State(state.clone()),
             Path((task_id.clone(), "output".to_string())),
+            RawQuery(None),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FOUND);
@@ -820,6 +868,7 @@ params = { path = "/nonexistent/missing-art.txt" }
         let resp = get_task_artifact(
             State(state.clone()),
             Path((task_id.clone(), "input".to_string())),
+            RawQuery(None),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FOUND);
@@ -837,6 +886,7 @@ params = { path = "/nonexistent/missing-art.txt" }
         let resp = get_task_artifact(
             State(state.clone()),
             Path((task_id.clone(), "ghost".to_string())),
+            RawQuery(None),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -844,6 +894,7 @@ params = { path = "/nonexistent/missing-art.txt" }
         let resp = get_task_artifact(
             State(state.clone()),
             Path(("task-ghost".to_string(), "output".to_string())),
+            RawQuery(None),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -875,6 +926,7 @@ params = { path = "/nonexistent/missing-dl.txt" }
         let resp = get_task_artifact(
             State(state),
             Path((empty_task, "input".to_string())),
+            RawQuery(None),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -970,7 +1022,7 @@ to = ["output", "input"]
 
         // 等待全部终结
         for _ in 0..300 {
-            let all_terminal = [member_ids.as_slice(), &[solo_id.clone()]].concat();
+            let all_terminal = [member_ids.as_slice(), std::slice::from_ref(&solo_id)].concat();
             let done = all_terminal.iter().all(|id| {
                 execution::snapshot(id).map(|r| r.status.is_terminal()).unwrap_or(false)
             });
@@ -1069,5 +1121,118 @@ to = ["output", "input"]
         assert_eq!(group_entry["status"], "partial", "completed+failed 应滚动为 partial");
         assert_eq!(group_entry["node_count"], 2);
         assert_eq!(group_entry["completed_nodes"], 1);
+    }
+
+    // ── 11. 内联预览白名单：inline=1 且图片/视频/音频才免 attachment；
+    //        .html/.svg 等可携带脚本的类型仍强制下载 ─────────────────────────
+
+    #[tokio::test]
+    async fn test_attachment_middleware_inline_whitelist() {
+        use tower::ServiceExt;
+
+        // 以 200 空响应模拟 ServeDir 命中，只验证中间件对 Content-Disposition
+        // 的决策（Route 通配段覆盖任务产物的真实地址形状）
+        let app = Router::new()
+            .route("/files/{*path}", get(|| async { "ok" }))
+            .layer(middleware::from_fn(attachment_disposition));
+
+        async fn disposition(app: &Router, uri: &str) -> Option<String> {
+            let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "用例应为成功响应: {uri}");
+            resp.headers()
+                .get(header::CONTENT_DISPOSITION)
+                .map(|v| v.to_str().unwrap().to_string())
+        }
+
+        // 1) 白名单类型 + inline=1 → 不注入 attachment（浏览器内联看/播）
+        for uri in [
+            "/files/t/files/output/a.png?inline=1",
+            "/files/t/files/output/a.JPG?inline=1",
+            "/files/t/files/output/a.avif?inline=1",
+            "/files/t/files/output/a.mp4?inline=1",
+            "/files/t/files/output/a.webm?inline=1",
+            "/files/t/files/output/a.mp3?inline=1",
+            "/files/t/files/output/a.flac?inline=1",
+            "/files/t/files/output/a.png?foo=1&inline=1",
+        ] {
+            assert!(
+                disposition(&app, uri).await.is_none(),
+                "白名单类型应内联返回: {uri}"
+            );
+        }
+
+        // 2) 非白名单（html/svg 可执行脚本）即使 inline=1 也必须 attachment；
+        //    未带 inline=1 / 白名单类型缺失时同样保持下载语义
+        for uri in [
+            "/files/t/files/output/a.html?inline=1",
+            "/files/t/files/output/a.svg?inline=1",
+            "/files/t/files/output/a.txt?inline=1",
+            "/files/t/files/output/a.exe?inline=1",
+            "/files/t/files/output/a.png",
+            "/files/t/files/output/a.png?inline=0",
+            "/files/t/files/output/a.png?download=1",
+        ] {
+            let value = disposition(&app, uri)
+                .await
+                .unwrap_or_else(|| panic!("非白名单/未请求内联应 attachment: {uri}"));
+            assert!(
+                value.starts_with("attachment;"),
+                "应为 attachment: {uri} => {value}"
+            );
+        }
+    }
+
+    // ── 12. 产物 302 只透传 inline=1（其余 query 一律丢弃）──────────────────
+
+    #[tokio::test]
+    async fn test_artifact_redirect_forwards_inline_only() {
+        let _guard = lock_for_tests();
+        execution::clear_registry_for_tests();
+
+        let root = unique_root("inline-302");
+        let state = test_state(root.clone());
+        let src = root.join("inline-in.png");
+        std::fs::write(&src, b"png-bytes").unwrap();
+        let dest = root.join("inline-out.png");
+        let task_id = run_copy_task(&state, "inline-pipe", &src, &dest).await;
+
+        async fn location_of(
+            state: Arc<AppState>,
+            task_id: String,
+            query: Option<&str>,
+        ) -> String {
+            let resp = get_task_artifact(
+                State(state),
+                Path((task_id, "output".to_string())),
+                RawQuery(query.map(str::to_string)),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::FOUND);
+            resp.headers()
+                .get(header::LOCATION)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        }
+
+        // inline=1 → 302 Location 带 ?inline=1，供静态文件中间件识别
+        let loc = location_of(state.clone(), task_id.clone(), Some("inline=1")).await;
+        assert!(loc.ends_with("?inline=1"), "应透传 inline=1: {loc}");
+
+        // 其他 query 丢弃
+        let loc = location_of(state.clone(), task_id.clone(), Some("download=1&foo=2")).await;
+        assert!(!loc.contains('?'), "其余 query 应丢弃: {loc}");
+
+        // 混排只保留 inline=1
+        let loc = location_of(state.clone(), task_id.clone(), Some("download=1&inline=1")).await;
+        assert!(loc.ends_with("?inline=1"), "混排只透传 inline=1: {loc}");
+
+        // inline=0 / 无 query 不追加参数
+        let loc = location_of(state.clone(), task_id.clone(), Some("inline=0")).await;
+        assert!(!loc.contains('?'), "inline=0 不应透传: {loc}");
+        let loc = location_of(state, task_id, None).await;
+        assert!(!loc.contains('?'), "无 query 时 Location 不应带参数: {loc}");
     }
 }

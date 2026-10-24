@@ -6,6 +6,7 @@ import {
   CircleStop,
   Copy,
   Download,
+  Eye,
   FileBox,
   GitBranch,
   Inbox,
@@ -28,6 +29,13 @@ import { PageContainer } from '@/components/layout/page-container'
 import { SegmentedTabs } from '@/components/shared/segmented-tabs'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { Skeleton } from '@/components/ui/skeleton'
 import { statusMeta } from '@/lib/constants'
 import { cn, formatBytes, formatUptime } from '@/lib/utils'
@@ -234,6 +242,82 @@ function isActive(m: ModuleResponse): boolean {
   return ACTIVE_STATUSES.has((m.service_status || m.status).toLowerCase())
 }
 
+// ─── 产物在线预览 ───────────────────────────────────────────────────────────
+
+/** 产物在线预览类型：按扩展名判定；null 表示不支持预览（仅保留下载） */
+type ArtifactPreviewKind = 'image' | 'video' | 'audio' | 'text'
+
+/** 图片扩展名（与 daemon 的 INLINE_PREVIEW_EXTS 白名单保持一致） */
+const IMAGE_ARTIFACT_EXTS = new Set([
+  'png',
+  'jpg',
+  'jpeg',
+  'gif',
+  'webp',
+  'bmp',
+  'avif',
+])
+
+/** 视频扩展名（同上） */
+const VIDEO_ARTIFACT_EXTS = new Set(['mp4', 'webm', 'm4v', 'mov', 'mkv'])
+
+/** 音频扩展名（同上） */
+const AUDIO_ARTIFACT_EXTS = new Set([
+  'wav',
+  'mp3',
+  'flac',
+  'ogg',
+  'm4a',
+  'aac',
+  'opus',
+  'wma',
+])
+
+/** 文本类扩展名：fetch 后按纯文本渲染（不含可执行脚本的 html/svg） */
+const TEXT_ARTIFACT_EXTS = new Set([
+  'txt',
+  'md',
+  'srt',
+  'vtt',
+  'ass',
+  'json',
+  'csv',
+  'log',
+])
+
+/** 文本预览最多渲染的字符数（1MB；超出部分截断并提示） */
+const TEXT_PREVIEW_LIMIT = 1024 * 1024
+
+/** 取扩展名（小写，不含点）；无扩展名返回空串 */
+function artifactExtension(name: string): string {
+  const dot = name.lastIndexOf('.')
+  return dot > 0 && dot < name.length - 1 ? name.slice(dot + 1).toLowerCase() : ''
+}
+
+/** 产物文件名 → 预览类型；exe/zip/html/svg 等不可预览返回 null */
+function artifactPreviewKind(name: string): ArtifactPreviewKind | null {
+  const ext = artifactExtension(name)
+  if (IMAGE_ARTIFACT_EXTS.has(ext)) return 'image'
+  if (VIDEO_ARTIFACT_EXTS.has(ext)) return 'video'
+  if (AUDIO_ARTIFACT_EXTS.has(ext)) return 'audio'
+  if (TEXT_ARTIFACT_EXTS.has(ext)) return 'text'
+  return null
+}
+
+/** 预览对话框状态：非文本类型打开即就绪；文本类型先 loading 再填充 */
+interface ArtifactPreviewState {
+  artifact: TaskArtifact
+  kind: ArtifactPreviewKind
+  /** 仅 text 类型：是否仍在拉取内容 */
+  loading: boolean
+  /** 仅 text 类型：截断后的文本内容 */
+  text: string | null
+  /** 仅 text 类型：内容超过上限、已截断 */
+  truncated: boolean
+  /** 仅 text 类型：加载失败原因（展示在 i18n 错误文案旁） */
+  error: string | null
+}
+
 /** 模块分类 → tasks 命名空间分类标签键；未知分类原样展示 */
 const CATEGORY_KEYS: Record<string, string> = {
   asr: 'category.asr',
@@ -376,6 +460,10 @@ function TaskCard({
   const [artifactsError, setArtifactsError] = useState<string | null>(null)
   const [artifactRetry, setArtifactRetry] = useState(0)
   const [cancelling, setCancelling] = useState(false)
+  /** 产物预览对话框（null = 关闭） */
+  const [preview, setPreview] = useState<ArtifactPreviewState | null>(null)
+  /** 文本预览请求序号：关闭/切换产物后丢弃过期响应 */
+  const previewSeq = useRef(0)
 
   const terminal = isTerminalStatus(task.status)
 
@@ -417,6 +505,55 @@ function TaskCard({
     } finally {
       setCancelling(false)
     }
+  }
+
+  /** 关闭预览：递增请求序号，丢弃仍在途的文本响应 */
+  function closePreview() {
+    previewSeq.current += 1
+    setPreview(null)
+  }
+
+  /** 打开预览：图片/视频/音频直接用 inline URL；文本走 fetch 后按纯文本渲染 */
+  function openPreview(artifact: TaskArtifact) {
+    const kind = artifactPreviewKind(artifact.name)
+    if (kind === null) return
+    const seq = previewSeq.current + 1
+    previewSeq.current = seq
+    setPreview({
+      artifact,
+      kind,
+      loading: kind === 'text',
+      text: null,
+      truncated: false,
+      error: null,
+    })
+    if (kind !== 'text') return
+    // 文本下载对 Content-Disposition 不敏感，直接复用下载 URL 取内容
+    fetch(api.taskArtifactUrl(task.id, artifact.node_id))
+      .then((resp) => {
+        if (!resp.ok) throw new Error(`API ${resp.status}`)
+        return resp.text()
+      })
+      .then((text) => {
+        if (seq !== previewSeq.current) return
+        // 超大文本只保留前 1MB，避免 <pre> 渲染卡顿
+        setPreview((cur) =>
+          cur === null
+            ? null
+            : {
+                ...cur,
+                loading: false,
+                text: text.slice(0, TEXT_PREVIEW_LIMIT),
+                truncated: text.length > TEXT_PREVIEW_LIMIT,
+              },
+        )
+      })
+      .catch((e: unknown) => {
+        if (seq !== previewSeq.current) return
+        setPreview((cur) =>
+          cur === null ? null : { ...cur, loading: false, error: failMsg(e) },
+        )
+      })
   }
 
   // 非终态任务驱动「已运行 Xs」走针：仅本卡片自身以 1s 频率重渲染，
@@ -709,6 +846,17 @@ function TaskCard({
                   <span className="shrink-0 font-mono text-xs text-muted-foreground">
                     {formatBytes(a.size)}
                   </span>
+                  {artifactPreviewKind(a.name) !== null && (
+                    <Button
+                      variant="outline"
+                      size="xs"
+                      onClick={() => openPreview(a)}
+                      title={t('artifacts.preview')}
+                    >
+                      <Eye />
+                      {t('artifacts.preview')}
+                    </Button>
+                  )}
                   <Button asChild variant="outline" size="xs">
                     <a
                       href={api.taskArtifactUrl(task.id, a.node_id)}
@@ -724,6 +872,81 @@ function TaskCard({
           )}
         </div>
       )}
+
+      {/* 产物预览：图片/视频/音频走 inline URL，文本 fetch 后按纯文本渲染 */}
+      <Dialog
+        open={preview !== null}
+        onOpenChange={(open) => {
+          if (!open) closePreview()
+        }}
+      >
+        <DialogContent className="sm:max-w-3xl">
+          {preview !== null && (
+            <>
+              <DialogHeader>
+                <DialogTitle className="truncate pr-6 font-mono text-sm">
+                  {preview.artifact.name}
+                </DialogTitle>
+                <DialogDescription>
+                  {formatBytes(preview.artifact.size)}
+                </DialogDescription>
+              </DialogHeader>
+
+              {preview.loading ? (
+                <div className="flex items-center gap-2 py-2 text-xs text-muted-foreground">
+                  <Loader2 className="size-3.5 animate-spin" />
+                  {t('artifacts.previewLoading')}
+                </div>
+              ) : preview.error !== null ? (
+                <div className="flex items-start gap-2 rounded-md border border-status-error/30 bg-status-error/10 px-3 py-2 text-xs text-status-error">
+                  <TriangleAlert className="mt-px size-3.5 shrink-0" />
+                  <span className="min-w-0 flex-1 break-all">
+                    {t('artifacts.previewLoadFailed')}：{preview.error}
+                  </span>
+                </div>
+              ) : preview.kind === 'image' ? (
+                <img
+                  src={api.taskArtifactPreviewUrl(
+                    task.id,
+                    preview.artifact.node_id,
+                  )}
+                  alt={preview.artifact.name}
+                  className="mx-auto max-h-[70vh] rounded-md border border-border object-contain"
+                />
+              ) : preview.kind === 'video' ? (
+                <video
+                  controls
+                  src={api.taskArtifactPreviewUrl(
+                    task.id,
+                    preview.artifact.node_id,
+                  )}
+                  className="max-h-[70vh] w-full rounded-md border border-border"
+                />
+              ) : preview.kind === 'audio' ? (
+                <audio
+                  controls
+                  src={api.taskArtifactPreviewUrl(
+                    task.id,
+                    preview.artifact.node_id,
+                  )}
+                  className="w-full"
+                />
+              ) : (
+                <div className="space-y-1">
+                  {preview.truncated && (
+                    <p className="text-xs text-muted-foreground">
+                      {t('artifacts.previewTruncated')}
+                    </p>
+                  )}
+                  <pre className="max-h-[70vh] overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted/30 p-3 font-mono text-xs leading-relaxed">
+                    {preview.text}
+                  </pre>
+                </div>
+              )}
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

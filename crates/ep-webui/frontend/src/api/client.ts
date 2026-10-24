@@ -305,6 +305,13 @@ export const api = {
   /** 任务产物下载 URL（直接用于 <a href> / window.open，不走 fetch） */
   taskArtifactUrl: (taskId: string, nodeId: string) =>
     `/api/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeURIComponent(nodeId)}`,
+  /**
+   * 任务产物预览 URL（带 inline=1）：图片/视频/音频命中 daemon 白名单时
+   * 以内联 Content-Disposition 返回，可直接喂给 <img>/<video>/<audio>；
+   * 其余类型（含 html/svg）仍按下载处理。仅生成 URL，不走 fetch。
+   */
+  taskArtifactPreviewUrl: (taskId: string, nodeId: string) =>
+    `/api/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeURIComponent(nodeId)}?inline=1`,
 
   // Pipelines
   listPipelines: () => apiFetch<PipelineSummary[]>('/pipelines'),
