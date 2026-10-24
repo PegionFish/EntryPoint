@@ -146,6 +146,15 @@ pub struct AppState {
     /// 生产消费方：`api/models.rs`（模型下载）与 `api/packs.rs`（整合包内
     /// 模型下载，B2）；`GET /api/models/downloads` 直接读取本表。
     pub downloads: Arc<std::sync::Mutex<HashMap<String, DownloadEntry>>>,
+    /// 用户手动停止信号（T-14 P1-1）：`POST /api/modules/:id/stop` 成功后入队，
+    /// 自愈监督器每个采样周期取走并取消该模块的待执行/在途自愈。
+    ///
+    /// 只表达“用户意图”——autostart 失败清理、空闲释放等程序化停止不入队，
+    /// 否则会误伤自愈自身的退避清理路径。
+    pub manual_stops: Arc<std::sync::Mutex<Vec<String>>>,
+    /// 每模块手动停止代次（单调递增）：autostart 在启动前记录、启动完成后比对，
+    /// 代次变化说明用户在启动期间点了“停止”，本次拉起应取消（P1-1）。
+    pub manual_stop_seq: Arc<std::sync::Mutex<HashMap<String, u64>>>,
 }
 
 impl AppState {
@@ -204,7 +213,55 @@ impl AppState {
             progress_tx,
             model_download_tx,
             downloads: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            manual_stops: Arc::new(std::sync::Mutex::new(Vec::new())),
+            manual_stop_seq: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// 记录一次用户手动停止：入队待监督器取消，并递增该模块的停止代次。
+    ///
+    /// 入队去重（同一模块在监督器取走前多次停止只处理一次）；代次只增不减，
+    /// 供 autostart 判定“启动期间是否被用户取消”（见 [`Self::manual_stop_seq`]）。
+    pub fn record_manual_stop(&self, module_id: &str) {
+        {
+            let mut stops = self
+                .manual_stops
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !stops.iter().any(|id| id == module_id) {
+                stops.push(module_id.to_string());
+            }
+        }
+        let mut seq = self
+            .manual_stop_seq
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *seq.entry(module_id.to_string()).or_insert(0) += 1;
+    }
+
+    /// 取走待处理的手动停止信号（自愈监督器消费）。
+    ///
+    /// e2e 集成测试 target 通过 `#[path]` 只包含 `state.rs` 等部分源文件、
+    /// 不含 `health_supervisor.rs`，该 target 下本方法无调用点；真实 daemon
+    /// 由 `spawn_health_supervisor` 每轮调用，故仅对测试 target 放行 dead_code。
+    #[allow(dead_code)]
+    pub fn take_manual_stops(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .manual_stops
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    /// 该模块当前的手动停止代次（从未停止过 = 0）。
+    pub fn manual_stop_seq(&self, module_id: &str) -> u64 {
+        self.manual_stop_seq
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(module_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// 当前 UI 语言码：读取 `config.general.language` 并归一化为 `"zh-CN"` / `"en"`。

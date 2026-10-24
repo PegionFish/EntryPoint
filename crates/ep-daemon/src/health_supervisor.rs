@@ -11,7 +11,11 @@
 //! - 连续失败达 `circuit_breaker_after` 次后熔断：停止自动重启并写事件
 //!   日志，需用户手动启动模块解除（观察到非 supervisor 发起的 Starting
 //!   即复位）；`circuit_breaker_after = 0` 表示不熔断；
-//! - 开关关闭时不重启、不写事件，并丢弃全部调度状态。
+//! - 开关关闭时不重启、不写事件，并丢弃全部调度状态；
+//! - 用户手动停止（`POST /api/modules/:id/stop`）会取消该模块的待执行/在途
+//!   重启：清零失败计数与退避，迟到的重启结果按尝试序号丢弃；
+//! - 重启结果回填前先采样本轮 fresh 状态：拉起返回成功但模块并不在运行
+//!   （已再次退出）按失败计数，不静默漏计；拉起任务带超时兜底。
 //!
 //! 任务前按需拉起（§6.5）仍走既有 autostart 路径，不退避；本模块只管
 //! 运行中死亡。每次重启尝试/结果与熔断都写统一事件日志（eventlog）：
@@ -45,6 +49,9 @@ const TICK: Duration = Duration::from_secs(1);
 const STABLE_RUNNING_SECS: i64 = 10 * 60;
 /// 退避基数（秒）：第 2 次起的重试间隔为 2、4、8…（首次立即重启）
 const BASE_BACKOFF_SECS: u64 = 2;
+/// 单次自愈重启任务的最长容忍时长（含等待健康）：超时视为失败并释放调度，
+/// 防止拉起入口卡死时 `in_flight` 永久为真、该模块再也不自愈（T-14 P2-1）。
+const RESTART_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(300);
 
 // ─── 事件（纯状态机输出，由运行循环落盘）────────────────────────────────
 
@@ -104,6 +111,8 @@ struct RestartRequest {
     module_id: String,
     attempt: u32,
     backoff_secs: u64,
+    /// 本次尝试的序号（单调递增；回填结果时用于丢弃已取消/迟到的旧结果）
+    attempt_seq: u64,
 }
 
 // ─── 纯状态机（可注入时间，便于单测）────────────────────────────────────
@@ -121,6 +130,8 @@ struct ModuleRuntime {
     restart_at: Option<DateTime<Utc>>,
     /// supervisor 发起的重启正在执行（避免重复调度）
     in_flight: bool,
+    /// 在途尝试的序号（每发起一次尝试自增；用于丢弃迟到/已取消的结果）
+    attempt_seq: u64,
     /// 已熔断：本轮不再自动重启
     circuit_open: bool,
 }
@@ -144,6 +155,33 @@ impl Supervisor {
     /// 丢弃全部调度状态（开关关闭时调用）
     fn reset(&mut self) {
         self.modules.clear();
+    }
+
+    /// 用户手动停止该模块：取消其待执行与在途自愈，并清零失败计数/熔断。
+    ///
+    /// 在途尝试通过递增 `attempt_seq` 失效——迟到的结果会被
+    /// [`Self::on_restart_result`] 丢弃，不会重新排定重试。返回是否确有
+    /// 调度状态被取消（仅用于日志）。
+    fn cancel(&mut self, module_id: &str) -> bool {
+        let Some(rt) = self.modules.get_mut(module_id) else {
+            return false;
+        };
+        let had_pending = rt.in_flight || rt.restart_at.is_some() || rt.circuit_open;
+        if had_pending || rt.failures > 0 {
+            debug!(
+                module_id,
+                in_flight = rt.in_flight,
+                had_pending,
+                "用户手动停止，取消该模块的自愈调度"
+            );
+        }
+        rt.in_flight = false;
+        rt.restart_at = None;
+        rt.circuit_open = false;
+        rt.failures = 0;
+        rt.running_since = None;
+        rt.attempt_seq = rt.attempt_seq.wrapping_add(1);
+        had_pending
     }
 
     /// 观察一轮模块状态快照，返回需要落盘的事件。
@@ -267,10 +305,12 @@ impl Supervisor {
             }
             rt.in_flight = true;
             rt.restart_at = None;
+            rt.attempt_seq = rt.attempt_seq.wrapping_add(1);
             due.push(RestartRequest {
                 module_id: id.clone(),
                 attempt: rt.failures.max(1),
                 backoff_secs: backoff_secs(rt.failures, policy),
+                attempt_seq: rt.attempt_seq,
             });
         }
         // 固定顺序，便于日志与测试断言
@@ -279,10 +319,17 @@ impl Supervisor {
     }
 
     /// 回填一次重启的结果，返回需要落盘的事件（可能同时触发熔断）。
+    ///
+    /// `attempt_seq` 为发起本次尝试时分配的序号：与当前序号不一致（用户手动
+    /// 停止/已取消）或已不在途时直接丢弃，避免迟到的旧结果污染调度。
+    /// `current_status` 为本轮采样到的 fresh 状态（采样先于回填）：拉起返回成功
+    /// 但模块并不在 Running 时按失败计数，不让“Ok 后 ≤1s 再死”静默停在 Error。
     fn on_restart_result(
         &mut self,
         module_id: &str,
+        attempt_seq: u64,
         result: Result<(), String>,
+        current_status: Option<&ServiceStatus>,
         now: DateTime<Utc>,
         policy: &ModulesAutoRestartConfig,
     ) -> Vec<SupervisorEvent> {
@@ -290,15 +337,34 @@ impl Supervisor {
         let Some(rt) = self.modules.get_mut(module_id) else {
             return events;
         };
-        // 非 supervisor 发起（已被复位或模块已卸载）的结果直接忽略
-        if !rt.in_flight {
+        // 非 supervisor 发起（已被复位/取消）或已换代的结果直接丢弃
+        if !rt.in_flight || rt.attempt_seq != attempt_seq {
+            debug!(
+                module_id,
+                attempt_seq,
+                "忽略过期/已取消的自愈重启结果（不改变调度）"
+            );
             return events;
         }
         rt.in_flight = false;
         let attempt = rt.failures.max(1);
 
-        match result {
-            Ok(()) => {
+        // 结果判定：Ok 仍需本轮 fresh 状态确认“真的在运行”。采样在回填之前
+        // 完成，本轮的 Error 不会在 observe 里被重复计数（observe 对 in_flight
+        // 直接跳过），因此这里计数不会与采样重复。
+        let failure = match result {
+            Ok(()) => match current_status {
+                Some(ServiceStatus::Running) => None,
+                other => Some(format!(
+                    "restart finished but module is not running (current status: {})",
+                    other.map(status_label).unwrap_or("missing")
+                )),
+            },
+            Err(err) => Some(err),
+        };
+
+        match failure {
+            None => {
                 rt.restart_at = None;
                 info!(module_id = %module_id, attempt, "模块自愈重启成功");
                 events.push(SupervisorEvent::Restart(RestartEvent {
@@ -310,7 +376,7 @@ impl Supervisor {
                     at: now,
                 }));
             }
-            Err(err) => {
+            Some(err) => {
                 rt.failures = rt.failures.saturating_add(1);
                 let delay = backoff_secs(rt.failures, policy);
                 warn!(
@@ -356,9 +422,22 @@ impl Supervisor {
     }
 }
 
-/// 熔断阈值：0 = 不熔断
+/// 熔断阈值：0 = 不熔断；1 钳制为 2（至少保留一次自动重启机会，避免
+/// “首死立即重启”退化成一次都不重试；与 CONFIG_REFERENCE §1.14 文案一致）。
 fn breaker_threshold(policy: &ModulesAutoRestartConfig) -> Option<u32> {
-    (policy.circuit_breaker_after > 0).then_some(policy.circuit_breaker_after)
+    (policy.circuit_breaker_after > 0).then_some(policy.circuit_breaker_after.max(2))
+}
+
+/// 状态码（错误消息/日志用；Error 详情不重复展开）
+fn status_label(status: &ServiceStatus) -> &'static str {
+    match status {
+        ServiceStatus::NotReady => "not_ready",
+        ServiceStatus::Stopped => "stopped",
+        ServiceStatus::Preparing => "preparing",
+        ServiceStatus::Starting => "starting",
+        ServiceStatus::Running => "running",
+        ServiceStatus::Error(_) => "error",
+    }
 }
 
 /// 第 `failures` 次连续失败后、下一轮重启前的退避时长（秒）。
@@ -411,12 +490,15 @@ fn write_event(root: &Path, event: &SupervisorEvent) {
 
 /// 启动模块故障自愈监督循环（daemon 启动时调用一次）。
 ///
-/// 每 [`TICK`] 采样一次状态：先回填上一轮重启结果，再观察状态并执行到期
-/// 重启。重启本身在独立 task 中执行（内部会等待健康检查），不阻塞采样。
-pub fn spawn_health_supervisor(state: Arc<AppState>) {
+/// 每 [`TICK`] 采样一次状态：先消费用户手动停止信号，再采集本轮 fresh 状态
+/// （采样前置）、观察状态、用 fresh 状态回填上一轮重启结果，最后执行到期
+/// 重启。重启本身在独立 task 中执行（内部会等待健康检查，带超时兜底），
+/// 不阻塞采样。返回的 [`JoinHandle`] 由 main 在关闭时 abort（P2-2）。
+pub fn spawn_health_supervisor(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut supervisor = Supervisor::new();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, Result<(), String>)>();
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<(String, u64, Result<(), String>)>();
         let mut interval = tokio::time::interval(TICK);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -427,21 +509,20 @@ pub fn spawn_health_supervisor(state: Arc<AppState>) {
                 let cfg = state.config.read().await;
                 cfg.modules.auto_restart.clone()
             };
+
+            // 0) 用户手动停止：先于开关判断消费（即使自愈已关闭也不留下陈旧
+            //    意图），取消该模块的待执行/在途重启（T-14 P1-1）。
+            for module_id in state.take_manual_stops() {
+                supervisor.cancel(&module_id);
+            }
+
             if !policy.enabled {
                 supervisor.reset();
                 continue;
             }
 
-            // 1) 回填上一轮重启结果（可能触发退避重试或熔断事件）
-            while let Ok((module_id, result)) = rx.try_recv() {
-                let events =
-                    supervisor.on_restart_result(&module_id, result, Utc::now(), &policy);
-                for event in &events {
-                    write_event(&state.root, event);
-                }
-            }
-
-            // 2) 采样：已跟踪模块（可能已 Error/Stopped）+ 当前运行中模块
+            // 1) 采样前置：已跟踪模块（可能已 Error/Stopped）+ 当前运行中模块。
+            //    持有 process_manager 读锁期间只调同步方法，锁不跨 await。
             let samples: Vec<(String, ServiceStatus)> = {
                 let pm = state.process_manager.read().await;
                 let mut ids = supervisor.tracked_ids();
@@ -457,11 +538,31 @@ pub fn spawn_health_supervisor(state: Arc<AppState>) {
                     .collect()
             };
 
-            // 3) 观察状态，写熔断/恢复事件
+            // 2) 观察状态：先把“曾 Running → Error”计入失败并排定首次（立即）重启
             let now = Utc::now();
             let events = supervisor.observe(&samples, now, &policy);
             for event in &events {
                 write_event(&state.root, event);
+            }
+
+            // 3) 回填上一轮重启结果：用本轮已采集的 fresh 状态确认“真恢复”，
+            //    拉起返回成功但模块已再次退出时按失败计数（T-14 P1-2）。
+            while let Ok((module_id, attempt_seq, result)) = rx.try_recv() {
+                let current = samples
+                    .iter()
+                    .find(|(id, _)| id == &module_id)
+                    .map(|(_, status)| status);
+                let events = supervisor.on_restart_result(
+                    &module_id,
+                    attempt_seq,
+                    result,
+                    current,
+                    now,
+                    &policy,
+                );
+                for event in &events {
+                    write_event(&state.root, event);
+                }
             }
 
             // 4) 执行到期重启（每次尝试写“starting”事件，结果异步回填）
@@ -485,15 +586,27 @@ pub fn spawn_health_supervisor(state: Arc<AppState>) {
                 let state = state.clone();
                 let tx = tx.clone();
                 let module_id = request.module_id.clone();
+                let attempt_seq = request.attempt_seq;
                 tokio::spawn(async move {
-                    let result = autostart::ensure_module_running(&state, &module_id)
-                        .await
-                        .map_err(|e| e.to_string());
-                    let _ = tx.send((module_id, result));
+                    // 超时兜底：拉起入口卡死时也要回填失败，避免 in_flight
+                    // 永久为真导致该模块再也不会自愈（P2-1）。
+                    let result = tokio::time::timeout(
+                        RESTART_ATTEMPT_TIMEOUT,
+                        autostart::ensure_module_running(&state, &module_id),
+                    )
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "restart attempt timed out after {}s",
+                            RESTART_ATTEMPT_TIMEOUT.as_secs()
+                        )
+                    })
+                    .and_then(|attempt| attempt.map_err(|e| e.to_string()));
+                    let _ = tx.send((module_id, attempt_seq, result));
                 });
             }
         }
-    });
+    })
 }
 
 #[cfg(test)]
@@ -555,14 +668,22 @@ mod tests {
         assert_eq!(due[0].module_id, "asr");
         assert_eq!(due[0].attempt, 1);
         assert_eq!(due[0].backoff_secs, 0);
+        let attempt_seq = due[0].attempt_seq;
         // 已 in_flight，不会重复调度
         assert!(supervisor
             .take_due_restarts(t1 + chrono::Duration::seconds(5), &p)
             .is_empty());
 
-        // 重启成功事件
+        // 重启成功事件（fresh 状态确认为 Running）
         let t2 = t1 + chrono::Duration::seconds(2);
-        let events = supervisor.on_restart_result("asr", Ok(()), t2, &p);
+        let events = supervisor.on_restart_result(
+            "asr",
+            attempt_seq,
+            Ok(()),
+            Some(&ServiceStatus::Running),
+            t2,
+            &p,
+        );
         assert_eq!(events.len(), 1);
         match &events[0] {
             SupervisorEvent::Restart(e) => {
@@ -603,10 +724,19 @@ mod tests {
             &p,
         );
         let mut now = t0 + chrono::Duration::seconds(1);
-        assert_eq!(supervisor.take_due_restarts(now, &p).len(), 1);
+        let due = supervisor.take_due_restarts(now, &p);
+        assert_eq!(due.len(), 1);
+        let mut attempt_seq = due[0].attempt_seq;
 
         // 失败 → 等待 2s
-        let events = supervisor.on_restart_result("asr", Err("spawn failed".to_string()), now, &p);
+        let events = supervisor.on_restart_result(
+            "asr",
+            attempt_seq,
+            Err("spawn failed".to_string()),
+            Some(&ServiceStatus::Stopped),
+            now,
+            &p,
+        );
         let backoff = match &events[0] {
             SupervisorEvent::Restart(e) => {
                 assert_eq!(e.stage, RestartStage::Failed);
@@ -618,12 +748,20 @@ mod tests {
         now += chrono::Duration::seconds(1); // 到期前 1s
         assert!(supervisor.take_due_restarts(now, &p).is_empty());
         now += chrono::Duration::seconds(1); // 到期
-        assert_eq!(supervisor.take_due_restarts(now, &p).len(), 1);
+        let due = supervisor.take_due_restarts(now, &p);
+        assert_eq!(due.len(), 1);
+        attempt_seq = due[0].attempt_seq;
 
         // 连续失败：4s → 8s → 8s（封顶）
         for expected in [4u64, 8, 8] {
-            let events =
-                supervisor.on_restart_result("asr", Err("health timed out".to_string()), now, &p);
+            let events = supervisor.on_restart_result(
+                "asr",
+                attempt_seq,
+                Err("health timed out".to_string()),
+                Some(&ServiceStatus::Stopped),
+                now,
+                &p,
+            );
             let backoff = match &events[0] {
                 SupervisorEvent::Restart(e) => e.backoff_secs,
                 other => panic!("expected restart event, got {other:?}"),
@@ -637,7 +775,9 @@ mod tests {
                 )
                 .is_empty());
             now += chrono::Duration::seconds(expected as i64);
-            assert_eq!(supervisor.take_due_restarts(now, &p).len(), 1);
+            let due = supervisor.take_due_restarts(now, &p);
+            assert_eq!(due.len(), 1);
+            attempt_seq = due[0].attempt_seq;
         }
     }
 
@@ -654,13 +794,21 @@ mod tests {
             &p,
         );
         let mut now = t0 + chrono::Duration::seconds(1);
-        assert_eq!(supervisor.take_due_restarts(now, &p).len(), 1);
+        let due = supervisor.take_due_restarts(now, &p);
+        assert_eq!(due.len(), 1);
+        let mut attempt_seq = due[0].attempt_seq;
 
         // 第 2、3 次连续失败：第 3 次达到阈值 → 熔断
         let mut breaker_events = 0;
         for _ in 0..2 {
-            let events =
-                supervisor.on_restart_result("asr", Err("spawn failed".to_string()), now, &p);
+            let events = supervisor.on_restart_result(
+                "asr",
+                attempt_seq,
+                Err("spawn failed".to_string()),
+                Some(&ServiceStatus::Stopped),
+                now,
+                &p,
+            );
             breaker_events += events
                 .iter()
                 .filter(|e| matches!(e, SupervisorEvent::CircuitBreaker(_)))
@@ -671,7 +819,9 @@ mod tests {
                     other => panic!("expected restart event, got {other:?}"),
                 };
                 now += chrono::Duration::seconds(delay as i64);
-                assert_eq!(supervisor.take_due_restarts(now, &p).len(), 1);
+                let due = supervisor.take_due_restarts(now, &p);
+                assert_eq!(due.len(), 1);
+                attempt_seq = due[0].attempt_seq;
             }
         }
         assert_eq!(breaker_events, 1);
@@ -702,9 +852,17 @@ mod tests {
             &p,
         );
         let mut now = t0 + chrono::Duration::seconds(1);
-        supervisor.take_due_restarts(now, &p);
+        let due = supervisor.take_due_restarts(now, &p);
+        assert_eq!(due.len(), 1);
         // 一次失败即达阈值 2
-        let events = supervisor.on_restart_result("asr", Err("spawn failed".to_string()), now, &p);
+        let events = supervisor.on_restart_result(
+            "asr",
+            due[0].attempt_seq,
+            Err("spawn failed".to_string()),
+            Some(&ServiceStatus::Stopped),
+            now,
+            &p,
+        );
         assert!(events
             .iter()
             .any(|e| matches!(e, SupervisorEvent::CircuitBreaker(_))));
@@ -747,8 +905,16 @@ mod tests {
             &p,
         );
         let now = t0 + chrono::Duration::seconds(1);
-        supervisor.take_due_restarts(now, &p);
-        supervisor.on_restart_result("asr", Err("spawn failed".to_string()), now, &p);
+        let due = supervisor.take_due_restarts(now, &p);
+        assert_eq!(due.len(), 1);
+        supervisor.on_restart_result(
+            "asr",
+            due[0].attempt_seq,
+            Err("spawn failed".to_string()),
+            Some(&ServiceStatus::Stopped),
+            now,
+            &p,
+        );
         assert!(supervisor.modules["asr"].restart_at.is_some());
 
         // autostart 失败清理后状态为 Stopped：应保留重试计划
@@ -759,6 +925,124 @@ mod tests {
         );
         assert!(supervisor.modules["asr"].restart_at.is_some());
         assert_eq!(supervisor.modules["asr"].failures, 2);
+    }
+
+    /// 8) 用户手动停止：清零退避/失败计数并取消在途与待执行重启（T-14 P1-1）
+    #[test]
+    fn manual_stop_cancels_pending_retry_and_clears_state() {
+        let mut supervisor = Supervisor::new();
+        let p = policy(30, 5);
+        let t0 = Utc::now();
+        supervisor.observe(&sample("asr", ServiceStatus::Running), t0, &p);
+        let t1 = t0 + chrono::Duration::seconds(1);
+        supervisor.observe(&sample("asr", died()), t1, &p);
+        assert!(supervisor.modules["asr"].restart_at.is_some());
+
+        assert!(supervisor.cancel("asr"));
+        let rt = &supervisor.modules["asr"];
+        assert!(rt.restart_at.is_none());
+        assert_eq!(rt.failures, 0);
+        assert!(!rt.in_flight);
+        assert!(!rt.circuit_open);
+        assert!(supervisor
+            .take_due_restarts(t1 + chrono::Duration::seconds(3600), &p)
+            .is_empty());
+        // 未跟踪模块的取消无副作用
+        assert!(!supervisor.cancel("missing"));
+    }
+
+    /// 9) 手动停止后在途重启的迟到结果被丢弃，不会重新排定重试
+    #[test]
+    fn manual_stop_discards_late_restart_result() {
+        let mut supervisor = Supervisor::new();
+        let p = policy(30, 5);
+        let t0 = Utc::now();
+        supervisor.observe(&sample("asr", ServiceStatus::Running), t0, &p);
+        let t1 = t0 + chrono::Duration::seconds(1);
+        supervisor.observe(&sample("asr", died()), t1, &p);
+        let due = supervisor.take_due_restarts(t1, &p);
+        assert_eq!(due.len(), 1);
+
+        supervisor.cancel("asr");
+        let events = supervisor.on_restart_result(
+            "asr",
+            due[0].attempt_seq,
+            Err("health timed out".to_string()),
+            Some(&ServiceStatus::Stopped),
+            t1 + chrono::Duration::seconds(5),
+            &p,
+        );
+        assert!(events.is_empty());
+        let rt = &supervisor.modules["asr"];
+        assert!(rt.restart_at.is_none());
+        assert_eq!(rt.failures, 0);
+    }
+
+    /// 10) 拉起返回成功但 fresh 状态显示已再次退出：按失败计数并退避（P1-2）
+    #[test]
+    fn restart_success_but_module_not_running_counts_as_failure() {
+        let mut supervisor = Supervisor::new();
+        let p = policy(30, 5);
+        let t0 = Utc::now();
+        supervisor.observe(&sample("asr", ServiceStatus::Running), t0, &p);
+        let t1 = t0 + chrono::Duration::seconds(1);
+        supervisor.observe(&sample("asr", died()), t1, &p);
+        let due = supervisor.take_due_restarts(t1, &p);
+        assert_eq!(due.len(), 1);
+
+        let events = supervisor.on_restart_result(
+            "asr",
+            due[0].attempt_seq,
+            Ok(()),
+            Some(&died()),
+            t1 + chrono::Duration::seconds(2),
+            &p,
+        );
+        match &events[0] {
+            SupervisorEvent::Restart(e) => {
+                assert_eq!(e.stage, RestartStage::Failed);
+                assert!(e.error.as_deref().unwrap_or("").contains("not running"));
+            }
+            other => panic!("expected restart event, got {other:?}"),
+        }
+        let rt = &supervisor.modules["asr"];
+        assert_eq!(rt.failures, 2);
+        assert!(rt.restart_at.is_some());
+    }
+
+    /// 11) 拉起返回成功且 fresh 状态为 Running：正常 succeeded，不涨失败计数
+    #[test]
+    fn restart_success_with_running_status_succeeds() {
+        let mut supervisor = Supervisor::new();
+        let p = policy(30, 5);
+        let t0 = Utc::now();
+        supervisor.observe(&sample("asr", ServiceStatus::Running), t0, &p);
+        let t1 = t0 + chrono::Duration::seconds(1);
+        supervisor.observe(&sample("asr", died()), t1, &p);
+        let due = supervisor.take_due_restarts(t1, &p);
+        assert_eq!(due.len(), 1);
+
+        let events = supervisor.on_restart_result(
+            "asr",
+            due[0].attempt_seq,
+            Ok(()),
+            Some(&ServiceStatus::Running),
+            t1 + chrono::Duration::seconds(2),
+            &p,
+        );
+        match &events[0] {
+            SupervisorEvent::Restart(e) => assert_eq!(e.stage, RestartStage::Succeeded),
+            other => panic!("expected restart event, got {other:?}"),
+        }
+        assert_eq!(supervisor.modules["asr"].failures, 1);
+    }
+
+    /// 12) 熔断阈值 1 钳制为 2（至少一次自动重启机会）；0 = 不熔断
+    #[test]
+    fn breaker_threshold_is_clamped_to_two() {
+        assert_eq!(breaker_threshold(&policy(30, 0)), None);
+        assert_eq!(breaker_threshold(&policy(30, 1)), Some(2));
+        assert_eq!(breaker_threshold(&policy(30, 5)), Some(5));
     }
 
     /// 7) 事件真正写入 eventlog：重启开始/失败/熔断可被 read_events 检索

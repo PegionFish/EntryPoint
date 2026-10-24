@@ -169,6 +169,10 @@ async fn ensure_module_running_with_timeout_on_device(
         .clone()
         .ok_or_else(|| AutoStartError::InvalidManifest(module_id.to_string()))?;
 
+    // 记录启动前的手动停止代次：启动准备（venv/端口）期间用户若点了“停止”，
+    // 代次会变化，本次拉起必须取消而不是把已停止的模块重新拉起（T-14 P1-1）。
+    let stop_seq = state.manual_stop_seq(module_id);
+
     // 2. 状态分流：Running 直通；Starting/Preparing 仅等健康；其余走启动路径
     let needs_start = {
         let pm = state.process_manager.read().await;
@@ -179,7 +183,7 @@ async fn ensure_module_running_with_timeout_on_device(
         }
     };
 
-    if needs_start {
+    let started_at = if needs_start {
         // 显式设备指定先行硬校验（D-Device）；auto/None 走策略选择。
         // 注意：Starting/Preparing 旁路（他人拉起中）不重复校验，等健康即可。
         let device_override = match device_hint {
@@ -188,14 +192,26 @@ async fn ensure_module_running_with_timeout_on_device(
                 .map_err(AutoStartError::DeviceHint)?,
             None => None,
         };
-        start_via_existing_path(state, module_id, &manifest, device_override).await?;
+        start_via_existing_path(state, module_id, &manifest, device_override).await?
+    } else {
+        None
+    };
+
+    // 启动准备期间用户点了“停止”：只回收本次尝试启动的实例，取消拉起。
+    if let Some(started_at) = started_at {
+        if state.manual_stop_seq(module_id) != stop_seq {
+            cleanup_failed_start(state, module_id, Some(started_at)).await;
+            return Err(AutoStartError::StartFailed(
+                "autostart cancelled: module was stopped by user during startup".to_string(),
+            ));
+        }
     }
 
-    // 3. 轮询等待健康（失败时清理已拉起的进程与端口）
+    // 3. 轮询等待健康（失败时清理本次拉起的进程与端口）
     match wait_healthy(state, module_id, timeout).await {
         Ok(()) => Ok(()),
         Err(e) => {
-            cleanup_failed_start(state, module_id).await;
+            cleanup_failed_start(state, module_id, started_at).await;
             Err(e)
         }
     }
@@ -204,12 +220,16 @@ async fn ensure_module_running_with_timeout_on_device(
 // ─── 启动路径（与 api/modules.rs::start_module 同一套设施） ─────────────────
 
 /// 完整启动路径：模型就绪 → venv 准备（P0-5 前置）→ 端口 → 设备 → 进程。
+///
+/// 返回**本次尝试启动的实例启动时间**（`started_at`）：未由本次尝试启动
+/// （他人已在拉起/复用既有实例）时为 `None`。调用方用它作为 attempt token，
+/// 失败清理时只回收自己启动的实例，避免误杀用户/他人新起的进程。
 async fn start_via_existing_path(
     state: &Arc<AppState>,
     module_id: &str,
     manifest: &ModuleManifest,
     device_override: Option<ep_core::types::DeviceId>,
-) -> Result<(), AutoStartError> {
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, AutoStartError> {
     // 1. 模型前置检查（与手动启动端点同语义：激活变体缺失 → 拒绝）。
     //    F1 修复：变体选择经 [`super::active_model_decl`] 三级回退（config
     //    active_models → manifest default → 首个）与手动启动共用唯一真源；
@@ -270,23 +290,30 @@ async fn start_via_existing_path(
     info!(module_id, %port, %device, "autostart: starting module");
 
     // 6. 启动进程（并发竞态：另一请求已先行拉起 → 转入等待健康而非报错）
+    let mut started_at = None;
     {
         let mut pm = state.process_manager.write().await;
-        if let Err(e) = pm
+        match pm
             .start_module(module_id, manifest, device, port, env_vars)
             .await
         {
-            drop(pm);
-            state.port_manager.write().await.release(module_id);
-            let msg = e.to_string();
-            if msg.contains("already running") {
-                debug!(module_id, "autostart: module already starting concurrently, waiting for health");
-            } else {
-                return Err(AutoStartError::StartFailed(msg));
+            Ok(()) => {
+                // attempt token：记录本次启动的实例时间戳，供失败清理精确回收
+                started_at = pm.get_instance(module_id).and_then(|inst| inst.started_at);
+            }
+            Err(e) => {
+                drop(pm);
+                state.port_manager.write().await.release(module_id);
+                let msg = e.to_string();
+                if msg.contains("already running") {
+                    debug!(module_id, "autostart: module already starting concurrently, waiting for health");
+                } else {
+                    return Err(AutoStartError::StartFailed(msg));
+                }
             }
         }
     }
-    Ok(())
+    Ok(started_at)
 }
 
 // ─── 健康等待 ────────────────────────────────────────────────────────────────
@@ -377,17 +404,62 @@ async fn wait_healthy(
     }
 }
 
-/// 拉起失败后的清理：停止进程 + 释放端口（失败不留僵尸实例与泄漏端口）
-async fn cleanup_failed_start(state: &Arc<AppState>, module_id: &str) {
-    {
+/// 拉起失败后的清理：只回收**本次尝试**启动的实例 + 端口（失败不留僵尸实例）。
+///
+/// `started_at` 为本次启动成功时记录的实例启动时间（attempt token）。若实例
+/// 已被用户/他人重新拉起（`started_at` 不同），说明当前进程不属于本次尝试，
+/// 不得停止，也不得释放端口（端口可能属于他人实例）；未由本次尝试启动
+/// （`None`，如并发拉起走“等待健康”旁路）时同样不做任何回收。
+///
+/// 注意 `monitor_process` 的健康超时分支会 teardown 并清空同一实例的
+/// `started_at`、把状态置为 `Error`（`ep-core/src/process.rs`）。这种
+/// “本次尝试的残留实例”必须收敛回 `Stopped` 并释放端口（保持既有清理
+/// 语义，避免 UI 显示 Error、端口泄漏），因此 `started_at` 为空的
+/// `Error`/`Starting` 实例也视为本次尝试所有；已被他人重新拉起时
+/// `started_at` 会是新的 `Some(...)`，仍受上面的 token 保护。
+async fn cleanup_failed_start(
+    state: &Arc<AppState>,
+    module_id: &str,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    let Some(started_at) = started_at else {
+        debug!(
+            module_id,
+            "autostart: cleanup skipped, instance was not started by this attempt"
+        );
+        return;
+    };
+    let should_release = {
         let mut pm = state.process_manager.write().await;
-        if pm.get_instance(module_id).is_some() {
+        // 实例已不存在 = 本次启动的进程已自行退出，仅需释放端口防泄漏；
+        // 实例时间戳一致 = 仍是本次启动的实例，停止它；时间戳为空且状态为
+        // Error/Starting = monitor 健康超时 teardown 过的本次残留（见函数注释），
+        // 也要收敛；其余（含被他人重新拉起的新时间戳）= 不属于本次尝试，不动。
+        let owned = match pm.get_instance(module_id) {
+            None => true,
+            Some(inst) => match inst.started_at {
+                Some(token) => token == started_at,
+                None => matches!(
+                    inst.status,
+                    ep_core::types::ServiceStatus::Error(_) | ep_core::types::ServiceStatus::Starting
+                ),
+            },
+        };
+        if owned && pm.get_instance(module_id).is_some() {
             if let Err(e) = pm.stop_module(module_id).await {
                 warn!(module_id, error = %e, "autostart: cleanup stop failed (non-fatal)");
             }
         }
+        owned
+    };
+    if should_release {
+        state.port_manager.write().await.release(module_id);
+    } else {
+        debug!(
+            module_id,
+            "autostart: cleanup skipped, instance was restarted by another start"
+        );
     }
-    state.port_manager.write().await.release(module_id);
 }
 
 // ─── 辅助 ────────────────────────────────────────────────────────────────────

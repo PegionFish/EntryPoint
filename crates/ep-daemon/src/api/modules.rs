@@ -404,6 +404,9 @@ pub async fn stop_module(
         Ok(()) => {
             drop(pm);
             state.port_manager.write().await.release(&id);
+            // T-14 P1-1：手动停止是用户意图 → 通知自愈监督器取消该模块的
+            // 待执行/在途重启（否则失败重启排定的退避会无视“停止”再次拉起）。
+            state.record_manual_stop(&id);
             info!(module_id = %id, "module stopped");
             (
                 StatusCode::OK,

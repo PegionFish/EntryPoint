@@ -763,7 +763,7 @@ async fn run_server(root: PathBuf, cfg: AppConfig) -> anyhow::Result<()> {
     //      max_backoff_secs），稳定运行 10 分钟重置；连续失败达阈值熔断并写
     //      eventlog，需手动启动解除。开关与参数每轮实时读取，PUT /api/config
     //      改动即时生效，无需重启。
-    health_supervisor::spawn_health_supervisor(state.clone());
+    let supervisor_handle = health_supervisor::spawn_health_supervisor(state.clone());
 
     // 12. Start server
     let cfg = state.config.read().await;
@@ -783,6 +783,8 @@ async fn run_server(root: PathBuf, cfg: AppConfig) -> anyhow::Result<()> {
 
     // 优雅退出：回收所有运行中的模块子进程（stop_module 会 kill 子进程并
     // 释放端口）。已知限制修复：daemon 重启不再留下孤儿进程占用端口。
+    // T-14 P2-2：先 abort 自愈监督器，避免关闭期间它再排定/发起重启拉起子进程。
+    supervisor_handle.abort();
     stop_all_modules(&state).await;
 
     tracing::info!("Daemon shut down gracefully");
