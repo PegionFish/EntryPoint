@@ -120,6 +120,23 @@ function parseExtensions(text: string): string[] {
   return Array.from(new Set(list))
 }
 
+/**
+ * 平台感知的绝对路径判定（T-04）。
+ *
+ * 前端只做语法层放行，最终以服务端 `Path::is_absolute()` 为准：
+ * - POSIX：`/` 开头（如 `/data/watch`）
+ * - Windows 盘符：`C:\` 或 `C:/` 开头（如 `F:\watch`、`F:/watch`）
+ * - UNC 共享：`\\` 开头（如 `\\nas\share`）
+ * 其余（相对路径、空串）一律非法。
+ */
+function isAbsolutePath(path: string): boolean {
+  return (
+    path.startsWith('/') ||
+    /^[A-Za-z]:[\\/]/.test(path) ||
+    path.startsWith('\\\\')
+  )
+}
+
 /** 从 apiFetch 抛出的 `API <status>: <body>` 错误中提取后端 error 字段 */
 function backendErrorMessage(err: unknown): string {
   if (!(err instanceof Error)) return String(err)
@@ -342,8 +359,8 @@ function RuleDialog({
       toast.error(t('validation.watchDirRequired'))
       return
     }
-    if (!form.watch_dir.trim().startsWith('/')) {
-      toast.error(t('validation.watchDirAbsolute'))
+    if (!isAbsolutePath(form.watch_dir.trim())) {
+      toast.error(t('validation.watchDirInvalid'))
       return
     }
     if (form.mode === 'direct-module' && (!form.moduleId || !form.capability)) {
@@ -359,8 +376,8 @@ function RuleDialog({
         toast.error(t('validation.destDirRequired'))
         return
       }
-      if (!form.dest_dir.trim().startsWith('/')) {
-        toast.error(t('validation.destDirAbsolute'))
+      if (!isAbsolutePath(form.dest_dir.trim())) {
+        toast.error(t('validation.destDirInvalid'))
         return
       }
     }

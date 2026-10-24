@@ -107,8 +107,10 @@
   "validation.nameRequired": "名称不能为空",
   "validation.watchDirRequired": "监控目录不能为空",
   "validation.watchDirAbsolute": "监控目录必须是绝对路径",
+  "validation.watchDirInvalid": "请输入绝对路径（如 /data/watch、F:\\watch 或 \\\\nas\\share）",
   "validation.capabilityRequired": "请选择模块与能力",
   "validation.pipelineRequired": "请选择管线与输入节点",
   "validation.destDirRequired": "输出目录不能为空",
-  "validation.destDirAbsolute": "输出目录必须是绝对路径"
+  "validation.destDirAbsolute": "输出目录必须是绝对路径",
+  "validation.destDirInvalid": "请输入绝对路径（如 /data/output、F:\\output 或 \\\\nas\\share）"
 }

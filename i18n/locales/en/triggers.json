@@ -107,8 +107,10 @@
   "validation.nameRequired": "Name is required",
   "validation.watchDirRequired": "Watch directory is required",
   "validation.watchDirAbsolute": "Watch directory must be an absolute path",
+  "validation.watchDirInvalid": "Enter an absolute path (e.g. /data/watch, F:\\watch or \\\\nas\\share)",
   "validation.capabilityRequired": "Select a module and capability",
   "validation.pipelineRequired": "Select a pipeline and input node",
   "validation.destDirRequired": "Destination directory is required",
-  "validation.destDirAbsolute": "Destination directory must be an absolute path"
+  "validation.destDirAbsolute": "Destination directory must be an absolute path",
+  "validation.destDirInvalid": "Enter an absolute path (e.g. /data/output, F:\\output or \\\\nas\\share)"
 }
