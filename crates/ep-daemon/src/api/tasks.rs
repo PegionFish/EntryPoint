@@ -17,6 +17,7 @@
 //! 产物在执行收尾时已硬链接/复制进 `{workspace}/tasks/{task_id}/files/`
 //! （见 execution.rs 归集逻辑），全部位于 ServeDir 根内。
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
@@ -49,7 +50,7 @@ pub fn router() -> Router<Arc<AppState>> {
             get(get_task_artifact),
         )
         // 产物文件流式下载通道（handler 302 到此处，ServeDir 负责流式发送）
-        .nest("/task-files", task_files_router())
+        .nest("/task-files", task_files_router(resolve_tasks_root()))
 }
 
 /// ServeDir 根 = `{workspace}/tasks`（与 execution.rs 的任务目录同源）。
@@ -57,13 +58,23 @@ pub fn router() -> Router<Arc<AppState>> {
 /// 路由构造先于 AppState 注入，无法读取运行期状态，故按启动同款方式
 /// （resolve_root + 磁盘 config）重新解析。运行期经 PUT /api/config 修改
 /// workspace_dir 不会热跟随——与 main.rs 对静态目录 static_dir 的处理一致。
-fn task_files_router() -> Router<Arc<AppState>> {
+///
+/// `append_index_html_on_directories(false)`：关闭目录索引。产物都是平铺文件，
+/// 目录请求不应命中 `index.html`（该类型可携带脚本，会绕过白名单内联防线）；
+/// 中间件另对「2xx 且文件名为空」强制 attachment 作为双保险。
+fn task_files_router(tasks_root: PathBuf) -> Router<Arc<AppState>> {
+    Router::new()
+        .fallback_service(
+            ServeDir::new(tasks_root).append_index_html_on_directories(false),
+        )
+        .layer(middleware::from_fn(attachment_disposition))
+}
+
+/// 解析 `{workspace}/tasks`（ServeDir 根）：路由构造期与测试共用。
+fn resolve_tasks_root() -> PathBuf {
     let root = config::resolve_root();
     let cfg = AppConfig::load(&root.join("config")).unwrap_or_default();
-    let tasks_root = cfg.resolve_workspace_dir(&root).join("tasks");
-    Router::new()
-        .fallback_service(ServeDir::new(tasks_root))
-        .layer(middleware::from_fn(attachment_disposition))
+    cfg.resolve_workspace_dir(&root).join("tasks")
 }
 
 /// 允许内联展示（浏览器直接看/播）的产物扩展名白名单（小写）。
@@ -101,13 +112,25 @@ fn has_inline_flag(query: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+/// 从原始 query 中提取 `token` 的原始（未解码）值（T-06）。
+///
+/// 302 重定向必须原样透传百分号编码，避免二次编码；只取第一个 `token`
+/// 参数，其余参数一律丢弃。
+fn raw_query_token(query: Option<&str>) -> Option<&str> {
+    query?.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == "token").then_some(value)
+    })
+}
+
 /// 为 ServeDir 的成功响应补 `Content-Disposition: attachment; filename=...`
 ///
-/// ServeDir 本身只按 inline 语义提供文件；文件名取 URI 最后一段
-/// （百分号编码形态），按 RFC 5987 同时给出 `filename*`（UTF-8）。
+/// ServeDir 本身只按 inline 语义提供文件；文件名取 URI 最后一段并按 RFC 5987
+/// 给出 `filename*`（UTF-8 百分号编码），ASCII `filename` 仅保留安全字符。
 ///
 /// 例外：`?inline=1` 且扩展名命中 [`INLINE_PREVIEW_EXTS`] 时**不加** attachment
 /// 头，保留 ServeDir 自带的 inline + MIME + Range 语义（产物在线预览）。
+/// 文件名为空（目录请求）时一律强制 attachment，作为关闭目录索引之外的双保险。
 async fn attachment_disposition(req: Request<Body>, next: Next) -> Response {
     let raw_name = req
         .uri()
@@ -118,24 +141,31 @@ async fn attachment_disposition(req: Request<Body>, next: Next) -> Response {
         .to_string();
     let inline_preview = wants_inline_preview(req.uri().path(), req.uri().query());
     let mut resp = next.run(req).await;
-    if resp.status().is_success() && !raw_name.is_empty() && !inline_preview {
-        let decoded = percent_decode(&raw_name);
-        let mut fallback: String = decoded
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        if fallback.is_empty() {
-            fallback = "artifact".to_string();
-        }
-        let value = format!(
-            "attachment; filename=\"{fallback}\"; filename*=UTF-8''{raw_name}"
-        );
+    if resp.status().is_success() && !inline_preview {
+        // 文件名为空 = ServeDir 目录请求：即使上游放开目录索引，也强制下载，
+        // 避免目录内 index.html 以同源内联方式渲染。
+        let value = if raw_name.is_empty() {
+            "attachment; filename=\"artifact\"".to_string()
+        } else {
+            let decoded = percent_decode(&raw_name);
+            let mut fallback: String = decoded
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            if fallback.is_empty() {
+                fallback = "artifact".to_string();
+            }
+            // filename* 必须按 RFC 5987 重新百分号编码：直接拼 URI 原始段时，
+            // `;` / `"` / `'` 等字符会破坏 ext-value，甚至注入额外参数。
+            let encoded = percent_encode(&decoded);
+            format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}")
+        };
         if let Ok(v) = HeaderValue::from_str(&value) {
             resp.headers_mut()
                 .insert(header::CONTENT_DISPOSITION, v);
@@ -388,8 +418,8 @@ async fn list_task_artifacts(
 /// 校验通过后 302 到 `/api/task-files/...`（ServeDir 流式发送，支持大文件
 /// 与 Range）；任务/节点/产物不存在 → 404。
 ///
-/// query 只透传 `inline=1`（供在线预览），其余参数在跳转时丢弃；是否真正
-/// 内联由静态文件中间件按扩展名白名单二次把关。
+/// query 只透传 `inline=1`（供在线预览）与 `token`（T-06 访问保护），其余
+/// 参数在跳转时丢弃；是否真正内联由静态文件中间件按扩展名白名单二次把关。
 async fn get_task_artifact(
     State(state): State<Arc<AppState>>,
     Path((task_id, node_id)): Path<(String, String)>,
@@ -446,8 +476,18 @@ async fn get_task_artifact(
         percent_encode(&file_name.to_string_lossy()),
     );
     // 仅透传 inline=1（预览开关）；是否真正内联由静态文件中间件按白名单把关
+    let mut sep = '?';
     if has_inline_flag(query.as_deref()) {
         location.push_str("?inline=1");
+        sep = '&';
+    }
+    // T-06：token 模式下 302 需透传原始（未解码）token，否则浏览器跟随
+    // 重定向到 /api/task-files/* 后无凭据被拒 401。路由仅接受 GET/HEAD，
+    // 不会把写操作令牌带进 URL。
+    if let Some(raw_token) = raw_query_token(query.as_deref()) {
+        location.push(sep);
+        location.push_str("token=");
+        location.push_str(raw_token);
     }
     (
         StatusCode::FOUND,
@@ -864,6 +904,30 @@ params = { path = "/nonexistent/missing-art.txt" }
         assert!(location.contains(&format!("{task_id}/files/output/")));
         assert!(location.contains("dl-out.txt"));
 
+        // T-06：token 模式下 302 原样透传 token（不二次编码），其余 query 丢弃
+        let resp = get_task_artifact(
+            State(state.clone()),
+            Path((task_id.clone(), "output".to_string())),
+            RawQuery(Some("inline=1&token=abc%20def&foo=bar".to_string())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            location.contains("?inline=1&token=abc%20def"),
+            "Location 应原样透传 token: {location}"
+        );
+        assert!(
+            !location.contains("foo=bar"),
+            "Location 不应透传无关键: {location}"
+        );
+
         // input 节点产物（文件名含中文/空格）→ 必须百分号编码
         let resp = get_task_artifact(
             State(state.clone()),
@@ -952,7 +1016,7 @@ params = { path = "/nonexistent/missing-dl.txt" }
 
     #[test]
     fn test_task_files_router_builds() {
-        let router = task_files_router();
+        let router = task_files_router(unique_root("router-build"));
         let _ = router; // 能构造即通过（ServeDir 根目录不存在也不报错）
     }
 
@@ -1234,5 +1298,322 @@ to = ["output", "input"]
         assert!(!loc.contains('?'), "inline=0 不应透传: {loc}");
         let loc = location_of(state, task_id, None).await;
         assert!(!loc.contains('?'), "无 query 时 Location 不应带参数: {loc}");
+    }
+
+    // ── 13. 目录索引：ServeDir 关闭 index.html，中间件空文件名双保险 ────────
+
+    #[tokio::test]
+    async fn test_attachment_directory_index_forced_download() {
+        use tower::ServiceExt;
+
+        // 1) ServeDir 关闭目录索引：/sub/ 不再隐式返回 index.html
+        let root = unique_root("dir-index");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("index.html"), "<script>x</script>")
+            .unwrap();
+        let app = Router::new()
+            .fallback_service(
+                ServeDir::new(&root).append_index_html_on_directories(false),
+            )
+            .layer(middleware::from_fn(attachment_disposition));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sub/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "关闭目录索引后 /sub/ 应 404"
+        );
+
+        // 2) 双保险：上游若仍对目录请求返回 200（文件名为空），中间件强制下载
+        let app = Router::new()
+            .route("/sub/", get(|| async { "index" }))
+            .layer(middleware::from_fn(attachment_disposition));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sub/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let value = resp
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .expect("目录请求应强制 attachment")
+            .to_str()
+            .unwrap();
+        assert!(value.starts_with("attachment;"), "应强制下载: {value}");
+        assert!(
+            value.contains("filename=\"artifact\""),
+            "空文件名应回退 artifact: {value}"
+        );
+    }
+
+    // ── 14. filename* 按 RFC 5987 重编码（中文 / 引号 / 分号 / 单引号）──────
+
+    #[tokio::test]
+    async fn test_attachment_filename_star_rfc5987() {
+        use tower::ServiceExt;
+
+        async fn disposition(app: &Router, uri: &str) -> String {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "用例应为成功响应: {uri}");
+            resp.headers()
+                .get(header::CONTENT_DISPOSITION)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        }
+
+        let app = Router::new()
+            .route("/files/{*path}", get(|| async { "ok" }))
+            .layer(middleware::from_fn(attachment_disposition));
+
+        // 中文 + 空格：filename* 必须保持 UTF-8 百分号编码
+        let value =
+            disposition(&app, "/files/t/files/output/%E4%B8%AD%E6%96%87%20clip.mp4")
+                .await;
+        assert!(
+            value.contains("filename*=UTF-8''%E4%B8%AD%E6%96%87%20clip.mp4"),
+            "中文应编码为 UTF-8 百分号序列: {value}"
+        );
+
+        // 引号 / 分号 / 单引号：不得以原文进入 ext-value
+        let value = disposition(&app, "/files/t/files/output/a%22b%3Bc%27d.png").await;
+        assert!(
+            value.contains("filename*=UTF-8''a%22b%3Bc%27d.png"),
+            "引号/分号/单引号应被百分号编码: {value}"
+        );
+        assert!(
+            !value.contains("a\"b"),
+            "filename* 不应遗留裸引号: {value}"
+        );
+        // ASCII fallback 仍保留且只含安全字符
+        assert!(
+            value.contains("filename=\"a_b_c_d.png\""),
+            "ASCII fallback 应为安全字符: {value}"
+        );
+    }
+
+    // ── 15. Range 穿透中间件：206 原样保留，CD 不破坏分段语义 ──────────────
+
+    #[tokio::test]
+    async fn test_attachment_range_preserved() {
+        use tower::ServiceExt;
+
+        let root = unique_root("range");
+        std::fs::write(root.join("clip.mp4"), b"0123456789").unwrap();
+        std::fs::write(root.join("doc.txt"), b"0123456789").unwrap();
+        let app = Router::new()
+            .fallback_service(ServeDir::new(&root))
+            .layer(middleware::from_fn(attachment_disposition));
+
+        // 内联媒体 + Range → 206，无 Content-Disposition
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/clip.mp4?inline=1")
+                    .header(header::RANGE, "bytes=0-3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(
+            resp.headers().get(header::CONTENT_DISPOSITION).is_none(),
+            "内联媒体 Range 不应注入 attachment"
+        );
+        let range = resp.headers()[header::CONTENT_RANGE]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"0123");
+        assert_eq!(range, "bytes 0-3/10");
+
+        // 下载类型 + Range → 206 仍带 attachment（CD 不影响 Range 语义）
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/doc.txt?inline=1")
+                    .header(header::RANGE, "bytes=0-3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        let value = resp
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .expect("非白名单应带 attachment")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(value.starts_with("attachment;"), "应带 attachment: {value}");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"0123");
+    }
+
+    // ── 16. 302 → ServeDir 端到端：白名单内联 / html 强制下载 / Range ──────
+
+    #[tokio::test]
+    async fn test_artifact_redirect_to_served_file_e2e() {
+        use tower::ServiceExt;
+
+        let _guard = lock_for_tests();
+        execution::clear_registry_for_tests();
+
+        let root = unique_root("e2e");
+        let state = test_state(root.clone());
+        let tasks_root = root.join("workspace").join("tasks");
+
+        // output 节点产物为 .png：inline=1 应 302 → 200 且无 attachment
+        let src_png = root.join("e2e-in.png");
+        std::fs::write(&src_png, b"png-payload").unwrap();
+        let dest_png = root.join("e2e-out.png");
+        let png_task = run_copy_task(&state, "e2e-png", &src_png, &dest_png).await;
+
+        let app = Router::new()
+            .route(
+                "/api/tasks/{task_id}/artifacts/{node_id}",
+                get(get_task_artifact),
+            )
+            .nest("/api/task-files", task_files_router(tasks_root))
+            .with_state(state.clone());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/tasks/{png_task}/artifacts/output?inline=1"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let location = resp.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            location.ends_with("?inline=1"),
+            "Location 应透传 inline=1: {location}"
+        );
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&location)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get(header::CONTENT_DISPOSITION).is_none(),
+            "白名单图片不应带 attachment"
+        );
+        assert!(
+            resp.headers()[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("image/png"),
+            "ServeDir 应按扩展名给出 MIME"
+        );
+
+        // Range 走同一 Location：206 + 4 字节，媒体内联不被 CD 影响
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&location)
+                    .header(header::RANGE, "bytes=0-3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"png-");
+
+        // .html 产物：即使 inline=1，跟随 302 后仍强制下载
+        let src_html = root.join("e2e-in.html");
+        std::fs::write(&src_html, b"<script>alert(1)</script>").unwrap();
+        let dest_html = root.join("e2e-out.html");
+        let html_task = run_copy_task(&state, "e2e-html", &src_html, &dest_html).await;
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/tasks/{html_task}/artifacts/output?inline=1"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let location = resp.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(&location)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let value = resp
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .expect("html 即使 inline=1 也应 attachment")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(value.starts_with("attachment;"), "html 应强制下载: {value}");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"<script>alert(1)</script>");
     }
 }

@@ -464,6 +464,8 @@ function TaskCard({
   const [preview, setPreview] = useState<ArtifactPreviewState | null>(null)
   /** 文本预览请求序号：关闭/切换产物后丢弃过期响应 */
   const previewSeq = useRef(0)
+  /** 文本预览在途请求：关闭对话框/切换产物时中断，避免后台继续下载大文件 */
+  const previewAbort = useRef<AbortController | null>(null)
 
   const terminal = isTerminalStatus(task.status)
 
@@ -507,8 +509,10 @@ function TaskCard({
     }
   }
 
-  /** 关闭预览：递增请求序号，丢弃仍在途的文本响应 */
+  /** 关闭预览：中断在途文本请求并递增序号，丢弃过期响应 */
   function closePreview() {
+    previewAbort.current?.abort()
+    previewAbort.current = null
     previewSeq.current += 1
     setPreview(null)
   }
@@ -517,6 +521,9 @@ function TaskCard({
   function openPreview(artifact: TaskArtifact) {
     const kind = artifactPreviewKind(artifact.name)
     if (kind === null) return
+    previewAbort.current?.abort()
+    const controller = new AbortController()
+    previewAbort.current = controller
     const seq = previewSeq.current + 1
     previewSeq.current = seq
     setPreview({
@@ -528,15 +535,19 @@ function TaskCard({
       error: null,
     })
     if (kind !== 'text') return
-    // 文本下载对 Content-Disposition 不敏感，直接复用下载 URL 取内容
-    fetch(api.taskArtifactUrl(task.id, artifact.node_id))
+    // 文本只取前 1MiB：ServeDir 支持 Range，超出自动 206；再 slice 兜底
+    fetch(api.taskArtifactUrl(task.id, artifact.node_id), {
+      headers: { Range: `bytes=0-${TEXT_PREVIEW_LIMIT - 1}` },
+      signal: controller.signal,
+    })
       .then((resp) => {
+        // 0 字节文件在部分实现下返回 416；按空内容处理
+        if (resp.status === 416) return ''
         if (!resp.ok) throw new Error(`API ${resp.status}`)
         return resp.text()
       })
       .then((text) => {
         if (seq !== previewSeq.current) return
-        // 超大文本只保留前 1MB，避免 <pre> 渲染卡顿
         setPreview((cur) =>
           cur === null
             ? null
@@ -550,9 +561,12 @@ function TaskCard({
       })
       .catch((e: unknown) => {
         if (seq !== previewSeq.current) return
+        if (e instanceof DOMException && e.name === 'AbortError') return
+        const msg = failMsg(e)
         setPreview((cur) =>
-          cur === null ? null : { ...cur, loading: false, error: failMsg(e) },
+          cur === null ? null : { ...cur, loading: false, error: msg },
         )
+        toast.error(t('artifacts.previewLoadFailed'), { description: msg })
       })
   }
 
@@ -565,6 +579,9 @@ function TaskCard({
     const timer = setInterval(() => setNow(Date.now()), 1000)
     return () => clearInterval(timer)
   }, [terminal])
+
+  // 卡片卸载时中断在途文本预览请求
+  useEffect(() => () => previewAbort.current?.abort(), [])
 
   // 展开时拉取节点详情；未终态的任务每轮询周期刷新一次
   useEffect(() => {

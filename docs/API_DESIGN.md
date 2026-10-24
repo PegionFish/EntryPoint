@@ -92,6 +92,12 @@
 | GET | `/api/tasks/{task_id}/artifacts[/{node_id}]` | 产物列举 / 下载 |
 | POST | `/api/tasks/{task_id}/cancel` | |
 
+产物下载默认带 `Content-Disposition: attachment`。`GET /api/tasks/{task_id}/artifacts/{node_id}?inline=1`
+仅对白名单媒体扩展名（图片 png/jpg/jpeg/gif/webp/bmp/avif、视频 mp4/webm/m4v/mov/mkv、音频
+wav/mp3/flac/ogg/m4a/aac/opus/wma）省略该头，供 `<img>`/`<video>`/`<audio>` 内联预览；
+`svg`/`html` 永不内联。302 跳转到 `/api/task-files/...` 时只透传 `inline=1`，其余 query 一律丢弃，
+最终白名单仍由静态文件中间件校验。
+
 ### 其他
 
 | 方法 | 路径 |
