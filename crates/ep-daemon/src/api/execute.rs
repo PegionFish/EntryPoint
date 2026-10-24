@@ -1092,7 +1092,12 @@ to = ["output", "input"]
             }))),
         )
         .await;
-        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "unexpected submit status, body={}",
+            body.0
+        );
         let task_id = body.0["task_id"].as_str().unwrap().to_string();
         assert!(task_id.starts_with("task-"));
 

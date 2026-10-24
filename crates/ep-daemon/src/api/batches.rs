@@ -330,7 +330,7 @@ fn enumerate_files(
                     .extension()
                     .map(|e| e.to_string_lossy().to_ascii_lowercase())
                     .unwrap_or_default();
-                if !filter.iter().any(|f| *f == ext) {
+                if !filter.contains(&ext) {
                     continue;
                 }
             }
@@ -760,6 +760,8 @@ output_type = "text"
     // ── 7. 提交风暴容量预检：整批超过在途容量 → 429 ─────────────────────────
 
     #[tokio::test]
+    // 该 guard 有意跨 await 持有：串行化全局任务注册表的读写，避免并发用例互相污染
+    #[allow(clippy::await_holding_lock)]
     async fn batch_exceeding_queue_capacity_is_429() {
         let _guard = lock_for_tests();
         execution::clear_registry_for_tests();

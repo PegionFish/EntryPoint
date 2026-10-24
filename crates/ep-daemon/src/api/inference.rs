@@ -10,8 +10,7 @@
 //! - `POST /v1/inference/{module_id}/{capability}`  — 提交推理（multipart / JSON）
 //! - `GET  /v1/tasks`                               — 任务列表（task_id + status）
 //! - `GET  /v1/tasks/{task_id}`                     — 任务状态与产物查询（轮询用；
-//!                                                    旧 `/v1/inference/result/{task_id}`
-//!                                                    为弃用别名，形状不变）
+//!   旧 `/v1/inference/result/{task_id}` 为弃用别名，形状不变）
 //! - `POST /v1/tasks/{task_id}/cancel`              — 取消任务
 //!
 //! 错误契约：`{"error": {"code": <MACHINE_CODE>, "message": <可读文案>}}`。

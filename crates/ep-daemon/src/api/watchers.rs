@@ -462,14 +462,26 @@ mod tests {
     fn valid_direct_body(tag: &str) -> Value {
         json!({
             "name": format!("规则-{tag}"),
-            "watch_dir": "/tmp/ep-watch-src",
+            "watch_dir": test_abs("ep-watch-src"),
             "direct": { "kind": { "type": "Archive" } },
             "output": {
-                "dest_dir": "/tmp/ep-watch-dest",
+                "dest_dir": test_abs("ep-watch-dest"),
                 "name_template": "{name}.{ext}",
                 "on_conflict": "suffix"
             }
         })
+    }
+
+    /// 平台绝对路径夹具。
+    ///
+    /// POSIX 字面量（`/tmp/a`）在 Windows 上 `Path::is_absolute()` 为 false，
+    /// 会让"合法绝对路径"用例被 `watchDirNotAbsolute` 误拒——测试夹具必须
+    /// 按平台生成绝对路径（与 T-04 前端校验同一类问题）。
+    fn test_abs(name: &str) -> String {
+        std::env::temp_dir()
+            .join(name)
+            .to_string_lossy()
+            .replace('\\', "/")
     }
 
     // ── 校验链顺序（冻结）───────────────────────────────────────────────
@@ -530,7 +542,7 @@ mod tests {
         let state = state_at(root.clone());
 
         let app = super::router().with_state(state.clone());
-        let no_action = json!({"name": "x", "watch_dir": "/tmp/a"});
+        let no_action = json!({"name": "x", "watch_dir": test_abs("a")});
         let resp = app.oneshot(req("POST", "/watchers", Some(no_action))).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
@@ -579,7 +591,7 @@ builtin = "file_output"
         let state = state_at(root.clone());
         let app = super::router().with_state(state.clone());
         let missing = json!({
-            "name": "x", "watch_dir": "/tmp/a",
+            "name": "x", "watch_dir": test_abs("a"),
             "pipeline": {"pipeline_id": "no-such-pipe", "input_node": "input"}
         });
         let resp = app.oneshot(req("POST", "/watchers", Some(missing))).await.unwrap();
@@ -592,7 +604,7 @@ builtin = "file_output"
         // 真实管线（pipe-x）+ 非法 input_node
         let app = super::router().with_state(state.clone());
         let bad_node = json!({
-            "name": "x", "watch_dir": "/tmp/a",
+            "name": "x", "watch_dir": test_abs("a"),
             "pipeline": {"pipeline_id": "pipe-x", "input_node": "ghost-node"}
         });
         let resp = app.oneshot(req("POST", "/watchers", Some(bad_node))).await.unwrap();
@@ -605,7 +617,7 @@ builtin = "file_output"
         // 合法注入节点（spec 实际节点）→ 创建成功
         let app = super::router().with_state(state.clone());
         let good = json!({
-            "name": "pipe-ok", "watch_dir": "/tmp/a",
+            "name": "pipe-ok", "watch_dir": test_abs("a"),
             "pipeline": {"pipeline_id": "pipe-x", "input_node": "input"}
         });
         let resp = app.oneshot(req("POST", "/watchers", Some(good))).await.unwrap();
@@ -620,9 +632,9 @@ builtin = "file_output"
         let state = state_at(root.clone());
         let app = super::router().with_state(state.clone());
         let body = json!({
-            "name": "x", "watch_dir": "/tmp/a",
+            "name": "x", "watch_dir": test_abs("a"),
             "direct": {"kind": {"type": "Module", "module_id": "ghost-mod", "capability": "ghost-cap"}},
-            "output": {"dest_dir": "/tmp/b"}
+            "output": {"dest_dir": test_abs("b")}
         });
         let resp = app.oneshot(req("POST", "/watchers", Some(body))).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -685,9 +697,9 @@ max_file_size_mb = 100
         let app = super::router().with_state(state.clone());
         let body = json!({
             "name": "cap-ok",
-            "watch_dir": "/tmp/ep-watch-src",
+            "watch_dir": test_abs("ep-watch-src"),
             "direct": {"kind": {"type": "Module", "module_id": "demo-mod", "capability": "remove-bg"}},
-            "output": {"dest_dir": "/tmp/ep-watch-dest"}
+            "output": {"dest_dir": test_abs("ep-watch-dest")}
         });
         let resp = app.oneshot(req("POST", "/watchers", Some(body))).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "合法模块直调规则应创建成功");
@@ -707,7 +719,7 @@ max_file_size_mb = 100
 
         let app = super::router().with_state(state.clone());
         let no_output = json!({
-            "name": "x", "watch_dir": "/tmp/a",
+            "name": "x", "watch_dir": test_abs("a"),
             "direct": {"kind": {"type": "Archive"}}
         });
         let resp = app.oneshot(req("POST", "/watchers", Some(no_output))).await.unwrap();

@@ -796,7 +796,7 @@ async fn cancel_task(
     AxumPath(task_id): AxumPath<String>,
 ) -> (StatusCode, Json<Value>) {
     // 组 id 兼容：外部批量接入的任务组（grp-* 成员聚合）整组取消
-    if execution::snapshot_group(&task_id).len() > 0 {
+    if !execution::snapshot_group(&task_id).is_empty() {
         return match execution::cancel_group(&state, &task_id).await {
             execution::GroupCancelOutcome::NotFound => {
                 err_response(

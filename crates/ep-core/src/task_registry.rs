@@ -330,10 +330,13 @@ impl TaskRegistry {
     // ── 写路径 ───────────────────────────────────────────────────────────────
 
     /// 插入新记录（同 id 已存在则覆盖）并落盘
+    ///
+    /// 内存优先：落盘失败时记录仍保留在内存（返错仅供调用方告警），
+    /// 避免磁盘/隔离环境异常直接拒绝任务提交（无人值守语义）。
     pub fn insert(&mut self, record: TaskRecord) -> std::io::Result<()> {
-        self.persist_one(&record)?;
+        let persist_result = self.persist_one(&record);
         self.records.insert(record.id.clone(), record);
-        Ok(())
+        persist_result
     }
 
     /// 原地更新记录并落盘；任务不存在返回 `None`
@@ -491,6 +494,21 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].id, "task-b", "新任务在前");
         assert_eq!(all[1].id, "task-a");
+    }
+
+    /// 内存优先：落盘失败（持久化目录被同名普通文件占位）时记录仍保留在内存
+    #[test]
+    fn insert_keeps_memory_when_persist_fails() {
+        let mut reg = TaskRegistry::new();
+        let dir = temp_dir("persist-degraded");
+        reg.enable_persistence(&dir).unwrap();
+        // 把持久化目录替换成同名普通文件 → 后续 create_dir_all 必然失败
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::write(&dir, b"blocked").unwrap();
+
+        let err = reg.insert(record("task-x", "p1", TaskState::Queued));
+        assert!(err.is_err(), "落盘应失败");
+        assert!(reg.get("task-x").is_some(), "落盘失败也须保留内存记录");
     }
 
     #[test]

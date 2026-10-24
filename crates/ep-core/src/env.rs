@@ -1629,9 +1629,13 @@ mod tests {
 
         let env = mgr.build_uv_env("mod-env");
         let get = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+        // Windows 下 `root.join("runtime/.uv-cache")` 保留配置串里的 `/`，
+        // 与 join 链产生的 `\` 字面不等——此处断言的是"指向同一目录"而非
+        // 分隔符风格，两侧统一归一后比较（§2.5 路径归一约定）。
+        let norm = |s: &str| s.replace('\\', "/");
         assert_eq!(
-            get("UV_CACHE_DIR").unwrap(),
-            root.join("runtime").join(".uv-cache").to_string_lossy()
+            norm(&get("UV_CACHE_DIR").unwrap()),
+            norm(&root.join("runtime").join(".uv-cache").to_string_lossy())
         );
         assert_eq!(
             get("UV_PYTHON_INSTALL_DIR").unwrap(),
