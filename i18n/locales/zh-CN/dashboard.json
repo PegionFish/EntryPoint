@@ -28,6 +28,7 @@
   "storage.title": "存储空间",
   "storage.summary": "<b>{{used}}</b> 已用 · <b>{{free}}</b> 可用",
   "storage.usage": "磁盘占用",
+  "storage.unknown": "未知",
   "storage.loadFailed": "存储信息加载失败",
   "storage.loadFailedHint": "无法获取存储水位，请检查后端服务是否正常运行（每 30 秒自动重试）。",
   "storage.dir.workspace": "工作区",

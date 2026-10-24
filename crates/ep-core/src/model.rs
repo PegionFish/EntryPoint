@@ -854,7 +854,7 @@ impl ModelManager {
 
         // T-11：启动下载子进程前做空间预检——磁盘不足时立即失败，
         // 避免 python 侧下到一半才因 ENOSPC 崩掉并留下残缺产物。
-        Self::ensure_download_space(&target_dir_path, model.size_estimate_mb)?;
+        Self::ensure_download_space(&target_dir_path, model.size_estimate_mb).await?;
 
         info!(
             model_id = %model.id,
@@ -998,7 +998,8 @@ impl ModelManager {
 
     /// 下载所需字节数：`size_estimate_mb` × 1.05 安全余量。
     ///
-    /// 5% 覆盖解包临时文件、元数据与文件系统块开销；向上取整到整 MiB。
+    /// 5% 覆盖解包临时文件、元数据与文件系统块开销；余量按字节整数向下取整
+    /// （`bytes / 20`，不做 MiB 级进位）。
     pub fn required_download_bytes(size_estimate_mb: u32) -> u64 {
         let bytes = u64::from(size_estimate_mb).saturating_mul(1024 * 1024);
         bytes.saturating_add(bytes / 20)
@@ -1009,15 +1010,27 @@ impl ModelManager {
     /// 清单未声明大小（`None` 或 0）或探测失败时放行：无法估算需求时不应把
     /// “不可知”当作“不足”（探测失败常见于权限受限/网络盘，下载本身会给出
     /// 真实错误）。
-    pub fn ensure_download_space(target_dir: &Path, size_estimate_mb: Option<u32>) -> Result<()> {
+    ///
+    /// 探测（`Path::exists` + `fs2::available_space`）是阻塞系统调用，NAS/网络盘
+    /// 挂起时可能持续数百毫秒，因此统一丢进 [`tokio::task::spawn_blocking`]，
+    /// 不占用 async worker（与 storage 端点同源的策略，T-15）。
+    pub async fn ensure_download_space(
+        target_dir: &Path,
+        size_estimate_mb: Option<u32>,
+    ) -> Result<()> {
         let Some(estimate) = size_estimate_mb.filter(|mb| *mb > 0) else {
             return Ok(());
         };
-        let Some(available) = Self::available_space_bytes(target_dir) else {
-            return Ok(());
-        };
-        let required = Self::required_download_bytes(estimate);
-        check_download_space(required, available, target_dir).map_err(anyhow::Error::from)
+        let target_dir = target_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let Some(available) = Self::available_space_bytes(&target_dir) else {
+                return Ok(());
+            };
+            let required = Self::required_download_bytes(estimate);
+            check_download_space(required, available, &target_dir).map_err(anyhow::Error::from)
+        })
+        .await
+        .context("disk space precheck task failed")?
     }
 
     // ─── 带进度的下载 ─────────────────────────────────────────────────────
@@ -1035,7 +1048,7 @@ impl ModelManager {
     ///
     /// `source` 为下载源覆写（None = 主 source），走 `ModelDecl::resolve`。
     /// 成功后同样写入 `.ep_meta.json`。
-    pub fn execute_download_with_progress(
+    pub async fn execute_download_with_progress(
         &self,
         module_id: &str,
         model: &ModelDecl,
@@ -1069,7 +1082,7 @@ impl ModelManager {
 
         // T-11：同步启动路径同样先做空间预检——daemon 的
         // `execute_download_with_progress` 调用方能在 HTTP 层立即拿到失败。
-        Self::ensure_download_space(&target_dir_path, model.size_estimate_mb)?;
+        Self::ensure_download_space(&target_dir_path, model.size_estimate_mb).await?;
 
         let dir_was_empty_at_start = !dir_has_entries(&target_dir_path);
 
@@ -2602,22 +2615,23 @@ mod tests {
         assert_eq!(err.path, PathBuf::from("C:/models"));
     }
 
-    #[test]
-    fn ensure_download_space_skips_unknown_estimate() {
+    #[tokio::test]
+    async fn ensure_download_space_skips_unknown_estimate() {
         let dir = std::env::temp_dir().join(format!("ep-model-space-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // 无大小估算 / 0 MB → 不做判断（无法估算需求时不误杀）
-        assert!(ModelManager::ensure_download_space(&dir, None).is_ok());
-        assert!(ModelManager::ensure_download_space(&dir, Some(0)).is_ok());
+        assert!(ModelManager::ensure_download_space(&dir, None).await.is_ok());
+        assert!(ModelManager::ensure_download_space(&dir, Some(0)).await.is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn ensure_download_space_rejects_impossible_download() {
+    #[tokio::test]
+    async fn ensure_download_space_rejects_impossible_download() {
         let dir = std::env::temp_dir().join(format!("ep-model-space-big-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // u32::MAX MB ≈ 4.6 PB，任何真实磁盘都不可能满足 → 预检必须失败
         let err = ModelManager::ensure_download_space(&dir, Some(u32::MAX))
+            .await
             .expect_err("impossible download must be rejected");
         let insufficient = err
             .downcast_ref::<StorageInsufficient>()

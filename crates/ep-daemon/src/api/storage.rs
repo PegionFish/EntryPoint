@@ -7,6 +7,7 @@
 //! 递归求和在 [`tokio::task::spawn_blocking`] 中执行：目录树可能是深层的 O(n)
 //! 扫描，若直接跑在 async worker 上会阻塞轮询请求（T-03 的教训）。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -32,7 +33,10 @@ pub struct StorageDirReport {
     pub name: &'static str,
     /// 解析后的绝对路径（展示用）
     pub path: String,
-    /// 目录内所有普通文件的字节数之和（不跟随符号链接）
+    /// 目录内所有普通文件的字节数之和
+    ///
+    /// 子目录符号链接不跟随（防重复计数）；根目录本身是符号链接/junction 时
+    /// 跟随（workspace 常整体链接到数据盘/NAS）。
     pub used_bytes: u64,
 }
 
@@ -56,22 +60,7 @@ async fn storage_report(State(state): State<Arc<AppState>>) -> (StatusCode, Json
 
     // 三个目录的递归求和 + 模型缓存盘 free 探测，统一丢进阻塞线程池。
     let scan = tokio::task::spawn_blocking(move || {
-        let targets: [(&'static str, PathBuf); 3] = [
-            ("workspace", workspace_dir),
-            ("models", model_cache_dir.clone()),
-            ("tasks", tasks_dir),
-        ];
-        let dirs = targets
-            .into_iter()
-            .map(|(name, path)| StorageDirReport {
-                used_bytes: dir_used_bytes(&path),
-                path: path.to_string_lossy().into_owned(),
-                name,
-            })
-            .collect();
-        // 复用 ep-core 的跨平台探测（目标盘可用空间，含祖先回退）。
-        let free_bytes = ModelManager::available_space_bytes(&model_cache_dir);
-        StorageReport { dirs, free_bytes }
+        build_report(workspace_dir, model_cache_dir, tasks_dir)
     })
     .await;
 
@@ -91,20 +80,53 @@ async fn storage_report(State(state): State<Arc<AppState>>) -> (StatusCode, Json
     (StatusCode::OK, Json(json!(report)))
 }
 
+/// 组装响应（同步内核，便于单测直接注入目录；调用方负责放进阻塞线程池）。
+fn build_report(
+    workspace_dir: PathBuf,
+    model_cache_dir: PathBuf,
+    tasks_dir: PathBuf,
+) -> StorageReport {
+    let free_probe_dir = model_cache_dir.clone();
+    let targets: [(&'static str, PathBuf); 3] = [
+        ("workspace", workspace_dir),
+        ("models", model_cache_dir),
+        ("tasks", tasks_dir),
+    ];
+    let dirs = targets
+        .into_iter()
+        .map(|(name, path)| StorageDirReport {
+            used_bytes: dir_used_bytes(&path),
+            path: path.to_string_lossy().into_owned(),
+            name,
+        })
+        .collect();
+    // 复用 ep-core 的跨平台探测（目标盘可用空间，含祖先回退）。
+    let free_bytes = ModelManager::available_space_bytes(&free_probe_dir);
+    StorageReport { dirs, free_bytes }
+}
+
 /// 递归统计目录内普通文件字节数。
 ///
-/// - 不跟随符号链接（`file_type().is_symlink()` 直接跳过）：避免重复计数与环路；
+/// - 根目录本身是符号链接/junction 时**跟随**：workspace 常整体链到数据盘/NAS，
+///   若按 link 自身处理会把水位恒报 0；用 `metadata`（跟随）而非 `symlink_metadata`；
+/// - 子目录符号链接不跟随（`file_type().is_symlink()` 直接跳过）：避免重复计数与环路；
+/// - `canonicalize` 记录已访问目录，junction/绑定挂载造成的环只遍历一次；
 /// - 不可读的子目录静默跳过：单点权限问题不应让整张卡片失败；
 /// - 目录不存在（如从未导入任务的 tasks/）返回 0。
 fn dir_used_bytes(path: &Path) -> u64 {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
+    let Ok(meta) = std::fs::metadata(path) else {
         return 0;
     };
-    if meta.file_type().is_symlink() || !meta.is_dir() {
+    if !meta.is_dir() {
         return 0;
     }
 
     let mut total = 0u64;
+    // 已访问目录的规范路径集合：junction 环 / 多路径指向同一目录时只统计一次。
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        visited.insert(canonical);
+    }
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -118,7 +140,15 @@ fn dir_used_bytes(path: &Path) -> u64 {
                 continue;
             }
             if file_type.is_dir() {
-                stack.push(entry.path());
+                let child = entry.path();
+                let Ok(canonical) = std::fs::canonicalize(&child) else {
+                    // 无法规范化时按原路径遍历（visited 仅做尽力去重）。
+                    stack.push(child);
+                    continue;
+                };
+                if visited.insert(canonical) {
+                    stack.push(child);
+                }
             } else if file_type.is_file() {
                 let len = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
                 total = total.saturating_add(len);
@@ -205,6 +235,9 @@ mod tests {
         assert_eq!(used("workspace"), workspace_used);
         assert_eq!(used("models"), models_used);
         assert_eq!(used("tasks"), 40);
+        // workspace 的 used_bytes 已包含 tasks（tasks 位于 workspace 下）：
+        // 前端聚合总占用时只能取 workspace + models，避免 tasks 重复计数。
+        assert_eq!(used("workspace"), used("tasks") + 100);
         // 路径解析到 root 下（AppConfig 默认相对路径 workspace / models）
         assert!(dirs[0]["path"].as_str().unwrap().contains("workspace"));
         assert!(body["free_bytes"].as_u64().expect("free_bytes") > 0);
@@ -234,5 +267,92 @@ mod tests {
 
         assert_eq!(super::dir_used_bytes(&root), 64);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 三个目录都不存在时仍返回 3 条 0 值目录，不 panic。
+    #[test]
+    fn build_report_handles_missing_dirs() {
+        let root = std::env::temp_dir().join(format!(
+            "ep-storage-report-missing-{}",
+            std::process::id()
+        ));
+        let report = super::build_report(
+            root.join("workspace"),
+            root.join("models"),
+            root.join("workspace").join("tasks"),
+        );
+        assert_eq!(report.dirs.len(), 3);
+        assert!(report.dirs.iter().all(|d| d.used_bytes == 0));
+    }
+
+    // 根目录本身是符号链接时跟随（workspace 可整体链到 NAS）；子目录软链仍跳过。
+    #[cfg(unix)]
+    #[test]
+    fn dir_used_bytes_follows_root_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "ep-storage-rootlink-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let real = root.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("a.bin"), vec![0u8; 64]).unwrap();
+        let link = root.join("link");
+        symlink(&real, &link).unwrap();
+
+        assert_eq!(super::dir_used_bytes(&link), 64);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Windows junction（目录联接）同为 reparse point：根目录需跟随，否则默认
+    // workspace 被联接到数据盘时水位恒为 0。无权限创建联接则跳过。
+    #[cfg(windows)]
+    #[test]
+    fn dir_used_bytes_follows_root_junction() {
+        let root = std::env::temp_dir().join(format!(
+            "ep-storage-junction-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let real = root.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("a.bin"), vec![0u8; 64]).unwrap();
+        let link = root.join("link");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .status();
+        let built = matches!(status, Ok(s) if s.success());
+        if !built {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+
+        assert_eq!(super::dir_used_bytes(&link), 64);
+
+        // 先删 junction 再删目录，避免递归删除跟随链接。
+        std::fs::remove_dir(&link).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 探测失败（不存在的盘符）→ free_bytes 为 null（前端显示未知态），
+    // used 仍按 0 上报，不 panic。
+    #[cfg(windows)]
+    #[test]
+    fn build_report_keeps_free_none_when_probe_fails() {
+        // Q: 不存在的机器上祖先链耗尽 → None；若本机恰好有 Q: 则跳过。
+        if Path::new("Q:\\").exists() {
+            return;
+        }
+        let report = super::build_report(
+            PathBuf::from("Q:\\ep-missing-workspace"),
+            PathBuf::from("Q:\\ep-missing-models"),
+            PathBuf::from("Q:\\ep-missing-workspace\\tasks"),
+        );
+        assert!(report.free_bytes.is_none());
+        assert!(report.dirs.iter().all(|d| d.used_bytes == 0));
     }
 }

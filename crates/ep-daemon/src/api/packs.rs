@@ -1506,13 +1506,16 @@ async fn start_one_pending_download(
 
     // 3. 启动下载（ep-core spawn python 子进程 + 进度广播）
     let config = state.config.read().await.clone();
-    let handle = match mgr.execute_download_with_progress(
-        &req.module_id,
-        &decl,
-        &venv_python,
-        &config,
-        None,
-    ) {
+    let handle = match mgr
+        .execute_download_with_progress(
+            &req.module_id,
+            &decl,
+            &venv_python,
+            &config,
+            None,
+        )
+        .await
+    {
         Ok(h) => h,
         Err(e) => {
             warn!(

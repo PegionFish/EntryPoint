@@ -355,8 +355,11 @@ function formatBytes(bytes: number): string {
  *
  *  数据来自 GET /api/storage（T-11），30s 轮询一次；失败时保留上一次数据
  *  只是翻转失败提示，避免网络抖动把整张卡片清空。
- *  占用条按「三目录已用 /（已用 + 模型盘剩余）」估算：默认部署三者同盘，
- *  自定义 cache_dir 跨盘时该比例仅供参考（标题旁同时给出精确剩余值）。 */
+ *  workspace 的 used_bytes 已包含其下的 tasks，聚合总占用时只取
+ *  workspace + models，避免 tasks 重复计数。
+ *  占用条按「(workspace + models) /（已用 + 模型盘剩余）」估算：默认部署三者
+ *  同盘，自定义 cache_dir 跨盘时该比例仅供参考（标题旁同时给出精确剩余值）。
+ *  free_bytes 为 null（探测失败）时比例不可知，显示中性态而不是 100%。 */
 function StorageSection() {
   const { t } = useTranslation('dashboard')
   const [report, setReport] = useState<StorageReport | null>(null)
@@ -385,16 +388,23 @@ function StorageSection() {
   }, [])
 
   const freeBytes = report?.free_bytes ?? null
-  const usedTotal =
-    report?.dirs.reduce((sum, dir) => sum + dir.used_bytes, 0) ?? 0
-  const capacity = usedTotal + (freeBytes ?? 0)
-  const ratio = capacity > 0 ? usedTotal / capacity : 0
+  // workspace 已包含 tasks：只聚合两个不重叠目录，避免重复计数。
+  const usedTotal = report
+    ? (report.dirs.find((dir) => dir.name === 'workspace')?.used_bytes ?? 0) +
+      (report.dirs.find((dir) => dir.name === 'models')?.used_bytes ?? 0)
+    : 0
+  // 探测失败时比例不可知：capacity/ratio 置 null，走中性态。
+  const capacity = freeBytes == null ? null : usedTotal + freeBytes
+  const ratio =
+    capacity != null && capacity > 0 ? usedTotal / capacity : null
   const tone =
-    ratio >= 0.9
-      ? 'bg-status-error'
-      : ratio >= 0.7
-        ? 'bg-status-preparing'
-        : 'bg-status-running'
+    ratio == null
+      ? 'bg-muted'
+      : ratio >= 0.9
+        ? 'bg-status-error'
+        : ratio >= 0.7
+          ? 'bg-status-preparing'
+          : 'bg-status-running'
 
   return (
     <section>
@@ -453,14 +463,19 @@ function StorageSection() {
                   {t('storage.usage')}
                 </span>
                 <span className="font-mono text-muted-foreground">
-                  {(ratio * 100).toFixed(1)}%
+                  {ratio == null
+                    ? t('storage.unknown')
+                    : `${(ratio * 100).toFixed(1)}%`}
                 </span>
               </div>
               <div
                 className="h-1.5 overflow-hidden rounded-full bg-muted"
                 role="progressbar"
                 aria-label={t('storage.title')}
-                aria-valuenow={Math.round(ratio * 100)}
+                aria-valuenow={
+                  ratio == null ? undefined : Math.round(ratio * 100)
+                }
+                aria-valuetext={ratio == null ? t('storage.unknown') : undefined}
                 aria-valuemin={0}
                 aria-valuemax={100}
               >
@@ -469,7 +484,10 @@ function StorageSection() {
                     'h-full rounded-full transition-[width] duration-500',
                     tone,
                   )}
-                  style={{ width: `${Math.min(100, ratio * 100)}%` }}
+                  style={{
+                    width:
+                      ratio == null ? '0%' : `${Math.min(100, ratio * 100)}%`,
+                  }}
                 />
               </div>
             </div>

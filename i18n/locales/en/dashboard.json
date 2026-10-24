@@ -28,6 +28,7 @@
   "storage.title": "Storage",
   "storage.summary": "<b>{{used}}</b> used · <b>{{free}}</b> free",
   "storage.usage": "Disk usage",
+  "storage.unknown": "Unknown",
   "storage.loadFailed": "Failed to load storage info",
   "storage.loadFailedHint": "Unable to fetch storage levels. Check that the backend service is running (auto-retry every 30s).",
   "storage.dir.workspace": "Workspace",

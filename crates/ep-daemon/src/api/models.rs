@@ -603,6 +603,50 @@ async fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> anyhow::R
 
 // ─── Wave 2：模型下载 / 删除 / 更新检查（W2-A 实现） ────────────────────────
 
+/// 把 `StorageInsufficient` 换算成 507 文案用的「需求 MB / 可用 MB」。
+///
+/// 需求**向上取整**、可用**向下取整**：若两者都四舍五入，会出现
+/// 「需要 105 MB、可用 105 MB」却仍然失败的矛盾文案；一上一下可保证
+/// 展示值 `required_mb > available_mb`。
+fn storage_insufficient_mb(err: &anyhow::Error) -> Option<(u64, u64)> {
+    let insufficient = err.downcast_ref::<ep_core::model::StorageInsufficient>()?;
+    let to_mb_ceil = |bytes: u64| (bytes as f64 / (1024.0 * 1024.0)).ceil() as u64;
+    let to_mb_floor = |bytes: u64| bytes / (1024 * 1024);
+    Some((
+        to_mb_ceil(insufficient.required_bytes),
+        to_mb_floor(insufficient.available_bytes),
+    ))
+}
+
+/// 下载启动失败的统一响应：磁盘空间不足 → 507 + 双语文案；
+/// 其它错误 → 500 + 原始详情。
+///
+/// 立即路径、排队路径（spawn 前二次预检）共用，避免两处映射漂移。
+async fn download_start_error_response(
+    state: &Arc<AppState>,
+    err: &anyhow::Error,
+) -> (StatusCode, Json<Value>) {
+    if let Some((required_mb, available_mb)) = storage_insufficient_mb(err) {
+        return err_response(
+            state,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "apiModels.storageInsufficient",
+            &[
+                ("required_mb", required_mb.to_string()),
+                ("available_mb", available_mb.to_string()),
+            ],
+        )
+        .await;
+    }
+    err_response(
+        state,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "apiModels.downloadStartFailed",
+        &[("detail", err.to_string())],
+    )
+    .await
+}
+
 /// POST /api/models/:module_id/download — 启动模型下载
 ///
 /// 请求体：`{"model_id": "...", "source": "huggingface" | "modelscope" | "url"?}`
@@ -616,6 +660,7 @@ async fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> anyhow::R
 ///   状态排队，空位释放后自动启动（排队行为详见 [`download_gate`]）。
 /// - 400 请求体非法 / 下载源不可用；404 模块或模型不存在
 /// - 409 正在下载中（含排队中）或模型已存在
+/// - 507 磁盘空间不足（`size_estimate_mb` × 1.05 预检失败，T-11）
 async fn download_model(
     State(state): State<Arc<AppState>>,
     Path(module_id): Path<String>,
@@ -690,34 +735,10 @@ async fn download_model(
     if let Err(err) = ep_core::model::ModelManager::ensure_download_space(
         &target_dir,
         decl.size_estimate_mb,
-    ) {
-        if let Some(insufficient) = err.downcast_ref::<ep_core::model::StorageInsufficient>() {
-            let to_mb = |bytes: u64| (bytes as f64 / (1024.0 * 1024.0)).ceil() as u64;
-            return err_response(
-                &state,
-                StatusCode::INSUFFICIENT_STORAGE,
-                "apiModels.storageInsufficient",
-                &[
-                    (
-                        "required_mb",
-                        to_mb(insufficient.required_bytes).to_string(),
-                    ),
-                    (
-                        "available_mb",
-                        to_mb(insufficient.available_bytes).to_string(),
-                    ),
-                ],
-            )
-            .await;
-        }
-        // 预检本身的非常规错误（如路径异常）：按启动失败返回，保留原始详情。
-        return err_response(
-            &state,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "apiModels.downloadStartFailed",
-            &[("detail", err.to_string())],
-        )
-        .await;
+    )
+    .await
+    {
+        return download_start_error_response(&state, &err).await;
     }
     // venv 就绪门禁（任务 #10，与手动启动/自动拉起同源的共享助手）：
     // is_venv_ready 哈希门禁修复"半壳 venv"误判；venv 缺失自动准备，
@@ -847,23 +868,20 @@ async fn download_model(
 
     // ── 立即路径：闸门有空位，启动下载（ep-core 内部 spawn python 子进程 + 轮询目录大小） ──
     let config = { state.config.read().await.clone() };
-    let mut handle = match mgr.execute_download_with_progress(
-        &module_id,
-        &decl,
-        &venv_python,
-        &config,
-        source,
-    ) {
+    let mut handle = match mgr
+        .execute_download_with_progress(
+            &module_id,
+            &decl,
+            &venv_python,
+            &config,
+            source,
+        )
+        .await
+    {
         Ok(h) => h,
         Err(e) => {
             drop(permit);
-            return err_response(
-                &state,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "apiModels.downloadStartFailed",
-                &[("detail", e.to_string())],
-            )
-            .await;
+            return download_start_error_response(&state, &e).await;
         }
     };
 
@@ -963,13 +981,10 @@ async fn queued_download_runner(
     }
 
     let config = { state.config.read().await.clone() };
-    let mut handle = match mgr.execute_download_with_progress(
-        &module_id,
-        &decl,
-        &venv_python,
-        &config,
-        source,
-    ) {
+    let mut handle = match mgr
+        .execute_download_with_progress(&module_id, &decl, &venv_python, &config, source)
+        .await
+    {
         Ok(h) => h,
         Err(e) => {
             // 启动失败：entry 落终态 failed 并广播，闸门空位随 permit drop 归还
@@ -986,7 +1001,29 @@ async fn queued_download_runner(
                 state: "failed".to_string(),
                 bytes: 0,
             });
-            warn!(module_id = %module_id, model_id = %model_id, error = %e, "queued model download failed to start");
+            // 失败原因按 UI 语言本地化后写日志：WS 协议没有 detail 字段，
+            // 前端只能显示通用失败文案（具体原因待协议扩展，记 T-11 follow-up）。
+            let lang = state.lang().await;
+            let reason = if let Some((required_mb, available_mb)) = storage_insufficient_mb(&e) {
+                let required = required_mb.to_string();
+                let available = available_mb.to_string();
+                ep_core::i18n::t(
+                    &lang,
+                    "apiModels.storageInsufficient",
+                    &[
+                        ("required_mb", required.as_str()),
+                        ("available_mb", available.as_str()),
+                    ],
+                )
+            } else {
+                let detail = e.to_string();
+                ep_core::i18n::t(
+                    &lang,
+                    "apiModels.downloadStartFailed",
+                    &[("detail", detail.as_str())],
+                )
+            };
+            warn!(module_id = %module_id, model_id = %model_id, reason = %reason, "queued model download failed to start");
             return;
         }
     };
@@ -1502,6 +1539,58 @@ mod tests {
     const MODEL_ID: &str = "m1";
     const URL_MODEL_ID: &str = "m2";
     const TARGET_DIR: &str = "test-model-dir";
+
+    // ── 磁盘空间预检：507 映射（T-11）────────────────────────────────────
+
+    fn insufficient_error(required_bytes: u64, available_bytes: u64) -> anyhow::Error {
+        anyhow::Error::new(ep_core::model::StorageInsufficient {
+            path: PathBuf::from("/tmp/ep-models"),
+            required_bytes,
+            available_bytes,
+        })
+    }
+
+    // 需求向上取整、可用向下取整：避免「需要 105 MB、可用 105 MB」的矛盾文案。
+    #[test]
+    fn storage_insufficient_mb_rounds_required_up_and_available_down() {
+        // 32 MiB vs 31.5 MiB → 文案展示 32 / 31
+        let err = insufficient_error(32 * 1024 * 1024, 33_030_144);
+        let (required_mb, available_mb) = storage_insufficient_mb(&err).expect("storage error");
+        assert_eq!((required_mb, available_mb), (32, 31));
+        assert!(required_mb > available_mb);
+    }
+
+    #[test]
+    fn storage_insufficient_mb_ignores_other_errors() {
+        assert_eq!(storage_insufficient_mb(&anyhow::anyhow!("boom")), None);
+    }
+
+    // 预检失败映射为 507 + apiModels.storageInsufficient 文案。
+    #[tokio::test]
+    async fn download_start_error_response_maps_storage_insufficient_to_507() {
+        let state = test_state();
+        let err = insufficient_error(32 * 1024 * 1024, 33_030_144);
+        let (status, json) = download_start_error_response(&state, &err).await;
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        let message = json.0["error"].as_str().expect("error message");
+        assert!(
+            message.contains("32"),
+            "message should carry required MB: {message}"
+        );
+        assert!(
+            message.contains("31"),
+            "message should carry available MB: {message}"
+        );
+    }
+
+    // 非空间错误仍按 500 返回，避免把启动失败误报成磁盘不足。
+    #[tokio::test]
+    async fn download_start_error_response_keeps_500_for_other_errors() {
+        let state = test_state();
+        let err = anyhow::anyhow!("spawn failed");
+        let (status, _) = download_start_error_response(&state, &err).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     fn hf_model_decl() -> ModelDecl {
         ModelDecl {

@@ -353,7 +353,6 @@ dependencies = [
  "ep-core",
  "ep-pack",
  "flate2",
- "fs2",
  "http-body-util",
  "multer",
  "reqwest",
