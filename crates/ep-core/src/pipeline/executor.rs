@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::types::{Artifact, TaskStatus};
 
+use super::builtin_templates::{self, BuiltinTemplate, TemplateRenderInput};
 use super::dag::{NodeKind, Pipeline, PipelineNode};
 
 // ─── 节点状态 ────────────────────────────────────────────────────────────────
@@ -545,6 +546,76 @@ to = ["save", "input"]
             timeout_secs: None,
             retry_count: None,
         }
+    }
+
+    // ── T-13：模板节点输出路径解析 ─────────────────────────────────────────
+
+    fn template_node(id: &str, params: serde_json::Value) -> PipelineNode {
+        PipelineNode {
+            id: id.to_string(),
+            kind: NodeKind::Builtin {
+                builtin: "ffmpeg_template".to_string(),
+            },
+            label: String::new(),
+            params,
+            position: None,
+            timeout_secs: None,
+            retry_count: None,
+        }
+    }
+
+    #[test]
+    fn test_resolve_template_output_path_uses_template_extension() {
+        // 默认扩展名来自模板表（transcode → mp4）
+        let node = template_node("tc", serde_json::json!({ "template": "transcode" }));
+        let template = builtin_templates::find_template("transcode").unwrap();
+        assert_eq!(
+            resolve_template_output_path(template, &node, Path::new("/work")),
+            PathBuf::from("/work/tc_output.mp4")
+        );
+    }
+
+    #[test]
+    fn test_resolve_template_output_path_uses_extension_param() {
+        // 字幕转码：扩展名跟 params.to_format 走（模板 extension_param）
+        let node = template_node(
+            "sc",
+            serde_json::json!({ "template": "subtitle-convert", "to_format": "ass" }),
+        );
+        let template = builtin_templates::find_template("subtitle-convert").unwrap();
+        assert_eq!(
+            resolve_template_output_path(template, &node, Path::new("/work")),
+            PathBuf::from("/work/sc_output.ass")
+        );
+    }
+
+    #[test]
+    fn test_resolve_template_output_path_directory_and_override() {
+        // 抽帧 → 目录产物
+        let frames = template_node(
+            "ef",
+            serde_json::json!({ "template": "extract-frames" }),
+        );
+        let extract = builtin_templates::find_template("extract-frames").unwrap();
+        assert_eq!(
+            resolve_template_output_path(extract, &frames, Path::new("/work")),
+            PathBuf::from("/work/ef_frames")
+        );
+
+        // 显式 params.output 优先（含 output_extension 时也以显式路径为准）
+        let override_node = template_node(
+            "cut",
+            serde_json::json!({
+                "template": "clip",
+                "output": "/out/cut.mkv",
+                "output_extension": "avi",
+            }),
+        );
+        let clip = builtin_templates::find_template("clip").unwrap();
+        assert_eq!(
+            resolve_template_output_path(clip, &override_node, Path::new("/work")),
+            PathBuf::from("/out/cut.mkv")
+        );
     }
 
     // ── 纯函数级：substitute_ffmpeg_placeholders ─────────────────────────────
@@ -2717,6 +2788,12 @@ async fn execute_builtin_node(
             let with_nodes = collect_upstream_artifacts_with_nodes(&node.id, pipeline, task);
             execute_builtin_ffmpeg(node, upstream, &with_nodes, work_dir).await
         }
+        // T-13：参数化 ffmpeg 模板节点（builtin = "ffmpeg_template"，
+        // params.template 选定模板）。命令由内置模板表渲染，见 builtin_templates 模块。
+        "ffmpeg_template" => {
+            let with_nodes = collect_upstream_artifacts_with_nodes(&node.id, pipeline, task);
+            execute_builtin_ffmpeg_template(node, &with_nodes, work_dir).await
+        }
         // §6.7 LLM builtin：规范名 `llm`；`external_api` 保留为别名，
         // 两名执行完全等价（builtin 形状无 kind 级字段，参数全部来自 params）
         "llm" | "external_api" => execute_llm_node(node, upstream, None, None).await,
@@ -3997,6 +4074,178 @@ async fn execute_builtin_ffmpeg(
     }
 
     Ok(Artifact::File(output_path))
+}
+
+// ─── T-13：ffmpeg 模板节点执行 ──────────────────────────────────────────────
+
+/// 执行参数化 ffmpeg 模板节点（`builtin = "ffmpeg_template"`）。
+///
+/// 与 [`execute_builtin_ffmpeg`] 的差异：
+/// - 不读 `params.args`，命令由内置模板表 [`builtin_templates`] 的 args 模板渲染，
+///   参数来自 `params`（缺省取模板默认值，非法值显式报错）；
+/// - 输入按模板 `input_ports` 顺序消费上游文件产物（`{input}` / `{input2}`）；
+/// - 产物可为单文件或目录（抽帧序列，`output_is_dir`）。
+async fn execute_builtin_ffmpeg_template(
+    node: &PipelineNode,
+    upstream_nodes: &[(String, Artifact)],
+    work_dir: &Path,
+) -> anyhow::Result<Artifact> {
+    let template_id = node
+        .params
+        .get("template")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "ffmpeg_template node '{}' is missing the 'template' param",
+                node.id
+            )
+        })?;
+    let template = builtin_templates::find_template(template_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "ffmpeg_template node '{}' references unknown template '{}'",
+            node.id,
+            template_id
+        )
+    })?;
+
+    // 上游文件产物（按边在 pipeline.edges 中的顺序）→ 命名输入端口
+    let input_files: Vec<&Path> = upstream_nodes
+        .iter()
+        .filter_map(|(_, artifact)| match artifact {
+            Artifact::File(path) => Some(path.as_path()),
+            _ => None,
+        })
+        .collect();
+    if template.input_ports.len() > input_files.len() {
+        let missing = template
+            .input_ports
+            .get(input_files.len())
+            .map(|(name, _)| *name)
+            .unwrap_or("input");
+        return Err(anyhow::anyhow!(
+            "ffmpeg_template node '{}' ({}) requires input port '{}' but only {} upstream file artifact(s) are available; connect all required inputs",
+            node.id,
+            template.id,
+            missing,
+            input_files.len()
+        ));
+    }
+    let input = input_files.first().copied();
+    let input2 = input_files.get(1).copied();
+
+    // 输出路径与目录准备（抽帧模板产出到目录）
+    let output_path = resolve_template_output_path(template, node, work_dir);
+    if template.ffmpeg_build.output_is_dir {
+        std::fs::create_dir_all(&output_path)?;
+    } else if let Some(parent) = output_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    let (args, output_substituted) = builtin_templates::render_template_args(
+        template,
+        &node.params,
+        &TemplateRenderInput {
+            input,
+            input2,
+            output: &output_path,
+        },
+    )
+    .map_err(|err| {
+        anyhow::anyhow!(
+            "ffmpeg_template node '{}' ({}) failed to render command: {err}",
+            node.id,
+            template.id
+        )
+    })?;
+
+    let ffmpeg_bin = resolve_ffmpeg_path();
+    let mut cmd = tokio::process::Command::new(&ffmpeg_bin);
+    // 与 execute_builtin_ffmpeg 一致：任务 abort 时一并终止子进程
+    cmd.kill_on_drop(true);
+    cmd.arg("-y"); // overwrite output
+
+    for arg in &args {
+        cmd.arg(arg);
+    }
+    // 防御：模板 args 未引用 {output} 时仍保证产物落到期望路径
+    if !output_substituted {
+        cmd.arg(&output_path);
+    }
+
+    let output = cmd.output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("ffmpeg failed: {stderr}"));
+    }
+
+    if template.ffmpeg_build.output_is_dir {
+        let has_entries = std::fs::read_dir(&output_path)
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false);
+        if !has_entries {
+            return Err(anyhow::anyhow!(
+                "ffmpeg succeeded but produced no frames in '{}'",
+                output_path.display()
+            ));
+        }
+    } else if !output_path.is_file() {
+        return Err(anyhow::anyhow!(
+            "ffmpeg succeeded but did not produce the expected output file '{}'",
+            output_path.display()
+        ));
+    }
+
+    Ok(Artifact::File(output_path))
+}
+
+/// 解析模板节点的输出路径。
+///
+/// 优先级：`params.output` 显式指定，其次模板目录产物
+/// （`{work_dir}/{node_id}_frames`），最后按扩展名规则（`params.output_extension`
+/// 优先于模板 `extension_param` 指向的参数值，再回退模板 `output_extension`）。
+fn resolve_template_output_path(
+    template: &BuiltinTemplate,
+    node: &PipelineNode,
+    work_dir: &Path,
+) -> PathBuf {
+    if let Some(output) = node.params.get("output").and_then(|v| v.as_str()) {
+        let trimmed = output.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
+    if template.ffmpeg_build.output_is_dir {
+        return work_dir.join(format!("{}_frames", node.id));
+    }
+
+    let normalize = |value: &str| -> Option<String> {
+        let ext = value.trim().trim_start_matches('.').to_lowercase();
+        (!ext.is_empty()).then_some(ext)
+    };
+    let extension = node
+        .params
+        .get("output_extension")
+        .and_then(|v| v.as_str())
+        .and_then(normalize)
+        .or_else(|| {
+            template
+                .ffmpeg_build
+                .extension_param
+                .and_then(|param| node.params.get(param))
+                .and_then(|v| v.as_str())
+                .and_then(normalize)
+        })
+        .unwrap_or_else(|| template.ffmpeg_build.output_extension.to_string());
+
+    let mut name = format!("{}_output", node.id);
+    if !extension.is_empty() {
+        name.push('.');
+        name.push_str(&extension);
+    }
+    work_dir.join(name)
 }
 
 /// 模块 HTTP 调用错误 — 携带可重试标志

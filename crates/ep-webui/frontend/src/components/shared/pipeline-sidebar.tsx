@@ -1,9 +1,17 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { DragEvent, KeyboardEvent } from 'react'
-import { CircleAlert, GripVertical, RefreshCw, Search, Wrench, X } from 'lucide-react'
+import {
+  Captions,
+  CircleAlert,
+  GripVertical,
+  RefreshCw,
+  Search,
+  Wrench,
+  X,
+} from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { api } from '@/api/client'
-import type { CapabilityDecl, ModuleResponse } from '@/api/types'
+import type { BuiltinTemplate, CapabilityDecl, ModuleResponse } from '@/api/types'
 import { categoryLabel, statusMeta } from '@/lib/constants'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -27,6 +35,32 @@ function capabilityNames(module_: ModuleResponse): string[] {
 function startDrag(event: DragEvent<HTMLDivElement>, payload: DragPayload) {
   event.dataTransfer.setData(DRAG_MIME, JSON.stringify(payload))
   event.dataTransfer.effectAllowed = 'move'
+}
+
+/**
+ * 内置模板的拖拽 / 点击载荷：在 builtin 载荷上附加模板 id。
+ * pipeline.tsx 据此按模板 schema 生成节点端口与参数；执行器侧对应
+ * builtin = "ffmpeg_template" + params.template（契约见 docs/PIPELINE_SPEC.md）。
+ */
+export interface TemplateDragPayload extends DragPayload {
+  templateId: string
+}
+
+/** 模板分类视觉：video/audio 复用模块分类配色，subtitle 用字幕图标 */
+function templateVisual(category: string): {
+  icon: React.ReactNode
+  accent: string
+} {
+  const key = category.toLowerCase()
+  if (key === 'subtitle') {
+    return {
+      icon: <Captions className="h-4 w-4" />,
+      accent: 'bg-cat-ocr/15 text-cat-ocr',
+    }
+  }
+  const visual = categoryVisual(key)
+  const Icon = visual.icon
+  return { icon: <Icon className="h-4 w-4" />, accent: visual.accent }
 }
 
 interface PaletteItemProps {
@@ -116,6 +150,9 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
   const { t, i18n } = useTranslation('components')
   const [modules, setModules] = useState<ModuleResponse[] | null>(null)
   const [failed, setFailed] = useState(false)
+  /** 内置 ffmpeg 模板目录（GET /api/builtins；与执行器/端口校验同源） */
+  const [templates, setTemplates] = useState<BuiltinTemplate[] | null>(null)
+  const [templatesFailed, setTemplatesFailed] = useState(false)
   const [filter, setFilter] = useState('')
 
   const load = useCallback(() => {
@@ -127,9 +164,19 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
       .catch(() => setFailed(true))
   }, [])
 
+  const loadTemplates = useCallback(() => {
+    setTemplatesFailed(false)
+    setTemplates(null)
+    api
+      .builtinTemplates()
+      .then((resp) => setTemplates(resp.templates))
+      .catch(() => setTemplatesFailed(true))
+  }, [])
+
   useEffect(() => {
     load()
-  }, [load])
+    loadTemplates()
+  }, [load, loadTemplates])
 
   const query = filter.trim().toLowerCase()
 
@@ -143,6 +190,33 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
       ),
     [query, i18n.language],
   )
+
+  /** 内置模板：按 category 分组（video/audio/subtitle），组内保持模板表顺序 */
+  const groupedTemplates = useMemo(() => {
+    if (!templates) return null
+    const matched = templates.filter((tpl) => {
+      if (!query) return true
+      const name = t(`pipeline:builtinTemplate.${tpl.id}.name`, {
+        defaultValue: tpl.display_name,
+      })
+      const description = t(`pipeline:builtinTemplate.${tpl.id}.description`, {
+        defaultValue: tpl.description,
+      })
+      const category = t(`pipeline:builtinTemplate.category.${tpl.category}`, {
+        defaultValue: tpl.category,
+      })
+      return [name, description, category, tpl.id, tpl.category].some((text) =>
+        text.toLowerCase().includes(query),
+      )
+    })
+    const groups = new Map<string, BuiltinTemplate[]>()
+    for (const tpl of matched) {
+      const list = groups.get(tpl.category) ?? []
+      list.push(tpl)
+      groups.set(tpl.category, list)
+    }
+    return [...groups.entries()]
+  }, [templates, query, t, i18n.language])
 
   /** 模块面板按功能类别分组展示（编排检索心智：按「做什么」找）；
    *  组内条目仍是模块 = 模型家族（realesr/animevideo/rife 各自独立，
@@ -179,12 +253,21 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
             <Button
               variant="ghost"
               size="icon-xs"
-              onClick={load}
+              onClick={() => {
+                load()
+                loadTemplates()
+              }}
               title={t('pipelineSidebar.refreshModules')}
               aria-label={t('pipelineSidebar.refreshModules')}
             >
               <RefreshCw
-                className={cn('h-3 w-3', modules === null && !failed && 'animate-spin')}
+                className={cn(
+                  'h-3 w-3',
+                  (modules === null || templates === null) &&
+                    !failed &&
+                    !templatesFailed &&
+                    'animate-spin',
+                )}
               />
             </Button>
             {onClose && (
@@ -228,6 +311,71 @@ export function PipelineSidebar({ onAdd, onClose, className }: PipelineSidebarPr
               />
             ))}
           </div>
+
+          <SectionTitle count={templates?.length}>
+            {t('pipeline:builtinTemplate.section')}
+          </SectionTitle>
+          {templates === null && !templatesFailed && (
+            <div className="space-y-1.5 px-2 py-1">
+              {Array.from({ length: 3 }).map((_, i) => (
+                <div key={i} className="flex items-center gap-2.5">
+                  <Skeleton className="h-7 w-7 rounded-md" />
+                  <div className="flex-1 space-y-1">
+                    <Skeleton className="h-3 w-3/4" />
+                    <Skeleton className="h-2.5 w-1/2" />
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {templatesFailed && (
+            <div className="mx-1 flex flex-col items-center gap-2 rounded-md border border-dashed border-border px-3 py-5 text-center">
+              <CircleAlert className="h-5 w-5 text-status-error" />
+              <p className="text-xs text-muted-foreground">
+                {t('pipeline:builtinTemplate.loadFailed')}
+              </p>
+              <Button variant="outline" size="xs" onClick={loadTemplates}>
+                {t('common:action.retry')}
+              </Button>
+            </div>
+          )}
+
+          {groupedTemplates?.map(([category, list]) => (
+            <div key={category} className="mb-1">
+              <p className="px-2 pb-1 pt-2 text-[11px] font-medium text-muted-foreground">
+                {t(`pipeline:builtinTemplate.category.${category}`, {
+                  defaultValue: category,
+                })}
+              </p>
+              <div className="space-y-0.5">
+                {list.map((tpl) => {
+                  const visual = templateVisual(tpl.category)
+                  const payload: TemplateDragPayload = {
+                    nodeType: 'builtin',
+                    builtin: 'ffmpeg',
+                    templateId: tpl.id,
+                  }
+                  return (
+                    <PaletteItem
+                      key={tpl.id}
+                      icon={visual.icon}
+                      title={t(`pipeline:builtinTemplate.${tpl.id}.name`, {
+                        defaultValue: tpl.display_name,
+                      })}
+                      subtitle={t(
+                        `pipeline:builtinTemplate.${tpl.id}.description`,
+                        { defaultValue: tpl.description },
+                      )}
+                      accent={visual.accent}
+                      payload={payload}
+                      onAdd={onAdd}
+                    />
+                  )
+                })}
+              </div>
+            </div>
+          ))}
 
           <SectionTitle count={modules?.length}>{t('common:label.module')}</SectionTitle>
           {modules === null && !failed && (

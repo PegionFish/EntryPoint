@@ -11,6 +11,8 @@ use crate::config::PipelineConfig;
 use crate::module::manifest::CapabilityDecl;
 use crate::types::{DataType, DeviceId};
 
+use super::builtin_templates;
+
 // ─── 错误类型 ────────────────────────────────────────────────────────────────
 
 /// 管线验证错误
@@ -147,6 +149,10 @@ fn builtin_port_type(
         "file_archive" if is_output && port == "output" => Some(PortType::File),
         "file_gate" if !is_output && port == "input" => Some(PortType::File),
         "file_gate" if is_output && port == "output" => Some(PortType::File),
+        // T-13：ffmpeg 模板节点的端口类型由模板表声明（数据驱动）
+        builtin_templates::FFMPEG_TEMPLATE_KIND => {
+            builtin_templates::template_port_type(params, port, is_output)
+        }
         // §6.7：llm input_type=text；output_format=json 时输出 Json
         "llm" | "external_api" if !is_output && port == "input" => Some(PortType::Text),
         "llm" | "external_api" if is_output && port == "output" => {
@@ -1523,6 +1529,111 @@ to = ["translate", "input"]
             )),
             "audio -> text must be flagged: {errors:?}"
         );
+    }
+
+    // T-13：ffmpeg 模板节点的端口类型由模板表登记（数据驱动）
+    #[test]
+    fn test_validate_ffmpeg_template_ports_ok() {
+        // file_input(video) → transcode(video→video) → file_output ✅
+        let toml_str = r#"
+[pipeline]
+id = "template-ok"
+name = "Template ok"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = { accept = "video" }
+
+[[nodes]]
+id = "tc"
+kind = "builtin"
+builtin = "ffmpeg_template"
+params = { template = "transcode", crf = 23 }
+
+[[nodes]]
+id = "out"
+kind = "builtin"
+builtin = "file_output"
+
+[[edges]]
+from = ["input", "output"]
+to = ["tc", "input"]
+
+[[edges]]
+from = ["tc", "output"]
+to = ["out", "input"]
+"#;
+        let pipeline = Pipeline::from_toml_str(toml_str).unwrap();
+        assert!(pipeline.validate().is_ok(), "模板端口应类型兼容");
+    }
+
+    #[test]
+    fn test_validate_ffmpeg_template_port_mismatch_detected() {
+        // file_input(accept=audio) → transcode(期望 video)：audio → video ❌
+        let toml_str = r#"
+[pipeline]
+id = "template-mismatch"
+name = "Template mismatch"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = { accept = "audio" }
+
+[[nodes]]
+id = "tc"
+kind = "builtin"
+builtin = "ffmpeg_template"
+params = { template = "transcode" }
+
+[[edges]]
+from = ["input", "output"]
+to = ["tc", "input"]
+"#;
+        let pipeline = Pipeline::from_toml_str(toml_str).unwrap();
+        let errors = pipeline.validate().unwrap_err();
+        let mismatch = errors.iter().find_map(|e| match e {
+            ValidationError::PortTypeMismatch {
+                from_type, to_type, ..
+            } => Some((*from_type, *to_type)),
+            _ => None,
+        });
+        assert_eq!(
+            mismatch,
+            Some((PortType::Audio, PortType::Video)),
+            "audio -> video 必须被模板端口检查拦下: {errors:?}"
+        );
+    }
+
+    // 未知模板 id → 端口类型不可知（None），跳过类型检查而非误报
+    #[test]
+    fn test_validate_unknown_template_skips_port_check() {
+        let toml_str = r#"
+[pipeline]
+id = "template-unknown"
+name = "Template unknown"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = { accept = "audio" }
+
+[[nodes]]
+id = "tc"
+kind = "builtin"
+builtin = "ffmpeg_template"
+params = { template = "no-such-template" }
+
+[[edges]]
+from = ["input", "output"]
+to = ["tc", "input"]
+"#;
+        let pipeline = Pipeline::from_toml_str(toml_str).unwrap();
+        assert!(pipeline.validate().is_ok(), "未知模板不应误报端口类型错");
     }
 
     #[test]

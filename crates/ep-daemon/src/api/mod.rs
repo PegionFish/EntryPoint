@@ -54,6 +54,11 @@ pub fn api_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // 触发规则（PLAN_TRIGGER_UNIFIED_LOG §5.3；巡检循环由 main.rs 驱动）
         .merge(watchers::router())
         // 统一推理 API v1 门面（/v1/*，外部稳定契约；token 中间件仅作用其子路由）
+        // T-13：内置 ffmpeg 模板目录（前端侧栏 / 节点参数表单 / DAG 端口同源）
+        .merge(Router::new().route(
+            "/api/builtins",
+            axum::routing::get(builtin_templates),
+        ))
         .merge(inference::router(state))
         // 未匹配的 /api/* → 404 + JSON，避免落入 SPA 的 HTML fallback
         .fallback(api_not_found)
@@ -298,6 +303,14 @@ pub(crate) async fn ensure_module_venv_ready(
 }
 
     #[cfg(test)]
+/// GET /api/builtins — 内置 ffmpeg 模板目录（T-13）。
+///
+/// 模板定义只有一处来源（`ep_core::pipeline::builtin_templates`）：侧栏、
+/// 节点参数表单与 DAG 端口校验都消费本端点/该表，零模型成本扩管线。
+async fn builtin_templates() -> Json<Value> {
+    Json(ep_core::pipeline::builtin_templates::builtin_templates_json())
+}
+
     mod tests {
         use super::*;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -371,6 +384,53 @@ pub(crate) async fn ensure_module_venv_ready(
     }
 
     // ── API_DESIGN.md 路由迁移：canonical 新路径 + 旧别名均不得落入
+    // T-13：GET /api/builtins 下发内置模板目录（侧栏/参数表单/端口校验同源）
+    #[tokio::test]
+    async fn builtins_route_returns_nine_templates_with_categories() {
+        let state = test_state("zh-CN");
+        let req = Request::builder()
+            .uri("/api/builtins")
+            .body(Body::empty())
+            .unwrap();
+        let app = api_router(state.clone()).with_state(state.clone());
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["count"], 9);
+        let templates = body["templates"].as_array().expect("templates array");
+        assert_eq!(templates.len(), 9);
+        let ids: Vec<&str> = templates
+            .iter()
+            .filter_map(|t| t["id"].as_str())
+            .collect();
+        assert_eq!(ids.len(), 9);
+        assert!(ids.contains(&"transcode"));
+        assert!(ids.contains(&"watermark"));
+
+        // 分类分组：至少 video / audio / subtitle 三类
+        let categories: std::collections::HashSet<&str> = templates
+            .iter()
+            .filter_map(|t| t["category"].as_str())
+            .collect();
+        assert!(categories.contains("video"));
+        assert!(categories.contains("audio"));
+        assert!(categories.contains("subtitle"));
+
+        // 参数 schema 随端点下发（前端参数表单据此渲染）
+        let transcode = templates
+            .iter()
+            .find(|t| t["id"] == "transcode")
+            .expect("transcode template");
+        assert_eq!(transcode["kind"], "ffmpeg_template");
+        assert!(transcode["params"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == "crf"));
+    }
+
     //    /api fallback（404 apiNotFound）。各请求选择的是"路由命中但业务
     //    校验失败"的确定性非 404 形态（400 校验错 / 409 模块未运行 /
     //    v1 404 带 code 字段），与 fallback 的 i18n 文案 404 可判别。 ─────

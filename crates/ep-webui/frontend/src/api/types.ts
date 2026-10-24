@@ -709,3 +709,64 @@ export interface ModuleImportSummary {
   total_bytes: number
   module: ModuleImportSummaryModule
 }
+
+// ===== 内置 ffmpeg 模板库（T-13；GET /api/builtins）=====
+
+/** 模板参数类型（对应后端 TemplateParamKind） */
+export type BuiltinTemplateParamKind =
+  | 'integer'
+  | 'number'
+  | 'select'
+  | 'bool'
+  | 'string'
+
+/** 模板参数 schema：参数表单据此渲染（与模块参数 schema 同形） */
+export interface BuiltinTemplateParam {
+  name: string
+  kind: BuiltinTemplateParamKind
+  /** 缺省值（后端保证类型与 kind 匹配） */
+  default: string | number | boolean
+  min?: number | null
+  max?: number | null
+  /** select 可选值 */
+  options: string[]
+  /** select 值 → ffmpeg 表达式映射（如 position → overlay 坐标），仅执行器使用 */
+  select_exprs: Record<string, string>
+  /** 值为空时省略该 ffmpeg 参数（如 scale 留空） */
+  omit_when_empty: boolean
+}
+
+/** 模板端口（输入/输出；端口类型供连线校验与参数表单提示） */
+export interface BuiltinTemplatePort {
+  name: string
+  port_type: 'audio' | 'video' | 'image' | 'text' | 'json' | 'file'
+}
+
+/** 内置 ffmpeg 模板（数据驱动：侧栏 / 参数表单 / 执行器同源） */
+export interface BuiltinTemplate {
+  id: string
+  kind: 'ffmpeg_template'
+  /** 侧栏分组：video / audio / subtitle */
+  category: string
+  display_name: string
+  display_name_en: string
+  description: string
+  description_en: string
+  inputs: BuiltinTemplatePort[]
+  outputs: BuiltinTemplatePort[]
+  params: BuiltinTemplateParam[]
+  /** ffmpeg args 模板（含 {input}/{input2}/{output}/{param:*} 占位符） */
+  args: string[]
+  /** 默认输出扩展名（不含点，抽帧为目录产物时为空串） */
+  output_extension: string
+  /** 扩展名跟随的参数名（如 subtitle-convert 的 to_format） */
+  extension_param?: string | null
+  /** true = 产物是目录（抽帧序列） */
+  output_is_dir: boolean
+}
+
+/** GET /api/builtins 响应 */
+export interface BuiltinTemplatesResponse {
+  count: number
+  templates: BuiltinTemplate[]
+}

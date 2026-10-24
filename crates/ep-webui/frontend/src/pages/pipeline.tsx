@@ -42,6 +42,7 @@ import { toast } from 'sonner'
 
 import { api } from '@/api/client'
 import type {
+  BuiltinTemplate,
   CapabilityDecl,
   DeviceResponse,
   ExecutePipelineRequest,
@@ -119,6 +120,7 @@ import type {
 } from '@/components/shared/pipeline-node'
 import { confirmDialog } from '@/components/shared/confirm-dialog'
 import { PipelineSidebar } from '@/components/shared/pipeline-sidebar'
+import type { TemplateDragPayload } from '@/components/shared/pipeline-sidebar'
 import { PipelineToolbar } from '@/components/shared/pipeline-toolbar'
 
 /** 媒体查询订阅 hook（lg = 64rem 为桌面三栏布局断点） */
@@ -588,6 +590,15 @@ function toSpec(
           for (const [flat] of FILE_GATE_MEDIA_KEYS) delete params[flat]
           if (Object.keys(media).length > 0) params.media = media as unknown as ParamValue
         }
+        // T-13：ffmpeg 模板节点（params.template）在服务端契约里是
+        // builtin = "ffmpeg_template"，模板 id 与参数原样下发（执行器零模型成本
+        // 按模板表渲染命令）；无模板的普通 ffmpeg 节点保持原样。
+        if (n.data.builtin === 'ffmpeg') {
+          const templateId = typeof params.template === 'string' ? params.template.trim() : ''
+          if (templateId) {
+            return { ...common, params, kind: 'builtin', builtin: 'ffmpeg_template' }
+          }
+        }
         return { ...common, params, kind: 'builtin', builtin: n.data.builtin }
       }
       case 'module':
@@ -732,6 +743,73 @@ function normalizePortName(
   return port
 }
 
+// ============================================================
+// T-13：内置 ffmpeg 模板库（GET /api/builtins）前端桥接
+//
+// 模板在服务端契约里是 builtin = "ffmpeg_template"（执行器按模板表渲染命令），
+// 画布上仍以 ffmpeg builtin 承载（端口/handle 沿用 BUILTIN_DEFS.ffmpeg），
+// 模板 id 存于 params.template，参数表单由模板 schema 数据驱动。
+// ============================================================
+
+/** 模板参数 schema → ParamSpec（与模块 manifest 参数表单同形；标签走 i18n）。 */
+function templateParamSpecs(template: BuiltinTemplate): ParamSpec[] {
+  return template.params.map((p) => {
+    const type: ParamSpec['type'] =
+      p.kind === 'select'
+        ? 'select'
+        : p.kind === 'bool'
+          ? 'boolean'
+          : p.kind === 'integer' || p.kind === 'number'
+            ? 'number'
+            : 'string'
+    const hint = tp(`builtinTemplate.${template.id}.params.${p.name}.hint`, { defaultValue: '' })
+    return {
+      name: p.name,
+      label: tp(`builtinTemplate.${template.id}.params.${p.name}`, { defaultValue: p.name }),
+      type,
+      ...(p.kind === 'select' ? { options: p.options } : {}),
+      ...(p.kind === 'integer' ? { step: 1 } : {}),
+      defaultValue: p.default,
+      ...(typeof p.min === 'number' ? { min: p.min } : {}),
+      ...(typeof p.max === 'number' ? { max: p.max } : {}),
+      ...(hint ? { hint } : {}),
+    }
+  })
+}
+
+/**
+ * 模板节点创建：基座走 createPipelineNode（builtin=ffmpeg 的端口/样式），
+ * 参数整体替换为「模板 id + 模板默认参数」，输出扩展名按模板元数据补齐
+ * （extension_param 由执行器从对应参数推导，目录产物不设扩展名）。
+ */
+function createTemplateNode(
+  payload: DragPayload,
+  position: { x: number; y: number },
+  templateList: BuiltinTemplate[] | null,
+): PipelineFlowNode {
+  const templateId = (payload as TemplateDragPayload).templateId
+  const template = templateId ? (templateList?.find((item) => item.id === templateId) ?? null) : null
+  const base = createPipelineNode(payload, position)
+  if (!template || base.data.kind !== 'builtin') return base
+  // 已收窄到 builtin 分支；createPipelineNode 的返回是联合类型，这里显式收窄
+  const builtinBase = base as BuiltinFlowNode
+  const params: NodeParams = {
+    template: template.id,
+    ...defaultParams(templateParamSpecs(template)),
+  }
+  if (!template.extension_param && !template.output_is_dir && template.output_extension) {
+    params.output_extension = template.output_extension
+  }
+  return {
+    ...builtinBase,
+    data: {
+      ...builtinBase.data,
+      label: tp(`builtinTemplate.${template.id}.name`, { defaultValue: template.display_name }),
+      params,
+    },
+  }
+}
+
 /**
  * 服务端 PipelineSpec → React Flow 画布（fromSpec）。
  *
@@ -769,6 +847,27 @@ function fromSpec(
     const params = (sn.params ?? {}) as NodeParams
 
     if (sn.kind === 'builtin') {
+      // T-13：执行器模板节点在画布上以 ffmpeg builtin 呈现（端口/handle 沿用
+      // BUILTIN_DEFS.ffmpeg），模板 id 保留在 params.template，保存时由 toSpec
+      // 桥接回 ffmpeg_template，保证 加载→保存 往返不丢失。
+      if (sn.builtin === 'ffmpeg_template') {
+        const templateId = typeof params.template === 'string' ? params.template.trim() : ''
+        const data: PipelineNodeData = {
+          kind: 'builtin',
+          builtin: 'ffmpeg',
+          label:
+            sn.label ||
+            (templateId
+              ? tp(`builtinTemplate.${templateId}.name`, { defaultValue: templateId })
+              : BUILTIN_DEFS.ffmpeg.label),
+          status: 'waiting',
+          params,
+        }
+        applyTiming(data, sn)
+        nodes.push({ id: sn.id, type: 'builtin', position, data })
+        known.add(sn.id)
+        continue
+      }
       const builtin = sn.builtin as BuiltinKind | undefined
       if (builtin && builtin in BUILTIN_DEFS) {
         // §5.6：file_gate 的嵌套 media 对象还原为 UI 平铺键（往返不丢失；
@@ -1434,7 +1533,13 @@ function collectImportIssues(
   const issues: ImportIssue[] = []
   for (const node of spec.nodes) {
     if (node.kind === 'builtin') {
-      if (node.builtin && !(node.builtin in BUILTIN_DEFS)) {
+      // T-13：ffmpeg_template 是执行器模板节点（画布可渲染，fromSpec 桥接），
+      // 不算未知 builtin。
+      if (
+        node.builtin &&
+        node.builtin !== 'ffmpeg_template' &&
+        !(node.builtin in BUILTIN_DEFS)
+      ) {
         issues.push({
           level: 'info',
           text: t('io.builtinSkipped', {
@@ -1603,6 +1708,8 @@ interface NodeParamsPanelProps {
   devices?: DeviceResponse[]
   /** 该模块当前激活变体（config.active_models；undefined = 未知/跟随默认变体） */
   activeVariant?: string
+  /** T-13：内置 ffmpeg 模板目录（模板节点的参数表单按模板 schema 渲染） */
+  templateList?: BuiltinTemplate[] | null
 }
 
 function NodeParamsPanel({
@@ -1616,9 +1723,14 @@ function NodeParamsPanel({
   variants,
   devices,
   activeVariant,
+  templateList,
 }: NodeParamsPanelProps) {
   const { t } = useTranslation('pipeline')
-  const specs = getParamSpecs(node.data)
+  // T-13：模板节点（params.template 命中模板目录）用模板参数 schema，
+  // 普通节点沿用 getParamSpecs（builtin/module 元数据）。
+  const templateId = typeof node.data.params.template === 'string' ? node.data.params.template : ''
+  const template = templateList?.find((item) => item.id === templateId) ?? null
+  const specs = template ? templateParamSpecs(template) : getParamSpecs(node.data)
   const status = NODE_STATUS_META[node.data.status]
   const moduleData = node.data.kind === 'module' ? node.data : null
   const binding = getModuleBinding(node.data)
@@ -3250,6 +3362,8 @@ function PipelineEditor() {
   // ---- 设备 / 模块 / 模型 / 激活变体（§6.2/§6.3/§5.2 数据源） ----
   const [devices, setDevices] = useState<DeviceResponse[]>([])
   const [moduleList, setModuleList] = useState<ModuleResponse[] | null>(null)
+  /** T-13：内置 ffmpeg 模板目录（/api/builtins；侧栏/节点创建/参数表单同源） */
+  const [templateList, setTemplateList] = useState<BuiltinTemplate[] | null>(null)
   const [modelsList, setModelsList] = useState<ModelListResponse | null>(null)
   const [activeModels, setActiveModels] = useState<Record<string, string> | null>(null)
 
@@ -3344,11 +3458,15 @@ function PipelineEditor() {
           : { x: 112, y: 40 }
         target = center
       }
-      const node = createPipelineNode(payload, { x: target.x - 112, y: target.y - 40 })
+      // T-13：模板载荷（带 templateId）生成模板节点：label/参数按模板 schema，
+      // 其余载荷（模块/普通 builtin/external）沿用 createPipelineNode。
+      const node = (payload as TemplateDragPayload).templateId
+        ? createTemplateNode(payload, { x: target.x - 112, y: target.y - 40 }, templateList)
+        : createPipelineNode(payload, { x: target.x - 112, y: target.y - 40 })
       setNodes((nds) => [...nds, node])
       toast.success(t('node.addedToast', { label: node.data.label }))
     },
-    [screenToFlowPosition, setNodes, t],
+    [screenToFlowPosition, setNodes, t, templateList],
   )
 
   const onDrop = useCallback(
@@ -3612,6 +3730,11 @@ function PipelineEditor() {
     api
       .models()
       .then(setModelsList)
+      .catch(() => {})
+    // T-13：模板目录与侧栏同源（失败不阻塞画布，模板节点退化为普通 ffmpeg 节点）
+    api
+      .builtinTemplates()
+      .then((resp) => setTemplateList(resp.templates))
       .catch(() => {})
   }, [refreshDevices, refreshActiveModels])
 
@@ -4637,6 +4760,7 @@ function PipelineEditor() {
             onParamsChange={(patch) => updateNodeParams(selectedNode.id, patch)}
             onDelete={() => void requestDeleteNode(selectedNode.id)}
             onClose={() => setSelectedNodeId(null)}
+            templateList={templateList}
             onBindingChange={(patch) => updateNodeBinding(selectedNode.id, patch)}
             onCapabilityChange={(capabilityId) =>
               changeNodeCapability(selectedNode.id, capabilityId)

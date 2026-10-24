@@ -1,5 +1,6 @@
 import type {
   AppConfig,
+  BuiltinTemplatesResponse,
   DepReport,
   DeviceResponse,
   ScheduleInfo,
@@ -501,3 +502,8 @@ export const api = {
     )
   },
 }
+
+  // 内置 ffmpeg 模板库（T-13；侧栏 / 参数表单 / 执行器同源）
+  /** 全部内置模板（GET /api/builtins；静态表投影） */
+  builtinTemplates: () =>
+    apiFetch<BuiltinTemplatesResponse>('/builtins'),

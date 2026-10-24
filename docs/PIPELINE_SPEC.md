@@ -971,3 +971,172 @@ model = "ep.systran.faster-whisper@medium"
   **无需**在 adapter 内做并发防护；
 - 并发管线 pin 同模块不同变体时，后到任务在模块节点前显式报错（§11.5
   `model` pin 语义），不静默重启模块。
+
+## 12. 内置 ffmpeg 模板契约（T-13）
+
+内置 ffmpeg 模板是**零模型成本**扩管线能力的机制：模板是纯数据（参数 schema +
+ffmpeg args 模板），执行器按模板表拼装命令，不引入任何模型/模块依赖。
+
+### 12.1 单一数据源
+
+| 消费方 | 位置 | 说明 |
+|---|---|---|
+| 模板表（唯一来源） | `crates/ep-core/src/pipeline/builtin_templates.rs` 的 `TEMPLATES` 静态表 | 新增模板只改这里，Rust/前端零改动 |
+| 执行器 | `executor::execute_builtin_ffmpeg_template` | `builtin = "ffmpeg_template"` 的 dispatch 分支 |
+| DAG 端口登记 | `dag::builtin_port_type` → `builtin_templates::template_port_type` | 端口类型参与连边兼容校验 |
+| HTTP 目录 | `GET /api/builtins` | 返回 `{"count": N, "templates": [...]}`（与模板表同源序列化） |
+| 前端侧栏/参数表单 | 侧栏按 `category` 分组渲染；节点参数表单按模板 `params` schema 渲染 | 模板名/参数标签走 `i18n/*/pipeline.json` 的 `builtinTemplate.*` |
+
+### 12.2 节点形态（管线 spec / TOML）
+
+模板节点与既有 builtin 节点同形，仅 `builtin` 取 `"ffmpeg_template"` 且
+`params` 至少含 `template`：
+
+```json
+{
+  "kind": "builtin",
+  "builtin": "ffmpeg_template",
+  "params": { "template": "transcode", "codec": "h264", "crf": 23 }
+}
+```
+
+对应 TOML：
+
+```toml
+[[nodes]]
+id = "transcode-1"
+kind = "builtin"
+builtin = "ffmpeg_template"
+label = "转码"
+params = { template = "transcode", codec = "h264", crf = 23 }
+```
+
+参数规则：
+
+- `params.template`（必填）：模板 id，未知 id → 节点失败（`unknown ffmpeg
+  template`），不做静默回退；
+- 其余键为模板参数，缺省取模板默认值；数值参数做 `min..=max` 闭区间校验、
+  `select` 参数做 `options` 白名单校验，越界/非法值 → 节点失败并给出模板 id 与参数名；
+- `params.output`（可选）：显式输出路径，优先级高于一切扩展名规则；
+- `params.output_extension`（可选）：覆盖默认输出扩展名（抽帧等目录产物忽略）。
+
+画布往返（`toSpec`/`fromSpec`）约定：画布节点仍以 `builtin = "ffmpeg"` +
+`params.template` 呈现（复用既有 ffmpeg 节点端口/样式），保存时桥接为
+`ffmpeg_template`，加载时反向还原，模板 id 与参数在 加载→保存 往返中不丢失。
+画布单入口 handle `in` 对应模板的首个输入端口，多入口模板需要两条入边（按边顺序
+依次对应 `{input}` / `{input2}`）；执行器不依赖端口名，按入边顺序收集上游文件产物。
+
+### 12.3 `GET /api/builtins` 模板 JSON 形态
+
+```json
+{
+  "count": 9,
+  "templates": [
+    {
+      "id": "transcode",
+      "kind": "ffmpeg_template",
+      "category": "video",
+      "display_name": "转码",
+      "display_name_en": "Transcode",
+      "description": "统一编码格式，可调 CRF / 预设，可选缩放",
+      "description_en": "Re-encode with codec, CRF and preset; optional scaling",
+      "inputs": [{ "name": "input", "port_type": "video" }],
+      "outputs": [{ "name": "output", "port_type": "video" }],
+      "params": [
+        {
+          "name": "codec",
+          "kind": "select",
+          "default": "h264",
+          "min": null,
+          "max": null,
+          "options": ["h264", "hevc"],
+          "select_exprs": { "h264": "libx264", "hevc": "libx265" },
+          "omit_when_empty": false
+        },
+        { "name": "crf", "kind": "integer", "default": 23, "min": 0, "max": 51, "options": [], "select_exprs": {}, "omit_when_empty": false }
+      ],
+      "args": ["-i", "{input}", "-c:v", "{param:codec}", "-crf", "{param:crf}", "-preset", "{param:preset}", "-c:a", "copy", "-vf", "scale={param:scale}", "{output}"],
+      "output_extension": "mp4",
+      "extension_param": null,
+      "output_is_dir": false
+    }
+  ]
+}
+```
+
+字段语义：
+
+| 字段 | 语义 |
+|---|---|
+| `id` | 模板 id（全局唯一，小写连字符；`params.template` 取值） |
+| `kind` | 恒为 `"ffmpeg_template"` |
+| `category` | 侧栏分组：`video` / `audio` / `subtitle` |
+| `display_name` / `display_name_en` | 中/英文展示名（前端再经 i18n 覆盖，缺失时兜底） |
+| `inputs` / `outputs` | 端口列表 `{name, port_type}`；`port_type ∈ audio/video/image/text/json/file` |
+| `params` | 参数 schema 数组，字段见下 |
+| `args` | ffmpeg 参数模板（不含程序名，运行时 `ffmpeg -y <args...>`） |
+| `output_extension` | 默认产物扩展名（不含点；目录产物为空串） |
+| `extension_param` | 扩展名跟随的参数名（如 `subtitle-convert` 的 `to_format`），非空时优先于 `output_extension` |
+| `output_is_dir` | `true` = 产物是目录（抽帧序列），输出路径为 `{work_dir}/{node_id}_frames` |
+
+参数 schema 字段：`name`、`kind`（`integer`/`number`/`select`/`bool`/`string`）、
+`default`（与 kind 匹配的类型：整数/浮点 → number，布尔 → bool，其余 → string）、
+`min`/`max`（数值闭区间，可空）、`options`（select 白名单）、`select_exprs`
+（select 值 → ffmpeg 表达式映射，仅执行器消费）、`omit_when_empty`（渲染为空时
+连同紧邻的前一个 ffmpeg 选项 flag 一并省略，实现可选滤镜/可选参数）。
+
+### 12.4 参数 → ffmpeg 参数映射规则
+
+`render_template_args` 对 `args` 逐 token 做占位符替换（`select_exprs` 表达式内
+可继续嵌套 `{param:*}`，最多 4 轮展开）：
+
+| 占位符 | 替换为 |
+|---|---|
+| `{input}` / `{input2}` | 第 1/2 个上游文件产物路径（按入边顺序；缺失 → 报错并提示连接对应输入端口） |
+| `{input_filter}` / `{input2_filter}` | 同上，但按 ffmpeg 滤镜参数转义：`\` → `/`，并转义 `:` `'` `[` `]` `,` `;`（Windows `C:\a\b.srt` → `C\:/a/b.srt`，供 `subtitles=` 等滤镜使用） |
+| `{output}` | 本节点输出路径（渲染器回报是否使用过，供执行器决定是否自动追加输出路径） |
+| `{param:<name>}` | 参数值（缺省取模板默认值；select 先按 `select_exprs` 映射） |
+
+补充规则：
+
+- `omit_when_empty = true` 的参数渲染为空串时，该 token 连同相邻的前一个
+  `-flag` 一并省略（如 `scale` 留空时整段 `-vf scale=…` 消失）；
+- 输出路径解析顺序：`params.output` → 目录产物（`{work_dir}/{node_id}_frames`）
+  → `params.output_extension` → `extension_param` 指向的参数值 → 模板
+  `output_extension`；
+- 目录产物执行成功后要求目录内至少存在 1 个文件，否则节点失败；
+- 打包/失败语义与既有 ffmpeg builtin 节点一致：`kill_on_drop`、stderr 透出、
+  产物未落盘报错、成功返回 `Artifact::File`。
+
+### 12.5 内置模板清单（9 个）
+
+| id | 分类 | 参数（默认值） | 输入端口 | 输出 | 产物 |
+|---|---|---|---|---|---|
+| `transcode` | video | codec(h264)、crf(23)、preset(medium)、scale(空) | `input`: video | video | `.mp4` |
+| `concat` | video | 无 | `input`: video、`input2`: video | video | `.mp4`（两段首尾拼接） |
+| `extract-frames` | video | fps(1)、format(png)、start(0) | `input`: video | image | 目录 `frame_%04d.<format>` |
+| `clip` | video | start(0)、end(10) | `input`: video | video | `.mp4`（`-c copy` 无损） |
+| `speed` | video | factor(2，0.25–4) | `input`: video | video | `.mp4` |
+| `volume-normalize` | audio | target(-16 LUFS，-70–-5) | `input`: audio | audio | `.m4a`（loudnorm） |
+| `subtitle-convert` | subtitle | to_format(srt；srt/vtt/ass) | `input`: file | file | 扩展名随 `to_format` |
+| `burn-in` | subtitle | crf(20) | `input`: video、`input2`: file | video | `.mp4`（字幕硬烧） |
+| `watermark` | video | position(bottom-right)、opacity(0.8)、margin(10) | `input`: video、`input2`: image | video | `.mp4` |
+
+### 12.6 端口类型与 DAG 校验
+
+- `template_port_type(params, port, is_output)`：按 `params.template` 查表；
+  输出端口 `output`（兼容画布 handle `out`），输入端口按 `inputs[].name`
+  （兼容画布单入口 handle `in` → 首个输入端口）；
+- 未知模板或未知端口名 → `None`，DAG 校验跳过该端口的类型兼容检查（与既有
+  builtin 节点语义一致，不误报）；
+- 端口类型不兼容（如 audio 上游接 `transcode` 的 video 输入）在
+  `Pipeline::validate` 阶段报 `PortTypeMismatch`，执行前拦截。
+
+### 12.7 新增模板的步骤（维护契约）
+
+1. 在 `builtin_templates.rs` 的 `TEMPLATES` 追加一条 `BuiltinTemplate`；
+2. 在 `i18n/locales/{zh-CN,en}/pipeline.json` 追加
+   `builtinTemplate.<id>.name/description` 与
+   `builtinTemplate.<id>.params.<param>` 标签；
+3. 补一条 `args` 渲染单测（默认值 → 期望命令、必填输入缺失 → 报错）；
+4. 无需改动执行器、DAG、API 或前端组件——四处消费方均读同一张表。
