@@ -18,6 +18,9 @@ uuid.workspace = true
 sha2.workspace = true
 hex.workspace = true
 
+# T-11：模型下载前目标盘剩余空间探测（available_space，跨平台）
+fs2.workspace = true
+
 # LNX-02：Unix 进程组级进程树回收（kill(-pgid, …)），Windows 编译面不引入
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

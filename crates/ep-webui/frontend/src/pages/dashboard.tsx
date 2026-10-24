@@ -7,12 +7,15 @@ import {
   TriangleAlert,
 } from 'lucide-react'
 import type { ReactNode } from 'react'
+import { useEffect, useState } from 'react'
 import { Trans, useTranslation } from 'react-i18next'
+import { api } from '@/api/client'
 import type {
   DepReport,
   DeviceResponse,
   ModuleResponse,
   ModuleStatusResponse,
+  StorageReport,
 } from '@/api/types'
 import { PageContainer } from '@/components/layout/page-container'
 import { DeviceCard } from '@/components/shared/device-card'
@@ -337,7 +340,174 @@ function ModulesSection({
   )
 }
 
-/* ---------- 区块三：系统依赖 ---------- */
+/* ---------- 区块三：存储水位（T-11） ---------- */
+
+/** 字节数 → 人类可读（1024 进制：GiB 保留 1 位小数，MiB/KiB 取整） */
+function formatBytes(bytes: number): string {
+  const gib = bytes / 1024 ** 3
+  if (gib >= 1) return `${gib.toFixed(1)} GiB`
+  const mib = bytes / 1024 ** 2
+  if (mib >= 1) return `${mib.toFixed(0)} MiB`
+  return `${Math.round(bytes / 1024)} KiB`
+}
+
+/** 存储水位卡片：workspace / models / tasks 三目录已用 + 模型缓存盘剩余。
+ *
+ *  数据来自 GET /api/storage（T-11），30s 轮询一次；失败时保留上一次数据
+ *  只是翻转失败提示，避免网络抖动把整张卡片清空。
+ *  占用条按「三目录已用 /（已用 + 模型盘剩余）」估算：默认部署三者同盘，
+ *  自定义 cache_dir 跨盘时该比例仅供参考（标题旁同时给出精确剩余值）。 */
+function StorageSection() {
+  const { t } = useTranslation('dashboard')
+  const [report, setReport] = useState<StorageReport | null>(null)
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    const load = () => {
+      api
+        .storage()
+        .then((data) => {
+          if (cancelled) return
+          setReport(data)
+          setFailed(false)
+        })
+        .catch(() => {
+          if (!cancelled) setFailed(true)
+        })
+    }
+    load()
+    const timer = window.setInterval(load, 30_000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [])
+
+  const freeBytes = report?.free_bytes ?? null
+  const usedTotal =
+    report?.dirs.reduce((sum, dir) => sum + dir.used_bytes, 0) ?? 0
+  const capacity = usedTotal + (freeBytes ?? 0)
+  const ratio = capacity > 0 ? usedTotal / capacity : 0
+  const tone =
+    ratio >= 0.9
+      ? 'bg-status-error'
+      : ratio >= 0.7
+        ? 'bg-status-preparing'
+        : 'bg-status-running'
+
+  return (
+    <section>
+      <SectionHeader
+        icon={<HardDrive className="size-4" />}
+        title={t('storage.title')}
+        extra={
+          report ? (
+            <span className="text-xs text-muted-foreground">
+              <Trans
+                i18nKey="storage.summary"
+                ns="dashboard"
+                values={{
+                  used: formatBytes(usedTotal),
+                  free: freeBytes == null ? '—' : formatBytes(freeBytes),
+                }}
+                components={{
+                  b: <span className="font-mono font-semibold text-foreground" />,
+                }}
+              />
+            </span>
+          ) : undefined
+        }
+      />
+      {report == null ? (
+        failed ? (
+          <Card className="glass-card border-dashed py-0">
+            <CardContent className="flex items-start gap-2.5 px-5 py-4">
+              <CircleAlert className="mt-0.5 size-4 shrink-0 text-status-error" />
+              <div>
+                <p className="text-sm font-medium text-status-error">
+                  {t('storage.loadFailed')}
+                </p>
+                <p className="mt-0.5 text-xs text-muted-foreground">
+                  {t('storage.loadFailedHint')}
+                </p>
+              </div>
+            </CardContent>
+          </Card>
+        ) : (
+          <Card className="glass-card py-0">
+            <CardContent className="space-y-3 px-5 py-4">
+              {Array.from({ length: 3 }).map((_, i) => (
+                <Skeleton key={i} className="h-5 w-full" />
+              ))}
+            </CardContent>
+          </Card>
+        )
+      ) : (
+        <Card className="glass-card py-0">
+          <CardContent className="space-y-4 px-5 py-4">
+            {/* 总占用条：>=70% 预警、>=90% 危险（状态色令牌） */}
+            <div className="space-y-1.5">
+              <div className="flex items-baseline justify-between text-xs">
+                <span className="text-muted-foreground">
+                  {t('storage.usage')}
+                </span>
+                <span className="font-mono text-muted-foreground">
+                  {(ratio * 100).toFixed(1)}%
+                </span>
+              </div>
+              <div
+                className="h-1.5 overflow-hidden rounded-full bg-muted"
+                role="progressbar"
+                aria-label={t('storage.title')}
+                aria-valuenow={Math.round(ratio * 100)}
+                aria-valuemin={0}
+                aria-valuemax={100}
+              >
+                <div
+                  className={cn(
+                    'h-full rounded-full transition-[width] duration-500',
+                    tone,
+                  )}
+                  style={{ width: `${Math.min(100, ratio * 100)}%` }}
+                />
+              </div>
+            </div>
+
+            <div className="space-y-2.5">
+              {report.dirs.map((dir) => (
+                <div
+                  key={dir.name}
+                  className="flex items-baseline justify-between gap-3 text-xs"
+                >
+                  <div className="min-w-0">
+                    <span className="font-medium">
+                      {t(`storage.dir.${dir.name}`)}
+                    </span>
+                    <p className="truncate font-mono text-[11px] text-muted-foreground/70">
+                      {dir.path}
+                    </p>
+                  </div>
+                  <span className="shrink-0 font-mono text-muted-foreground">
+                    {formatBytes(dir.used_bytes)}
+                  </span>
+                </div>
+              ))}
+            </div>
+
+            {failed && (
+              <p className="text-xs text-status-error">
+                {t('storage.loadFailedHint')}
+              </p>
+            )}
+          </CardContent>
+        </Card>
+      )}
+    </section>
+  )
+}
+
+/* ---------- 区块四：系统依赖 ---------- */
 
 function DepCard({
   title,
@@ -550,6 +720,7 @@ export function DashboardPage() {
           moduleStatus={moduleStatus}
           loading={loading}
         />
+        <StorageSection />
         <DepsSection deps={deps} loading={loading} />
       </div>
     </PageContainer>

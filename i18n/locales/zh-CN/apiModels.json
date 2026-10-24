@@ -55,5 +55,6 @@
   "inputUploadPlaceFailed": "输入文件落盘失败: {{detail}}",
   "tagsNoMeta": "模型没有下载元数据（.ep_meta.json），无法设置标签",
   "tagsWriteFailed": "写入模型标签失败：{{detail}}",
-  "cancelNotActive": "该模型没有进行中的下载，无需取消"
+  "cancelNotActive": "该模型没有进行中的下载，无需取消",
+  "storageInsufficient": "磁盘空间不足：模型下载约需 {{required_mb}} MB，模型缓存盘当前可用 {{available_mb}} MB。请清理磁盘或更换模型缓存目录后重试"
 }

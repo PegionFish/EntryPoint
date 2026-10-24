@@ -683,6 +683,42 @@ async fn download_model(
         )
         .await;
     }
+    // ── 磁盘空间预检（T-11）──
+    // 放在「去重/已存在」检查之后、入队与 spawn 之前：磁盘明显不足时立即
+    // 失败，避免下载跑到一半因 ENOSPC 留下残缺产物（排队中的任务同样受此门禁）。
+    let target_dir = mgr.cache_dir().join(&decl.target_dir);
+    if let Err(err) = ep_core::model::ModelManager::ensure_download_space(
+        &target_dir,
+        decl.size_estimate_mb,
+    ) {
+        if let Some(insufficient) = err.downcast_ref::<ep_core::model::StorageInsufficient>() {
+            let to_mb = |bytes: u64| (bytes as f64 / (1024.0 * 1024.0)).ceil() as u64;
+            return err_response(
+                &state,
+                StatusCode::INSUFFICIENT_STORAGE,
+                "apiModels.storageInsufficient",
+                &[
+                    (
+                        "required_mb",
+                        to_mb(insufficient.required_bytes).to_string(),
+                    ),
+                    (
+                        "available_mb",
+                        to_mb(insufficient.available_bytes).to_string(),
+                    ),
+                ],
+            )
+            .await;
+        }
+        // 预检本身的非常规错误（如路径异常）：按启动失败返回，保留原始详情。
+        return err_response(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "apiModels.downloadStartFailed",
+            &[("detail", err.to_string())],
+        )
+        .await;
+    }
     // venv 就绪门禁（任务 #10，与手动启动/自动拉起同源的共享助手）：
     // is_venv_ready 哈希门禁修复"半壳 venv"误判；venv 缺失自动准备，
     // 化解全新安装"下载需要 venv、启动又需要模型"的死锁。

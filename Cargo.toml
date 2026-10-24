@@ -52,6 +52,9 @@ libc = "0.2"
 sha2 = "0.11"
 hex = "0.4"
 
+# 跨平台磁盘剩余空间探测（T-11：下载前空间预检 + GET /api/storage）
+fs2 = "0.4"
+
 # Internal
 ep-core = { path = "crates/ep-core" }
 ep-pack = { path = "crates/ep-pack" }

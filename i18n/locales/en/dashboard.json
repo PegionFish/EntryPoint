@@ -24,5 +24,13 @@
   "dep.title": "System dependencies",
   "dep.ready": "Ready",
   "dep.notInstalled": "Not installed",
-  "dep.missingHint": "This dependency is missing. Some features may be unavailable."
+  "dep.missingHint": "This dependency is missing. Some features may be unavailable.",
+  "storage.title": "Storage",
+  "storage.summary": "<b>{{used}}</b> used · <b>{{free}}</b> free",
+  "storage.usage": "Disk usage",
+  "storage.loadFailed": "Failed to load storage info",
+  "storage.loadFailedHint": "Unable to fetch storage levels. Check that the backend service is running (auto-retry every 30s).",
+  "storage.dir.workspace": "Workspace",
+  "storage.dir.models": "Model cache",
+  "storage.dir.tasks": "Tasks"
 }

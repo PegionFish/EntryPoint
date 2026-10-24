@@ -207,6 +207,41 @@ pub struct UpdateCheckResult {
 
 // ─── ModelManager ────────────────────────────────────────────────────────────
 
+/// 磁盘空间不足（下载预检失败，T-11）。
+///
+/// daemon 层通过 `downcast_ref::<StorageInsufficient>()` 映射 i18n 文案，
+/// 因此字段保留原始字节数，由上层决定展示单位。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "insufficient disk space for model download: required {required_bytes} bytes, \
+     available {available_bytes} bytes at {path}"
+)]
+pub struct StorageInsufficient {
+    pub path: PathBuf,
+    pub required_bytes: u64,
+    pub available_bytes: u64,
+}
+
+/// 纯判定：可用空间 **严格小于** 需求即失败（恰好相等视为足够）。
+///
+/// 与探测解耦便于单测边界语义；探测层见
+/// [`ModelManager::available_space_bytes`]。
+fn check_download_space(
+    required: u64,
+    available: u64,
+    path: &Path,
+) -> std::result::Result<(), StorageInsufficient> {
+    if available < required {
+        Err(StorageInsufficient {
+            path: path.to_path_buf(),
+            required_bytes: required,
+            available_bytes: available,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 /// 模型下载管理器
 ///
 /// 管理模型缓存目录、元数据文件、下载命令构建。
@@ -817,6 +852,10 @@ impl ModelManager {
 
         let target_dir_path = self.model_dir(&model.target_dir);
 
+        // T-11：启动下载子进程前做空间预检——磁盘不足时立即失败，
+        // 避免 python 侧下到一半才因 ENOSPC 崩掉并留下残缺产物。
+        Self::ensure_download_space(&target_dir_path, model.size_estimate_mb)?;
+
         info!(
             model_id = %model.id,
             program = %program,
@@ -939,6 +978,48 @@ impl ModelManager {
         }
     }
 
+    // ─── 磁盘空间预检（T-11）──────────────────────────────────────────────
+
+    /// 目标路径所在磁盘卷的可用字节数。
+    ///
+    /// [`fs2::available_space`] 要求路径已存在；模型目标目录在下载前可能尚未
+    /// 创建，因此向上查找最近存在的祖先目录（模型缓存根在 daemon 启动时即存在）。
+    /// 探测失败返回 `None`：空间预检是保护而非硬门禁，见
+    /// [`ModelManager::ensure_download_space`] 的容错语义。
+    pub fn available_space_bytes(path: &Path) -> Option<u64> {
+        let mut probe = path;
+        loop {
+            if probe.exists() {
+                return fs2::available_space(probe).ok();
+            }
+            probe = probe.parent()?;
+        }
+    }
+
+    /// 下载所需字节数：`size_estimate_mb` × 1.05 安全余量。
+    ///
+    /// 5% 覆盖解包临时文件、元数据与文件系统块开销；向上取整到整 MiB。
+    pub fn required_download_bytes(size_estimate_mb: u32) -> u64 {
+        let bytes = u64::from(size_estimate_mb).saturating_mul(1024 * 1024);
+        bytes.saturating_add(bytes / 20)
+    }
+
+    /// 下载前空间预检：目标盘可用空间 < `size_estimate_mb` × 1.05 → 直接失败。
+    ///
+    /// 清单未声明大小（`None` 或 0）或探测失败时放行：无法估算需求时不应把
+    /// “不可知”当作“不足”（探测失败常见于权限受限/网络盘，下载本身会给出
+    /// 真实错误）。
+    pub fn ensure_download_space(target_dir: &Path, size_estimate_mb: Option<u32>) -> Result<()> {
+        let Some(estimate) = size_estimate_mb.filter(|mb| *mb > 0) else {
+            return Ok(());
+        };
+        let Some(available) = Self::available_space_bytes(target_dir) else {
+            return Ok(());
+        };
+        let required = Self::required_download_bytes(estimate);
+        check_download_space(required, available, target_dir).map_err(anyhow::Error::from)
+    }
+
     // ─── 带进度的下载 ─────────────────────────────────────────────────────
 
     /// 启动带进度上报的模型下载，立即返回 `DownloadHandle`。
@@ -985,6 +1066,11 @@ impl ModelManager {
 
         // 残缺产物清理依据：spawn 前判定目录是否为空（见 cleanup_partial_download）
         let target_dir_path = self.model_dir(&model.target_dir);
+
+        // T-11：同步启动路径同样先做空间预检——daemon 的
+        // `execute_download_with_progress` 调用方能在 HTTP 层立即拿到失败。
+        Self::ensure_download_space(&target_dir_path, model.size_estimate_mb)?;
+
         let dir_was_empty_at_start = !dir_has_entries(&target_dir_path);
 
         let child = cmd
@@ -2489,6 +2575,69 @@ pub fn dir_total_size(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── T-11：磁盘空间预检 ───────────────────────────────────────────────
+
+    #[test]
+    fn required_download_bytes_adds_five_percent_margin() {
+        // 100 MiB → 105 MiB（5% 余量，含临时文件与文件系统块开销）
+        assert_eq!(
+            ModelManager::required_download_bytes(100),
+            105 * 1024 * 1024
+        );
+        assert_eq!(ModelManager::required_download_bytes(0), 0);
+        // 极大值不 panic（saturating）
+        let _ = ModelManager::required_download_bytes(u32::MAX);
+    }
+
+    #[test]
+    fn check_download_space_threshold_is_strictly_less() {
+        let path = Path::new("C:/models");
+        // 恰好够用 → 放行
+        assert!(check_download_space(1000, 1000, path).is_ok());
+        // 差 1 字节 → 失败，且错误携带需求/可用/路径
+        let err = check_download_space(1000, 999, path).expect_err("should be insufficient");
+        assert_eq!(err.required_bytes, 1000);
+        assert_eq!(err.available_bytes, 999);
+        assert_eq!(err.path, PathBuf::from("C:/models"));
+    }
+
+    #[test]
+    fn ensure_download_space_skips_unknown_estimate() {
+        let dir = std::env::temp_dir().join(format!("ep-model-space-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 无大小估算 / 0 MB → 不做判断（无法估算需求时不误杀）
+        assert!(ModelManager::ensure_download_space(&dir, None).is_ok());
+        assert!(ModelManager::ensure_download_space(&dir, Some(0)).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_download_space_rejects_impossible_download() {
+        let dir = std::env::temp_dir().join(format!("ep-model-space-big-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // u32::MAX MB ≈ 4.6 PB，任何真实磁盘都不可能满足 → 预检必须失败
+        let err = ModelManager::ensure_download_space(&dir, Some(u32::MAX))
+            .expect_err("impossible download must be rejected");
+        let insufficient = err
+            .downcast_ref::<StorageInsufficient>()
+            .expect("error should be StorageInsufficient");
+        assert!(insufficient.required_bytes > insufficient.available_bytes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn available_space_bytes_probes_existing_ancestor() {
+        let dir = std::env::temp_dir().join(format!("ep-model-space-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let available =
+            ModelManager::available_space_bytes(&dir).expect("available space on temp dir");
+        assert!(available > 0);
+        // 不存在的子路径 → 向上找到存在的祖先，仍能探测
+        let nested = dir.join("not-yet-created").join("model");
+        assert!(ModelManager::available_space_bytes(&nested).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// 创建测试用 ModelsConfig
     fn test_config(cache_dir: &str) -> ModelsConfig {

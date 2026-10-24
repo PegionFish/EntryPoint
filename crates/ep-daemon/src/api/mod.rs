@@ -14,6 +14,7 @@ pub mod module_import;
 pub mod module_proxy;
 pub mod packs;
 pub mod pipelines;
+pub mod storage;
 pub mod tasks;
 pub mod upload;
 pub mod watchers;
@@ -59,6 +60,8 @@ pub fn api_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/api/builtins",
             axum::routing::get(builtin_templates),
         ))
+        // T-11：存储水位（仪表盘存储卡片 + 下载前空间预检的可观测面）
+        .merge(storage::router())
         // 统一推理 API v1 门面（/v1/*，外部稳定契约；token 中间件仅作用其子路由）
         .merge(inference::router(state))
         // 未匹配的 /api/* → 404 + JSON，避免落入 SPA 的 HTML fallback

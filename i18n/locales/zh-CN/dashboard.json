@@ -24,5 +24,13 @@
   "dep.title": "系统依赖",
   "dep.ready": "已就绪",
   "dep.notInstalled": "未安装",
-  "dep.missingHint": "该依赖缺失，部分功能可能无法使用。"
+  "dep.missingHint": "该依赖缺失，部分功能可能无法使用。",
+  "storage.title": "存储空间",
+  "storage.summary": "<b>{{used}}</b> 已用 · <b>{{free}}</b> 可用",
+  "storage.usage": "磁盘占用",
+  "storage.loadFailed": "存储信息加载失败",
+  "storage.loadFailedHint": "无法获取存储水位，请检查后端服务是否正常运行（每 30 秒自动重试）。",
+  "storage.dir.workspace": "工作区",
+  "storage.dir.models": "模型缓存",
+  "storage.dir.tasks": "任务目录"
 }

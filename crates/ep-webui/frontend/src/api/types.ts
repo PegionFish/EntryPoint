@@ -770,3 +770,21 @@ export interface BuiltinTemplatesResponse {
   count: number
   templates: BuiltinTemplate[]
 }
+
+// ===== 存储水位（T-11；GET /api/storage）=====
+
+/** 单个存储目录的已用字节数（递归统计，不跟随符号链接） */
+export interface StorageDirInfo {
+  /** 稳定逻辑名：workspace / models / tasks */
+  name: 'workspace' | 'models' | 'tasks'
+  /** 解析后的绝对路径（展示用） */
+  path: string
+  used_bytes: number
+}
+
+/** GET /api/storage 响应：三目录已用 + 模型缓存盘剩余空间 */
+export interface StorageReport {
+  dirs: StorageDirInfo[]
+  /** 探测失败时为 null（卡片只显示已用部分） */
+  free_bytes: number | null
+}

@@ -4,6 +4,7 @@ import type {
   DepReport,
   DeviceResponse,
   ScheduleInfo,
+  StorageReport,
   ExecutePipelineRequest,
   ExecutePipelineResponse,
   ImportRequest,
@@ -565,4 +566,8 @@ export const api = {
   /** 全部内置模板（GET /api/builtins；静态表投影） */
   builtinTemplates: () =>
     apiFetch<BuiltinTemplatesResponse>('/builtins'),
+
+  // 存储水位（T-11；仪表盘存储卡片）
+  /** 三目录已用字节数 + 模型缓存盘剩余空间（GET /api/storage） */
+  storage: () => apiFetch<StorageReport>('/storage'),
 }
