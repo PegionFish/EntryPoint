@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
 /// 启动加载时对非终态任务的改判错误文本（"重启中断"特征）。
 ///
 /// 上次进程退出时仍处于 `queued` / `running` 的任务不可能再完成，
@@ -34,6 +35,17 @@ use serde::{Deserialize, Serialize};
 /// 逻辑据此特征识别崩溃遗留任务，避免把仍在运行中的任务误判为终态。
 pub const INTERRUPTED_BY_RESTART_ERROR: &str =
     "task interrupted by daemon restart (never finished)";
+
+/// 任务调度默认优先级（§6.8 排序扩展）。
+///
+/// 数值越小越先出队：`0-49` 为高优先，`50` 为缺省，`51-255` 为低优先。
+/// 同优先级严格按入队 FIFO 保序，因此旧行为（全部缺省）与纯 FIFO 完全一致。
+pub const DEFAULT_TASK_PRIORITY: u8 = 50;
+
+/// 旧落盘 JSON 无 `priority` 字段时的 serde 默认值
+fn default_priority() -> u8 {
+    DEFAULT_TASK_PRIORITY
+}
 
 // ─── 任务状态 ────────────────────────────────────────────────────────────────
 
@@ -110,6 +122,10 @@ pub struct TaskRecord {
     /// 队列位置（1 起；仅 status=Queued 时有意义）。运行期瞬态值，不落盘。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_position: Option<usize>,
+    /// 调度优先级（数值越小越先出队；0-49 高优先，50 缺省，同优先级 FIFO）。
+    /// 旧落盘 JSON 无此字段 → 默认 50。
+    #[serde(default = "default_priority")]
+    pub priority: u8,
     /// 提交（入队）时间。命名沿用既有 API 契约（tasks.rs 直接消费）。
     pub started_at: DateTime<Utc>,
     /// 实际开始执行时间（Queued 期间为 None；用于排队耗时统计）
@@ -445,6 +461,7 @@ mod tests {
             status,
             error: None,
             queue_position: None,
+            priority: DEFAULT_TASK_PRIORITY,
             started_at: Utc::now(),
             started_running_at: None,
             finished_at: None,
@@ -483,6 +500,26 @@ mod tests {
         assert_eq!(v, serde_json::json!("queued"));
         let back: TaskState = serde_json::from_value(serde_json::json!("cancelled")).unwrap();
         assert_eq!(back, TaskState::Cancelled);
+    }
+
+    // ── 调度优先级（§6.8 排序扩展） ──────────────────────────────────────────
+
+    #[test]
+    fn task_record_priority_defaults_to_50_and_roundtrips() {
+        // 旧落盘 JSON（无 priority 字段）反序列化 → 默认 50，兼容历史记录
+        let mut value = serde_json::to_value(record("t1", "p1", TaskState::Queued)).unwrap();
+        value.as_object_mut().unwrap().remove("priority");
+        let parsed: TaskRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.priority, DEFAULT_TASK_PRIORITY);
+        assert_eq!(parsed.priority, 50);
+
+        // 显式优先级随 JSON 往返保真
+        let mut rec = record("t2", "p1", TaskState::Queued);
+        rec.priority = 10;
+        let value = serde_json::to_value(&rec).unwrap();
+        assert_eq!(value["priority"], serde_json::json!(10));
+        let back: TaskRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(back.priority, 10);
     }
 
     // ── 内存注册表基本操作 ───────────────────────────────────────────────────

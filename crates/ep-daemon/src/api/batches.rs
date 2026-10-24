@@ -192,6 +192,8 @@ async fn submit_batch(
         wait: false,
         callback_url: req.callback_url.clone(),
         group: Some(group_id.clone()),
+        // 批量接入缺省优先级（T-15：50 = 与既有纯 FIFO 行为一致）
+        priority: None,
     };
     let mut task_ids = Vec::with_capacity(files.len());
     let mut failed_submissions: Vec<String> = Vec::new();

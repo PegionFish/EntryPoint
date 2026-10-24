@@ -69,6 +69,9 @@ pub(crate) struct ExecuteRequest {
     /// §6.5 完成回调：终态时 POST {task_id, status, artifacts}（best-effort）
     #[serde(default)]
     callback_url: Option<String>,
+    /// T-15 调度优先级（0-49 高优先，缺省 = 50；同优先级保持入队 FIFO）
+    #[serde(default)]
+    priority: Option<u8>,
 }
 
 /// POST /api/pipelines/{pipeline_id}/runs — 提交管线执行（run 资源化端点，
@@ -148,6 +151,7 @@ async fn execute_pipeline(
         wait: req.wait.unwrap_or(false),
         callback_url: req.callback_url,
         group: None,
+        priority: req.priority,
     };
     match execution::submit_pipeline_full(&state, pipeline, req.inputs, options).await {
         Ok(outcome) => {
@@ -589,6 +593,12 @@ async fn execute_single(
         .map(str::trim)
         .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto"))
         .map(str::to_string);
+    // priority（T-15）：可选调度优先级；缺省 50。非数字/越界宽容按缺省处理
+    // （与本 handler 其余可选字段的宽松口径一致）。
+    let priority: Option<u8> = body
+        .get("priority")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u8::try_from(v).ok());
     let request_params = match body.get("params") {
         None | Some(Value::Null) => json!({}),
         Some(p) if p.is_object() => p.clone(),
@@ -724,7 +734,10 @@ async fn execute_single(
         params,
         input_path,
         device_hint.as_deref(),
-        execution::SubmitOptions::default(),
+        execution::SubmitOptions {
+            priority,
+            ..Default::default()
+        },
     )
     .await
     {

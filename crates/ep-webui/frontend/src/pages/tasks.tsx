@@ -10,13 +10,16 @@ import {
   FileBox,
   GitBranch,
   Inbox,
+  ListOrdered,
   Loader2,
+  Pause,
+  Play,
   RefreshCw,
   TriangleAlert,
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
-import { api } from '@/api/client'
+import { api, type QueueStatus } from '@/api/client'
 import type {
   ModuleResponse,
   ModuleStatusResponse,
@@ -986,6 +989,9 @@ export function TasksPage() {
   >({})
   const [tasks, setTasks] = useState<TaskSummary[] | null>(null)
   const [tasksError, setTasksError] = useState<string | null>(null)
+  /** 全局队列状态（T-15）：暂停只挡新任务派发，运行中任务不受影响 */
+  const [queueStatus, setQueueStatus] = useState<QueueStatus | null>(null)
+  const [queueBusy, setQueueBusy] = useState(false)
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   /** 任务状态筛选（§7.4；会话内保持） */
@@ -1057,16 +1063,44 @@ export function TasksPage() {
     }
   }, [t])
 
+  const refreshQueue = useCallback(async () => {
+    try {
+      setQueueStatus(await api.getQueueStatus())
+    } catch {
+      // 队列状态是辅助信息：失败静默，任务列表轮询自会提示连接异常
+    }
+  }, [])
+
+  const toggleQueue = useCallback(async () => {
+    if (queueBusy) return
+    setQueueBusy(true)
+    try {
+      const next = queueStatus?.paused
+        ? await api.resumeQueue()
+        : await api.pauseQueue()
+      setQueueStatus(next)
+      toast.success(
+        next.paused ? t('queue.pausedToast') : t('queue.resumedToast'),
+      )
+    } catch (e) {
+      toast.error(t('queue.toggleFailed'), { description: failMsg(e) })
+    } finally {
+      setQueueBusy(false)
+    }
+  }, [queueBusy, queueStatus?.paused, t])
+
   useEffect(() => {
     void refresh()
     void refreshTasks()
+    void refreshQueue()
     const timer = setInterval(() => {
       if (document.hidden) return
       void refresh()
       void refreshTasks()
+      void refreshQueue()
     }, POLL_INTERVAL)
     return () => clearInterval(timer)
-  }, [refresh, refreshTasks])
+  }, [refresh, refreshTasks, refreshQueue])
 
   // WS progress 消息：有任务在动时节流触发一次立即刷新
   useEffect(() => {
@@ -1269,6 +1303,55 @@ export function TasksPage() {
             </Button>
           </div>
         )}
+
+        {/* ── 队列状态（T-15）：优先级出队 + 全局暂停/恢复 ── */}
+        <div className="glass-card flex flex-wrap items-center gap-x-5 gap-y-3 rounded-lg px-5 py-3">
+          <div className="flex items-center gap-2 text-sm font-medium">
+            <ListOrdered className="size-4 text-muted-foreground" />
+            {t('queue.title')}
+          </div>
+          <div className="flex items-center gap-x-4 gap-y-1.5 text-sm">
+            <span className="flex items-center gap-1.5">
+              <span className="size-2 rounded-full bg-status-running" />
+              <span className="text-muted-foreground">
+                {t('queue.running')}
+              </span>
+              <span className="font-mono font-medium">
+                {queueStatus === null ? '–' : queueStatus.running}
+              </span>
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="size-2 rounded-full bg-status-preparing" />
+              <span className="text-muted-foreground">{t('queue.queued')}</span>
+              <span className="font-mono font-medium">
+                {queueStatus === null ? '–' : queueStatus.queued}
+              </span>
+            </span>
+          </div>
+          {queueStatus?.paused && (
+            <Badge
+              variant="outline"
+              className="gap-1 border-status-preparing/40 text-status-preparing"
+            >
+              <Pause className="size-3" />
+              {t('queue.paused')}
+            </Badge>
+          )}
+          <Button
+            variant={queueStatus?.paused ? 'default' : 'outline'}
+            size="sm"
+            className="ml-auto"
+            disabled={queueBusy || queueStatus === null}
+            onClick={() => void toggleQueue()}
+          >
+            {queueStatus?.paused ? (
+              <Play className="size-3.5" />
+            ) : (
+              <Pause className="size-3.5" />
+            )}
+            {queueStatus?.paused ? t('queue.resume') : t('queue.pause')}
+          </Button>
+        </div>
 
         {/* ── 概览 ── */}
         <div className="glass-card flex flex-wrap items-center gap-4 rounded-lg px-6 py-4 sm:gap-8">

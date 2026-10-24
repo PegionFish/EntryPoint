@@ -44,6 +44,13 @@ import type {
 /** apiFetch 默认超时（毫秒）：防挂死请求（如慢响应下的轮询堆积） */
 const DEFAULT_TIMEOUT_MS = 30_000
 
+/** 全局队列状态（T-15）：paused=true 时不再派发新任务，运行中任务不受影响 */
+export interface QueueStatus {
+  paused: boolean
+  running: number
+  queued: number
+}
+
 /** 访问保护令牌的 localStorage 键（T-06；仅存于当前浏览器） */
 export const API_TOKEN_STORAGE_KEY = 'entrypoint.apiToken'
 
@@ -372,6 +379,13 @@ export const api = {
     withApiToken(
       `/api/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeURIComponent(nodeId)}?inline=1`,
     ),
+  /** 全局队列状态（T-15）：运行/排队计数 + 是否暂停 */
+  getQueueStatus: () => apiFetch<QueueStatus>('/queue'),
+  /** 暂停队列（T-15）：只阻止新任务派发，运行中任务不受影响，排队任务保留 */
+  pauseQueue: () => apiFetch<QueueStatus>('/queue/pause', { method: 'POST' }),
+  /** 恢复队列（T-15）：立即尝试派发排队任务 */
+  resumeQueue: () =>
+    apiFetch<QueueStatus>('/queue/resume', { method: 'POST' }),
 
   // Pipelines
   listPipelines: () => apiFetch<PipelineSummary[]>('/pipelines'),

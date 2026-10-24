@@ -350,6 +350,9 @@ struct InferenceJsonRequest {
     #[serde(default)]
     wait: bool,
     callback_url: Option<String>,
+    /// T-15 调度优先级（0-49 高优先，缺省 = 50；同优先级保持入队 FIFO）
+    #[serde(default)]
+    priority: Option<u8>,
 }
 
 /// 提交推理（双形态）：按 Content-Type 分流。
@@ -450,6 +453,8 @@ async fn submit_multipart(
     let mut file_staged: Option<(PathBuf, String)> = None;
     let mut params = json!({});
     let mut wait = false;
+    // T-15：可选调度优先级；缺省 None（按默认 50 调度）
+    let mut priority: Option<u8> = None;
 
     loop {
         let field = match multipart.next_field().await {
@@ -556,6 +561,16 @@ async fn submit_multipart(
                     }
                 };
             }
+            "priority" => {
+                // 宽容口径：非数字/越界视为未指定（与 execute_single 一致）
+                priority = match field.text().await {
+                    Ok(text) => text.trim().parse::<u8>().ok(),
+                    Err(e) => {
+                        cleanup_staged(&file_staged).await;
+                        return multipart_field_error("priority", &e, Some(TEXT_FIELD_LIMIT));
+                    }
+                };
+            }
             _ => {} // 未知字段忽略（multer 自动丢弃未读内容）
         }
     }
@@ -581,8 +596,11 @@ async fn submit_multipart(
         &cap,
         params,
         stored,
-        wait,
-        None,
+        InferenceRunOptions {
+            wait,
+            callback_url: None,
+            priority,
+        },
     )
     .await
 }
@@ -732,10 +750,20 @@ async fn submit_json(
         &cap,
         params,
         input_path,
-        req.wait,
-        req.callback_url,
+        InferenceRunOptions {
+            wait: req.wait,
+            callback_url: req.callback_url,
+            priority: req.priority,
+        },
     )
     .await
+}
+
+/// 推理提交选项（T-15）：wait / callback / priority 一并透传给直跑执行器
+struct InferenceRunOptions {
+    wait: bool,
+    callback_url: Option<String>,
+    priority: Option<u8>,
 }
 
 /// 公共执行序列（对齐 execute_single 校验顺序）：参数 schema 校验与默认值
@@ -750,8 +778,7 @@ async fn run_inference(
     cap: &CapabilityDecl,
     request_params: Value,
     input_path: PathBuf,
-    wait: bool,
-    callback_url: Option<String>,
+    options: InferenceRunOptions,
 ) -> (StatusCode, Json<Value>) {
     // 1. 参数 schema 校验与默认值注入（复用 execute.rs 同一实现；
     //    multipart 路径 params 字段解析时已尽早校验过一次，此处幂等重验）
@@ -765,11 +792,13 @@ async fn run_inference(
         return autostart_error_response(e);
     }
 
-    // 3. 提交（wait/callback 语义镜像 submit_pipeline_full）
+    // 3. 提交（wait/callback 语义镜像 submit_pipeline_full；T-15 priority 透传）
+    let wait = options.wait;
     let options = SubmitOptions {
         wait,
-        callback_url,
+        callback_url: options.callback_url,
         group: None,
+        priority: options.priority,
     };
     match execution::submit_direct_full(
         state,

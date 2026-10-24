@@ -14,6 +14,7 @@ pub mod module_import;
 pub mod module_proxy;
 pub mod packs;
 pub mod pipelines;
+pub mod scheduler;
 pub mod storage;
 pub mod tasks;
 pub mod upload;
@@ -50,6 +51,8 @@ pub fn api_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .merge(models::router())
         .merge(upload::router())
         .merge(tasks::router())
+        // T-15：全局队列控制（暂停/恢复派发 + 队列运行态）
+        .merge(scheduler::router())
         .merge(deps::router())
         .merge(packs::router())
         .merge(module_proxy::router())

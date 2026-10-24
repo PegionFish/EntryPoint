@@ -58,6 +58,7 @@ WebUI 内部端点分离：本文件描述的请求/响应形状与错误码属�
 | `file` | 是 | 输入文件（落盘至 workspace/uploads）；大小受能力声明 `max_file_size_mb` 限制（未声明时 2GB 兜底），超限 → `400 INPUT_INVALID` |
 | `params` | 否 | JSON 字符串（对象），模块参数；字段上限 1MB |
 | `wait` | 否 | `"true"` 同步等待终态；缺省异步；字段上限 1MB |
+| `priority` | 否 | 任务优先级 `0`–`255`（十进制字符串）：`0`–`49` 高于缺省、`50` 缺省、同优先级先入先出；字段上限 1MB |
 
 重复 `file` 字段以最后一个为准（先前已接收的文件会被清理）。
 
@@ -69,9 +70,14 @@ WebUI 内部端点分离：本文件描述的请求/响应形状与错误码属�
   "input_path": "仅限 workspace/uploads 前缀的路径",
   "params": {},
   "wait": false,
+  "priority": 10,
   "callback_url": "http://your-host/done"
 }
 ```
+
+`priority` 可省略（缺省 50）；数值越小越先出队，同等优先级按提交顺序
+派发。全局队列暂停/恢复见 `POST /api/queue/pause`、`POST /api/queue/resume`
+（暂停只阻止新任务派发，运行中任务不受影响，排队任务保留）。
 
 `input_text` 与 `input_path` **互斥**：双缺或同传均返回 `400 INPUT_INVALID`
 （对齐内部 `POST /api/modules/{module_id}/runs`（旧别名

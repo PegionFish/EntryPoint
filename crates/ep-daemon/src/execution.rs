@@ -105,7 +105,9 @@ use ep_core::types::{Artifact, DataType, DeviceId, PipelineRunner};
 use crate::state::{AppState, ProgressMessage};
 
 // 类型下沉 ep-core 后对既有消费方（tasks.rs / execute.rs）保持原路径可用
-pub use ep_core::task_registry::{NodeRecord, TaskRecord, TaskState};
+pub use ep_core::task_registry::{
+    NodeRecord, TaskRecord, TaskState, DEFAULT_TASK_PRIORITY,
+};
 
 // ─── 进程级状态：注册表 / 调度器 / 待执行载荷 / 运行时标志 ──────────────────
 
@@ -219,11 +221,13 @@ pub fn bind_persistence(root: &Path) {
     }
 }
 
-/// 调度器：FIFO 队列 + 两级闸门计数（§6.8）+ 动态 VRAM 准入账本（§6.8b）
+/// 调度器：优先级队列（同优先级 FIFO）+ 两级闸门计数（§6.8）+ 动态 VRAM 准入账本（§6.8b）
 #[derive(Debug, Default)]
 struct Scheduler {
-    /// 等待闸门的任务（FIFO）
+    /// 等待闸门的任务（按优先级出队；同优先级保持入队顺序）
     queue: VecDeque<QueuedEntry>,
+    /// 全局暂停标志（T-15）：只挡新任务准入，运行中照常完成、排队保留
+    paused: bool,
     /// 全局运行中任务数（≤ max_parallel）
     running_count: usize,
     /// 每管线运行中任务数（≤ 该管线 max_instances，缺省跟随全局）
@@ -243,6 +247,8 @@ struct Scheduler {
 struct QueuedEntry {
     task_id: String,
     pipeline_id: String,
+    /// 调度优先级（越小越先出队；同优先级按入队顺序 FIFO）
+    priority: u8,
     /// 任务引用的模块 id（去重；动态准入消费，提交时随载荷登记）
     module_ids: Vec<String>,
 }
@@ -481,25 +487,77 @@ pub fn set_running_count_for_tests(n: usize) {
         .running_count = n;
 }
 
-fn live_queue_position(task_id: &str) -> Option<usize> {
-    scheduler()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+// ─── 队列运行态与全局暂停控制（T-15） ───────────────────────────────────────
+
+/// 队列运行态快照（`GET /api/queue` 响应体；前端队列状态条消费）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueStatus {
+    /// 是否暂停派发（运行中任务不受影响，排队任务保留）
+    pub paused: bool,
+    /// 当前运行中任务数
+    pub running: usize,
+    /// 当前排队等待派发的任务数
+    pub queued: usize,
+}
+
+/// 读取队列运行态
+pub fn queue_status() -> QueueStatus {
+    let sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
+    QueueStatus {
+        paused: sched.paused,
+        running: sched.running_count,
+        queued: sched.queue.len(),
+    }
+}
+
+/// 暂停派发（T-15）：只挡新任务准入，运行中任务照常完成，排队任务保留。
+pub fn pause_queue() -> QueueStatus {
+    {
+        let mut sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
+        sched.paused = true;
+    }
+    info!("task queue paused; running tasks keep going, queued tasks retained");
+    queue_status()
+}
+
+/// 恢复派发并立即尝试准入（异步；返回恢复后的队列快照）。
+pub fn resume_queue(state: &Arc<AppState>) -> QueueStatus {
+    {
+        let mut sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
+        sched.paused = false;
+    }
+    info!("task queue resumed");
+    tokio::spawn({
+        let state = state.clone();
+        async move { try_promote(state).await }
+    });
+    queue_status()
+}
+
+/// 排队任务的“派发序位”（1 起）：按出队规则（优先级升序，同优先级 FIFO）
+/// 计算前面还有多少任务，供任务中心展示真实等待顺序。
+fn queued_position_in(sched: &Scheduler, task_id: &str) -> Option<usize> {
+    let idx = sched.queue.iter().position(|e| e.task_id == task_id)?;
+    let target = &sched.queue[idx];
+    let ahead = sched
         .queue
         .iter()
-        .position(|e| e.task_id == task_id)
-        .map(|p| p + 1)
+        .enumerate()
+        .filter(|(i, e)| (e.priority, *i) < (target.priority, idx))
+        .count();
+    Some(ahead + 1)
+}
+
+fn live_queue_position(task_id: &str) -> Option<usize> {
+    let sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
+    queued_position_in(&sched, task_id)
 }
 
 fn annotate_queue_positions(list: &mut [TaskRecord]) {
     let sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
     for record in list.iter_mut() {
         record.queue_position = if record.status == TaskState::Queued {
-            sched
-                .queue
-                .iter()
-                .position(|e| e.task_id == record.id)
-                .map(|p| p + 1)
+            queued_position_in(&sched, &record.id)
         } else {
             None
         };
@@ -689,6 +747,9 @@ pub struct SubmitOptions {
     /// 所属任务组（外部批量接入）：同组任务共享组 id，任务中心折叠为
     /// 一条聚合展示，单个任务仍按 task_id 独立寻址
     pub group: Option<String>,
+    /// 调度优先级（T-15，§6.8 排序扩展）：`None` = 默认 50；
+    /// 0-49 高优先，同优先级保持入队 FIFO
+    pub priority: Option<u8>,
 }
 
 /// 提交结果
@@ -765,6 +826,9 @@ pub async fn submit_pipeline_full(
         return Err(SubmitError::QueueFull(MAX_INFLIGHT_TASKS));
     }
 
+    // T-15：调度优先级（缺省 50；缺省值下与纯 FIFO 行为完全一致）
+    let priority = options.priority.unwrap_or(DEFAULT_TASK_PRIORITY);
+
     let workspace = state
         .config
         .read()
@@ -813,6 +877,7 @@ pub async fn submit_pipeline_full(
         status: TaskState::Queued,
         error: None,
         queue_position: None,
+        priority,
         started_at: Utc::now(),
         started_running_at: None,
         finished_at: None,
@@ -857,6 +922,7 @@ pub async fn submit_pipeline_full(
         sched.queue.push_back(QueuedEntry {
             task_id: task_id.clone(),
             pipeline_id: pipeline_id.clone(),
+            priority,
             module_ids,
         });
     }
@@ -1076,6 +1142,26 @@ async fn admission_snapshot(state: &Arc<AppState>) -> AdmissionSnapshot {
     snap
 }
 
+/// T-15 出队选择：在通过两级闸门的排队任务中取优先级最小者；
+/// 同优先级保持 FIFO（取队列中最靠前者）。准入判定本身不变，仅改变排序。
+fn pick_next_index<F>(queue: &VecDeque<QueuedEntry>, mut eligible: F) -> Option<usize>
+where
+    F: FnMut(&QueuedEntry) -> bool,
+{
+    let mut best: Option<usize> = None;
+    for (idx, entry) in queue.iter().enumerate() {
+        if !eligible(entry) {
+            continue;
+        }
+        match best {
+            // 已选中者优先级更高（或同优先级且更靠前）→ 保持
+            Some(best_idx) if queue[best_idx].priority <= entry.priority => {}
+            _ => best = Some(idx),
+        }
+    }
+    best
+}
+
 async fn try_promote(state: Arc<AppState>) {
     let (max_parallel, timeout_secs) = {
         let cfg = state.config.read().await;
@@ -1091,10 +1177,14 @@ async fn try_promote(state: Arc<AppState>) {
         let snapshot = admission_snapshot(&state).await;
         let admitted = {
             let mut sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
+            // T-15 全局暂停：只挡新任务派发，运行中任务不受影响
+            if sched.paused {
+                break;
+            }
             if sched.running_count >= max_parallel {
                 break;
             }
-            let pick = sched.queue.iter().position(|entry| {
+            let pick = pick_next_index(&sched.queue, |entry| {
                 let limit = sched
                     .pipeline_limits
                     .get(&entry.pipeline_id)
@@ -1814,6 +1904,7 @@ async fn wait_until_terminal(state: &Arc<AppState>, task_id: &str) -> TaskRecord
                     status: TaskState::Running,
                     error: None,
                     queue_position: None,
+                    priority: DEFAULT_TASK_PRIORITY,
                     started_at: Utc::now(),
                     started_running_at: None,
                     finished_at: None,
@@ -2780,6 +2871,7 @@ to = ["output", "input"]
             status: TaskState::Completed,
             error: None,
             queue_position: None,
+            priority: DEFAULT_TASK_PRIORITY,
             started_at: now,
             started_running_at: None,
             finished_at: Some(now),
@@ -3118,6 +3210,174 @@ builtin = "file_output"
         set_test_run_hook(None);
     }
 
+    // ── 10b. 优先级出队与全局暂停/恢复（T-15） ──────────────────────────────
+
+    fn queued_entry(task_id: &str, priority: u8) -> QueuedEntry {
+        QueuedEntry {
+            task_id: task_id.to_string(),
+            pipeline_id: "p".to_string(),
+            priority,
+            module_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pick_next_index_prefers_highest_priority_then_fifo() {
+        // 高优先级任务排在后面 → 仍应被选中（数值越小越先出队）
+        let mut queue = VecDeque::from([
+            queued_entry("normal-1", 50),
+            queued_entry("normal-2", 50),
+            queued_entry("high", 10),
+        ]);
+        assert_eq!(pick_next_index(&queue, |_| true), Some(2));
+
+        // 同优先级 → FIFO（取最靠前者）
+        queue.remove(2);
+        assert_eq!(pick_next_index(&queue, |_| true), Some(0));
+
+        // 准入过滤：队首不可准入时跳过，取下一个可准入的
+        assert_eq!(
+            pick_next_index(&queue, |e| e.task_id != "normal-1"),
+            Some(1)
+        );
+
+        // 全部不可准入 → 不派发
+        assert_eq!(pick_next_index(&queue, |_| false), None);
+    }
+
+    #[test]
+    fn queued_position_reflects_priority_order() {
+        let sched = Scheduler {
+            queue: VecDeque::from([
+                queued_entry("normal-1", 50),
+                queued_entry("normal-2", 50),
+                queued_entry("high", 10),
+            ]),
+            ..Scheduler::default()
+        };
+        // 队列物理序仍是 FIFO，但展示序位按出队规则（优先级升序、同级 FIFO）编号
+        assert_eq!(queued_position_in(&sched, "high"), Some(1));
+        assert_eq!(queued_position_in(&sched, "normal-1"), Some(2));
+        assert_eq!(queued_position_in(&sched, "normal-2"), Some(3));
+        assert_eq!(queued_position_in(&sched, "ghost"), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pause_queue_holds_dispatch_and_resume_drains() {
+        let _guard = lock_for_tests();
+        clear_registry_for_tests();
+
+        let root = unique_root("pause");
+        let state = test_state(root.clone());
+        let src = root.join("pause-src.txt");
+        let dest = root.join("pause-out.txt");
+        std::fs::write(&src, "pause").unwrap();
+
+        let paused = pause_queue();
+        assert!(paused.paused, "暂停后状态应为 paused");
+
+        let outcome = submit_pipeline_full(
+            &state,
+            copy_pipeline("pause-pipe", &src, &dest),
+            None,
+            SubmitOptions {
+                wait: false,
+                callback_url: None,
+                group: None,
+                priority: Some(10),
+            },
+        )
+        .await
+        .unwrap();
+
+        // 暂停期间不派发：任务保持 queued（不产生运行）
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let record = snapshot(&outcome.task_id).unwrap();
+        assert_eq!(record.status, TaskState::Queued, "暂停后不应派发新任务");
+        assert_eq!(record.priority, 10, "提交优先级应写入任务记录");
+        let status = queue_status();
+        assert!(status.paused);
+        assert_eq!(status.queued, 1);
+        assert_eq!(status.running, 0);
+
+        // 恢复后立即派发并完成
+        let resumed = resume_queue(&state);
+        assert!(!resumed.paused, "恢复后应重新派发");
+        let done = wait_terminal(&outcome.task_id)
+            .await
+            .expect("恢复后任务应终结");
+        assert_eq!(done.status, TaskState::Completed);
+        assert!(dest.exists(), "恢复后任务应产出结果文件");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn high_priority_task_overtakes_earlier_normal_task() {
+        let _guard = lock_for_tests();
+        clear_registry_for_tests();
+
+        let root = unique_root("priority-order");
+        let mut config = AppConfig::default();
+        config.pipeline.max_parallel = 1;
+        config.pipeline.default_timeout_secs = 120;
+        let state = Arc::new(AppState::new(
+            root.clone(),
+            config,
+            vec![],
+            vec![],
+            PortManager::new(18000, 19000),
+        ));
+
+        // 记录实际执行顺序；每任务持闸 150ms，保证另一任务在排队可见
+        let order: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let order_hook = order.clone();
+        set_test_run_hook(Some(Arc::new(move |task_id| {
+            order_hook
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(task_id.to_string());
+            std::thread::sleep(Duration::from_millis(150));
+        })));
+
+        // 暂停队列先累积两个任务：normal 先入队、high 后入队
+        pause_queue();
+        let mut task_ids = Vec::new();
+        for (priority, label) in [(50u8, "normal"), (10u8, "high")] {
+            let src = root.join(format!("prio-src-{label}.txt"));
+            let dest = root.join(format!("prio-out-{label}.txt"));
+            std::fs::write(&src, "prio").unwrap();
+            let outcome = submit_pipeline_full(
+                &state,
+                copy_pipeline(&format!("prio-{label}"), &src, &dest),
+                None,
+                SubmitOptions {
+                    wait: false,
+                    callback_url: None,
+                    group: None,
+                    priority: Some(priority),
+                },
+            )
+            .await
+            .unwrap();
+            task_ids.push(outcome.task_id);
+        }
+
+        // 展示序位按优先级：high=1、normal=2（尽管 normal 先入队）
+        assert_eq!(snapshot(&task_ids[1]).unwrap().queue_position, Some(1));
+        assert_eq!(snapshot(&task_ids[0]).unwrap().queue_position, Some(2));
+
+        resume_queue(&state);
+        for id in &task_ids {
+            wait_terminal(id).await.expect("任务应终结");
+        }
+        set_test_run_hook(None);
+
+        let started = order.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(started.len(), 2);
+        assert_eq!(started[0], task_ids[1], "高优先级任务应先被执行");
+        assert_eq!(started[1], task_ids[0], "槽位释放后执行普通任务");
+    }
+
     // ── 11. 管线级 max_instances（§6.8） ────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3416,6 +3676,7 @@ builtin = "file_output"
                 wait: true,
                 callback_url: None,
                 group: None,
+                priority: None,
                 },
         )
         .await
@@ -3493,6 +3754,7 @@ builtin = "file_output"
                 wait: true,
                 callback_url: Some(format!("http://{addr}/cb")),
                 group: None,
+                priority: None,
                 },
         )
         .await
@@ -3810,6 +4072,7 @@ output_type = "json"
                 wait: true,
                 callback_url: None,
                 group: None,
+                priority: None,
                 },
         )
         .await
@@ -3897,6 +4160,7 @@ output_type = "json"
             status: TaskState::Running,
             error: None,
             queue_position: None,
+            priority: DEFAULT_TASK_PRIORITY,
             started_at: Utc::now(),
             started_running_at: Some(Utc::now()),
             finished_at: None,
@@ -3938,6 +4202,7 @@ output_type = "json"
             status: TaskState::Running,
             error: None,
             queue_position: None,
+            priority: DEFAULT_TASK_PRIORITY,
             started_at: Utc::now(),
             started_running_at: Some(Utc::now()),
             finished_at: None,
