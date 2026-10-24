@@ -192,6 +192,8 @@ token = ""
 
 令牌可经 `Authorization: Bearer <token>` 或 `X-API-Key: <token>` 提供；WebSocket 握手与 GET/HEAD 原生加载（图片/视频/下载链接）额外支持 `?token=`，POST/PUT/DELETE 不接受 query token。**令牌进入 URL 可能被访问日志、浏览器历史或 Referer 泄漏，仅建议在内网或反向代理 + TLS 下使用。** 公网暴露前建议配置随机长令牌。
 
+**`/api/v1` 独立鉴权（重要）：** `access_protection` 不覆盖 `/api/v1`——该前缀由 `[api].token` 单独守护（见 `[api]` 一节）。只开启 `access_protection` 而未配置 `[api].token` 时，v1 的推理提交、任务查询/取消与批量入口仍可匿名访问（含私网 LAN），daemon 启动时会打印告警；WebUI 设置页在令牌模式且 v1 未配置令牌时也会给出提示。
+
 ### 1.8 `[network]` — 网络代理
 
 统一控制模型下载、依赖安装与模块子进程的出口代理。取代此前"子进程隐式继承 daemon 环境变量"的不可控方式：所有需要联网的子进程显式注入这里配置的环境变量。

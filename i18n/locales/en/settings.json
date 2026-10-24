@@ -139,6 +139,7 @@
   "security.clearToken": "Clear token",
   "security.tokenWillClear": "The access token will be cleared after saving",
   "security.tokenHint": "Takes effect in this browser immediately after saving",
+  "security.apiTokenHint": "Note: access protection does not cover /api/v1 (inference, task queries/cancel, batches), which is guarded by a separate [api].token. Without it, v1 remains anonymously reachable—set [api].token in config/app.toml.",
   "validation.token": "An access token is required in token mode",
   "error.loadFailed": "Failed to load configuration. Retry or enter an access token.",
   "authDialog.title": "Access token required",

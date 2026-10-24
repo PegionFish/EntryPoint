@@ -21,7 +21,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 
 use ep_core::compute::detect_all_devices;
-use ep_core::config::{self, AppConfig};
+use ep_core::config::{self, AccessProtection, AppConfig};
 use ep_core::deps::DepReport;
 use ep_core::module::discovery::discover_modules;
 use ep_core::port::PortManager;
@@ -246,6 +246,15 @@ async fn run_server(root: PathBuf, cfg: AppConfig) -> anyhow::Result<()> {
             }
         } else {
             tracing::info!("public access blocked — only private/loopback IPs allowed (set allow_public=true to change)");
+        }
+        // 访问保护开启但 v1 无独立令牌：/api/v1 不受 access_protection 覆盖，
+        // 推理提交/任务查询/批量入口仍匿名可达（含私网 LAN），启动即告警。
+        if matches!(cfg.server.access_protection, AccessProtection::Token)
+            && (!cfg.api.enabled || cfg.api.token.as_deref().unwrap_or("").is_empty())
+        {
+            tracing::warn!(
+                "access protection (token) ENABLED but [api].token is empty — /api/v1/* (inference, tasks, batches) remains unauthenticated; set [api].token in config/app.toml"
+            );
         }
     }
 

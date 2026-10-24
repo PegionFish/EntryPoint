@@ -139,6 +139,7 @@
   "security.clearToken": "清除令牌",
   "security.tokenWillClear": "保存后将清除访问令牌",
   "security.tokenHint": "保存后本浏览器立即生效",
+  "security.apiTokenHint": "注意：访问保护不覆盖 /api/v1（推理提交、任务查询/取消、批量入口），该前缀由独立的 [api].token 守护；未配置时 v1 仍可匿名访问，请在 config/app.toml 中设置 [api].token。",
   "validation.token": "令牌模式必须填写访问令牌",
   "error.loadFailed": "配置加载失败，请重试或输入访问令牌",
   "authDialog.title": "需要访问令牌",

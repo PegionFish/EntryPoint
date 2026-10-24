@@ -381,6 +381,8 @@ export function SettingsPage() {
   /** T-16：本次保存显式清除 server.token */
   const clearServerToken =
     (config as AppConfigExt | null)?.clear_server_token === true
+  /** T-06 审查 P1：/api/v1 由独立 [api].token 守护，未配置时访问保护不覆盖 */
+  const apiTokenSet = (config as AppConfigExt | null)?.api_token_set === true
 
   /** T-06：API 返回 401 时弹出令牌输入（apiFetch / use-config 派发） */
   useEffect(() => {
@@ -847,6 +849,11 @@ export function SettingsPage() {
                   </p>
                 </div>
               </Field>
+            )}
+            {securityMode === 'token' && !apiTokenSet && (
+              <p className="text-xs text-amber-600 dark:text-amber-400">
+                {t('security.apiTokenHint')}
+              </p>
             )}
           </Section>
 
