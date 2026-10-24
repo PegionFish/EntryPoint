@@ -1,5 +1,6 @@
 mod api;
 pub(crate) mod eventlog;
+mod health_supervisor;
 mod logging;
 mod retention;
 mod schedule;
@@ -756,6 +757,13 @@ async fn run_server(root: PathBuf, cfg: AppConfig) -> anyhow::Result<()> {
     //     开关每轮实时读取——运行期经 PUT /api/config 改动即时生效，无需重启。
     updates::spawn_auto_update_checker(state.clone());
 
+    // 11.5 Spawn 模块故障自愈监督（T-14）：每 1 秒采样运行中模块状态，检测到
+    //      “曾 Running → 进程消失/健康失败”后经既有 autostart 入口自动重启；
+    //      首次立即重启、后续按 2s×2 指数退避（封顶 modules.auto_restart.
+    //      max_backoff_secs），稳定运行 10 分钟重置；连续失败达阈值熔断并写
+    //      eventlog，需手动启动解除。开关与参数每轮实时读取，PUT /api/config
+    //      改动即时生效，无需重启。
+    health_supervisor::spawn_health_supervisor(state.clone());
 
     // 12. Start server
     let cfg = state.config.read().await;
