@@ -1,0 +1,139 @@
+# EntryPoint CI 门禁（T-01）
+#
+# 三个 job 对应 reports/handoff/AGENT_HANDOFF.md §5 T-01 的三条门禁线：
+#   1. rust     —— clippy（-D warnings，与 build.sh L296 同口径）+ workspace 全量测试
+#   2. frontend —— oxlint + 生产构建（tsc -b && vite build），不跑 e2e
+#   3. matrix   —— aarch64 交叉目标 cargo check（只做类型检查，不链接、不产包）
+#
+# 范围约束（handoff §5 T-01 禁区）：CI 不安装 Python / GPU / sherpa 等模块推理依赖，
+# modules/ 适配层不在本仓库 CI 范围；所有依赖走 action 缓存。
+# README 未加状态徽章：仓库为私有，shields.io 的匿名徽章请求无法解析，加了只会显示
+# "repo not found"；需要对外展示时再补带 token 的徽章方案。
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  # 允许在 Actions 页面手动触发，便于验证 CI 本身
+  workflow_dispatch:
+
+# 同一 ref 有新 push 时取消上一轮 run：PR 连推不排队烧算力
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # 测试失败时输出完整 backtrace，便于从 CI 日志定位
+  RUST_BACKTRACE: "1"
+
+jobs:
+  rust:
+    name: rust（clippy + test）
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust stable + clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: 缓存 Cargo 构建产物
+        uses: Swatinem/rust-cache@v2
+
+      # 与 build.sh L296 严格口径一致：任何 clippy 警告都让门禁失败
+      - name: Clippy（零警告门禁）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 测试（workspace 全量）
+        run: cargo test --workspace
+
+  frontend:
+    name: frontend（lint + build）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: crates/ep-webui/frontend
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: crates/ep-webui/frontend/package-lock.json
+
+      - name: 安装前端依赖（按锁文件精确安装）
+        run: npm ci
+
+      - name: Lint（oxlint）
+        run: npm run lint
+
+      # vite 产物输出到 crates/ep-webui/static（仓库跟踪目录），仅 CI 工作区重建，不回写仓库
+      - name: 构建（tsc -b && vite build）
+        run: npm run build
+
+  matrix:
+    name: matrix（${{ matrix.target }}）
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            allow_failure: false
+          # windows arm64：check 不做链接，因此无需 MSVC 链接器；若托管 runner 的
+          # arm64 工具链异常则降级为软失败（不阻断主门禁），失败原因见 job 日志
+          # （handoff §5 T-01 允许该降级并注释说明）。
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            allow_failure: true
+    continue-on-error: ${{ matrix.allow_failure }}
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Cargo 构建产物（按目标隔离）
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: matrix-${{ matrix.target }}
+
+      - name: 安装 aarch64 标准库目标
+        run: rustup target add ${{ matrix.target }}
+
+      # aarch64 Linux 目标会编译 reqwest -> native-tls -> openssl-sys：
+      # 其构建脚本要用交叉 gcc 预处理 OpenSSL 头文件，并用 pkg-config 找到宿主 OpenSSL
+      # 头（cargo check 不链接，故宿主 amd64 的 .so 不会被真正使用）。
+      - name: 安装 aarch64 交叉检查依赖（Linux）
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu pkg-config libssl-dev
+          # Ubuntu 的多架构头文件布局：opensslconf.h 位于 /usr/include/<multiarch>/openssl/，
+          # 交叉 gcc 默认不搜索宿主的 multiarch 目录，这里显式补进 C 头文件搜索路径，
+          # 否则 openssl-sys 构建脚本的 expando.c 预处理会报 "Header expansion error"。
+          multiarch="$(gcc -dumpmachine)"
+          echo "CFLAGS_aarch64_unknown_linux_gnu=-I/usr/include -I/usr/include/${multiarch}" >> "$GITHUB_ENV"
+
+      # 仅类型检查：不链接、不产二进制，验证 arm64 目标下依赖树与代码可编译性
+      - name: cargo check（${{ matrix.target }}）
+        run: cargo check --workspace --target ${{ matrix.target }}
+        env:
+          # 允许 pkg-config 在交叉目标下探测宿主 OpenSSL 头文件（见上一步注释）
+          PKG_CONFIG_ALLOW_CROSS: "1"
