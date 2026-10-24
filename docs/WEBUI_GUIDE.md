@@ -251,7 +251,7 @@ EntryPoint 的日志分四类，位置、查看方式与保留策略各异：
 | daemon 运行日志 | daemon 自身 tracing 输出（级别 `RUST_LOG` 环境变量 > `[general].log_level`，支持运行期热调级） | **不落盘**：控制台 / systemd journal | 启动终端直接查看；systemd 部署用 `journalctl -u <service>` | 由宿主（journal）管理 |
 | 模块进程日志 | daemon 捕获的各模块子进程 stdout/stderr 增量行 | `runtime/logs/<module>*.log` | 模块页「日志抽屉」（§4.1，实时/搜索/过滤/导出）；或直接读文件 | `[general].log_retention_days`（默认 90 天，`0` = 永久；按文件 mtime 巡检清理） |
 | 任务注册表 | 任务生命周期记录（daemon 重启后非终态任务改判 failed） | `runtime/tasks/` | 任务中心页（§8）/ `GET /api/tasks` | 随任务保留，无自动清理 |
-| 统一事件日志 | 结构化事件：`watcher_trigger`（触发器提交结果，§7.4）与 `task_terminal`（任务终态 completed/failed/cancelled + 错误摘要） | `runtime/logs/events-YYYY-MM.jsonl`（按月滚动，单行 JSON 追加） | 触发器页「触发历史」（§7.4）；REST `GET /api/events?rule=&type=&limit=`（默认 100，上限 1000）；或直接读文件（容忍尾行不完整/损坏） | `[general].log_retention_days` 同上 |
+| 统一事件日志 | 结构化事件：`watcher_trigger`（触发器提交结果，§7.4）、`task_terminal`（任务终态 completed/failed/cancelled + 错误摘要）与 `task_retention_cleanup`（任务产物保留巡检删除记录：task_id/pipeline_id/status/reason/size_bytes） | `runtime/logs/events-YYYY-MM.jsonl`（按月滚动，单行 JSON 追加） | 触发器页「触发历史」（§7.4）；REST `GET /api/events?rule=&type=&limit=`（默认 100，上限 1000）；或直接读文件（容忍尾行不完整/损坏） | `[general].log_retention_days` 同上 |
 
 保留期清理由 daemon 每小时巡检一次：`log_retention_days > 0` 时删除
 `runtime/logs/` 下 mtime 超期的 `events-*.jsonl` 与模块日志（`*.log`）；
