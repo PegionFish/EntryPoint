@@ -176,5 +176,9 @@
   "pipelineToolbar.importShare": "导入分享",
   "pipelineToolbar.importShareTitle": "导入分享的管线 JSON，直接创建为服务端管线",
   "pipelineToolbar.schedule": "定时",
-  "pipelineToolbar.scheduleTitle": "配置本管线的 cron 定时执行"
+  "pipelineToolbar.scheduleTitle": "配置本管线的 cron 定时执行",
+  "errorBoundary.title": "页面出错了",
+  "errorBoundary.description": "当前页面渲染时发生异常。你可以重新加载页面，或从左侧导航前往其他页面，其余功能不受影响。",
+  "errorBoundary.reload": "重新加载",
+  "errorBoundary.unknownError": "未知错误（无错误信息）"
 }

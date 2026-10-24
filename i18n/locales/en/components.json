@@ -176,5 +176,9 @@
   "pipelineToolbar.importShare": "Import share",
   "pipelineToolbar.importShareTitle": "Import a shared pipeline JSON as a server-side pipeline",
   "pipelineToolbar.schedule": "Schedule",
-  "pipelineToolbar.scheduleTitle": "Configure cron-based scheduled execution for this pipeline"
+  "pipelineToolbar.scheduleTitle": "Configure cron-based scheduled execution for this pipeline",
+  "errorBoundary.title": "Something went wrong",
+  "errorBoundary.description": "This page crashed while rendering. Reload the page or pick another page from the sidebar — the rest of the app keeps working.",
+  "errorBoundary.reload": "Reload page",
+  "errorBoundary.unknownError": "Unknown error (no message)"
 }

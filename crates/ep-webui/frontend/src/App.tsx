@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react'
-import { Navigate, Route, Routes } from 'react-router-dom'
+import { Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import '@/i18n'
 import { normalizeLanguage, setAppLanguage } from '@/i18n'
 import { Header } from '@/components/layout/header'
 import { MobileNav } from '@/components/layout/mobile-nav'
 import { Sidebar } from '@/components/layout/sidebar'
+import { ErrorBoundary } from '@/components/shared/error-boundary'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { Toaster } from '@/components/ui/sonner'
 import { api } from '@/api/client'
@@ -22,6 +23,8 @@ import { NotFoundPage } from '@/pages/not-found'
 export default function App() {
   // 移动端（<lg）导航抽屉开关状态
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
+  // 当前路径用于重建错误边界：换页后自动清除上一页的崩溃态
+  const location = useLocation()
 
   // 应用启动时建立全局 WebSocket 连接
   useEffect(() => {
@@ -50,20 +53,24 @@ export default function App() {
         <div className="flex flex-1 overflow-hidden">
           <Sidebar />
           <main className="flex-1 overflow-hidden">
-            <Routes>
-              <Route path="/" element={<DashboardPage />} />
-              <Route path="/modules" element={<ModulesPage />} />
-              {/* W2：模块详情独立页裁撤，旧路由重定向回模块页（详情统一为抽屉） */}
-              <Route path="/modules/:id" element={<Navigate to="/modules" replace />} />
-              <Route path="/pipeline" element={<PipelinePage />} />
-              {/* 触发器：目录监控 + 自动执行（PLAN_TRIGGER_UNIFIED_LOG D2 独立顶级页） */}
-              <Route path="/triggers" element={<TriggersPage />} />
-              {/* 快速调用：与管线同级的单模块 ad hoc 直跑（QUICK_RUN_PLAN D1） */}
-              <Route path="/run" element={<RunPage />} />
-              <Route path="/tasks" element={<TasksPage />} />
-              <Route path="/settings" element={<SettingsPage />} />
-              <Route path="*" element={<NotFoundPage />} />
-            </Routes>
+            {/* 仅包裹路由区域：Header/Sidebar 位于边界之外保持存活，页面崩溃时仍可导航离开。
+                key 随路径变化重建边界，离开崩溃页后错误态自动清除。 */}
+            <ErrorBoundary key={location.pathname}>
+              <Routes>
+                <Route path="/" element={<DashboardPage />} />
+                <Route path="/modules" element={<ModulesPage />} />
+                {/* W2：模块详情独立页裁撤，旧路由重定向回模块页（详情统一为抽屉） */}
+                <Route path="/modules/:id" element={<Navigate to="/modules" replace />} />
+                <Route path="/pipeline" element={<PipelinePage />} />
+                {/* 触发器：目录监控 + 自动执行（PLAN_TRIGGER_UNIFIED_LOG D2 独立顶级页） */}
+                <Route path="/triggers" element={<TriggersPage />} />
+                {/* 快速调用：与管线同级的单模块 ad hoc 直跑（QUICK_RUN_PLAN D1） */}
+                <Route path="/run" element={<RunPage />} />
+                <Route path="/tasks" element={<TasksPage />} />
+                <Route path="/settings" element={<SettingsPage />} />
+                <Route path="*" element={<NotFoundPage />} />
+              </Routes>
+            </ErrorBoundary>
           </main>
         </div>
       </div>
