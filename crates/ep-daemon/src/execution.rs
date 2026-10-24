@@ -390,7 +390,7 @@ pub fn snapshot_group(group_id: &str) -> Vec<TaskRecord> {
         .into_iter()
         .filter(|r| r.group.as_deref() == Some(group_id))
         .collect();
-    members.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+    members.sort_by_key(|m| m.started_at);
     members
 }
 
@@ -411,7 +411,7 @@ pub fn group_ids() -> Vec<String> {
             }
         }
     }
-    groups.sort_by(|a, b| b.1.cmp(&a.1));
+    groups.sort_by_key(|g| std::cmp::Reverse(g.1));
     groups.into_iter().map(|(id, _)| id).collect()
 }
 
@@ -837,11 +837,15 @@ pub async fn submit_pipeline_full(
         module_ids: record_module_ids,
         group: options.group.clone(),
     };
-    registry()
+    // 落盘失败不拒绝提交：记录已保留在内存（TaskRegistry::insert 内存优先），
+    // 任务继续执行；磁盘/权限异常仅告警，避免单点 IO 故障让整机提交不可用。
+    if let Err(e) = registry()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(record)
-        .map_err(|e| SubmitError::Internal(format!("failed to persist task record: {e}")))?;
+    {
+        warn!(task_id = %task_id, error = %e, "任务记录落盘失败，仅保留内存副本（任务继续执行）");
+    }
 
     // 入队（FIFO）+ 载荷寄存
     {
@@ -914,10 +918,12 @@ fn resolve_max_instances(root: &Path, pipeline_id: &str) -> Option<u32> {
 
 // ─── 准入调度（两级闸门 + 公平 FIFO） ───────────────────────────────────────
 
-/// 尝试把队列中的任务提升为 running：全局闸门 + 管线闸门均放行才准入。
-///
-/// 公平性：按 FIFO 顺序取**第一个**可准入的任务（跳过管线闸门已满的，
-/// 避免队头阻塞）；循环准入直到无可准入任务或全局闸门满。
+// 尝试把队列中的任务提升为 running：全局闸门 + 管线闸门均放行才准入。
+//
+// 公平性：按 FIFO 顺序取**第一个**可准入的任务（跳过管线闸门已满的，
+// 避免队头阻塞）；循环准入直到无可准入任务或全局闸门满。
+// （原 `///` 文档注释已降级为普通注释：此处是准入章节导语，真正的
+//   `try_promote` 定义在下方，避免 clippy::empty_line_after_doc_comments）
 // ─── 动态 VRAM 准入（§6.8b：按实时显存余额与模块声明自动安排并发） ──────────
 //
 // 静态两级闸（全局 max_parallel + 管线 max_instances）只回答"允许几个"，
