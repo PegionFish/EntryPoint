@@ -293,12 +293,14 @@ function validateConfig(config: AppConfig, t: TranslateFn): ValidationErrors {
   const errors: ValidationErrors = {}
   if (portInvalid(config.server.port))
     errors.server_port = t('validation.port')
-  // T-06：开启访问保护时令牌必填（空令牌会导致服务端失败关闭）
-  const server = config.server as AppConfig['server'] & {
-    access_protection?: 'none' | 'token'
-    token?: string
-  }
-  if (server.access_protection === 'token' && !server.token?.trim()) {
+  // T-06/T-16：开启访问保护时必须有可用令牌——已配置（脱敏标记）或本次填写；
+  // 显式清除与 token 模式互斥（否则服务端会拒绝保存，避免自锁）。
+  const tokenWillClear = (config as AppConfigExt).clear_server_token === true
+  if (
+    config.server.access_protection === 'token' &&
+    (tokenWillClear ||
+      (config.server_token_set !== true && !config.server.token?.trim()))
+  ) {
     errors.server_token = t('validation.token')
   }
   if (portInvalid(config.ports.range_start))
@@ -373,6 +375,12 @@ export function SettingsPage() {
       ? 'token'
       : 'none'
   const securityToken = (config as AppConfigExt | null)?.server?.token ?? ''
+  /** T-16：服务端令牌已配置（GET 只返回该标记，不回显明文） */
+  const serverTokenSet =
+    (config as AppConfigExt | null)?.server_token_set === true
+  /** T-16：本次保存显式清除 server.token */
+  const clearServerToken =
+    (config as AppConfigExt | null)?.clear_server_token === true
 
   /** T-06：API 返回 401 时弹出令牌输入（apiFetch / use-config 派发） */
   useEffect(() => {
@@ -434,7 +442,11 @@ export function SettingsPage() {
   ) {
     setConfig(
       (prev) =>
-        ({ ...prev, [key]: { ...prev[key], ...patch } }) as AppConfigExt,
+        ({
+          ...prev,
+          // T-16：AppConfigExt 顶层新增了布尔标记，K 不再必然是对象分区
+          [key]: { ...(prev[key] as object), ...patch },
+        }) as AppConfigExt,
     )
   }
 
@@ -544,11 +556,18 @@ export function SettingsPage() {
       return
     }
     const toastId = toast.loading(t('toast.saving'))
+    // T-16：保存前先记住本次填写的令牌（响应已脱敏，不能再从配置回读）
+    const submittedToken = securityToken.trim()
     const resp = await save()
     if (resp) {
-      // T-06：token 模式保存成功后，让本浏览器 API/WS 立即使用新令牌
+      // T-06/T-16：token 模式保存成功后，让本浏览器 API/WS 立即使用新令牌；
+      // 留空表示沿用既有令牌（本地已有则保留）。
       if (securityMode === 'token') {
-        setApiToken(securityToken.trim())
+        if (submittedToken) setApiToken(submittedToken)
+        wsManager.reconnect()
+      } else {
+        // P3：关闭访问保护时清除本浏览器的 server token
+        setApiToken(null)
         wsManager.reconnect()
       }
       if (resp.requires_restart) {
@@ -640,22 +659,48 @@ export function SettingsPage() {
         </>
       }
     >
-      {loading || !config ? (
+      {/* P2-5：错误/重试移到加载三元之外——config=null 时也能看到失败原因 */}
+      {error && (
+        <div className="mx-auto max-w-5xl">
+          <div className="flex items-center gap-2 rounded-lg border border-status-error/30 bg-status-error/10 px-4 py-3 text-sm text-status-error">
+            <TriangleAlert className="size-4 shrink-0" />
+            <span className="min-w-0 flex-1 truncate">{error}</span>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void reload()}
+              disabled={loading}
+            >
+              <RotateCcw className="size-3.5" />
+              {t('common:action.retry')}
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {loading ? (
         // W4 密度修正：max-w-4xl → max-w-5xl，缓解 ≥1440px 宽屏右侧留白
         <div className="mx-auto max-w-5xl space-y-6">
           {Array.from({ length: 3 }).map((_, i) => (
             <Skeleton key={i} className="h-48 rounded-lg" />
           ))}
         </div>
+      ) : !config ? (
+        // 配置加载失败（如 401）：给出空态与重试入口，不再永久停在骨架屏
+        <div className="mx-auto max-w-5xl">
+          <Card className="glass-card">
+            <CardContent className="flex flex-col items-center gap-3 py-10 text-sm text-muted-foreground">
+              <TriangleAlert className="size-5 text-status-error" />
+              <p>{t('error.loadFailed')}</p>
+              <Button variant="outline" size="sm" onClick={() => void reload()}>
+                <RotateCcw className="size-3.5" />
+                {t('common:action.retry')}
+              </Button>
+            </CardContent>
+          </Card>
+        </div>
       ) : (
         <div className="mx-auto max-w-5xl space-y-6">
-          {error && (
-            <div className="flex items-center gap-2 rounded-lg border border-status-error/30 bg-status-error/10 px-4 py-3 text-sm text-status-error">
-              <TriangleAlert className="size-4 shrink-0" />
-              <span className="min-w-0 flex-1 truncate">{error}</span>
-            </div>
-          )}
-
           {/* ── 服务器 ── */}
           <Section
             icon={Server}
@@ -734,18 +779,70 @@ export function SettingsPage() {
                 field="server-token"
                 error={errors.server_token}
               >
-                <div className="space-y-1">
-                  <Input
-                    type="password"
-                    autoComplete="new-password"
-                    value={securityToken}
-                    onChange={(e) =>
-                      patchSection('server', { token: e.target.value })
-                    }
-                    placeholder={t('security.tokenPlaceholder')}
-                    className="font-mono text-xs"
-                  />
+                <div className="space-y-1.5">
+                  <div className="flex items-center gap-2">
+                    <Input
+                      type="password"
+                      autoComplete="new-password"
+                      value={clearServerToken ? '' : securityToken}
+                      onChange={(e) =>
+                        patchSection('server', { token: e.target.value })
+                      }
+                      placeholder={
+                        serverTokenSet && !clearServerToken
+                          ? t('security.tokenKeepPlaceholder')
+                          : t('security.tokenPlaceholder')
+                      }
+                      className="font-mono text-xs"
+                      disabled={clearServerToken}
+                    />
+                    {serverTokenSet && !clearServerToken && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => {
+                          // T-16：清除必须经 clear_server_token 显式表达；
+                          // 空串只表示「保持不变」，不能用于清除。
+                          patchSection('server', { token: '' })
+                          setConfig(
+                            (prev) =>
+                              ({
+                                ...prev,
+                                clear_server_token: true,
+                              }) as AppConfigExt,
+                          )
+                        }}
+                      >
+                        {t('security.clearToken')}
+                      </Button>
+                    )}
+                    {clearServerToken && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() =>
+                          setConfig(
+                            (prev) =>
+                              ({
+                                ...prev,
+                                clear_server_token: false,
+                              }) as AppConfigExt,
+                          )
+                        }
+                      >
+                        {t('common:action.cancel')}
+                      </Button>
+                    )}
+                  </div>
                   <p className="text-xs text-muted-foreground">
+                    {clearServerToken
+                      ? t('security.tokenWillClear')
+                      : serverTokenSet
+                        ? t('security.tokenConfigured')
+                        : t('security.tokenNotConfigured')}
+                    {' · '}
                     {t('security.tokenHint')}
                   </p>
                 </div>

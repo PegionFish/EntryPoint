@@ -22,6 +22,11 @@ export interface AppConfigExt extends AppConfig {
     access_protection?: 'none' | 'token'
     token?: string
   }
+  /** T-16：GET/PUT /api/config 凭据状态标记（令牌明文不返回） */
+  server_token_set?: boolean
+  api_token_set?: boolean
+  /** T-16：显式清除 server.token 的 PUT 控制字段（true 才清除） */
+  clear_server_token?: boolean
 }
 
 /** PUT /api/config 响应（§8.2）：合并后完整配置 + requires_restart 平级 */

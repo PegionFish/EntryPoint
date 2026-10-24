@@ -1,5 +1,5 @@
 import type { WsMessage } from './types'
-import { withApiToken } from './client'
+import { AUTH_REQUIRED_EVENT, withApiToken } from './client'
 
 /** WebSocket 连接状态 */
 export type WsConnectionState =
@@ -44,6 +44,8 @@ export class WebSocketManager {
   private heartbeatTimer: number | null = null
   /** 最近一次收到消息的时间戳（毫秒），用于心跳超时判死 */
   private lastActivity = 0
+  /** P2-6：本轮连续失败是否已派发过认证事件（避免每轮重连都弹令牌框） */
+  private authNotified = false
 
   constructor(url?: string) {
     this.url = url ?? WebSocketManager.defaultUrl()
@@ -83,6 +85,8 @@ export class WebSocketManager {
    * 浏览器 WebSocket 无法在握手后改 header，只能换一条连接。
    */
   reconnect(): void {
+    // 凭据可能已更新：允许新的连续失败再次提示认证
+    this.authNotified = false
     this.disconnect()
     this.connect()
   }
@@ -166,6 +170,7 @@ export class WebSocketManager {
 
     socket.onopen = () => {
       this.reconnectAttempt = 0
+      this.authNotified = false
       this.lastActivity = Date.now()
       this.setState('connected')
       this.startHeartbeat()
@@ -211,6 +216,13 @@ export class WebSocketManager {
 
   private scheduleReconnect(): void {
     this.setState('reconnecting')
+    // P2-6：连续失败 3 次才派发一次认证事件（且仅一次），避免令牌缺失时
+    // 每轮重连都弹出输入框；backoff 本身不变。
+    const failures = this.reconnectAttempt + 1
+    if (failures >= 3 && !this.authNotified) {
+      this.authNotified = true
+      window.dispatchEvent(new CustomEvent(AUTH_REQUIRED_EVENT))
+    }
     const delay = Math.min(
       MIN_BACKOFF_MS * Math.pow(2, this.reconnectAttempt),
       MAX_BACKOFF_MS,

@@ -14,15 +14,17 @@ use std::sync::Arc;
 
 use axum::{
     Router,
-    extract::State,
-    http::StatusCode,
+    extract::{Request, State},
+    http::{header, HeaderValue, StatusCode},
+    middleware::{self, Next},
+    response::Response,
     routing::{get, put},
     Json,
 };
 use serde::Serialize;
 use serde_json::Value;
 
-use ep_core::config::AppConfig;
+use ep_core::config::{AccessProtection, AppConfig};
 
 use super::err_response;
 use crate::state::AppState;
@@ -33,11 +35,66 @@ pub fn router() -> Router<Arc<AppState>> {
         // 路由层以 Value 接收任意 JSON patch；handler 泛型保留
         // `Json<AppConfig>`（全量配置）直调兼容（main.rs 既有测试）。
         .route("/config", put(put_config::<Value>))
+        // T-16：配置响应含凭据状态，禁止中间层缓存（成功与错误响应一并覆盖）。
+        .layer(middleware::from_fn(no_store))
 }
 
-pub async fn get_config(State(state): State<Arc<AppState>>) -> Json<AppConfig> {
+/// T-16：给 `/api/config` 的所有响应（含 400）加 `Cache-Control: no-store`。
+async fn no_store(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// GET/PUT `/api/config` 的凭据脱敏视图（T-16）。
+///
+/// `server.token` / `api.token` 一律输出空串，只暴露「是否已设置」的布尔标记；
+/// 避免默认 `access_protection = none` + `host = 0.0.0.0` 时，局域网内可直接
+/// 读取共享访问令牌或 v1 鉴权凭据。
+#[derive(Debug, Serialize)]
+pub struct ConfigView {
+    #[serde(flatten)]
+    pub config: AppConfig,
+    /// `server.token` 是否已配置（响应中不返回其明文）
+    pub server_token_set: bool,
+    /// `api.token` 是否已配置（响应中不返回其明文）
+    pub api_token_set: bool,
+}
+
+impl ConfigView {
+    fn from_config(config: &AppConfig) -> Self {
+        let server_token_set = !config.server.token.trim().is_empty();
+        let api_token_set = config
+            .api
+            .token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty());
+        let mut redacted = config.clone();
+        redacted.server.token.clear();
+        // `api.token` 是 Option，这里统一成空串，保证响应形状稳定（不出现 null）。
+        redacted.api.token = Some(String::new());
+        Self {
+            config: redacted,
+            server_token_set,
+            api_token_set,
+        }
+    }
+}
+
+impl std::ops::Deref for ConfigView {
+    type Target = AppConfig;
+
+    fn deref(&self) -> &Self::Target {
+        &self.config
+    }
+}
+
+pub async fn get_config(State(state): State<Arc<AppState>>) -> Json<ConfigView> {
     let config = state.config.read().await;
-    Json(config.clone())
+    Json(ConfigView::from_config(&config))
 }
 
 /// PUT /api/config 响应（§8.2）：合并后的完整配置 + `requires_restart`。
@@ -50,6 +107,10 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> Json<AppConfig> {
 pub struct PutConfigResponse {
     #[serde(flatten)]
     pub config: AppConfig,
+    /// 合并后 `server.token` 是否已配置（响应中不返回其明文）
+    pub server_token_set: bool,
+    /// 合并后 `api.token` 是否已配置（响应中不返回其明文）
+    pub api_token_set: bool,
     /// 本次改动是否触及重启敏感项（见 [`restart_sensitive_changed`]，§8.2）
     pub requires_restart: bool,
 }
@@ -92,6 +153,32 @@ fn restart_sensitive_changed(before: &AppConfig, after: &AppConfig) -> bool {
         || before.network.no_proxy != after.network.no_proxy
 }
 
+/// 取出并移除 patch 顶层的显式清除开关；缺省/非布尔值均视为 false。
+///
+/// T-16 起 token 不参与普通合并：只有 `clear_server_token` / `clear_api_token`
+/// 显式为 `true` 才清除，避免前端回传空串时误把已配置凭据清掉。
+fn take_control_bool(patch: &mut Value, key: &str) -> bool {
+    patch
+        .as_object_mut()
+        .and_then(|obj| obj.remove(key))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
+/// 取出 patch 指定分区里的 token，并把它从 patch 中移除。
+///
+/// - 非空字符串 → 返回新值（调用方在合并后覆盖，空串不会参与合并）；
+/// - 空串/空白/非字符串/字段缺省 → 返回 None（保留旧值，即「不修改」）。
+fn take_token_value(patch: &mut Value, section: &str) -> Option<String> {
+    let section = patch.get_mut(section)?.as_object_mut()?;
+    let value = section.remove("token")?;
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+}
+
 /// PUT /api/config — 深度合并 JSON patch、持久化并更新内存共享配置（P1-9）。
 ///
 /// 泛型请求体：路由注册为 `put_config::<Value>`（任意 patch 形状）；
@@ -112,7 +199,7 @@ pub async fn put_config<T>(
 where
     T: Serialize + serde::de::DeserializeOwned,
 {
-    let patch = match serde_json::to_value(&patch) {
+    let mut patch = match serde_json::to_value(&patch) {
         Ok(value) => value,
         Err(e) => {
             return Err(err_response(
@@ -125,6 +212,13 @@ where
         }
     };
 
+    // T-16：token 字段不走普通合并——空串/缺省表示「不修改」，显式 clear_* 才清除。
+    // 先摘出控制字段与新值，合并成功后再应用（避免空串覆盖旧 token）。
+    let clear_server_token = take_control_bool(&mut patch, "clear_server_token");
+    let clear_api_token = take_control_bool(&mut patch, "clear_api_token");
+    let new_server_token = take_token_value(&mut patch, "server");
+    let new_api_token = take_token_value(&mut patch, "api");
+
     let config_dir = state.root.join("config");
 
     enum Outcome {
@@ -135,6 +229,8 @@ where
             log_level_changed: bool,
         },
         InvalidPatch(anyhow::Error),
+        /// P2-3：token 模式下 server.token 为空，拒绝保存并回滚内存态。
+        TokenRequired,
         SaveFailed(anyhow::Error),
     }
 
@@ -143,19 +239,41 @@ where
         let before = config.clone();
         match config.merge_partial(&patch) {
             Ok(()) => {
-                // #48：merge_partial 经 serde 重建配置，运行期解析缓存
-                // （#[serde(skip)]）被重置 → 基于 root 重新填充。
-                // 序列化字段保持原始形态（相对仍为相对），save() 落盘不绝对化。
-                config.resolve_paths(&state.root);
-                let requires_restart = restart_sensitive_changed(&before, &config);
-                let log_level_changed = before.general.log_level != config.general.log_level;
-                match config.save(&config_dir) {
-                    Ok(()) => Outcome::Merged {
-                        snapshot: Box::new(config.clone()),
-                        requires_restart,
-                        log_level_changed,
-                    },
-                    Err(e) => Outcome::SaveFailed(e),
+                // T-16：先应用 patch 携带的新 token，再处理显式清除（clear_* 优先）。
+                if let Some(token) = new_server_token {
+                    config.server.token = token;
+                }
+                if let Some(token) = new_api_token {
+                    config.api.token = Some(token);
+                }
+                if clear_server_token {
+                    config.server.token.clear();
+                }
+                if clear_api_token {
+                    config.api.token = None;
+                }
+                // P2-3：token 模式缺少 server.token 会让中间件失败关闭（自锁），
+                // 拒绝保存并回滚本次合并，保证 400 时内存配置保持不变。
+                if config.server.access_protection == AccessProtection::Token
+                    && config.server.token.trim().is_empty()
+                {
+                    *config = before.clone();
+                    Outcome::TokenRequired
+                } else {
+                    // #48：merge_partial 经 serde 重建配置，运行期解析缓存
+                    // （#[serde(skip)]）被重置 → 基于 root 重新填充。
+                    // 序列化字段保持原始形态（相对仍为相对），save() 落盘不绝对化。
+                    config.resolve_paths(&state.root);
+                    let requires_restart = restart_sensitive_changed(&before, &config);
+                    let log_level_changed = before.general.log_level != config.general.log_level;
+                    match config.save(&config_dir) {
+                        Ok(()) => Outcome::Merged {
+                            snapshot: Box::new(config.clone()),
+                            requires_restart,
+                            log_level_changed,
+                        },
+                        Err(e) => Outcome::SaveFailed(e),
+                    }
                 }
             }
             Err(e) => Outcome::InvalidPatch(e),
@@ -178,10 +296,25 @@ where
                 );
             }
             tracing::debug!(requires_restart, "config patch merged and persisted");
+            let view = ConfigView::from_config(&snapshot);
             Ok(Json(PutConfigResponse {
-                config: *snapshot,
+                config: view.config,
+                server_token_set: view.server_token_set,
+                api_token_set: view.api_token_set,
                 requires_restart,
             }))
+        }
+        Outcome::TokenRequired => {
+            tracing::warn!(
+                "rejected config patch: access_protection=token requires a non-empty server.token"
+            );
+            Err(err_response(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "apiCore.config.tokenRequired",
+                &[],
+            )
+            .await)
         }
         Outcome::InvalidPatch(e) => {
             tracing::warn!(error = %e, "rejected invalid config patch");
@@ -608,5 +741,201 @@ mod tests {
         assert_eq!(json["general"]["language"], "en");
         // GET 响应为纯 AppConfig，无 requires_restart 键
         assert!(json.get("requires_restart").is_none());
+    }
+
+    // ── T-16：凭据脱敏 / no-store / 显式清除 / P2-3 ─────────────────────
+
+    /// 走完整路由执行 PUT，并保留响应头（no-store 断言用）
+    async fn route_put_with_headers(
+        state: Arc<AppState>,
+        body: &str,
+    ) -> (StatusCode, axum::http::HeaderMap, serde_json::Value) {
+        let app = router().with_state(state);
+        let resp = app.oneshot(put_request(body)).await.unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, headers, json)
+    }
+
+    /// 走完整路由执行 GET，并保留响应头（no-store 断言用）
+    async fn get_config_with_headers(
+        state: Arc<AppState>,
+    ) -> (StatusCode, axum::http::HeaderMap, serde_json::Value) {
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, headers, json)
+    }
+
+    fn cache_control(headers: &axum::http::HeaderMap) -> Option<&str> {
+        headers.get(header::CACHE_CONTROL).and_then(|v| v.to_str().ok())
+    }
+
+    // GET 不得回显任一 token，只暴露 *_token_set；所有响应禁缓存
+    #[tokio::test]
+    async fn oneshot_get_redacts_tokens_and_sets_no_store() {
+        let state = seq_state("zh-CN");
+        {
+            let mut cfg = state.config.write().await;
+            cfg.server.token = "s3cret-server".into();
+            cfg.api.token = Some("s3cret-v1".into());
+        }
+
+        let (status, headers, json) = get_config_with_headers(state.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(cache_control(&headers), Some("no-store"));
+        assert_eq!(json["server"]["token"], "");
+        assert_eq!(json["api"]["token"], "");
+        assert_eq!(json["server_token_set"], true);
+        assert_eq!(json["api_token_set"], true);
+        assert!(json.get("requires_restart").is_none());
+
+        // 明文不得出现在响应体任何位置
+        let body = serde_json::to_string(&json).unwrap();
+        assert!(!body.contains("s3cret-server"));
+        assert!(!body.contains("s3cret-v1"));
+
+        // 未配置时两个标记均为 false
+        let empty = seq_state("zh-CN");
+        let (_, _, json) = get_config_with_headers(empty).await;
+        assert_eq!(json["server_token_set"], false);
+        assert_eq!(json["api_token_set"], false);
+    }
+
+    // PUT 空串/缺省 token = 保持原值（避免前端回传脱敏后的空串误清空）
+    #[tokio::test]
+    async fn put_empty_or_missing_token_keeps_existing() {
+        let state = seq_state("zh-CN");
+        {
+            let mut cfg = state.config.write().await;
+            cfg.server.token = "keep-server".into();
+            cfg.api.token = Some("keep-api".into());
+        }
+
+        let (status, headers, json) = route_put_with_headers(
+            state.clone(),
+            r#"{"server":{"token":""},"api":{"token":""}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(cache_control(&headers), Some("no-store"));
+        assert_eq!(json["server"]["token"], "");
+        assert_eq!(json["server_token_set"], true);
+        assert_eq!(json["api_token_set"], true);
+        {
+            let cfg = state.config.read().await;
+            assert_eq!(cfg.server.token, "keep-server");
+            assert_eq!(cfg.api.token.as_deref(), Some("keep-api"));
+        }
+
+        // 完全省略 token 字段同样不修改
+        let (status, _, json) = route_put_with_headers(
+            state.clone(),
+            r#"{"server":{"port":9801}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["server_token_set"], true);
+        {
+            let cfg = state.config.read().await;
+            assert_eq!(cfg.server.token, "keep-server");
+            assert_eq!(cfg.server.port, 9801);
+        }
+    }
+
+    // 只有显式 clear_* = true 才清除；真实字符串仍可覆盖
+    #[tokio::test]
+    async fn put_explicit_clear_flags_clear_credentials() {
+        let state = seq_state("zh-CN");
+        {
+            let mut cfg = state.config.write().await;
+            cfg.server.token = "old-server".into();
+            cfg.api.token = Some("old-api".into());
+        }
+
+        let (status, _, json) = route_put_with_headers(
+            state.clone(),
+            r#"{"clear_server_token":true,"clear_api_token":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["server_token_set"], false);
+        assert_eq!(json["api_token_set"], false);
+        {
+            let cfg = state.config.read().await;
+            assert!(cfg.server.token.is_empty());
+            assert!(cfg.api.token.is_none());
+        }
+
+        // 新 token 覆盖 + 标记为 true
+        let (status, _, json) = route_put_with_headers(
+            state.clone(),
+            r#"{"server":{"token":"new-server"},"api":{"token":"new-api"}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["server_token_set"], true);
+        assert_eq!(json["api_token_set"], true);
+        let cfg = state.config.read().await;
+        assert_eq!(cfg.server.token, "new-server");
+        assert_eq!(cfg.api.token.as_deref(), Some("new-api"));
+    }
+
+    // P2-3：token 模式 + 空 server.token → 400 + i18n，且内存配置回滚
+    #[tokio::test]
+    async fn put_token_mode_without_token_rejected_and_rolled_back() {
+        let state = seq_state("zh-CN");
+
+        let (status, headers, json) = route_put_with_headers(
+            state.clone(),
+            r#"{"server":{"access_protection":"token"}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(cache_control(&headers), Some("no-store"));
+        assert!(json["error"].as_str().is_some_and(|s| !s.is_empty()));
+        {
+            let cfg = state.config.read().await;
+            assert_eq!(cfg.server.access_protection, AccessProtection::None);
+            assert!(cfg.server.token.is_empty());
+        }
+
+        // 同时给出令牌则允许开启
+        let (status, _, json) = route_put_with_headers(
+            state.clone(),
+            r#"{"server":{"access_protection":"token","token":"s3cret"}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["server_token_set"], true);
+        assert_eq!(json["server"]["token"], "");
+        {
+            let cfg = state.config.read().await;
+            assert_eq!(cfg.server.access_protection, AccessProtection::Token);
+            assert_eq!(cfg.server.token, "s3cret");
+        }
+
+        // token 模式下清除令牌同样被拒绝并回滚
+        let (status, _, _) =
+            route_put_with_headers(state.clone(), r#"{"clear_server_token":true}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        {
+            let cfg = state.config.read().await;
+            assert_eq!(cfg.server.access_protection, AccessProtection::Token);
+            assert_eq!(cfg.server.token, "s3cret");
+        }
     }
 }

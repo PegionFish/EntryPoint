@@ -58,6 +58,25 @@
 | GET | `/api/devices` |
 | GET | `/api/events`（支持 `?rule=&type=&limit=`） |
 | GET / PUT | `/api/config` |
+| GET | `/api/storage` |
+
+`GET /api/storage`（T-11）返回 `StorageReport`：`dirs[]` 为 `workspace` / `models` /
+`tasks` 三个逻辑目录（`path` 为解析后的绝对路径，`used_bytes` 递归求和；子目录符号链接
+不跟随、根目录 junction/symlink 跟随）。`workspace.used_bytes` 已包含其下的 `tasks`，
+聚合总占用时应取 `workspace + models`。`free_bytes` 为模型缓存盘剩余字节，探测失败为
+`null`，客户端应显示未知态而不是按 100% 处理。
+
+`GET /api/config` / `PUT /api/config`（T-16）返回脱敏后的配置视图：
+
+- `server.token` 与 `api.token` 恒输出空串；是否已配置由平级布尔字段
+  `server_token_set` / `api_token_set` 表示，客户端不得从响应回读令牌明文。
+- 响应头 `Cache-Control: no-store`（成功与 400 均包含）。
+- PUT patch 中 `server.token` / `api.token` **为空串或省略 = 保持不变**；覆盖需传
+  非空字符串；清除必须显式传 `clear_server_token: true` / `clear_api_token: true`
+  （不使用 `"***"` 掩码哨兵，避免误覆盖）。
+- PUT 响应额外含 `requires_restart`。`server.access_protection = "token"` 且合并后
+  `server.token` 为空时返回 400（i18n 键 `apiCore.config.tokenRequired`），且内存
+  配置回滚到请求前状态。
 
 ### 模块与模型
 
@@ -97,6 +116,23 @@
 wav/mp3/flac/ogg/m4a/aac/opus/wma）省略该头，供 `<img>`/`<video>`/`<audio>` 内联预览；
 `svg`/`html` 永不内联。302 跳转到 `/api/task-files/...` 时透传 `inline=1` 与 `token`，其余 query 一律丢弃，
 最终白名单仍由静态文件中间件校验。
+
+模型下载预检（T-11）：`POST /api/modules/{module_id}/models/download` 在入队与实际
+spawn 前检查模型缓存盘空间，需求按 `size_estimate_mb × 1.05` 估算；不足时返回
+`507 INSUFFICIENT_STORAGE` 与 i18n 键 `apiModels.storageInsufficient`（文案携带
+`required_mb` / `available_mb`）。排队任务在取得并发空位、启动下载前会再查一次，不足则
+把该排队任务置为 `failed`（此时不再有 HTTP 响应可返回）。清单未声明
+`size_estimate_mb`（缺省/0）或探测失败时放行：空间预检是保护而非硬门禁。
+
+**直跑结果缓存（T-16）**：`POST /api/pipelines/execute/single`、
+`POST /api/modules/{module_id}/runs` 与 `/api/v1/inference/...` 默认启用内容寻址
+缓存。键 = `sha256(module_id + capability + 规范化参数 JSON + 输入指纹)`：
+输入 ≤ 512MB 用内容 sha256，超过退化为 `size + mtime` 弱键（元信息 `weak: true`）。
+**命中**不占执行闸门，直接生成 `completed` 任务，产物硬链接（失败降级复制）进
+`tasks/{new_id}/files/`，任务详情 `cached_from` 指回原任务 id，回调/事件照常触发；
+**未命中**执行成功后写 `workspace/cache/`，按 `[cache] max_gb` 做 LRU 淘汰。
+请求体可选 `bypass_cache: true`（multipart 为文本字段）单次旁路；`[cache] enabled=false`
+全局关闭。管线执行（`/api/pipelines/execute`、`/pipelines/{id}/runs`）不参与缓存。
 
 ### 其他
 

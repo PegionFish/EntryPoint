@@ -11,6 +11,7 @@
   "module.stopFailed": "停止模块失败：{{detail}}",
   "config.saveFailed": "保存配置失败：{{detail}}",
   "config.invalidPatch": "配置补丁无效：{{detail}}",
+  "config.tokenRequired": "启用访问保护时必须配置非空的访问令牌",
   "watcher.nameRequired": "规则名称不能为空",
   "watcher.watchDirRequired": "监控目录不能为空",
   "watcher.watchDirNotAbsolute": "监控目录必须为绝对路径",
