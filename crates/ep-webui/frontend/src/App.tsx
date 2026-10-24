@@ -54,8 +54,8 @@ export default function App() {
           <Sidebar />
           <main className="flex-1 overflow-hidden">
             {/* 仅包裹路由区域：Header/Sidebar 位于边界之外保持存活，页面崩溃时仍可导航离开。
-                key 随路径变化重建边界，离开崩溃页后错误态自动清除。 */}
-            <ErrorBoundary key={location.pathname}>
+                key 随路径与查询串变化重建边界，同路径切换参数或离开崩溃页后错误态自动清除。 */}
+            <ErrorBoundary key={`${location.pathname}${location.search}`}>
               <Routes>
                 <Route path="/" element={<DashboardPage />} />
                 <Route path="/modules" element={<ModulesPage />} />

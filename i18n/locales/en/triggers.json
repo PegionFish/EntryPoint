@@ -54,8 +54,8 @@
   "dialog.name": "Name",
   "dialog.namePlaceholder": "e.g. Archive downloads",
   "dialog.watchDir": "Watch directory",
-  "dialog.watchDirPlaceholder": "/absolute/path/to/watch",
-  "dialog.watchDirHint": "Absolute path. The directory may not exist yet; a warning is logged until it appears.",
+  "dialog.watchDirPlaceholder": "e.g. F:\\watch (Windows) or /data/watch (Linux/macOS)",
+  "dialog.watchDirHint": "Absolute path. Windows: F:\\watch or \\\\nas\\share; Linux/macOS: /data/watch. The directory may not exist yet; a warning is logged until it appears.",
   "dialog.extensions": "Extensions filter",
   "dialog.extensionsPlaceholder": "mp4, mkv, wav",
   "dialog.extensionsHint": "Comma separated. Dots are stripped and values lowercased. Leave empty to accept all files.",
@@ -92,7 +92,7 @@
   "dialog.inputNodeHint": "Files are injected at the selected file_input node.",
   "dialog.outputHint": "Matched files (or direct-action results) are delivered to the output directory with the naming template.",
   "dialog.destDir": "Destination directory",
-  "dialog.destDirPlaceholder": "/absolute/path/to/output",
+  "dialog.destDirPlaceholder": "e.g. F:\\output (Windows) or /data/output (Linux/macOS)",
   "dialog.nameTemplate": "Name template",
   "dialog.nameTemplatePlaceholder": "{name}.{ext}",
   "dialog.nameTemplateHint": "Placeholders: {name} {ext} {date} {datetime} {rule} {seq}",
@@ -106,11 +106,9 @@
   "dialog.saveFailed": "Failed to save rule",
   "validation.nameRequired": "Name is required",
   "validation.watchDirRequired": "Watch directory is required",
-  "validation.watchDirAbsolute": "Watch directory must be an absolute path",
-  "validation.watchDirInvalid": "Enter an absolute path (e.g. /data/watch, F:\\watch or \\\\nas\\share)",
+  "validation.watchDirInvalid": "Enter an absolute path (Windows: F:\\watch or \\\\nas\\share; Linux/macOS: /data/watch)",
   "validation.capabilityRequired": "Select a module and capability",
   "validation.pipelineRequired": "Select a pipeline and input node",
   "validation.destDirRequired": "Destination directory is required",
-  "validation.destDirAbsolute": "Destination directory must be an absolute path",
-  "validation.destDirInvalid": "Enter an absolute path (e.g. /data/output, F:\\output or \\\\nas\\share)"
+  "validation.destDirInvalid": "Enter an absolute path (Windows: F:\\output or \\\\nas\\share; Linux/macOS: /data/output)"
 }

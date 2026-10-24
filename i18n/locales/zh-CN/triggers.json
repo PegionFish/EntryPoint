@@ -54,8 +54,8 @@
   "dialog.name": "名称",
   "dialog.namePlaceholder": "如：归档下载目录",
   "dialog.watchDir": "监控目录",
-  "dialog.watchDirPlaceholder": "/监控目录的绝对路径",
-  "dialog.watchDirHint": "绝对路径。目录暂不存在不报错，出现后自动开始监控。",
+  "dialog.watchDirPlaceholder": "如 F:\\watch（Windows）或 /data/watch（Linux/macOS）",
+  "dialog.watchDirHint": "绝对路径。Windows 用 F:\\watch 或 \\\\nas\\share，Linux/macOS 用 /data/watch；目录暂不存在不报错，出现后自动开始监控。",
   "dialog.extensions": "扩展名过滤",
   "dialog.extensionsPlaceholder": "mp4, mkv, wav",
   "dialog.extensionsHint": "逗号分隔，自动去点转小写。留空表示接受全部文件。",
@@ -92,7 +92,7 @@
   "dialog.inputNodeHint": "文件将注入所选的 file_input 节点。",
   "dialog.outputHint": "命中的文件（或直调产物）将按命名模板投递到输出目录。",
   "dialog.destDir": "输出目录",
-  "dialog.destDirPlaceholder": "/输出目录的绝对路径",
+  "dialog.destDirPlaceholder": "如 F:\\output（Windows）或 /data/output（Linux/macOS）",
   "dialog.nameTemplate": "命名模板",
   "dialog.nameTemplatePlaceholder": "{name}.{ext}",
   "dialog.nameTemplateHint": "占位符：{name} {ext} {date} {datetime} {rule} {seq}",
@@ -106,11 +106,9 @@
   "dialog.saveFailed": "保存规则失败",
   "validation.nameRequired": "名称不能为空",
   "validation.watchDirRequired": "监控目录不能为空",
-  "validation.watchDirAbsolute": "监控目录必须是绝对路径",
-  "validation.watchDirInvalid": "请输入绝对路径（如 /data/watch、F:\\watch 或 \\\\nas\\share）",
+  "validation.watchDirInvalid": "请输入绝对路径（Windows：F:\\watch 或 \\\\nas\\share；Linux/macOS：/data/watch）",
   "validation.capabilityRequired": "请选择模块与能力",
   "validation.pipelineRequired": "请选择管线与输入节点",
   "validation.destDirRequired": "输出目录不能为空",
-  "validation.destDirAbsolute": "输出目录必须是绝对路径",
-  "validation.destDirInvalid": "请输入绝对路径（如 /data/output、F:\\output 或 \\\\nas\\share）"
+  "validation.destDirInvalid": "请输入绝对路径（Windows：F:\\output 或 \\\\nas\\share；Linux/macOS：/data/output）"
 }
