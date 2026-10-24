@@ -107,5 +107,13 @@
   "modulesLifecycle.idleTimeout": "Idle auto-unload (seconds)",
   "modulesLifecycle.idleTimeoutDescription": "Running modules idle beyond this duration are stopped automatically; 0 disables (always-on). Default 1800 (30 minutes).",
   "logRetention.label": "Log retention (days)",
-  "logRetention.description": "Unified event logs and module log files older than this are cleaned up by an hourly sweep; 0 = keep forever (never clean). Default 90."
+  "logRetention.description": "Unified event logs and module log files older than this are cleaned up by an hourly sweep; 0 = keep forever (never clean). Default 90.",
+  "tasksRetention.title": "Task artifact retention",
+  "tasksRetention.description": "Unattended disk guard: every 6 hours the daemon sweeps terminal task directories and prunes them by age/total size. Queued and running tasks are never touched.",
+  "tasksRetention.enabled": "Enable automatic cleanup",
+  "tasksRetention.enabledDescription": "When off, nothing is cleaned up (default). When on, terminal tasks are evicted by the two limits below.",
+  "tasksRetention.maxAgeDays": "Maximum age (days)",
+  "tasksRetention.maxAgeDaysDescription": "Terminal tasks (completed/failed/cancelled) older than this are deleted together with their artifacts; 0 = unlimited.",
+  "tasksRetention.maxTotalGb": "Total artifact size limit (GiB)",
+  "tasksRetention.maxTotalGbDescription": "When workspace/tasks exceeds this, the oldest terminal tasks are deleted until it fits, artifacts included; 0 = unlimited."
 }

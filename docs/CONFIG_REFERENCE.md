@@ -288,6 +288,33 @@ enabled = true
 idle_timeout_secs = 1800   # 空闲 30 分钟自动下线；0 = 常驻
 ```
 
+### 1.13 `[tasks]` — 任务产物保留（T-12）
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `retention.enabled` | bool | `false` | 后台清理总开关；`false` = 完全不清理 |
+| `retention.max_age_days` | u32 | `0` | 保留天数：任务进入终态超过该天数即删除整个任务目录；`0` = 不限 |
+| `retention.max_total_gb` | u32 | `0` | `workspace/tasks/` 总容量上限（GiB）：超限时按完成时间从最旧开始删除终态任务目录；`0` = 不限 |
+
+**清理机制：**
+
+- daemon 启动后延迟 3 分钟首跑，之后每 **6 小时**巡检一轮 `workspace/tasks/*`
+- **仅清理终态任务**（completed / failed / cancelled，以 `runtime/tasks/<task-id>.json` 注册表记录判定）；
+  排队 / 运行中任务绝不触碰，注册表缺失或损坏的目录保守跳过
+- 先按年龄（`max_age_days`）删除超龄任务；再按总容量（`max_total_gb`）从最旧开始淘汰，
+  直至满足上限；两个维度互相独立，`0` = 该维度不限
+- **删除整个任务目录**：`workspace/tasks/<task-id>/` 连同 `files/` 产物一并删除
+- 每次删除向统一事件日志（`runtime/logs/events-YYYY-MM.jsonl`）追加一条
+  `task_retention_cleanup` 事件（含 `task_id` / `pipeline_id` / `status` / `reason` / `size_bytes`）
+- **生效时机**：实时读取——运行期经 WebUI 设置页或 `PUT /api/config` 修改**下一轮巡检生效**，无需重启
+
+```toml
+[tasks.retention]
+enabled = true
+max_age_days = 30   # 终态任务保留 30 天；0 = 不限
+max_total_gb = 50   # workspace/tasks 总容量上限 50 GiB；0 = 不限
+```
+
 ---
 
 ## 2. 完整 app.toml 示例
@@ -348,6 +375,11 @@ staging_dir = ".pack-staging"
 
 [modules]
 idle_timeout_secs = 1800
+
+[tasks.retention]
+enabled = false
+max_age_days = 0
+max_total_gb = 0
 
 [api]
 enabled = true

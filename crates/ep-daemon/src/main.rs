@@ -1,6 +1,7 @@
 mod api;
 pub(crate) mod eventlog;
 mod logging;
+mod retention;
 mod schedule;
 mod state;
 mod updates;
@@ -742,6 +743,14 @@ async fn run_server(root: PathBuf, cfg: AppConfig) -> anyhow::Result<()> {
             }
         });
     }
+
+    // 10.9 Spawn 任务产物保留巡检（T-12）：启动后延迟 3 分钟首跑，之后每 6h
+    //      按 [tasks.retention] 清理 workspace/tasks/ 下的终态任务目录（含产物）。
+    //      仅清理 completed/failed/cancelled，running/queued 永不触碰；按完成时间
+    //      最旧优先淘汰，max_age_days / max_total_gb 为 0 表示该维度不限。
+    //      配置每轮实时读取——运行期经 PUT /api/config 改动下一轮生效，无需重启。
+    //      注：该 async fn 内部仅 tokio::spawn 后立即返回，await 不会阻塞启动。
+    retention::spawn_retention_loop(state.clone()).await;
 
     // 11. Spawn 后台模型更新自动检查（P1-10：general.check_updates 接线）。
     //     开关每轮实时读取——运行期经 PUT /api/config 改动即时生效，无需重启。

@@ -57,6 +57,27 @@ import { Switch } from '@/components/ui/switch'
 import { useConfig, type AppConfigExt } from '@/hooks/use-config'
 import { cn } from '@/lib/utils'
 
+/* ── 任务产物保留（T-12）────────────────────────────────────────
+ * 后端 [tasks.retention]；api/types.ts 的 AppConfig 与 use-config 的
+ * AppConfigExt 尚未声明该区，这里用局部交类型承载，保存仍走既有
+ * useConfig().save()（深度合并 PUT /api/config），不改共享类型文件。 */
+type TasksRetentionConfig = {
+  enabled: boolean
+  max_age_days: number
+  max_total_gb: number
+}
+
+type ConfigWithTasks = AppConfigExt & {
+  tasks?: { retention?: Partial<TasksRetentionConfig> }
+}
+
+/** 与后端 serde 默认值一致：关闭、两个维度均不限 */
+const DEFAULT_TASKS_RETENTION: TasksRetentionConfig = {
+  enabled: false,
+  max_age_days: 0,
+  max_total_gb: 0,
+}
+
 /* ── 本地表单小组件 ─────────────────────────────────────────── */
 
 function Section({
@@ -361,6 +382,33 @@ export function SettingsPage() {
           active_models: { ...(prev.active_models ?? {}), [moduleId]: modelId },
         }) as AppConfigExt,
     )
+  }
+
+  /** T-12 任务产物保留当前值（缺省与后端默认一致：关闭、不限） */
+  const retentionConfig = (config as ConfigWithTasks | null)?.tasks?.retention
+  const retentionEnabled =
+    retentionConfig?.enabled ?? DEFAULT_TASKS_RETENTION.enabled
+  const retentionMaxAgeDays =
+    retentionConfig?.max_age_days ?? DEFAULT_TASKS_RETENTION.max_age_days
+  const retentionMaxTotalGb =
+    retentionConfig?.max_total_gb ?? DEFAULT_TASKS_RETENTION.max_total_gb
+
+  /** T-12：写入任务产物保留配置（保存按钮经既有 diff + PUT /api/config 落盘） */
+  function patchTasksRetention(patch: Partial<TasksRetentionConfig>) {
+    setConfig((prev) => {
+      const current = prev as ConfigWithTasks
+      return {
+        ...prev,
+        tasks: {
+          ...current.tasks,
+          retention: {
+            ...DEFAULT_TASKS_RETENTION,
+            ...current.tasks?.retention,
+            ...patch,
+          },
+        },
+      } as AppConfigExt
+    })
   }
 
   /**
@@ -996,6 +1044,42 @@ export function SettingsPage() {
                 }
                 min={0}
                 max={604800}
+              />
+            </Field>
+          </Section>
+
+          {/* ── 任务产物保留（T-12）：终态任务目录按年龄/总量自动清盘，防磁盘爆 ── */}
+          <Section
+            icon={Database}
+            title={t('tasksRetention.title')}
+            description={t('tasksRetention.description')}
+          >
+            <SwitchRow
+              label={t('tasksRetention.enabled')}
+              description={t('tasksRetention.enabledDescription')}
+              checked={retentionEnabled}
+              onCheckedChange={(v) => patchTasksRetention({ enabled: v })}
+            />
+            <Field
+              label={t('tasksRetention.maxAgeDays')}
+              description={t('tasksRetention.maxAgeDaysDescription')}
+            >
+              <NumberField
+                value={retentionMaxAgeDays}
+                onValueChange={(v) => patchTasksRetention({ max_age_days: v })}
+                min={0}
+                max={3650}
+              />
+            </Field>
+            <Field
+              label={t('tasksRetention.maxTotalGb')}
+              description={t('tasksRetention.maxTotalGbDescription')}
+            >
+              <NumberField
+                value={retentionMaxTotalGb}
+                onValueChange={(v) => patchTasksRetention({ max_total_gb: v })}
+                min={0}
+                max={102400}
               />
             </Field>
           </Section>

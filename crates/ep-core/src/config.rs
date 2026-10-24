@@ -460,6 +460,36 @@ impl Default for ApiConfig {
     }
 }
 
+// ─── TasksConfig ───────────────────────────────────────────────────────────
+
+/// 任务相关配置（`[tasks]`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TasksConfig {
+    /// 任务产物保留策略（`[tasks.retention]`）
+    #[serde(default)]
+    pub retention: TasksRetentionConfig,
+}
+
+/// 任务产物保留策略（`[tasks.retention]`，T-12）。
+///
+/// daemon 每 6 小时扫描 `<workspace_dir>/tasks/*`，仅清理**终态**任务
+/// （completed / failed / cancelled）的整个任务目录（产物一并删除）；
+/// 运行中 / 排队任务永不触碰。两个上限维度互相独立，`0` = 该维度不限：
+/// - `max_age_days`：按任务完成时间计算的保留天数；
+/// - `max_total_gb`：任务目录总容量上限（GB），超出时按完成时间从最旧开始淘汰。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TasksRetentionConfig {
+    /// 总开关；缺省 false = 清理器不删除任何任务目录
+    #[serde(default)]
+    pub enabled: bool,
+    /// 最大保留天数（按完成时间）；0 = 不限该维度
+    #[serde(default)]
+    pub max_age_days: u32,
+    /// 任务产物总容量上限（GB）；0 = 不限该维度
+    #[serde(default)]
+    pub max_total_gb: u32,
+}
+
 // ─── AppConfig ──────────────────────────────────────────────────────────────
 
 /// 整合包配置（§8.3）
@@ -535,6 +565,9 @@ pub struct AppConfig {
     /// 统一推理 API（`/api/v1/*`）配置：可选 token 鉴权
     #[serde(default)]
     pub api: ApiConfig,
+    /// 任务配置（产物保留策略，T-12）
+    #[serde(default)]
+    pub tasks: TasksConfig,
     /// 每模块激活模型变体（单槽位语义 §5.2）：module_id → model_id；A6 消费
     #[serde(default)]
     pub active_models: std::collections::HashMap<String, String>,
@@ -915,6 +948,46 @@ mod tests {
         assert_eq!(restored.network.http_proxy, "");
         assert_eq!(restored.network.https_proxy, "");
         assert_eq!(restored.network.no_proxy, "localhost,127.0.0.1");
+    }
+
+    /// T-12：`[tasks.retention]` 缺省关闭；整节/字段省略均按默认值解析
+    /// （旧配置兼容），显式值经 TOML 往返保持不变。
+    #[test]
+    fn tasks_retention_defaults_and_partial_parse() {
+        let defaults = AppConfig::default();
+        assert!(!defaults.tasks.retention.enabled);
+        assert_eq!(defaults.tasks.retention.max_age_days, 0);
+        assert_eq!(defaults.tasks.retention.max_total_gb, 0);
+
+        // 旧配置整节省略 → 全部走 serde 默认值
+        let config: AppConfig = toml::from_str("[server]\nport = 9800\n").expect("parse legacy");
+        assert!(!config.tasks.retention.enabled);
+        assert_eq!(config.tasks.retention.max_age_days, 0);
+        assert_eq!(config.tasks.retention.max_total_gb, 0);
+
+        // 只写 enabled，两个数字字段省略 → 0（不限该维度）
+        let config: AppConfig =
+            toml::from_str("[tasks.retention]\nenabled = true\n").expect("parse partial");
+        assert!(config.tasks.retention.enabled);
+        assert_eq!(config.tasks.retention.max_age_days, 0);
+        assert_eq!(config.tasks.retention.max_total_gb, 0);
+
+        // 显式值往返不变
+        let config = AppConfig {
+            tasks: TasksConfig {
+                retention: TasksRetentionConfig {
+                    enabled: true,
+                    max_age_days: 7,
+                    max_total_gb: 50,
+                },
+            },
+            ..AppConfig::default()
+        };
+        let toml_str = toml::to_string_pretty(&config).expect("serialize");
+        let restored: AppConfig = toml::from_str(&toml_str).expect("deserialize");
+        assert!(restored.tasks.retention.enabled);
+        assert_eq!(restored.tasks.retention.max_age_days, 7);
+        assert_eq!(restored.tasks.retention.max_total_gb, 50);
     }
 
     /// 桌面端退役（2026-08-13）后旧配置可能仍含 `[ui]` 节：
