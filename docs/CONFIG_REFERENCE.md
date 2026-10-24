@@ -178,13 +178,19 @@ workspace_dir = "workspace"
 | `host` | string | 代码缺省 `"0.0.0.0"`；仓库自带配置模板为 `"127.0.0.1"`（仅本机） | 监听地址 |
 | `port` | u16 | `9800` | 监听端口（WebUI 与 REST API） |
 | `allow_public` | bool | `false` | 是否允许公网访问。`false` 时启用 IP 过滤，仅放行 RFC 1918 私有地址 |
+| `access_protection` | `"none"` \| `"token"` | `"none"` | 访问保护模式。`token` 时 `/api/*` 与 `/ws*` 需提供共享令牌；`/api/v1`（自带 token 校验）与页面/静态资源不受影响 |
+| `token` | string | `""` | `token` 模式使用的共享令牌。建议随机长字符串；为空时拒绝所有受保护请求（失败关闭） |
 
 ```toml
 [server]
 host = "0.0.0.0"
 port = 9800
 allow_public = false
+access_protection = "none"
+token = ""
 ```
+
+令牌可经 `Authorization: Bearer <token>` 或 `X-API-Key: <token>` 提供；WebSocket 握手与 GET/HEAD 原生加载（图片/视频/下载链接）额外支持 `?token=`，POST/PUT/DELETE 不接受 query token。**令牌进入 URL 可能被访问日志、浏览器历史或 Referer 泄漏，仅建议在内网或反向代理 + TLS 下使用。** 公网暴露前建议配置随机长令牌。
 
 ### 1.8 `[network]` — 网络代理
 
@@ -300,7 +306,10 @@ idle_timeout_secs = 1800   # 空闲 30 分钟自动下线；0 = 常驻
 
 - daemon 启动后延迟 3 分钟首跑，之后每 **6 小时**巡检一轮 `workspace/tasks/*`
 - **仅清理终态任务**（completed / failed / cancelled，以 `runtime/tasks/<task-id>.json` 注册表记录判定）；
-  排队 / 运行中任务绝不触碰，注册表缺失或损坏的目录保守跳过
+  排队 / 运行中任务绝不触碰，注册表缺失或损坏的目录保守跳过；daemon 重启时被改判为
+  「重启中断」的遗留任务按 failed 终态处理（可被清理）
+- 不可判定终态的目录（运行中 / 排队中、注册表缺失或损坏）仍计入总容量，但不参与清理；
+  若因此无法降到上限，本轮输出一条 `warn` 日志（含不可删目录数量与字节数）
 - 先按年龄（`max_age_days`）删除超龄任务；再按总容量（`max_total_gb`）从最旧开始淘汰，
   直至满足上限；两个维度互相独立，`0` = 该维度不限
 - **删除整个任务目录**：`workspace/tasks/<task-id>/` 连同 `files/` 产物一并删除
@@ -315,6 +324,38 @@ max_age_days = 30   # 终态任务保留 30 天；0 = 不限
 max_total_gb = 50   # workspace/tasks 总容量上限 50 GiB；0 = 不限
 ```
 
+### 1.14 `[modules.auto_restart]` — 模块故障自愈（T-14）
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `enabled` | bool | `false` | 自愈总开关；`false` = 进程异常退出后不自动重启（旧行为） |
+| `max_backoff_secs` | u32 | `30` | 单次退避上限（秒）：连续失败重试按 2s、4s、8s… 翻倍，封顶该值；小于 2 时按 2 秒处理 |
+| `circuit_breaker_after` | u32 | `5` | 连续失败熔断阈值：达到后停止自动重启并写事件日志，需手动启动解除；`0` = 不熔断（持续退避重试） |
+
+**自愈机制：**
+
+- 监督循环每 **1 秒**采样模块状态，只处理「曾 Running → Error（进程退出 /
+  健康检查失败）」的运行中死亡；任务前按需拉起（§6.5）路径不变，不引入退避
+- 首次死亡**立即**重启（复用既有拉起路径，含 venv / 模型 / 端口准备与健康检查）；
+  重启未恢复（启动失败或 10 分钟内再次死亡）后按 **2s 起 ×2** 退避重试，
+  封顶 `max_backoff_secs`
+- 模块**稳定运行 10 分钟**后失败计数与退避清零
+- 连续失败达 `circuit_breaker_after` 次 → **熔断**：停止自动重启，模块保持退出/
+  错误状态不再被拉起，需用户在模块页手动「启动」解除（观察到非自愈发起的启动即复位）
+- **事件日志**：每次重启尝试 / 结果写 `module_auto_restart`
+  （`{module_id, attempt, stage: starting|succeeded|failed, backoff_secs, error?}`），
+  熔断写 `module_circuit_breaker`（`{module_id, failures, threshold}`），
+  均落 `runtime/logs/events-YYYY-MM.jsonl`
+- **生效时机**：实时读取——运行期经 WebUI 设置页或 `PUT /api/config` 修改即时生效，
+  无需重启
+
+```toml
+[modules.auto_restart]
+enabled = true
+max_backoff_secs = 30       # 退避上限 30 秒（2s 起、每次 ×2）
+circuit_breaker_after = 5   # 连续失败 5 次熔断；0 = 不熔断
+```
+
 ---
 
 ## 2. 完整 app.toml 示例
@@ -327,6 +368,8 @@ max_total_gb = 50   # workspace/tasks 总容量上限 50 GiB；0 = 不限
 host = "0.0.0.0"
 port = 9800
 allow_public = false
+access_protection = "none"
+token = ""
 
 [general]
 language = "zh-CN"
@@ -375,6 +418,11 @@ staging_dir = ".pack-staging"
 
 [modules]
 idle_timeout_secs = 1800
+
+[modules.auto_restart]
+enabled = false
+max_backoff_secs = 30
+circuit_breaker_after = 5
 
 [tasks.retention]
 enabled = false
@@ -589,8 +637,9 @@ EntryPoint/                        ← 应用根目录
 │   ├── watchers.json              ← 触发器规则注册表（原子落盘；WebUI 触发器页 CRUD）
 │   └── logs/                      ← 模块日志（<module>*.log）+ 统一事件日志
 │       ├── <module>*.log          ←   daemon 捕获的模块子进程输出（WebUI 日志抽屉展示）
-│       └── events-YYYY-MM.jsonl   ←   统一事件日志（watcher_trigger / task_terminal，
-│                                        单行 JSON 追加、按月滚动；log_retention_days 清理）
+│       └── events-YYYY-MM.jsonl   ←   统一事件日志（watcher_trigger / task_terminal /
+│                                        task_retention_cleanup，单行 JSON 追加、按月滚动；
+│                                        log_retention_days 清理）
 ├── .pack-staging/                 ← 整合包导入/构建暂存（[packs].staging_dir，随用随清）
 ├── workspace/                     ← 管线任务工作目录
 │   └── <task-id>/

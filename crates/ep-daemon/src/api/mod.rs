@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod autostart;
 pub mod batches;
 pub mod config;

@@ -10,6 +10,7 @@ import {
   Database,
   GitBranch,
   Globe,
+  KeyRound,
   Loader2,
   Network,
   Plus,
@@ -25,6 +26,12 @@ import {
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import type { AppConfig } from '@/api/types'
+import {
+  AUTH_REQUIRED_EVENT,
+  getApiToken,
+  setApiToken,
+} from '@/api/client'
+import { wsManager } from '@/api/ws'
 import { normalizeLanguage, setAppLanguage } from '@/i18n'
 import { adoptTheme, useThemeStore } from '@/store/theme'
 import { PageContainer } from '@/components/layout/page-container'
@@ -54,7 +61,11 @@ import {
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
-import { useConfig, type AppConfigExt } from '@/hooks/use-config'
+import {
+  fetchServerConfig,
+  useConfig,
+  type AppConfigExt,
+} from '@/hooks/use-config'
 import { cn } from '@/lib/utils'
 
 /* ── 任务产物保留（T-12）────────────────────────────────────────
@@ -76,6 +87,29 @@ const DEFAULT_TASKS_RETENTION: TasksRetentionConfig = {
   enabled: false,
   max_age_days: 0,
   max_total_gb: 0,
+}
+
+/* ── 模块故障自愈（T-14）────────────────────────────────────────
+ * 后端 [modules.auto_restart]；api/types.ts 的 AppConfig 与 use-config 的
+ * AppConfigExt 尚未声明该区，这里用局部交类型承载，保存仍走既有
+ * useConfig().save()（深度合并 PUT /api/config），不改共享类型文件。 */
+type ModulesAutoRestartConfig = {
+  enabled: boolean
+  max_backoff_secs: number
+  circuit_breaker_after: number
+}
+
+type ConfigWithAutoRestart = AppConfigExt & {
+  modules: AppConfigExt['modules'] & {
+    auto_restart?: Partial<ModulesAutoRestartConfig>
+  }
+}
+
+/** 与后端 serde 默认值一致：关闭、退避封顶 30s、连续失败 5 次熔断 */
+const DEFAULT_AUTO_RESTART: ModulesAutoRestartConfig = {
+  enabled: false,
+  max_backoff_secs: 30,
+  circuit_breaker_after: 5,
 }
 
 /* ── 本地表单小组件 ─────────────────────────────────────────── */
@@ -230,6 +264,8 @@ function NumberField({
 /** 字段级校验错误（对应 key 缺失即无错误） */
 interface ValidationErrors {
   server_port?: string
+  /** T-06：token 模式下访问令牌不能为空 */
+  server_token?: string
   range_start?: string
   range_end?: string
   /** 交叉校验：起始端口必须小于结束端口（P2-53） */
@@ -257,6 +293,14 @@ function validateConfig(config: AppConfig, t: TranslateFn): ValidationErrors {
   const errors: ValidationErrors = {}
   if (portInvalid(config.server.port))
     errors.server_port = t('validation.port')
+  // T-06：开启访问保护时令牌必填（空令牌会导致服务端失败关闭）
+  const server = config.server as AppConfig['server'] & {
+    access_protection?: 'none' | 'token'
+    token?: string
+  }
+  if (server.access_protection === 'token' && !server.token?.trim()) {
+    errors.server_token = t('validation.token')
+  }
   if (portInvalid(config.ports.range_start))
     errors.range_start = t('validation.port')
   if (portInvalid(config.ports.range_end))
@@ -278,6 +322,7 @@ function validateConfig(config: AppConfig, t: TranslateFn): ValidationErrors {
 /** 校验失败时的滚动定位顺序：首个错误 → 页内锚点（data-field） */
 const VALIDATION_ORDER: { key: keyof ValidationErrors; anchor: string }[] = [
   { key: 'server_port', anchor: 'server-port' },
+  { key: 'server_token', anchor: 'server-token' },
   { key: 'range_start', anchor: 'range-start' },
   { key: 'range_end', anchor: 'range-end' },
   { key: 'ports_range', anchor: 'range-end' },
@@ -312,6 +357,9 @@ export function SettingsPage() {
   } = useConfig()
   /** 开启「允许公网访问」前的安全确认对话框 */
   const [publicDialogOpen, setPublicDialogOpen] = useState(false)
+  /** T-06：访问保护令牌输入对话框（401 或配置加载失败时弹出） */
+  const [authDialogOpen, setAuthDialogOpen] = useState(false)
+  const [authTokenDraft, setAuthTokenDraft] = useState('')
   /** active_models 新增行草稿（确认前不进入配置 draft） */
   const [newActiveModel, setNewActiveModel] = useState<{
     moduleId: string
@@ -319,6 +367,23 @@ export function SettingsPage() {
   } | null>(null)
   /** 实时字段校验错误（由当前表单内容派生） */
   const errors: ValidationErrors = config ? validateConfig(config, tr) : {}
+  /** T-06 访问保护当前值（后端缺省 none） */
+  const securityMode: 'none' | 'token' =
+    (config as AppConfigExt | null)?.server?.access_protection === 'token'
+      ? 'token'
+      : 'none'
+  const securityToken = (config as AppConfigExt | null)?.server?.token ?? ''
+
+  /** T-06：API 返回 401 时弹出令牌输入（apiFetch / use-config 派发） */
+  useEffect(() => {
+    const handleAuthRequired = () => {
+      setAuthTokenDraft(getApiToken())
+      setAuthDialogOpen(true)
+    }
+    window.addEventListener(AUTH_REQUIRED_EVENT, handleAuthRequired)
+    return () =>
+      window.removeEventListener(AUTH_REQUIRED_EVENT, handleAuthRequired)
+  }, [])
 
   /** 主题 store 当前值（作为订阅触发器：顶栏/外部入口切换时驱动草稿同步） */
   const storeTheme = useThemeStore((s) => s.theme)
@@ -411,6 +476,35 @@ export function SettingsPage() {
     })
   }
 
+  /** T-14 模块故障自愈当前值（缺省与后端默认一致：关闭、30s、5 次） */
+  const autoRestartConfig = (config as ConfigWithAutoRestart | null)?.modules
+    ?.auto_restart
+  const autoRestartEnabled =
+    autoRestartConfig?.enabled ?? DEFAULT_AUTO_RESTART.enabled
+  const autoRestartMaxBackoffSecs =
+    autoRestartConfig?.max_backoff_secs ?? DEFAULT_AUTO_RESTART.max_backoff_secs
+  const autoRestartBreakerAfter =
+    autoRestartConfig?.circuit_breaker_after ??
+    DEFAULT_AUTO_RESTART.circuit_breaker_after
+
+  /** T-14：写入模块故障自愈配置（保存按钮经既有 diff + PUT /api/config 落盘） */
+  function patchAutoRestart(patch: Partial<ModulesAutoRestartConfig>) {
+    setConfig((prev) => {
+      const current = prev as ConfigWithAutoRestart
+      return {
+        ...prev,
+        modules: {
+          ...current.modules,
+          auto_restart: {
+            ...DEFAULT_AUTO_RESTART,
+            ...current.modules?.auto_restart,
+            ...patch,
+          },
+        },
+      } as AppConfigExt
+    })
+  }
+
   /**
    * 界面语言切换：即时生效 + 立即持久化（不等保存按钮）。
    * 持久化以服务器最新配置为 PUT 基线、只覆盖 language 字段，
@@ -452,6 +546,11 @@ export function SettingsPage() {
     const toastId = toast.loading(t('toast.saving'))
     const resp = await save()
     if (resp) {
+      // T-06：token 模式保存成功后，让本浏览器 API/WS 立即使用新令牌
+      if (securityMode === 'token') {
+        setApiToken(securityToken.trim())
+        wsManager.reconnect()
+      }
       if (resp.requires_restart) {
         // §8.2：服务端判定本次改动触及重启敏感项（P2-15 重启引导）
         toast.warning(t('toast.savedRestart'), {
@@ -472,6 +571,27 @@ export function SettingsPage() {
   async function handleReset() {
     await reload()
     toast.info(t('toast.reset'))
+  }
+
+  /**
+   * T-06：提交访问令牌。先用候选令牌探测一次配置读取，
+   * 成功后写入 localStorage 并重建 WS；失败则恢复旧令牌并保留对话框。
+   */
+  async function handleAuthTokenSubmit() {
+    const token = authTokenDraft.trim()
+    if (!token) return
+    const previous = getApiToken()
+    setApiToken(token)
+    try {
+      await fetchServerConfig()
+      setAuthDialogOpen(false)
+      wsManager.reconnect()
+      await reload()
+      toast.success(t('authDialog.saved'))
+    } catch {
+      setApiToken(previous)
+      toast.error(t('authDialog.invalid'))
+    }
   }
 
   function handleAllowPublic(checked: boolean) {
@@ -576,6 +696,61 @@ export function SettingsPage() {
               checked={config.server.allow_public}
               onCheckedChange={handleAllowPublic}
             />
+          </Section>
+
+          {/* ── 访问保护（T-06）── */}
+          <Section
+            icon={KeyRound}
+            title={t('security.title')}
+            description={t('security.description')}
+          >
+            <Field
+              label={t('security.mode')}
+              description={t('security.modeDescription')}
+            >
+              <Select
+                value={securityMode}
+                onValueChange={(v) =>
+                  patchSection('server', {
+                    access_protection: v as 'none' | 'token',
+                  })
+                }
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">{t('security.modeNone')}</SelectItem>
+                  <SelectItem value="token">
+                    {t('security.modeToken')}
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+            </Field>
+            {securityMode === 'token' && (
+              <Field
+                label={t('security.token')}
+                description={t('security.tokenDescription')}
+                field="server-token"
+                error={errors.server_token}
+              >
+                <div className="space-y-1">
+                  <Input
+                    type="password"
+                    autoComplete="new-password"
+                    value={securityToken}
+                    onChange={(e) =>
+                      patchSection('server', { token: e.target.value })
+                    }
+                    placeholder={t('security.tokenPlaceholder')}
+                    className="font-mono text-xs"
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {t('security.tokenHint')}
+                  </p>
+                </div>
+              </Field>
+            )}
           </Section>
 
           {/* ── 通用 ── */}
@@ -1084,6 +1259,46 @@ export function SettingsPage() {
             </Field>
           </Section>
 
+          {/* ── 模块故障自愈（T-14）：异常退出按退避自动重启，连续失败熔断 ── */}
+          <Section
+            icon={Settings2}
+            title={t('modulesAutoRestart.title')}
+            description={t('modulesAutoRestart.description')}
+          >
+            <SwitchRow
+              label={t('modulesAutoRestart.enabled')}
+              description={t('modulesAutoRestart.enabledDescription')}
+              checked={autoRestartEnabled}
+              onCheckedChange={(v) => patchAutoRestart({ enabled: v })}
+            />
+            <Field
+              label={t('modulesAutoRestart.maxBackoffSecs')}
+              description={t('modulesAutoRestart.maxBackoffSecsDescription')}
+            >
+              <NumberField
+                value={autoRestartMaxBackoffSecs}
+                onValueChange={(v) => patchAutoRestart({ max_backoff_secs: v })}
+                min={2}
+                max={3600}
+              />
+            </Field>
+            <Field
+              label={t('modulesAutoRestart.circuitBreakerAfter')}
+              description={t(
+                'modulesAutoRestart.circuitBreakerAfterDescription',
+              )}
+            >
+              <NumberField
+                value={autoRestartBreakerAfter}
+                onValueChange={(v) =>
+                  patchAutoRestart({ circuit_breaker_after: v })
+                }
+                min={0}
+                max={100}
+              />
+            </Field>
+          </Section>
+
           {/* ── 高级（§8.3 active_models 单槽位）── */}
           <Section
             icon={SlidersHorizontal}
@@ -1206,6 +1421,52 @@ export function SettingsPage() {
           </Section>
         </div>
       )}
+
+      {/* ── T-06 访问令牌输入（配置加载 401 时也可用，渲染在配置分支之外）── */}
+      <Dialog
+        open={authDialogOpen}
+        onOpenChange={(open) => {
+          if (!open) setAuthDialogOpen(false)
+        }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <KeyRound className="size-4 text-primary" />
+              {t('authDialog.title')}
+            </DialogTitle>
+            <DialogDescription>{t('authDialog.description')}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2 pt-1">
+            <div className="text-sm font-medium">{t('authDialog.token')}</div>
+            <Input
+              type="password"
+              autoComplete="current-password"
+              value={authTokenDraft}
+              onChange={(e) => setAuthTokenDraft(e.target.value)}
+              placeholder={t('security.tokenPlaceholder')}
+              className="font-mono text-xs"
+              autoFocus
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && authTokenDraft.trim()) {
+                  void handleAuthTokenSubmit()
+                }
+              }}
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setAuthDialogOpen(false)}>
+              {t('common:action.cancel')}
+            </Button>
+            <Button
+              disabled={!authTokenDraft.trim()}
+              onClick={() => void handleAuthTokenSubmit()}
+            >
+              {t('authDialog.confirm')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* ── 公网访问安全确认 ── */}
       <Dialog

@@ -1,4 +1,5 @@
 import type { WsMessage } from './types'
+import { withApiToken } from './client'
 
 /** WebSocket 连接状态 */
 export type WsConnectionState =
@@ -77,6 +78,15 @@ export class WebSocketManager {
     this.setState('disconnected')
   }
 
+  /**
+   * 凭据变化后重建连接（T-06：设置页切换访问令牌后调用）。
+   * 浏览器 WebSocket 无法在握手后改 header，只能换一条连接。
+   */
+  reconnect(): void {
+    this.disconnect()
+    this.connect()
+  }
+
   getState(): WsConnectionState {
     return this.state
   }
@@ -145,7 +155,9 @@ export class WebSocketManager {
     this.setState(initialState)
     let socket: WebSocket
     try {
-      socket = new WebSocket(this.url)
+      // T-06：每次握手时重新读取令牌，支持设置页后置更新；
+      // 浏览器 WS 无法带 Authorization 头，只能走 ?token=。
+      socket = new WebSocket(withApiToken(this.url))
     } catch {
       this.scheduleReconnect()
       return

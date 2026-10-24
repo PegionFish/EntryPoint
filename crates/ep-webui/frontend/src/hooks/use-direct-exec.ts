@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { api } from '@/api/client'
+import { api, getApiToken } from '@/api/client'
 import { wsManager } from '@/api/ws'
 import type {
   DirectExecRequest,
@@ -45,11 +45,16 @@ export async function postExecuteSingle(
     DIRECT_EXEC_SUBMIT_TIMEOUT_MS,
   )
   try {
+    // T-06：token 模式下补 Authorization
+    const token = getApiToken()
     const resp = await fetch(
       `/api/modules/${encodeURIComponent(body.module_id)}/runs`,
       {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
       body: JSON.stringify(body),
       signal: controller.signal,
     })

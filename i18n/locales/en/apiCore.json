@@ -20,5 +20,7 @@
   "watcher.capabilityInvalid": "Module or capability does not exist: {{detail}}",
   "watcher.outputRequired": "Direct mode requires an output config with an absolute destination directory",
   "watcher.notFound": "Watch rule not found: {{id}}",
-  "watcher.saveFailed": "Failed to save watch rules: {{detail}}"
+  "watcher.saveFailed": "Failed to save watch rules: {{detail}}",
+  "accessProtection.unauthorized": "Missing or invalid access token: provide Authorization: Bearer <token> or X-API-Key: <token> (WebSocket and native previews may use ?token=)",
+  "storage.scanFailed": "Failed to scan storage directories: {{detail}}"
 }

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { AppConfig } from '@/api/types'
+import { AUTH_REQUIRED_EVENT, getApiToken } from '@/api/client'
 
 /* ── 类型（§8.2/§8.3 契约；api/types.ts 为 S2 所有权，扩展字段本地补充，
       入 types.ts 的对齐已列为仲裁请求）────────────────────────────── */
@@ -16,6 +17,11 @@ export interface AppConfigExt extends AppConfig {
   packs?: { staging_dir?: string }
   /** 每模块激活模型变体（单槽位 §5.2）：module_id → model_id */
   active_models?: Record<string, string>
+  /** T-06 访问保护（后端新增字段；types.ts 对齐前沿用本地扩展） */
+  server: AppConfig['server'] & {
+    access_protection?: 'none' | 'token'
+    token?: string
+  }
 }
 
 /** PUT /api/config 响应（§8.2）：合并后完整配置 + requires_restart 平级 */
@@ -68,10 +74,24 @@ function toMessage(e: unknown): string {
    匹配 api/client.ts（S2 所有权）现有 `putConfig(cfg: AppConfig)`
    签名；本地直连 /api/config，行为与 apiFetch 一致（非 2xx 抛错）。 */
 
+/** 访问保护请求头（T-06）：未配置令牌时返回原头部 */
+function withAuthHeaders(headers: Record<string, string> = {}): Record<string, string> {
+  const token = getApiToken()
+  return token ? { ...headers, Authorization: `Bearer ${token}` } : headers
+}
+
+/** 401 时通知设置页弹出令牌输入（与 apiFetch 行为一致） */
+function notifyUnauthorized(status: number): void {
+  if (status === 401) {
+    window.dispatchEvent(new CustomEvent(AUTH_REQUIRED_EVENT))
+  }
+}
+
 /** 拉取服务器全量配置（GET /api/config） */
 export async function fetchServerConfig(): Promise<AppConfigExt> {
-  const resp = await fetch('/api/config')
+  const resp = await fetch('/api/config', { headers: withAuthHeaders() })
   if (!resp.ok) {
+    notifyUnauthorized(resp.status)
     throw new Error(`API ${resp.status}: ${await resp.text()}`)
   }
   return (await resp.json()) as AppConfigExt
@@ -83,10 +103,11 @@ export async function putConfigPatch(
 ): Promise<PutConfigResponse> {
   const resp = await fetch('/api/config', {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
+    headers: withAuthHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify(patch),
   })
   if (!resp.ok) {
+    notifyUnauthorized(resp.status)
     throw new Error(`API ${resp.status}: ${await resp.text()}`)
   }
   return (await resp.json()) as PutConfigResponse

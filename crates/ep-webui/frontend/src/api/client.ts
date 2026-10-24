@@ -43,6 +43,47 @@ import type {
 /** apiFetch 默认超时（毫秒）：防挂死请求（如慢响应下的轮询堆积） */
 const DEFAULT_TIMEOUT_MS = 30_000
 
+/** 访问保护令牌的 localStorage 键（T-06；仅存于当前浏览器） */
+export const API_TOKEN_STORAGE_KEY = 'entrypoint.apiToken'
+
+/** API 返回 401 时派发的事件：设置页监听后弹出令牌输入对话框 */
+export const AUTH_REQUIRED_EVENT = 'entrypoint:auth-required'
+
+/** 读取当前浏览器保存的访问令牌（未配置时返回空串） */
+export function getApiToken(): string {
+  try {
+    return localStorage.getItem(API_TOKEN_STORAGE_KEY)?.trim() ?? ''
+  } catch {
+    // localStorage 不可用（隐私模式等）时视为未配置
+    return ''
+  }
+}
+
+/** 保存访问令牌；传空串 / null 清除 */
+export function setApiToken(token: string | null): void {
+  try {
+    if (token?.trim()) {
+      localStorage.setItem(API_TOKEN_STORAGE_KEY, token.trim())
+    } else {
+      localStorage.removeItem(API_TOKEN_STORAGE_KEY)
+    }
+  } catch {
+    // localStorage 不可用时静默降级（本次会话无法持久化令牌）
+  }
+}
+
+/**
+ * 给浏览器原生加载的 URL（`<img>/<video>/<a download>`、window.open）追加
+ * `?token=`：这些场景无法附加 Authorization 头。仅适用于 GET/HEAD 请求；
+ * 未配置令牌时原样返回。
+ */
+export function withApiToken(url: string): string {
+  const token = getApiToken()
+  if (!token) return url
+  const sep = url.includes('?') ? '&' : '?'
+  return `${url}${sep}token=${encodeURIComponent(token)}`
+}
+
 interface ApiFetchOptions extends RequestInit {
   /**
    * 请求超时（毫秒）；0 表示不限时（wait 同步执行等长任务显式 opt-out）。
@@ -58,12 +99,21 @@ async function apiFetch<T>(path: string, options?: ApiFetchOptions): Promise<T> 
     headers.set('Content-Type', 'application/json')
   }
   const { timeoutMs = DEFAULT_TIMEOUT_MS, ...init } = options ?? {}
+  // T-06：访问保护令牌（调用方显式设置的 Authorization 优先）
+  const token = getApiToken()
+  if (token && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${token}`)
+  }
   // 上传与调用方显式 signal 场景不叠加自动超时
   const needsTimeout =
     timeoutMs > 0 && !(init.body instanceof FormData) && init.signal === undefined
   const signal = needsTimeout ? AbortSignal.timeout(timeoutMs) : init.signal
   const resp = await fetch(`/api${path}`, { ...init, headers, signal })
   if (!resp.ok) {
+    // 401：通知设置页弹出令牌输入（不在此处阻断 UI 流程）
+    if (resp.status === 401) {
+      window.dispatchEvent(new CustomEvent(AUTH_REQUIRED_EVENT))
+    }
     throw new Error(`API ${resp.status}: ${await resp.text()}`)
   }
   return resp.json()
@@ -90,6 +140,8 @@ export function uploadModelWithProgress(
   return new Promise<{ ok: boolean }>((resolve, reject) => {
     const xhr = new XMLHttpRequest()
     xhr.open('POST', `/api/modules/${moduleId}/models/upload`)
+    const token = getApiToken()
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
     xhr.upload.addEventListener('progress', (e) => {
       if (!e.lengthComputable) return
       onProgress({
@@ -138,6 +190,8 @@ export function uploadModuleArchive(
   return new Promise<ModuleImportSummary>((resolve, reject) => {
     const xhr = new XMLHttpRequest()
     xhr.open('POST', '/api/modules/import')
+    const token = getApiToken()
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
     xhr.upload.addEventListener('progress', (e) => {
       if (!onProgress || !e.lengthComputable) return
       onProgress({
@@ -305,14 +359,18 @@ export const api = {
     ),
   /** 任务产物下载 URL（直接用于 <a href> / window.open，不走 fetch） */
   taskArtifactUrl: (taskId: string, nodeId: string) =>
-    `/api/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeURIComponent(nodeId)}`,
+    withApiToken(
+      `/api/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeURIComponent(nodeId)}`,
+    ),
   /**
    * 任务产物预览 URL（带 inline=1）：图片/视频/音频命中 daemon 白名单时
    * 以内联 Content-Disposition 返回，可直接喂给 <img>/<video>/<audio>；
    * 其余类型（含 html/svg）仍按下载处理。仅生成 URL，不走 fetch。
    */
   taskArtifactPreviewUrl: (taskId: string, nodeId: string) =>
-    `/api/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeURIComponent(nodeId)}?inline=1`,
+    withApiToken(
+      `/api/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeURIComponent(nodeId)}?inline=1`,
+    ),
 
   // Pipelines
   listPipelines: () => apiFetch<PipelineSummary[]>('/pipelines'),
@@ -329,7 +387,7 @@ export const api = {
     }),
   /** 导出分享 JSON（自包含信封，entrypoint-pipeline/v1） */
   exportPipelineUrl: (id: string) =>
-    `/api/pipelines/${encodeURIComponent(id)}/export`,
+    withApiToken(`/api/pipelines/${encodeURIComponent(id)}/export`),
   importPipelineShare: (jsonText: string) =>
     apiFetch<{ ok: boolean; id: string; name: string }>('/pipelines/import', {
       method: 'POST',
@@ -438,7 +496,8 @@ export const api = {
     }),
 
   /** 整合包 .zip 下载 URL（直接用于 <a href> / window.open，不走 fetch） */
-  packExportUrl: (id: string) => `/api/packs/${encodeURIComponent(id)}/export`,
+  packExportUrl: (id: string) =>
+    withApiToken(`/api/packs/${encodeURIComponent(id)}/export`),
 
   // 直跑（§5.3 / §8.1）
   // 提交走 hooks/use-direct-exec.ts 的 postExecuteSingle（需 AbortController
@@ -501,9 +560,9 @@ export const api = {
       `/events${suffix ? `?${suffix}` : ''}`,
     )
   },
-}
 
   // 内置 ffmpeg 模板库（T-13；侧栏 / 参数表单 / 执行器同源）
   /** 全部内置模板（GET /api/builtins；静态表投影） */
   builtinTemplates: () =>
     apiFetch<BuiltinTemplatesResponse>('/builtins'),
+}

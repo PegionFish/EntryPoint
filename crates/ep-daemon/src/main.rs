@@ -756,6 +756,7 @@ async fn run_server(root: PathBuf, cfg: AppConfig) -> anyhow::Result<()> {
     //     开关每轮实时读取——运行期经 PUT /api/config 改动即时生效，无需重启。
     updates::spawn_auto_update_checker(state.clone());
 
+
     // 12. Start server
     let cfg = state.config.read().await;
     let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port)
@@ -996,6 +997,12 @@ fn build_app_router(state: Arc<AppState>, static_dir: &Path) -> Router {
         // P2：请求总时长超时层（最外层，覆盖全部路由含 body 读取与响应）。
         // 大文件上传/产物流式下载长连接路径在中间件内豁免（见 request_timeout）。
         .layer(axum::middleware::from_fn(request_timeout))
+        // T-06：可选访问保护（默认 none 直通；token 模式覆盖 /api/* 与 /ws*）。
+        // 路径分流入中间件内部完成，静态资源不读 config 锁。
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            api::auth::require_access,
+        ))
         .with_state(state)
 }
 

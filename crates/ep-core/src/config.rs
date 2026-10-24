@@ -398,16 +398,77 @@ pub struct ModulesConfig {
     /// 0 = 停用（7×24 常驻）。缺省 1800（30 分钟）。
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
+    /// 模块故障自愈（`[modules.auto_restart]`，T-14）
+    #[serde(default)]
+    pub auto_restart: ModulesAutoRestartConfig,
+}
+
+/// 模块故障自愈配置（`[modules.auto_restart]`，T-14）。
+///
+/// supervisor 监控运行中模块：进程异常退出后按指数退避自动重启
+/// （2 秒起、每次 ×2，封顶 [`max_backoff_secs`](Self::max_backoff_secs)）；
+/// 连续失败达 [`circuit_breaker_after`](Self::circuit_breaker_after) 次后熔断：
+/// 停止自动重启并写事件日志，需手动启动模块解除；模块稳定运行 10 分钟后
+/// 退避计数重置。缺省关闭，旧配置行为不变。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModulesAutoRestartConfig {
+    /// 总开关；缺省 false = 不自动重启
+    #[serde(default)]
+    pub enabled: bool,
+    /// 单次退避上限（秒）；缺省 30，小于 2 时按 2 秒处理
+    #[serde(default = "default_max_backoff_secs")]
+    pub max_backoff_secs: u32,
+    /// 连续失败熔断阈值；缺省 5；0 = 不熔断（只按上限持续退避）
+    #[serde(default = "default_circuit_breaker_after")]
+    pub circuit_breaker_after: u32,
+}
+
+impl Default for ModulesAutoRestartConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_backoff_secs: default_max_backoff_secs(),
+            circuit_breaker_after: default_circuit_breaker_after(),
+        }
+    }
 }
 
 impl Default for ModulesConfig {
     fn default() -> Self {
-        Self { idle_timeout_secs: default_idle_timeout_secs() }
+        Self {
+            idle_timeout_secs: default_idle_timeout_secs(),
+            auto_restart: ModulesAutoRestartConfig::default(),
+        }
     }
 }
 
 fn default_idle_timeout_secs() -> u64 {
     1800
+}
+
+fn default_max_backoff_secs() -> u32 {
+    30
+}
+
+fn default_circuit_breaker_after() -> u32 {
+    5
+}
+
+/// 访问保护模式（T-06，`[server].access_protection`）。
+///
+/// - `none`（缺省）：不启用全局鉴权，行为与旧版完全一致；
+/// - `token`：`/api/*` 与 `/ws*` 要求 `Authorization: Bearer <token>` /
+///   `X-API-Key: <token>`，WebSocket 握手额外接受 `?token=`。
+///
+/// `/api/v1/*` 不受本开关影响（其自带 `[api].token` 校验，避免双重鉴权）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccessProtection {
+    /// 不启用访问保护（缺省）
+    #[default]
+    None,
+    /// 要求共享 token（Bearer / X-API-Key / WS query）
+    Token,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -418,6 +479,13 @@ pub struct ServerConfig {
     pub port: u16,
     #[serde(default)]
     pub allow_public: bool,
+    /// 全局访问保护模式（T-06）；缺省 `none`，旧配置文件无需迁移
+    #[serde(default)]
+    pub access_protection: AccessProtection,
+    /// token 模式下的共享访问令牌。空串视为配置不完整：
+    /// 中间件失败关闭（拒绝全部受保护请求），避免误以为已受保护。
+    #[serde(default)]
+    pub token: String,
 }
 
 impl Default for ServerConfig {
@@ -426,6 +494,8 @@ impl Default for ServerConfig {
             host: default_host(),
             port: default_port(),
             allow_public: false,
+            access_protection: AccessProtection::None,
+            token: String::new(),
         }
     }
 }
@@ -988,6 +1058,73 @@ mod tests {
         assert!(restored.tasks.retention.enabled);
         assert_eq!(restored.tasks.retention.max_age_days, 7);
         assert_eq!(restored.tasks.retention.max_total_gb, 50);
+    }
+
+    /// T-14：`[modules.auto_restart]` 缺省关闭；整节/字段省略均按默认值解析
+    /// （旧配置兼容），显式值经 TOML 往返保持不变。
+    #[test]
+    fn modules_auto_restart_defaults_and_partial_parse() {
+        let defaults = AppConfig::default();
+        assert!(!defaults.modules.auto_restart.enabled);
+        assert_eq!(defaults.modules.auto_restart.max_backoff_secs, 30);
+        assert_eq!(defaults.modules.auto_restart.circuit_breaker_after, 5);
+
+        // 旧配置只写 idle_timeout_secs → 自愈整节走 serde 默认值
+        let config: AppConfig =
+            toml::from_str("[modules]\nidle_timeout_secs = 60\n").expect("parse legacy");
+        assert_eq!(config.modules.idle_timeout_secs, 60);
+        assert!(!config.modules.auto_restart.enabled);
+        assert_eq!(config.modules.auto_restart.max_backoff_secs, 30);
+        assert_eq!(config.modules.auto_restart.circuit_breaker_after, 5);
+
+        // 只写 enabled，两个数字字段省略 → 30 / 5
+        let config: AppConfig =
+            toml::from_str("[modules.auto_restart]\nenabled = true\n").expect("parse partial");
+        assert!(config.modules.auto_restart.enabled);
+        assert_eq!(config.modules.auto_restart.max_backoff_secs, 30);
+        assert_eq!(config.modules.auto_restart.circuit_breaker_after, 5);
+
+        // 显式值往返不变
+        let config = AppConfig {
+            modules: ModulesConfig {
+                idle_timeout_secs: 120,
+                auto_restart: ModulesAutoRestartConfig {
+                    enabled: true,
+                    max_backoff_secs: 45,
+                    circuit_breaker_after: 3,
+                },
+            },
+            ..AppConfig::default()
+        };
+        let toml_str = toml::to_string_pretty(&config).expect("serialize");
+        let restored: AppConfig = toml::from_str(&toml_str).expect("deserialize");
+        assert!(restored.modules.auto_restart.enabled);
+        assert_eq!(restored.modules.auto_restart.max_backoff_secs, 45);
+        assert_eq!(restored.modules.auto_restart.circuit_breaker_after, 3);
+    }
+
+    /// T-06：`[server].access_protection` / `token` 缺省 none + 空串；
+    /// 旧配置省略两字段时行为不变，token 模式与非法枚举值按 serde 规则处理。
+    #[test]
+    fn server_access_protection_defaults_and_parse() {
+        let defaults = AppConfig::default();
+        assert_eq!(defaults.server.access_protection, AccessProtection::None);
+        assert!(defaults.server.token.is_empty());
+
+        // 旧配置只写 host/port → 新字段走 serde 默认，行为零变化
+        let config: AppConfig = toml::from_str("[server]\nport = 9800\n").expect("parse legacy");
+        assert_eq!(config.server.access_protection, AccessProtection::None);
+        assert!(config.server.token.is_empty());
+
+        // token 模式 + 共享令牌
+        let config: AppConfig =
+            toml::from_str("[server]\naccess_protection = \"token\"\ntoken = \"s3cret\"\n")
+                .expect("parse token mode");
+        assert_eq!(config.server.access_protection, AccessProtection::Token);
+        assert_eq!(config.server.token, "s3cret");
+
+        // 非法枚举值拒绝（PUT patch 同样经 serde 重建，不会被静默吞掉）
+        assert!(toml::from_str::<AppConfig>("[server]\naccess_protection = \"basic\"\n").is_err());
     }
 
     /// 桌面端退役（2026-08-13）后旧配置可能仍含 `[ui]` 节：

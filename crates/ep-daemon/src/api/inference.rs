@@ -189,7 +189,7 @@ pub(crate) fn autostart_error_response(e: AutoStartError) -> (StatusCode, Json<V
 ///
 /// ep-daemon 未引入 subtle crate：长度比较分支只泄漏长度（token 为部署方
 /// 自配长随机串，可接受）；逐字节 XOR 累积比较不提前退出。
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -260,7 +260,7 @@ async fn require_token(
 /// RFC 6750 Bearer 凭据解析：scheme 大小写不敏感（`bearer` 等价），
 /// 首个空白字符分割取凭据并 trim。非 Bearer scheme 返回 None（调用侧
 /// 继续回退 X-API-Key 校验）。
-fn parse_bearer_token(value: &str) -> Option<&str> {
+pub(crate) fn parse_bearer_token(value: &str) -> Option<&str> {
     let (scheme, credentials) = value.split_once(char::is_whitespace)?;
     if !scheme.eq_ignore_ascii_case("bearer") {
         return None;

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { api } from '@/api/client'
+import { api, getApiToken } from '@/api/client'
 import { wsManager } from '@/api/ws'
 import type {
   PackBuildRequest,
@@ -42,6 +42,9 @@ export function uploadPackWithProgress(
   const xhr = new XMLHttpRequest()
   const promise = new Promise<PackImportResponse>((resolve, reject) => {
     xhr.open('POST', '/api/packs/upload')
+    // T-06：token 模式下补 Authorization
+    const token = getApiToken()
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
     xhr.upload.addEventListener('progress', (e) => {
       if (!e.lengthComputable) return
       onProgress({
