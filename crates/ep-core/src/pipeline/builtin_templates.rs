@@ -27,7 +27,7 @@
 //! - 声明 `omit_when_empty` 的参数渲染为空串时，该 arg 连同紧邻的前一个
 //!   ffmpeg 选项 flag（如 `-vf`）一并省略——实现「可选滤镜/可选输出参数」。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
 use serde_json::{json, Map, Value};
@@ -36,6 +36,16 @@ use crate::pipeline::dag::PortType;
 
 /// 内置模板节点的 builtin 标识（`kind = "builtin"` 时的 `builtin` 字段值）。
 pub const FFMPEG_TEMPLATE_KIND: &str = "ffmpeg_template";
+
+/// 目录型产物（抽帧序列）manifest 的类型标识。
+///
+/// executor 对 `output_is_dir` 模板不再返回 `Artifact::File(目录)`（目录无法
+/// 下载、`size` 恒 0），而是返回带此标识的 [`Artifact::Json`] manifest，
+/// 由 daemon 侧展开为逐个可下载文件。两端共用本常量作契约。
+pub const FRAME_MANIFEST_KIND: &str = "ffmpeg_template_frames";
+
+/// 单节点展开登记的最大文件数：防一次抽帧数千帧把任务记录/产物列表撑爆。
+pub const MAX_EXPANDED_FRAME_FILES: usize = 200;
 
 /// 模板分类（侧栏分组维度；前端 i18n 映射为分组标题）。
 pub const CATEGORY_VIDEO: &str = "video";
@@ -829,7 +839,9 @@ fn resolve_param(
 
     match spec.kind {
         TemplateParamKind::Integer => {
-            let value: f64 = text.parse().map_err(|_| {
+            // 严格按整数解析：接受 "23" / `23`，拒绝 "23.9"（旧实现按 f64
+            // 解析后静默截断为 23，用户输错得不到反馈）。
+            let value: i64 = text.parse().map_err(|_| {
                 anyhow!(
                     "ffmpeg_template '{}' param '{}' must be an integer, got '{}'",
                     template.id,
@@ -837,8 +849,8 @@ fn resolve_param(
                     text
                 )
             })?;
-            check_range(template, spec, value)?;
-            Ok(format_number(value, true))
+            check_range(template, spec, value as f64)?;
+            Ok(value.to_string())
         }
         TemplateParamKind::Number => {
             let value: f64 = text.parse().map_err(|_| {
@@ -880,11 +892,21 @@ fn resolve_param(
 }
 
 /// 数值参数闭区间校验。
+///
+/// 非有限值（`NaN` / `inf`）先行拒绝：`NaN` 与任何值比较都为 false，
+/// 若直接做 min/max 比较会静默通过并渲染出 `-crf NaN` 之类的非法命令。
 fn check_range(
     template: &BuiltinTemplate,
     spec: &TemplateParam,
     value: f64,
 ) -> anyhow::Result<()> {
+    if !value.is_finite() {
+        return Err(anyhow!(
+            "ffmpeg_template '{}' param '{}' must be a finite number, got '{value}'",
+            template.id,
+            spec.name
+        ));
+    }
     if let Some(min) = spec.min {
         if value < min {
             return Err(anyhow!(
@@ -904,6 +926,35 @@ fn check_range(
         }
     }
     Ok(())
+}
+
+/// 构造目录型产物的 manifest（`kind = FRAME_MANIFEST_KIND`）。
+///
+/// 每个条目含文件名、绝对路径与字节数：daemon 侧据此把目录内文件逐个登记
+/// 为可下载产物（`{node_id}` / `{node_id}__{文件名}`），从而让
+/// `/api/tasks/{id}/artifacts` 的 `size` 有意义且下载可用。
+pub fn frame_directory_manifest(dir: &Path, files: &[PathBuf]) -> Value {
+    let entries: Vec<Value> = files
+        .iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let size = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+            json!({
+                "name": name,
+                "path": path.to_string_lossy(),
+                "size": size,
+            })
+        })
+        .collect();
+    json!({
+        "kind": FRAME_MANIFEST_KIND,
+        "dir": dir.to_string_lossy(),
+        "count": entries.len(),
+        "files": entries,
+    })
 }
 
 /// 数值的 ffmpeg 文本形态：整数值不带小数（`23` 而非 `23.0`）。
@@ -1459,5 +1510,99 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn integer_params_parse_strictly_and_reject_fractions() {
+        // JSON 数字 23 / 字符串 "18" 都能正常渲染
+        let args = render_with("transcode", json!({ "crf": 23 }), "in.mp4", None, "out.mp4");
+        assert!(
+            args.windows(2).any(|w| w == ["-crf", "23"]),
+            "args={args:?}"
+        );
+        let args = render_with(
+            "transcode",
+            json!({ "crf": "18" }),
+            "in.mp4",
+            None,
+            "out.mp4",
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["-crf", "18"]),
+            "args={args:?}"
+        );
+
+        // "23.9" 是常见误输入：必须显式报错，不能静默截断成 23
+        let template = find_template("transcode").unwrap();
+        let input = Path::new("in.mp4");
+        let err = render_template_args(
+            template,
+            &json!({ "crf": "23.9" }),
+            &TemplateRenderInput {
+                input: Some(input),
+                input2: None,
+                output: Path::new("out.mp4"),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("must be an integer"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn number_params_reject_non_finite_values() {
+        let template = find_template("speed").unwrap();
+        let input = Path::new("in.mp4");
+        for raw in ["NaN", "inf", "-inf"] {
+            let err = render_template_args(
+                template,
+                &json!({ "factor": raw }),
+                &TemplateRenderInput {
+                    input: Some(input),
+                    input2: None,
+                    output: Path::new("out.mp4"),
+                },
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("must be a finite number"),
+                "raw={raw} err={err}"
+            );
+        }
+        // check_range 是最后一道防线：NaN 直接调用也必须被拒绝
+        let spec = template
+            .params
+            .iter()
+            .find(|spec| spec.name == "factor")
+            .unwrap();
+        let err = check_range(template, spec, f64::NAN).unwrap_err();
+        assert!(err.to_string().contains("must be a finite number"), "err={err}");
+    }
+
+    #[test]
+    fn frame_directory_manifest_lists_files_with_sizes() {
+        let dir = std::env::temp_dir().join(format!("ep_manifest_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("frame_0001.png");
+        let second = dir.join("frame_0002.png");
+        std::fs::write(&first, b"abcd").unwrap();
+        std::fs::write(&second, b"abcdefgh").unwrap();
+
+        let manifest = frame_directory_manifest(&dir, &[first.clone(), second.clone()]);
+        assert_eq!(manifest["kind"], json!(FRAME_MANIFEST_KIND));
+        assert_eq!(manifest["count"], json!(2));
+        let files = manifest["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0]["name"], json!("frame_0001.png"));
+        assert_eq!(files[0]["size"], json!(4));
+        assert_eq!(files[1]["size"], json!(8));
+        assert_eq!(
+            files[0]["path"].as_str().unwrap(),
+            first.to_string_lossy()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

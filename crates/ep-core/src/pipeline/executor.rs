@@ -618,6 +618,40 @@ to = ["save", "input"]
         );
     }
 
+    #[test]
+    fn test_collect_expanded_frame_files_skips_hidden_and_subdirs() {
+        let dir = std::env::temp_dir().join(format!("ep_frames_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("frame_0002.png"), b"bb").unwrap();
+        std::fs::write(dir.join("frame_0001.png"), b"a").unwrap();
+        std::fs::write(dir.join(".hidden.png"), b"ccc").unwrap();
+        std::fs::write(dir.join("nested").join("inner.png"), b"dddd").unwrap();
+
+        let files = collect_expanded_frame_files(&dir).unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        // 跳过隐藏文件与子目录；按文件名排序
+        assert_eq!(names, vec!["frame_0001.png", "frame_0002.png"]);
+        assert!(files.iter().all(|p| p.is_file()));
+        assert!(files.len() <= builtin_templates::MAX_EXPANDED_FRAME_FILES);
+
+        // daemon 展开依赖的 manifest 契约：kind + 逐个文件 + 真实字节数
+        let manifest = builtin_templates::frame_directory_manifest(&dir, &files);
+        assert_eq!(
+            manifest["kind"],
+            serde_json::json!(builtin_templates::FRAME_MANIFEST_KIND)
+        );
+        assert_eq!(manifest["count"], serde_json::json!(2));
+        let entries = manifest["files"].as_array().unwrap();
+        assert_eq!(entries[0]["name"], serde_json::json!("frame_0001.png"));
+        assert_eq!(entries[0]["size"], serde_json::json!(1));
+        assert_eq!(entries[1]["size"], serde_json::json!(2));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // ── 纯函数级：substitute_ffmpeg_placeholders ─────────────────────────────
 
     #[test]
@@ -4078,6 +4112,32 @@ async fn execute_builtin_ffmpeg(
 
 // ─── T-13：ffmpeg 模板节点执行 ──────────────────────────────────────────────
 
+/// 收集目录型产物（抽帧序列）中的普通文件，跳过隐藏文件与子目录。
+///
+/// 返回按文件名排序的前 [`builtin_templates::MAX_EXPANDED_FRAME_FILES`] 个
+/// 路径：目录产物不能直接下载（`size` 恒 0），executor 改为返回文件清单，
+/// 由 daemon 侧逐个登记为可下载产物（T-13 P2-2）。
+fn collect_expanded_frame_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with('.') {
+            continue; // 隐藏文件（如 macOS .DS_Store）不计入产物
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue; // 子目录/符号链接不展开
+        }
+        files.push(entry.path());
+    }
+    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    files.truncate(builtin_templates::MAX_EXPANDED_FRAME_FILES);
+    Ok(files)
+}
+
 /// 执行参数化 ffmpeg 模板节点（`builtin = "ffmpeg_template"`）。
 ///
 /// 与 [`execute_builtin_ffmpeg`] 的差异：
@@ -4181,16 +4241,21 @@ async fn execute_builtin_ffmpeg_template(
     }
 
     if template.ffmpeg_build.output_is_dir {
-        let has_entries = std::fs::read_dir(&output_path)
-            .map(|mut entries| entries.next().is_some())
-            .unwrap_or(false);
-        if !has_entries {
+        // 目录产物以文件清单返回（T-13 P2-2）：`Artifact::File(目录)` 在
+        // daemon 侧 size=0、下载 404、finalize 跳过，链路断裂。
+        let frames = collect_expanded_frame_files(&output_path)?;
+        if frames.is_empty() {
             return Err(anyhow::anyhow!(
                 "ffmpeg succeeded but produced no frames in '{}'",
                 output_path.display()
             ));
         }
-    } else if !output_path.is_file() {
+        return Ok(Artifact::Json(builtin_templates::frame_directory_manifest(
+            &output_path,
+            &frames,
+        )));
+    }
+    if !output_path.is_file() {
         return Err(anyhow::anyhow!(
             "ffmpeg succeeded but did not produce the expected output file '{}'",
             output_path.display()

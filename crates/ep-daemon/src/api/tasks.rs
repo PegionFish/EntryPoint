@@ -391,32 +391,62 @@ async fn list_task_artifacts(
     };
     let mut out = Vec::new();
     for node_id in &record.node_order {
-        // 优先归集副本（served_artifacts，finalize 后恒在 files/{node_id}/ 下），
-        // 回退原始产物路径：任务终结后 workspace 清理会删除原始文件
-        // （keep_workspace=false），旧实现只读 record.artifacts → metadata 失败
-        // 全被跳过 → 返回空数组（任务 #10：与任务记录 json 不一致的根因）。
-        let Some(path) = record
-            .served_artifacts
-            .get(node_id)
-            .filter(|p| p.is_file())
-            .or_else(|| record.artifacts.get(node_id))
-        else {
-            continue;
-        };
-        let Ok(meta) = std::fs::metadata(path) else {
-            continue; // 文件已不存在 → 不列入
-        };
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        out.push(ArtifactOut {
-            node_id: node_id.clone(),
-            name,
-            size: meta.len(),
-        });
+        // 目录型产物（抽帧序列）在记录里展开为多个合成 id：
+        // 首个文件 `{node_id}`，其余 `{node_id}__{文件名}`（T-13 P2-2）。
+        let mut artifact_ids: Vec<String> = vec![node_id.clone()];
+        let prefix = format!("{node_id}__");
+        let mut expanded: Vec<String> = record
+            .artifacts
+            .keys()
+            .filter(|id| id.starts_with(&prefix))
+            .cloned()
+            .collect();
+        expanded.sort();
+        artifact_ids.extend(expanded);
+        for artifact_id in artifact_ids {
+            // 优先归集副本（served_artifacts，finalize 后恒在 files/{artifact_id}/ 下），
+            // 回退原始产物路径：任务终结后 workspace 清理会删除原始文件
+            // （keep_workspace=false），旧实现只读 record.artifacts → metadata 失败
+            // 全被跳过 → 返回空数组（任务 #10：与任务记录 json 不一致的根因）。
+            let Some(path) = record
+                .served_artifacts
+                .get(&artifact_id)
+                .filter(|p| p.is_file())
+                .or_else(|| record.artifacts.get(&artifact_id))
+            else {
+                continue;
+            };
+            let Ok(meta) = std::fs::metadata(path) else {
+                continue; // 文件已不存在 → 不列入
+            };
+            let Some(file_name) = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+            else {
+                continue;
+            };
+            // 展开产物带相对子路径语义（`ef/frame_0002.png`），前端按
+            // node_id 下载时用合成 id 唯一定位
+            let name = if artifact_id.as_str() == node_id.as_str() {
+                file_name
+            } else {
+                format!("{node_id}/{file_name}")
+            };
+            out.push(ArtifactOut {
+                node_id: artifact_id,
+                name,
+                size: meta.len(),
+            });
+        }
     }
     (StatusCode::OK, Json(json!(out)))
+}
+
+/// 下载请求的 `artifact_id` 是否对应已知节点（精确 node_id，或
+/// `{node_id}__{文件名}` 形式的目录型产物展开项——后者同样登记在
+/// `record.artifacts` 里）。
+fn artifact_is_known(record: &TaskRecord, artifact_id: &str) -> bool {
+    record.nodes.contains_key(artifact_id) || record.artifacts.contains_key(artifact_id)
 }
 
 /// GET /api/tasks/:task_id/artifacts/:node_id — 单节点产物下载
@@ -441,7 +471,7 @@ async fn get_task_artifact(
         .await
         .into_response();
     };
-    if !record.nodes.contains_key(&node_id) {
+    if !artifact_is_known(&record, &node_id) {
         return err_response(
             &state,
             StatusCode::NOT_FOUND,
@@ -556,9 +586,11 @@ mod tests {
     use ep_core::config::AppConfig;
     use ep_core::pipeline::dag::Pipeline;
     use ep_core::port::PortManager;
+    use ep_core::task_registry::{NodeRecord, TaskState, DEFAULT_TASK_PRIORITY};
 
     use crate::api::execute::execution::{self, lock_for_tests, SubmitOptions};
 
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -872,6 +904,97 @@ params = { path = "/nonexistent/missing-art.txt" }
         for artifact in arr {
             assert!(artifact["size"].as_u64().unwrap() > 0);
         }
+    }
+
+    // ── 5c. T-13 P2-2：抽帧目录产物展开后列表 size>0 且可下载 ──────────────
+
+    #[tokio::test]
+    async fn test_frame_directory_artifacts_are_listed_and_downloadable() {
+        let _guard = lock_for_tests();
+        execution::clear_registry_for_tests();
+
+        let root = unique_root("frames-list");
+        let state = test_state(root.clone());
+        let task_dir = root.join("tasks").join("t-frames");
+        let frames_dir = root.join("ef_frames");
+        std::fs::create_dir_all(&frames_dir).unwrap();
+        let first = frames_dir.join("frame_0001.png");
+        let second = frames_dir.join("frame_0002.png");
+        std::fs::write(&first, b"frame-one").unwrap();
+        std::fs::write(&second, b"frame-two").unwrap();
+
+        // 模拟 executor 展开后的记录：首个文件沿用 node_id，其余合成 id
+        let mut artifacts = HashMap::new();
+        artifacts.insert("ef".to_string(), first);
+        artifacts.insert("ef__frame_0002.png".to_string(), second);
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "ef".to_string(),
+            NodeRecord {
+                state: "completed".to_string(),
+                error: None,
+            },
+        );
+        execution::insert_record_for_tests(TaskRecord {
+            id: "t-frames".to_string(),
+            pipeline_id: "frames-pipeline".to_string(),
+            status: TaskState::Completed,
+            error: None,
+            queue_position: None,
+            priority: DEFAULT_TASK_PRIORITY,
+            started_at: chrono::Utc::now(),
+            started_running_at: None,
+            finished_at: None,
+            node_order: vec!["ef".to_string()],
+            nodes,
+            artifacts,
+            served_artifacts: HashMap::new(),
+            work_dir: task_dir,
+            staging_dir: None,
+            module_ids: Vec::new(),
+            group: None,
+            cached_from: None,
+        });
+
+        // 列表：两个文件都在，size 为真实字节数（旧实现目录产物 size=0 且被跳过）
+        let (status, body) = list_task_artifacts(
+            State(state.clone()),
+            Path("t-frames".to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let arr = body.0.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "抽帧目录产物应展开为两个产物: {arr:?}");
+        assert_eq!(arr[0]["node_id"], "ef");
+        assert_eq!(arr[0]["name"], "frame_0001.png");
+        assert_eq!(arr[1]["node_id"], "ef__frame_0002.png");
+        assert_eq!(arr[1]["name"], "ef/frame_0002.png");
+        for artifact in arr {
+            assert!(artifact["size"].as_u64().unwrap() > 0);
+        }
+
+        // 下载：合成 id 也能通过节点校验并 302 到 task-files 通道
+        let resp = get_task_artifact(
+            State(state),
+            Path((
+                "t-frames".to_string(),
+                "ef__frame_0002.png".to_string(),
+            )),
+            RawQuery(None),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            location.contains("t-frames/files/ef__frame_0002.png/frame_0002.png"),
+            "Location={location}"
+        );
     }
 
     // ── 6. 下载重定向：302 + Location；未知任务/节点/产物 → 404 ───────────

@@ -94,6 +94,7 @@ use tracing::{debug, info, warn};
 
 use ep_core::cache::{CacheKey, CacheMeta};
 use ep_core::module::manifest::CapabilityDecl;
+use ep_core::pipeline::builtin_templates;
 use ep_core::pipeline::dag::{
     direct_output_extension, NodeKind, Pipeline, PipelineNode, ValidationError,
 };
@@ -2669,18 +2670,34 @@ fn run_task(
                 // 内联产物物化为任务目录内文件，随产物归集进入 files/ 可下载
                 //（直跑 JSON/Text 输出能力省略 file_output 节点后的产物通道）
                 Artifact::Json(value) => {
-                    let dest = tdir.join(format!("{node_id}_output.json"));
-                    let written = serde_json::to_string_pretty(value)
-                        .ok()
-                        .is_some_and(|s| std::fs::write(&dest, s).is_ok());
-                    if written {
-                        record_artifact(&tid, node_id, &dest);
+                    // 目录型产物（抽帧序列）以 manifest 返回（T-13 P2-2）：
+                    // 逐个文件登记为可下载产物，而不是把清单本身物化成 JSON
+                    // （目录内文件才可下载，size 才有意义）。
+                    if value.get("kind").and_then(Value::as_str)
+                        == Some(builtin_templates::FRAME_MANIFEST_KIND)
+                    {
+                        let count = record_expanded_frame_artifacts(&tid, node_id, value);
+                        if count == 0 {
+                            warn!(
+                                task_id = %tid,
+                                node_id,
+                                "frame manifest contained no usable file; result will not be downloadable"
+                            );
+                        }
                     } else {
-                        warn!(
-                            task_id = %tid,
-                            node_id,
-                            "failed to materialize JSON artifact; result will not be downloadable"
-                        );
+                        let dest = tdir.join(format!("{node_id}_output.json"));
+                        let written = serde_json::to_string_pretty(value)
+                            .ok()
+                            .is_some_and(|s| std::fs::write(&dest, s).is_ok());
+                        if written {
+                            record_artifact(&tid, node_id, &dest);
+                        } else {
+                            warn!(
+                                task_id = %tid,
+                                node_id,
+                                "failed to materialize JSON artifact; result will not be downloadable"
+                            );
+                        }
                     }
                 }
                 Artifact::Text(text) => {
@@ -2754,6 +2771,68 @@ fn record_artifact(task_id: &str, node_id: &str, path: &Path) {
     }
 }
 
+/// 目录型产物 manifest → `(合成产物 id, 绝对路径)` 列表。
+///
+/// 合成 id 约定：第一个文件沿用真实 `node_id`（前端既有下载/预览路径与
+/// UI 展示不变），其余为 `{node_id}__{文件名}`。只登记真实存在的普通文件。
+fn expanded_frame_entries(node_id: &str, manifest: &Value) -> Vec<(String, PathBuf)> {
+    let Some(files) = manifest.get("files").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut entries: Vec<(String, PathBuf)> = Vec::new();
+    for file in files
+        .iter()
+        .take(builtin_templates::MAX_EXPANDED_FRAME_FILES)
+    {
+        let Some(raw_path) = file.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let path = PathBuf::from(raw_path);
+        if !path.is_file() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let mut artifact_id = if entries.is_empty() {
+            node_id.to_string()
+        } else {
+            format!("{node_id}__{name}")
+        };
+        // 重名防御：同一目录内文件名理论上唯一，冲突时追加序号
+        let mut seq = 2;
+        while used.contains(&artifact_id) {
+            artifact_id = format!("{node_id}__{seq}__{name}");
+            seq += 1;
+        }
+        used.insert(artifact_id.clone());
+        entries.push((artifact_id, path));
+    }
+    entries
+}
+
+/// 把目录型产物展开登记进任务记录，返回登记数量（记录缺失时为 0）。
+fn record_expanded_frame_artifacts(task_id: &str, node_id: &str, manifest: &Value) -> usize {
+    let entries = expanded_frame_entries(node_id, manifest);
+    if entries.is_empty() {
+        return 0;
+    }
+    let count = entries.len();
+    let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(record) = reg.get_mut(task_id) else {
+        return 0;
+    };
+    for (artifact_id, path) in entries {
+        record.artifacts.insert(artifact_id, path);
+    }
+    count
+}
+
 // ─── 测试专用 ────────────────────────────────────────────────────────────────
 
 /// 串行化所有触碰进程级静态（注册表/调度器）的测试
@@ -2777,6 +2856,15 @@ pub fn clear_registry_for_tests() {
     extras().lock().unwrap_or_else(|e| e.into_inner()).clear();
     finalized().lock().unwrap_or_else(|e| e.into_inner()).clear();
     set_test_run_hook(None);
+}
+
+/// 测试专用：直接写入一条任务记录（产物列表/下载展开等 handler 级夹具）。
+#[cfg(test)]
+pub fn insert_record_for_tests(record: TaskRecord) {
+    let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+    if let Err(err) = reg.insert(record) {
+        panic!("insert test task record failed: {err}");
+    }
 }
 
 /// 重置 + 原子绑定持久化目录（持注册表锁完成，杜绝并发 AppState::new
@@ -2866,6 +2954,97 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    /// 构造一条 completed 任务记录夹具（产物展开相关 handler 级测试用）
+    fn sample_completed_record(
+        id: &str,
+        work_dir: PathBuf,
+        node_id: &str,
+        artifacts: HashMap<String, PathBuf>,
+    ) -> TaskRecord {
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            node_id.to_string(),
+            NodeRecord {
+                state: "completed".to_string(),
+                error: None,
+            },
+        );
+        TaskRecord {
+            id: id.to_string(),
+            pipeline_id: "test-pipeline".to_string(),
+            status: TaskState::Completed,
+            error: None,
+            queue_position: None,
+            priority: DEFAULT_TASK_PRIORITY,
+            started_at: Utc::now(),
+            started_running_at: None,
+            finished_at: None,
+            node_order: vec![node_id.to_string()],
+            nodes,
+            artifacts,
+            served_artifacts: HashMap::new(),
+            work_dir,
+            staging_dir: None,
+            module_ids: Vec::new(),
+            group: None,
+            cached_from: None,
+        }
+    }
+
+    // ── T-13 P2-2：目录型产物（抽帧）展开为可下载文件 ──────────────────────
+
+    #[test]
+    fn expanded_frame_entries_map_first_to_node_id_then_prefixed_keys() {
+        let root = unique_root("frames-entries");
+        let dir = root.join("ef_frames");
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("frame_0001.png");
+        let second = dir.join("frame_0002.png");
+        std::fs::write(&first, b"a").unwrap();
+        std::fs::write(&second, b"bb").unwrap();
+        // manifest 中夹带一个已不存在的文件：展开时应跳过
+        let manifest = builtin_templates::frame_directory_manifest(
+            &dir,
+            &[first.clone(), second, dir.join("missing.png")],
+        );
+
+        let entries = expanded_frame_entries("ef", &manifest);
+        assert_eq!(entries.len(), 2);
+        // 首个文件沿用真实 node_id，其余 `{node_id}__{文件名}`
+        assert_eq!(entries[0].0, "ef");
+        assert_eq!(entries[1].0, "ef__frame_0002.png");
+        assert_eq!(entries[0].1, first);
+    }
+
+    #[test]
+    fn record_expanded_frame_artifacts_registers_downloadable_files() {
+        let _guard = lock_for_tests();
+        clear_registry_for_tests();
+        let root = unique_root("frames-registry");
+        let dir = root.join("ef_frames");
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("frame_0001.png");
+        let second = dir.join("frame_0002.png");
+        std::fs::write(&first, b"a").unwrap();
+        std::fs::write(&second, b"bb").unwrap();
+        let manifest = builtin_templates::frame_directory_manifest(&dir, &[first.clone(), second]);
+
+        let record = sample_completed_record(
+            "t-frames",
+            root.join("tasks").join("t-frames"),
+            "ef",
+            HashMap::new(),
+        );
+        insert_record_for_tests(record);
+
+        let count = record_expanded_frame_artifacts("t-frames", "ef", &manifest);
+        assert_eq!(count, 2);
+        let rec = snapshot("t-frames").expect("record must exist");
+        assert_eq!(rec.artifacts.len(), 2);
+        assert_eq!(rec.artifacts.get("ef"), Some(&first));
+        assert!(rec.artifacts.contains_key("ef__frame_0002.png"));
     }
 
     // ── cleanup_task_workdir：keep_workspace=false 中间文件清理 ──────────────
