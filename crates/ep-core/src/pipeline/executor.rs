@@ -97,7 +97,8 @@ impl PipelineTask {
 
     /// 执行一层节点 — 将该层所有 Pending 节点标记为 Running
     ///
-    /// TODO: 实际执行逻辑（HTTP 调用 / spawn 进程 / 内置函数）
+    /// 本函数仅负责层状态迁移与调度标记；实际节点执行逻辑见
+    /// `execute_node`（本模块）与 `runner` 模块中的 DAG 驱动。
     pub fn execute_layer(&mut self, layer: &[String]) {
         // 首次执行时将任务状态设为 Running
         if self.status == TaskStatus::Pending {

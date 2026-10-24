@@ -878,8 +878,13 @@ impl ModelManager {
 
             // 校验门禁：声明了 sha256/sha256s 时，校验通过才算下载成功；
             // 失败按残缺产物清理，防止坏文件蒙混成 ready
-            if let Err(e) =
-                verify_model_checksum(&target_dir_path, &ModelChecksumSpec::from_decl(model), &model.id)
+            // （哈希走 spawn_blocking，避免阻塞 async worker）
+            if let Err(e) = verify_model_checksum_offload(
+                target_dir_path.clone(),
+                ModelChecksumSpec::from_decl(model),
+                model.id.clone(),
+            )
+            .await
             {
                 cleanup_partial_download(&target_dir_path, dir_was_empty_at_start);
                 anyhow::bail!("{e:#}");
@@ -1150,8 +1155,13 @@ impl ModelManager {
             })?;
 
         // 校验门禁：声明了 sha256/sha256s 时，先校验源目录再复制落盘
-        verify_model_checksum(source_path, &ModelChecksumSpec::from_decl(decl), model_id)
-            .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+        // （哈希走 spawn_blocking，避免阻塞 async worker）
+        verify_model_checksum_offload(
+            source_path.to_path_buf(),
+            ModelChecksumSpec::from_decl(decl),
+            model_id.to_string(),
+        )
+        .await?;
 
         self.import_model_into(module_id, model_id, &decl.target_dir, source_path)
             .await
@@ -1332,7 +1342,9 @@ impl ModelManager {
 
                 // 每 10 个文件输出一次进度
                 // （% 而非 is_multiple_of：后者 1.87 才转正，Debian 13 的
-                //   系统 rustc 1.85 需在服务器本地整仓编译）
+                //   系统 rustc 1.85 需在服务器本地整仓编译——不得按 clippy
+                //   建议改写，否则 MSRV 1.85 服务器本地编译失败）
+                #[allow(clippy::manual_is_multiple_of)]
                 if file_count % 10 == 0 {
                     info!(
                         files_copied = file_count,
@@ -1723,6 +1735,28 @@ pub(crate) fn verify_model_checksum(dir: &Path, spec: &ModelChecksumSpec, model_
     Ok(())
 }
 
+/// [`verify_model_checksum`] 的异步包装：递归遍历目录并逐文件 sha256 属
+/// 同步阻塞 IO（大模型可达数十 GB），直接在 async worker 上执行会占满
+/// tokio 调度线程，故统一经 `spawn_blocking` 卸载到阻塞线程池。
+///
+/// 校验语义与错误文案与同步版本完全一致（`{e:#}` 保留完整错误链）；
+/// 仅在阻塞任务本身异常终止（panic / runtime 关闭）时返回新的中文错误。
+pub(crate) async fn verify_model_checksum_offload(
+    dir: PathBuf,
+    spec: ModelChecksumSpec,
+    model_id: String,
+) -> Result<()> {
+    // 闭包拿所有权副本，model_id 本体留给 JoinError 分支拼错误文案
+    let task_model_id = model_id.clone();
+    let joined =
+        tokio::task::spawn_blocking(move || verify_model_checksum(&dir, &spec, &task_model_id))
+            .await;
+    match joined {
+        Ok(result) => result.map_err(|e| anyhow::anyhow!("{e:#}")),
+        Err(e) => Err(anyhow::anyhow!("模型 '{model_id}' 校验任务异常终止：{e}")),
+    }
+}
+
 /// 取消/失败/超时后清理残缺下载产物。
 ///
 /// 下载启动时目标目录为空（首次下载）→ 目录内任何文件都是本次子进程落盘的
@@ -2015,8 +2049,13 @@ async fn supervise_download(
                     Ok(status) if status.success() => {
                         // 校验门禁：声明了 sha256/sha256s 时，校验通过才算完成；
                         // 失败按残缺产物清理，落 Failed 终态
-                        if let Err(e) =
-                            verify_model_checksum(&poll_dir, &checksum, &model_id)
+                        // （哈希走 spawn_blocking，避免阻塞 async worker）
+                        if let Err(e) = verify_model_checksum_offload(
+                            poll_dir.clone(),
+                            checksum.clone(),
+                            model_id.clone(),
+                        )
+                        .await
                         {
                             cleanup_partial_download(&poll_dir, dir_was_empty_at_start);
                             let msg = format!("{e:#}");
@@ -4280,6 +4319,53 @@ mod tests {
                 break;
             }
         }
+
+        cleanup(&dir);
+    }
+
+    /// T-03：offload 包装与同步版本语义一致——空声明直接通过、摘要匹配通过、
+    /// 不匹配时用户可见错误文案与同步版本逐字一致。
+    #[tokio::test]
+    async fn test_verify_model_checksum_offload_preserves_error_text() {
+        let dir = temp_dir("offload_checksum");
+        fs::write(dir.join("weights.bin"), b"payload-bytes").unwrap();
+        let expected = sha256_file_hex(&dir.join("weights.bin")).unwrap();
+
+        // 1. 空声明：不读文件直接通过（与同步版本一致）
+        verify_model_checksum_offload(
+            dir.clone(),
+            ModelChecksumSpec::default(),
+            "empty".to_string(),
+        )
+        .await
+        .expect("empty checksum spec must pass");
+
+        // 2. 摘要匹配：通过
+        let matched = ModelChecksumSpec {
+            single: Some(expected),
+            files: Default::default(),
+        };
+        verify_model_checksum_offload(dir.clone(), matched, "matched".to_string())
+            .await
+            .expect("matching sha256 must pass");
+
+        // 3. 摘要不匹配：错误文案与同步版本逐字一致（含期望/实际摘要）
+        let mismatched = ModelChecksumSpec {
+            single: Some("0".repeat(64)),
+            files: Default::default(),
+        };
+        let sync_msg = format!(
+            "{:#}",
+            verify_model_checksum(&dir, &mismatched, "badsum").unwrap_err()
+        );
+        let offload_err =
+            verify_model_checksum_offload(dir.clone(), mismatched, "badsum".to_string())
+                .await
+                .expect_err("mismatched sha256 must fail");
+        let offload_msg = format!("{offload_err:#}");
+        assert_eq!(offload_msg, sync_msg, "错误文案必须与同步版本一致");
+        assert!(offload_msg.contains("校验失败"), "msg: {offload_msg}");
+        assert!(offload_msg.contains("sha256 不匹配"), "msg: {offload_msg}");
 
         cleanup(&dir);
     }
