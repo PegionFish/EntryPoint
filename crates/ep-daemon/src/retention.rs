@@ -8,6 +8,12 @@
 //! - **只清理终态任务**：以 `runtime/tasks/{task_id}.json` 注册表记录判定
 //!   completed / failed / cancelled；queued / running 永不删除。注册表缺失、
 //!   损坏或 id 不匹配的目录一律跳过（无法证明终态 → 保守不动）。
+//! - 崩溃遗留豁免：磁盘记录仍是非终态、但内存注册表已在启动加载时改判 failed
+//!   且错误文本为 [`ep_core::task_registry::INTERRUPTED_BY_RESTART_ERROR`] 的
+//!   任务，按 failed 终态处理（无人值守场景下断电重启的遗留目录不会永远占盘）；
+//!   真正运行中 / 排队中的任务内存状态未变，仍绝不触碰。
+//! - 不可判定终态的目录（运行中 / 排队中、注册表缺失或损坏）计入总容量，
+//!   但不参与清理；若因此无法满足 `max_total_gb`，本轮输出一条 `warn` 日志。
 //! - 淘汰顺序按完成时间（`finished_at`，缺失时回退 `started_at`）升序：
 //!   先删超龄任务（`max_age_days`），再按总容量（`max_total_gb`）从最旧开始删，
 //!   直至满足上限；两个维度互相独立，`0` = 该维度不限。
@@ -27,7 +33,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use ep_core::config::TasksRetentionConfig;
-use ep_core::task_registry::{TaskRecord, TaskState};
+use ep_core::task_registry::{TaskRecord, TaskState, INTERRUPTED_BY_RESTART_ERROR};
 use serde_json::json;
 
 use crate::eventlog;
@@ -118,6 +124,23 @@ pub(crate) fn run_retention_once(
     policy: &TasksRetentionConfig,
     now: DateTime<Utc>,
 ) -> RetentionReport {
+    run_retention_once_with(root, workspace_dir, policy, now, |task_id| {
+        crate::api::execute::execution::snapshot(task_id)
+    })
+}
+
+/// [`run_retention_once`] 的可注入实现。
+///
+/// `memory_record` 查询内存注册表状态：生产路径固定使用
+/// [`crate::api::execute::execution::snapshot`]；单测可注入构造的记录，覆盖
+/// 「内存已改判 / 仍在运行」两类场景，无需改动进程级全局注册表。
+fn run_retention_once_with(
+    root: &Path,
+    workspace_dir: &Path,
+    policy: &TasksRetentionConfig,
+    now: DateTime<Utc>,
+    memory_record: impl Fn(&str) -> Option<TaskRecord>,
+) -> RetentionReport {
     let mut report = RetentionReport::default();
     if !policy.enabled || (policy.max_age_days == 0 && policy.max_total_gb == 0) {
         return report;
@@ -137,6 +160,10 @@ pub(crate) fn run_retention_once(
     // 因为容量上限约束的是整个 workspace/tasks 的磁盘占用。
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut total_bytes: u64 = 0;
+    // 不可判定终态的目录（运行中 / 排队中、注册表缺失或损坏）：计入 total_bytes，
+    // 但不参与清理；容量超限时用于告警，避免「清完仍超限」静默失败。
+    let mut undeletable_count: usize = 0;
+    let mut undeletable_bytes: u64 = 0;
     for entry in entries.flatten() {
         let Ok(file_type) = entry.file_type() else {
             continue;
@@ -157,6 +184,8 @@ pub(crate) fn run_retention_once(
 
         let Some(record) = load_record(root, &id) else {
             tracing::debug!(task_id = %id, "无任务注册表记录，跳过该目录（无法证明终态）");
+            undeletable_count += 1;
+            undeletable_bytes = undeletable_bytes.saturating_add(size_bytes);
             continue;
         };
         if record.id != id {
@@ -165,11 +194,22 @@ pub(crate) fn run_retention_once(
                 record_id = %record.id,
                 "任务目录名与注册表记录 id 不一致，跳过该目录"
             );
+            undeletable_count += 1;
+            undeletable_bytes = undeletable_bytes.saturating_add(size_bytes);
             continue;
         }
-        if !record.status.is_terminal() {
+        // 磁盘记录非终态时，仅当内存注册表已把它改判为「重启中断的 failed」
+        // 才视为终态候选；真正 running/queued 的任务内存状态未变，不会命中。
+        let memory = if record.status.is_terminal() {
+            None
+        } else {
+            memory_record(&id)
+        };
+        let Some(record) = terminal_candidate(record, memory) else {
+            undeletable_count += 1;
+            undeletable_bytes = undeletable_bytes.saturating_add(size_bytes);
             continue;
-        }
+        };
         report.terminal += 1;
         candidates.push(Candidate {
             id,
@@ -220,11 +260,21 @@ pub(crate) fn run_retention_once(
             }
         }
         if total_bytes > limit_bytes {
-            tracing::debug!(
-                total_bytes,
-                limit_bytes,
-                "终态任务已清空仍超出容量上限（非终态任务占用或上限过小）"
-            );
+            if undeletable_count > 0 {
+                tracing::warn!(
+                    total_bytes,
+                    limit_bytes,
+                    undeletable_count,
+                    undeletable_bytes,
+                    "容量上限未达成：存在不可删除目录（非终态、注册表缺失或损坏），其占用计入总量但不参与清理"
+                );
+            } else {
+                tracing::debug!(
+                    total_bytes,
+                    limit_bytes,
+                    "终态任务已清空仍超出容量上限（上限过小或删除失败）"
+                );
+            }
         }
     }
 
@@ -240,6 +290,30 @@ struct Candidate {
     /// 完成时间（`finished_at` 缺失回退 `started_at`）
     completed_at: DateTime<Utc>,
     size_bytes: u64,
+}
+
+/// 判定任务目录是否可作为终态候选。
+///
+/// 磁盘记录本身终态时直接候选；非终态时仅接受「内存已改判」的情况：启动加载
+/// 把上次退出时仍 queued/running 的任务改判为 `Failed`，并写入
+/// [`INTERRUPTED_BY_RESTART_ERROR`] 作为特征。该改判只发生在内存（不覆盖磁盘
+/// 原始状态），所以必须同时查内存注册表；真正运行中 / 排队中的任务内存状态仍
+/// 是 Running/Queued，不会被当作终态。
+fn terminal_candidate(
+    record: TaskRecord,
+    memory_record: Option<TaskRecord>,
+) -> Option<TaskRecord> {
+    if record.status.is_terminal() {
+        return Some(record);
+    }
+    let memory = memory_record?;
+    if memory.status == TaskState::Failed
+        && memory.error.as_deref() == Some(INTERRUPTED_BY_RESTART_ERROR)
+    {
+        Some(memory)
+    } else {
+        None
+    }
 }
 
 /// 删除整个任务目录（含产物）并写清理事件；失败仅告警返回 false。
@@ -282,7 +356,8 @@ fn cleanup_task(root: &Path, candidate: &Candidate, reason: &str, now: DateTime<
 ///
 /// 注意：**不能**用 [`ep_core::task_registry::TaskRegistry::load`]——它会把
 /// 上次进程退出时仍处于 queued/running 的任务改判 failed，而本清理器必须以
-/// 磁盘上的原始状态判定终态，运行中任务绝不能被误删。
+/// 磁盘上的原始状态判定终态，运行中任务绝不能被误删。启动改判只发生在内存
+/// 注册表，故非终态记录由 [`terminal_candidate`] 结合内存快照二次确认。
 fn load_record(root: &Path, task_id: &str) -> Option<TaskRecord> {
     let path = root
         .join("runtime")
@@ -395,6 +470,35 @@ mod tests {
 
     fn cleanup_events(root: &Path) -> Vec<serde_json::Value> {
         eventlog::read_events(root, None, Some(CLEANUP_EVENT_TYPE), 100)
+    }
+
+    /// 构造内存注册表记录（不落盘），用于向 `run_retention_once_with` 注入
+    /// 「启动改判 / 运行中」两类状态。
+    fn memory_record(
+        id: &str,
+        status: TaskState,
+        started_at: DateTime<Utc>,
+        finished_at: Option<DateTime<Utc>>,
+        error: Option<&str>,
+    ) -> TaskRecord {
+        let mut value = json!({
+            "id": id,
+            "pipeline_id": "pipeline-retention-test",
+            "status": status,
+            "started_at": started_at,
+            "work_dir": std::env::temp_dir(),
+            "node_order": [],
+            "nodes": {},
+            "artifacts": {},
+            "served_artifacts": {},
+        });
+        if let Some(finished_at) = finished_at {
+            value["finished_at"] = json!(finished_at);
+        }
+        if let Some(error) = error {
+            value["error"] = json!(error);
+        }
+        serde_json::from_value(value).expect("构造内存任务记录应成功")
     }
 
     /// 验收 ①：3 个超龄终态任务 + 1 个 running，`max_age_days = 1` →
@@ -569,6 +673,234 @@ mod tests {
         assert_eq!(report.deleted, 0);
         assert!(queued_dir.exists(), "排队任务目录绝不能被删除");
         assert!(orphan_dir.exists(), "无注册表记录的目录必须保守跳过");
+        assert!(cleanup_events(&root).is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P1 回归：磁盘记录仍为 running（模拟崩溃遗留），但内存注册表已在启动
+    /// 加载时改判 failed（错误文本为重启中断特征）→ 应纳入终态候选并按年龄清理。
+    #[test]
+    fn restart_interrupted_task_is_cleaned_by_age() {
+        let root = unique_root("interrupted");
+        let workspace = root.join("workspace");
+        let now = Utc::now();
+        let started_at = now - chrono::Duration::days(10);
+        let interrupted_at = now - chrono::Duration::days(2);
+        let dir = create_task_dir(&workspace, "interrupted-task", 1024);
+        write_record(
+            &root,
+            "interrupted-task",
+            "pipeline-interrupted",
+            TaskState::Running,
+            started_at,
+            None,
+            &dir,
+        );
+
+        let policy = TasksRetentionConfig {
+            enabled: true,
+            max_age_days: 1,
+            max_total_gb: 0,
+        };
+        let report = run_retention_once_with(&root, &workspace, &policy, now, |task_id| {
+            match task_id {
+                "interrupted-task" => Some(memory_record(
+                    "interrupted-task",
+                    TaskState::Failed,
+                    started_at,
+                    Some(interrupted_at),
+                    Some(INTERRUPTED_BY_RESTART_ERROR),
+                )),
+                _ => None,
+            }
+        });
+
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.terminal, 1);
+        assert_eq!(report.deleted, 1);
+        assert!(!dir.exists(), "重启中断遗留任务应按 failed 终态被清理");
+
+        let events = cleanup_events(&root);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["status"], "failed");
+        assert_eq!(events[0]["reason"], REASON_MAX_AGE);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 安全边界：内存注册表仍是 running / queued 的任务，即使磁盘记录较旧、
+    /// 占用超过容量上限，也绝不能被删除。
+    #[test]
+    fn memory_running_and_queued_tasks_are_never_deleted() {
+        let root = unique_root("live");
+        let workspace = root.join("workspace");
+        let now = Utc::now();
+        let started_at = now - chrono::Duration::days(30);
+        let running_dir = create_task_dir(&workspace, "live-running", 1024);
+        write_record(
+            &root,
+            "live-running",
+            "pipeline-live",
+            TaskState::Running,
+            started_at,
+            None,
+            &running_dir,
+        );
+        let queued_dir = create_task_dir(&workspace, "live-queued", 1024);
+        write_record(
+            &root,
+            "live-queued",
+            "pipeline-live",
+            TaskState::Queued,
+            started_at,
+            None,
+            &queued_dir,
+        );
+
+        let policy = TasksRetentionConfig {
+            enabled: true,
+            max_age_days: 1,
+            max_total_gb: 1,
+        };
+        let report = run_retention_once_with(&root, &workspace, &policy, now, |task_id| {
+            match task_id {
+                "live-running" => Some(memory_record(
+                    "live-running",
+                    TaskState::Running,
+                    started_at,
+                    None,
+                    None,
+                )),
+                "live-queued" => Some(memory_record(
+                    "live-queued",
+                    TaskState::Queued,
+                    started_at,
+                    None,
+                    None,
+                )),
+                _ => None,
+            }
+        });
+
+        assert_eq!(report.scanned, 2);
+        assert_eq!(report.terminal, 0);
+        assert_eq!(report.deleted, 0);
+        assert!(running_dir.exists(), "运行中任务目录绝不能被删除");
+        assert!(queued_dir.exists(), "排队任务目录绝不能被删除");
+        assert!(cleanup_events(&root).is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 改配置后下一轮按新约束收敛：先按容量删最旧，再把年龄上限调严继续删。
+    #[test]
+    fn changed_policy_converges_on_next_run() {
+        let root = unique_root("reconfig");
+        let workspace = root.join("workspace");
+        let now = Utc::now();
+        let tasks = [
+            ("oldest", now - chrono::Duration::days(10)),
+            ("middle", now - chrono::Duration::days(8)),
+            ("newest", now - chrono::Duration::hours(1)),
+        ];
+        for (id, finished_at) in tasks {
+            let dir = create_task_dir(&workspace, id, 400 * MB);
+            write_record(
+                &root,
+                id,
+                "pipeline-reconfig",
+                TaskState::Completed,
+                finished_at,
+                Some(finished_at),
+                &dir,
+            );
+        }
+
+        // 第一轮：只按容量（1 GiB）→ 3 × 400 MiB 超限，删最旧一个即满足
+        let capacity_policy = TasksRetentionConfig {
+            enabled: true,
+            max_age_days: 0,
+            max_total_gb: 1,
+        };
+        let first = run_retention_once(&root, &workspace, &capacity_policy, now);
+        assert_eq!(first.deleted, 1);
+        assert!(!workspace.join("tasks").join("oldest").exists());
+        assert!(workspace.join("tasks").join("middle").exists());
+
+        // 第二轮：只按年龄（1 天）→ 8 天前的 middle 被删，1 小时前的 newest 保留
+        let age_policy = TasksRetentionConfig {
+            enabled: true,
+            max_age_days: 1,
+            max_total_gb: 0,
+        };
+        let second = run_retention_once(&root, &workspace, &age_policy, now);
+        assert_eq!(second.deleted, 1);
+        assert!(!workspace.join("tasks").join("middle").exists());
+        assert!(workspace.join("tasks").join("newest").exists());
+
+        let events = cleanup_events(&root);
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|e| e["reason"] == REASON_MAX_TOTAL));
+        assert!(events.iter().any(|e| e["reason"] == REASON_MAX_AGE));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `finished_at` 缺失时按 `started_at` 回退计算年龄。
+    #[test]
+    fn missing_finished_at_falls_back_to_started_at() {
+        let root = unique_root("no-finished");
+        let workspace = root.join("workspace");
+        let now = Utc::now();
+        let started_at = now - chrono::Duration::days(5);
+        let dir = create_task_dir(&workspace, "no-finished", 1024);
+        write_record(
+            &root,
+            "no-finished",
+            "pipeline-no-finished",
+            TaskState::Completed,
+            started_at,
+            None,
+            &dir,
+        );
+
+        let policy = TasksRetentionConfig {
+            enabled: true,
+            max_age_days: 1,
+            max_total_gb: 0,
+        };
+        let report = run_retention_once(&root, &workspace, &policy, now);
+
+        assert_eq!(report.terminal, 1);
+        assert_eq!(report.deleted, 1);
+        assert!(!dir.exists(), "缺失 finished_at 时应按 started_at 判定超龄");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 注册表记录损坏时保守跳过（不删除、不写事件）。
+    #[test]
+    fn corrupt_registry_record_is_skipped() {
+        let root = unique_root("corrupt");
+        let workspace = root.join("workspace");
+        let now = Utc::now();
+        let dir = create_task_dir(&workspace, "corrupt-task", 1024);
+        let record_dir = root.join("runtime").join("tasks");
+        std::fs::create_dir_all(&record_dir).unwrap();
+        std::fs::write(record_dir.join("corrupt-task.json"), "{not-json").unwrap();
+
+        let policy = TasksRetentionConfig {
+            enabled: true,
+            max_age_days: 1,
+            max_total_gb: 1,
+        };
+        let report = run_retention_once(&root, &workspace, &policy, now);
+
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.terminal, 0);
+        assert_eq!(report.deleted, 0);
+        assert!(dir.exists(), "注册表损坏的目录必须保守跳过");
         assert!(cleanup_events(&root).is_empty());
 
         let _ = std::fs::remove_dir_all(&root);

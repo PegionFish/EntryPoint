@@ -12,6 +12,7 @@
 //! |---|---|---|
 //! | `watcher_trigger` | rule, file, task_id?, status, detail? | watcher 巡检循环 |
 //! | `task_terminal` | task_id, pipeline_id, status, error? | [`write_task_terminal`]（execution.rs finalize 统一出口接入） |
+//! | `task_retention_cleanup` | task_id, pipeline_id, status, reason, size_bytes | 任务产物保留巡检（retention.rs） |
 //!
 //! ## 读取
 //!

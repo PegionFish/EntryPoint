@@ -26,6 +26,14 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+/// 启动加载时对非终态任务的改判错误文本（"重启中断"特征）。
+///
+/// 上次进程退出时仍处于 `queued` / `running` 的任务不可能再完成，
+/// [`TaskRegistry::enable_persistence`] 加载时会统一改判 `failed` 并写入该文本
+/// （见 `load_from_disk`）。改判只发生在内存，不覆盖磁盘原始状态；清理器等外部
+/// 逻辑据此特征识别崩溃遗留任务，避免把仍在运行中的任务误判为终态。
+pub const INTERRUPTED_BY_RESTART_ERROR: &str =
+    "task interrupted by daemon restart (never finished)";
 
 // ─── 任务状态 ────────────────────────────────────────────────────────────────
 
@@ -300,9 +308,7 @@ impl TaskRegistry {
             // 进程重启后不可能继续执行：非终态一律改判 failed
             if !record.status.is_terminal() {
                 record.status = TaskState::Failed;
-                record.error = Some(
-                    "task interrupted by daemon restart (never finished)".to_string(),
-                );
+                record.error = Some(INTERRUPTED_BY_RESTART_ERROR.to_string());
                 record.finished_at = Some(Utc::now());
             }
             record.queue_position = None;
