@@ -44,11 +44,21 @@ use crate::state::AppState;
 
 use super::err_response;
 
+/// 审查 P2-2：webhooks 注册表读-改-写进程内串行化——并发 CRUD 各自
+/// load→save 会互相覆盖丢更新，且固定 tmp 路径（schedule.rs save）在并发
+/// save 下互踩。文件小、临界区纯同步 IO，std Mutex 足够；跨进程无竞争
+/// （单 daemon 进程）。guard 不得跨 .await 持有（见各 handler 的 outcome 结构）。
+fn webhook_registry_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/hooks", get(list_hooks).post(create_hook))
-        // POST /{hook_id} = 触发（对外契约：hook_id 即 URL 令牌位；
-        // 鉴权由 /api 全局中间件覆盖，见文件头）
+        // POST /{hook_id} = 触发（对外契约：hook_id 是触发能力位，不承担鉴权——
+        // 8 位时间衍生混合值可猜测；鉴权由 /api 全局中间件覆盖，见文件头与
+        // AUTOMATION §4.7。access_protection=none 部署勿将端口暴露公网）
         .route(
             "/hooks/{id}",
             get(get_hook).put(update_hook).delete(delete_hook).post(trigger_hook),
@@ -255,19 +265,27 @@ async fn create_hook(
     };
 
     let path = webhooks_path(&state);
-    let mut registry = WebhookRegistry::load(&path);
-    let id = registry.generate_hook_id();
-    let entry = WebhookEntry { id: id.clone(), name, enabled, target };
-    registry.entries.insert(id.clone(), entry);
-    if let Err(e) = registry.save(&path) {
-        return err_response(
-            &state,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "apiCore.hook.saveFailed",
-            &[("detail", e.to_string())],
-        )
-        .await;
-    }
+    let outcome = {
+        let _guard = webhook_registry_lock();
+        let mut registry = WebhookRegistry::load(&path);
+        let id = registry.generate_hook_id();
+        registry
+            .entries
+            .insert(id.clone(), WebhookEntry { id: id.clone(), name, enabled, target });
+        registry.save(&path).map(|_| id)
+    };
+    let id = match outcome {
+        Ok(id) => id,
+        Err(e) => {
+            return err_response(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "apiCore.hook.saveFailed",
+                &[("detail", e.to_string())],
+            )
+            .await;
+        }
+    };
     (StatusCode::OK, Json(json!({ "ok": true, "id": id })))
 }
 
@@ -284,22 +302,42 @@ async fn update_hook(
     };
 
     let path = webhooks_path(&state);
-    let mut registry = WebhookRegistry::load(&path);
-    if !registry.entries.contains_key(&id) {
-        return err_response(&state, StatusCode::NOT_FOUND, "apiCore.hook.notFound", &[("id", id)])
-            .await;
+    enum UpdateOutcome {
+        Saved,
+        NotFound,
+        SaveFailed(String),
     }
-    registry.entries.insert(id.clone(), WebhookEntry { id, name, enabled, target });
-    if let Err(e) = registry.save(&path) {
-        return err_response(
-            &state,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "apiCore.hook.saveFailed",
-            &[("detail", e.to_string())],
-        )
-        .await;
+    let outcome = {
+        let _guard = webhook_registry_lock();
+        let mut registry = WebhookRegistry::load(&path);
+        if !registry.entries.contains_key(&id) {
+            UpdateOutcome::NotFound
+        } else {
+            registry
+                .entries
+                .insert(id.clone(), WebhookEntry { id: id.clone(), name, enabled, target });
+            match registry.save(&path) {
+                Ok(()) => UpdateOutcome::Saved,
+                Err(e) => UpdateOutcome::SaveFailed(e.to_string()),
+            }
+        }
+    };
+    match outcome {
+        UpdateOutcome::Saved => (StatusCode::OK, Json(json!({ "ok": true }))),
+        UpdateOutcome::NotFound => {
+            err_response(&state, StatusCode::NOT_FOUND, "apiCore.hook.notFound", &[("id", id)])
+                .await
+        }
+        UpdateOutcome::SaveFailed(detail) => {
+            err_response(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "apiCore.hook.saveFailed",
+                &[("detail", detail)],
+            )
+            .await
+        }
     }
-    (StatusCode::OK, Json(json!({ "ok": true })))
 }
 
 /// DELETE /api/hooks/{id} — 删除（幂等）
@@ -308,9 +346,13 @@ async fn delete_hook(
     AxumPath(id): AxumPath<String>,
 ) -> (StatusCode, Json<Value>) {
     let path = webhooks_path(&state);
-    let mut registry = WebhookRegistry::load(&path);
-    registry.entries.remove(&id);
-    if let Err(e) = registry.save(&path) {
+    let outcome = {
+        let _guard = webhook_registry_lock();
+        let mut registry = WebhookRegistry::load(&path);
+        registry.entries.remove(&id);
+        registry.save(&path)
+    };
+    if let Err(e) = outcome {
         return err_response(
             &state,
             StatusCode::INTERNAL_SERVER_ERROR,

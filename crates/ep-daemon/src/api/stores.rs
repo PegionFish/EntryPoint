@@ -312,20 +312,24 @@ fn list_dir_entries(dir: &std::path::Path) -> std::io::Result<Vec<StoreDirEntry>
             Err(_) => continue, // 单点读失败不拖垮整列表
         };
         let name = entry.file_name().to_string_lossy().into_owned();
-        let meta = match entry.metadata() {
-            Ok(m) => m,
+        // 审查 P2-4：条目用 file_type（不跟随）而非 metadata（跟随）判型——
+        // 共享/NAS 池内他人可写入的 symlink/junction 指向池外时，跟随会外泄
+        // 池外目录的名字与大小；链接项不枚举、不下钻。池根本身链到 NAS 属
+        // store 配置意图（read_dir 打开的是配置解析后的路径），不受影响。
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
             Err(_) => continue,
         };
-        if meta.is_dir() {
-            out.push(StoreDirEntry { name, kind: "dir", size: 0 });
-        } else if meta.is_file() {
-            out.push(StoreDirEntry {
-                name,
-                kind: "file",
-                size: meta.len(),
-            });
+        if ft.is_symlink() {
+            continue;
         }
-        // 符号链接/设备等其他类型：跳过
+        if ft.is_dir() {
+            out.push(StoreDirEntry { name, kind: "dir", size: 0 });
+        } else if ft.is_file() {
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            out.push(StoreDirEntry { name, kind: "file", size });
+        }
+        // 设备/管道等其他类型：跳过
     }
     out.sort_by(|a, b| {
         a.kind.cmp(b.kind).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
