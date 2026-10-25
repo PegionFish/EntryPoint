@@ -595,6 +595,77 @@ fn default_cache_max_gb() -> u32 {
     8
 }
 
+// ─── LlmConfig（T-24：命名 LLM provider 档案）──────────────────────────────
+
+/// 单个 LLM 提供商档案（`[[llm.providers]]`，T-24）。
+///
+/// `api_key` **明文落盘**（与 `[server].token` / `[api].token` 同级的安全权衡，
+/// 安全审计已接受）；所有 API 响应一律脱敏——`api_key` 恒为空串，是否已配置
+/// 由 `api_key_set` 布尔标记表达（见 ep-daemon `api/llm.rs` 与
+/// `api/config.rs` 的 `ConfigView`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmProviderConfig {
+    /// 唯一逻辑名（URL 路径段；重复 id 由 API 层拒绝，创建后不可改名）
+    pub id: String,
+    /// 显示名（空串时 UI 回退显示 id）
+    #[serde(default)]
+    pub name: String,
+    /// OpenAI 兼容根地址（如 `https://api.openai.com`）；测试连接请求
+    /// `GET {base_url}/v1/models`
+    #[serde(default)]
+    pub base_url: String,
+    /// API 密钥（明文存盘；API 响应恒脱敏为空串 + `api_key_set`）
+    #[serde(default)]
+    pub api_key: String,
+    /// 请求超时（秒）；缺省 [`Self::DEFAULT_TIMEOUT_SECS`]
+    #[serde(default = "default_llm_timeout_secs")]
+    pub timeout_secs: u64,
+    /// 可选请求速率上限（RPM）；缺省不限制
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpm: Option<u32>,
+    /// 可选并发上限；缺省不限制
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<u32>,
+    /// 可选出口代理（如 `http://127.0.0.1:7890`）；缺省不使用
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+    /// 启用开关；缺省 true
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl LlmProviderConfig {
+    /// `timeout_secs` 缺省值；serde 缺省函数与 API 层创建共用同一常量
+    pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
+}
+
+fn default_llm_timeout_secs() -> u64 {
+    LlmProviderConfig::DEFAULT_TIMEOUT_SECS
+}
+
+/// LLM 提供商配置（`[llm]`，T-24）。
+///
+/// 旧配置文件无此段时经 `#[serde(default)]` 照常解析（`providers` 为空），
+/// 行为零变化。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmConfig {
+    /// 命名 provider 档案列表
+    #[serde(default)]
+    pub providers: Vec<LlmProviderConfig>,
+}
+
+impl LlmConfig {
+    /// 按 id 查找 provider 档案
+    pub fn provider(&self, id: &str) -> Option<&LlmProviderConfig> {
+        self.providers.iter().find(|p| p.id == id)
+    }
+
+    /// 按 id 可变查找 provider 档案
+    pub fn provider_mut(&mut self, id: &str) -> Option<&mut LlmProviderConfig> {
+        self.providers.iter_mut().find(|p| p.id == id)
+    }
+}
+
 // ─── AppConfig ──────────────────────────────────────────────────────────────
 
 /// 整合包配置（§8.3）
@@ -676,6 +747,9 @@ pub struct AppConfig {
     /// 直跑结果内容寻址缓存（`[cache]`，T-16）
     #[serde(default)]
     pub cache: CacheConfig,
+    /// 命名 LLM 提供商档案（`[llm]` + `[[llm.providers]]`，T-24）
+    #[serde(default)]
+    pub llm: LlmConfig,
     /// 每模块激活模型变体（单槽位语义 §5.2）：module_id → model_id；A6 消费
     #[serde(default)]
     pub active_models: std::collections::HashMap<String, String>,
@@ -1908,5 +1982,122 @@ workspace_dir = "workspace"
         assert_eq!(loaded.python.constraints, "config/constraints.txt");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── T-24：[llm] + [[llm.providers]] ────────────────────────────────
+
+    /// 旧配置无 `[llm]` 段照常解析（serde 默认 providers 为空，行为零变化）；
+    /// 字段省略时按缺省值填充（timeout 60 / enabled true）。
+    #[test]
+    fn llm_providers_legacy_config_without_llm_section() {
+        // 空配置 / 旧配置 → providers 为空
+        let config: AppConfig = toml::from_str("[server]\nport = 9800\n").expect("parse legacy");
+        assert!(config.llm.providers.is_empty());
+        assert_eq!(config.llm, LlmConfig::default());
+
+        // [llm] 段存在但 providers 省略 → 空
+        let config: AppConfig = toml::from_str("[llm]\n").expect("parse empty llm");
+        assert!(config.llm.providers.is_empty());
+
+        // 只写必填字段，可选字段省略 → timeout 60 / enabled true / 其余 None
+        let config: AppConfig = toml::from_str(
+            r#"
+[[llm.providers]]
+id = "openai"
+base_url = "https://api.openai.com"
+"#,
+        )
+        .expect("parse partial provider");
+        assert_eq!(config.llm.providers.len(), 1);
+        let p = &config.llm.providers[0];
+        assert_eq!(p.id, "openai");
+        assert_eq!(p.name, "");
+        assert_eq!(p.base_url, "https://api.openai.com");
+        assert!(p.api_key.is_empty());
+        assert_eq!(p.timeout_secs, LlmProviderConfig::DEFAULT_TIMEOUT_SECS);
+        assert_eq!(p.rpm, None);
+        assert_eq!(p.concurrency, None);
+        assert_eq!(p.proxy, None);
+        assert!(p.enabled);
+
+        // 按 id 查找助手
+        assert!(config.llm.provider("openai").is_some());
+        assert!(config.llm.provider("nope").is_none());
+    }
+
+    /// 完整 `[[llm.providers]]` TOML 往返：所有字段显式值经序列化/反序列化保持不变
+    #[test]
+    fn llm_providers_toml_roundtrip() {
+        let config = AppConfig {
+            llm: LlmConfig {
+                providers: vec![
+                    LlmProviderConfig {
+                        id: "openai".into(),
+                        name: "OpenAI 官方".into(),
+                        base_url: "https://api.openai.com".into(),
+                        api_key: "sk-s3cret".into(),
+                        timeout_secs: 30,
+                        rpm: Some(60),
+                        concurrency: Some(4),
+                        proxy: Some("http://127.0.0.1:7890".into()),
+                        enabled: true,
+                    },
+                    LlmProviderConfig {
+                        id: "local".into(),
+                        name: String::new(),
+                        base_url: "http://127.0.0.1:11434".into(),
+                        api_key: String::new(),
+                        timeout_secs: 5,
+                        rpm: None,
+                        concurrency: None,
+                        proxy: None,
+                        enabled: false,
+                    },
+                ],
+            },
+            ..AppConfig::default()
+        };
+
+        let toml_str = toml::to_string_pretty(&config).expect("serialize");
+        let restored: AppConfig = toml::from_str(&toml_str).expect("deserialize");
+        assert_eq!(restored.llm, config.llm, "TOML 往返后 [llm] 段逐字段一致");
+        assert_eq!(restored.llm.providers.len(), 2);
+        assert_eq!(restored.llm.providers[0].api_key, "sk-s3cret");
+        assert_eq!(restored.llm.providers[1].timeout_secs, 5);
+        assert!(!restored.llm.providers[1].enabled);
+
+        // 明文落盘为设计预期（安全审计已接受）；API 层负责响应脱敏
+        assert!(toml_str.contains("sk-s3cret"));
+    }
+
+    /// merge_partial 对 `[llm]`：providers 数组整体替换（与 disabled_backends
+    /// 等数组字段同一语义），未触及其它段时保持原值。
+    #[test]
+    fn llm_providers_merge_partial_replaces_arrays() {
+        let mut config = AppConfig::default();
+        config.llm.providers.push(LlmProviderConfig {
+            id: "old".into(),
+            name: String::new(),
+            base_url: "http://127.0.0.1:1".into(),
+            api_key: "keep-old".into(),
+            timeout_secs: 10,
+            rpm: None,
+            concurrency: None,
+            proxy: None,
+            enabled: true,
+        });
+
+        let patch = serde_json::json!({
+            "llm": { "providers": [ { "id": "new", "base_url": "https://x" } ] }
+        });
+        config.merge_partial(&patch).expect("merge");
+        assert_eq!(config.llm.providers.len(), 1, "数组整体替换");
+        assert_eq!(config.llm.providers[0].id, "new");
+        assert_eq!(
+            config.llm.providers[0].timeout_secs,
+            LlmProviderConfig::DEFAULT_TIMEOUT_SECS
+        );
+        // 其它段不受影响
+        assert_eq!(config.general.language, "zh-CN");
     }
 }

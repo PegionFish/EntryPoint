@@ -1,6 +1,10 @@
 # 配置参考 (Configuration Reference)
 
-> 版本：1.3 | 适用于 EntryPoint v0.x
+> 版本：1.4 | 适用于 EntryPoint v0.x
+>
+> v1.4 变更（T-24）：新增 `[llm]` + `[[llm.providers]]`——命名 LLM 提供商档案
+> （OpenAI 兼容 base_url + api_key + 超时/限速/代理/开关），经 WebUI 设置页或
+> `/api/llm/providers` CRUD 管理；旧配置文件无此段时照常解析（行为零变化）。
 >
 > v1.3 变更（PLAN_TRIGGER_UNIFIED_LOG §5.7）：新增 `[general].log_retention_days`
 > （`runtime/logs/` 下事件日志与模块日志的保留天数，0 = 永久）；目录结构总览
@@ -400,6 +404,53 @@ enabled = true
 max_gb = 8          # 0 = 不限（不淘汰，注意磁盘占用）
 ```
 
+### 1.16 `[llm]` — 命名 LLM 提供商档案（T-24）
+
+管理若干命名的 LLM 提供商（OpenAI 兼容），供后续 LLM 消费方按逻辑名引用。
+经 WebUI 设置页「LLM 提供商」管理区或 `/api/llm/providers` CRUD 端点维护
+（端点契约见 `docs/API_DESIGN.md` §LLM 提供商），改动即时落盘，无需重启。
+
+| 字段（`[[llm.providers]]`） | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `id` | string | —（必填） | 唯一逻辑名，URL 路径段；创建后不可改名，重复 id 被 API 拒绝（409）。不允许空白与 `/` `\` `#` `?`，≤128 字节 |
+| `name` | string | `""` | 显示名（空时 UI 回退显示 id） |
+| `base_url` | string | —（必填） | OpenAI 兼容根地址（如 `https://api.openai.com`）；必须以 `http://` / `https://` 开头且不含空白。测试连接请求 `GET {base_url}/v1/models` |
+| `api_key` | string | `""` | API 密钥。**明文落盘**（与 `[server].token` 同级的安全权衡，安全审计已接受）；所有 API 响应一律脱敏——`api_key` 恒为空串，是否已配置由 `api_key_set` 布尔标记表达 |
+| `timeout_secs` | u64 | `60` | 请求超时（秒）；合法范围 1–86400 |
+| `rpm` | u32（可选） | 无 | 请求速率上限（RPM）；缺省不限制 |
+| `concurrency` | u32（可选） | 无 | 并发上限；缺省不限制 |
+| `proxy` | string（可选） | 无 | 出口代理（如 `http://127.0.0.1:7890`）；缺省不使用 |
+| `enabled` | bool | `true` | 启用开关；`false` = 档案保留但不被下游调用使用 |
+
+**凭据脱敏（P0）**：`GET /api/config`、`GET/POST/PUT /api/llm/providers` 的
+响应中 `api_key` 恒为空串 + `api_key_set` 标记，并带 `Cache-Control: no-store`；
+更新时 `api_key` 空串/缺省 = 保留原值（防脱敏回传误清），清除必须显式
+`clear_api_key: true`。明文仅存在于 `config/app.toml` 与 daemon 内存。
+
+```toml
+[llm]
+
+[[llm.providers]]
+id = "openai"
+name = "OpenAI 官方"
+base_url = "https://api.openai.com"
+api_key = "sk-..."
+timeout_secs = 60
+# rpm = 60
+# concurrency = 4
+# proxy = "http://127.0.0.1:7890"
+enabled = true
+
+[[llm.providers]]
+id = "local-ollama"
+base_url = "http://127.0.0.1:11434"
+# 无密钥的本地服务：api_key 留空即可
+```
+
+> **旧配置兼容**：配置文件无 `[llm]` 段时照常解析（`providers` 视为空列表），
+> 行为零变化。`rpm`/`concurrency`/`proxy` 为当前及规划中消费方的预留字段，
+> 解析与落盘均支持。
+
 ---
 
 ## 2. 完整 app.toml 示例
@@ -476,6 +527,16 @@ max_total_gb = 0
 [cache]
 enabled = true
 max_gb = 8
+
+[llm]
+# 命名 LLM 提供商档案（T-24）；无提供商时可整节省略
+
+# [[llm.providers]]
+# id = "openai"
+# name = "OpenAI 官方"
+# base_url = "https://api.openai.com"
+# api_key = "sk-..."
+# timeout_secs = 60
 
 [api]
 enabled = true

@@ -832,3 +832,55 @@ export interface StorageReport {
   /** 探测失败时为 null（卡片只显示已用部分） */
   free_bytes: number | null
 }
+
+// ===== LLM 提供商档案（T-24；GET/POST/PUT /api/llm/providers）=====
+
+/**
+ * LLM 提供商脱敏视图：`api_key` 恒为空串（服务端不回显明文），
+ * 是否已配置看 `api_key_set`——与 /api/config 的 token 脱敏同模式。
+ */
+export interface LlmProvider {
+  id: string
+  name: string
+  base_url: string
+  /** 恒为空串（脱敏） */
+  api_key: string
+  /** 服务端是否已配置 api_key */
+  api_key_set: boolean
+  timeout_secs: number
+  rpm?: number | null
+  concurrency?: number | null
+  proxy?: string | null
+  enabled: boolean
+}
+
+/**
+ * POST/PUT /api/llm/providers 请求体。全字段可选：
+ * - PUT 缺省 = 保持原值；POST 缺省 = 取默认值（enabled=true、timeout=60）
+ * - `rpm`/`concurrency`/`proxy` 三态：缺省保留 / `null` 清除 / 值覆盖
+ * - `api_key`：空串或缺省 = 保留（防回传脱敏空串误清），非空 = 覆盖；
+ *   清除必须显式 `clear_api_key: true`（优先于 api_key 字段）
+ * - `id` 仅 POST 有效（PUT 不可改名，路径 id 为准）
+ */
+export interface LlmProviderInput {
+  id?: string
+  name?: string
+  base_url?: string
+  api_key?: string
+  timeout_secs?: number
+  rpm?: number | null
+  concurrency?: number | null
+  proxy?: string | null
+  enabled?: boolean
+  clear_api_key?: boolean
+}
+
+/** POST /api/llm/providers/{id}/test 响应：恒 200，业务两态在 ok */
+export interface LlmConnectionTestResult {
+  ok: boolean
+  elapsed_ms: number
+  /** OpenAI 兼容 /v1/models 响应 data 数组长度；非该形状或失败时缺失 */
+  model_count?: number | null
+  /** ok=false 时的失败原因 */
+  error?: string
+}

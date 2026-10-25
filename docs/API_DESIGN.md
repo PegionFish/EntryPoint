@@ -144,6 +144,31 @@ spawn 前检查模型缓存盘空间，需求按 `size_estimate_mb × 1.05` 估�
 | POST | `/api/files`（直跑输入上传） |
 | WS | `/ws`、`/ws/logs`、`/ws/progress`（根级，无版本，ComfyUI/InvokeAI 惯例） |
 
+### LLM 提供商（T-24；设置页管理区，配置字段见 CONFIG_REFERENCE.md §1.16）
+
+| 方法 | 路径 |
+|---|---|
+| GET | `/api/llm/providers`（脱敏视图列表） |
+| POST | `/api/llm/providers`（创建；重名 `id` → 409，校验失败 → 400） |
+| PUT / DELETE | `/api/llm/providers/{provider_id}`（更新 / 删除；未知 id → 404） |
+| POST | `/api/llm/providers/{provider_id}/test`（测试连接） |
+
+`id` 为唯一逻辑名（URL 路径段，创建后不可改名）。凭据脱敏与 `/api/config`
+的 token 同模式（P0）：
+
+- 所有响应（含 400/404/409）带 `Cache-Control: no-store`；`api_key` 恒输出
+  空串，是否已配置由 `api_key_set` 布尔标记表示。
+- PUT 语义：缺省字段保留原值；`api_key` 空串/缺省 = 保留（防脱敏回传误清），
+  非空 = 覆盖；清除必须显式 `clear_api_key: true`（优先于 `api_key` 字段）。
+  `rpm` / `concurrency` / `proxy` 支持显式 `null` = 清除。校验失败 → 400 且
+  内存/磁盘零改动；落盘失败 → 500 且内存回滚。
+- `POST .../test`：daemon 代调 `GET {base_url}/v1/models`（OpenAI 兼容惯例，
+  已配置密钥时附 Bearer；超时取 profile `timeout_secs`，配置 `proxy` 时经其
+  发出）。恒返回 200，业务两态在 `ok` 字段：成功
+  `{"ok":true,"elapsed_ms":…,"model_count":…}`，失败
+  `{"ok":false,"elapsed_ms":…,"error":"…"}`（非 OpenAI 形状的响应体不影响
+  成功判定，仅 `model_count` 缺失）。
+
 ### 对外稳定契约 `/api/v1`（token 鉴权；字段级定义见 INFERENCE_API.md）
 
 | 方法 | 路径 |

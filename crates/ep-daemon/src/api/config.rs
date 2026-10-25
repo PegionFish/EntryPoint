@@ -76,6 +76,13 @@ impl ConfigView {
         redacted.server.token.clear();
         // `api.token` 是 Option，这里统一成空串，保证响应形状稳定（不出现 null）。
         redacted.api.token = Some(String::new());
+        // T-24：`[[llm.providers]].api_key` 与 token 同级脱敏——明文只在
+        // config/app.toml 与专用 CRUD 端点（api/llm.rs）内部流转，
+        // /api/config 的 GET/PUT 响应一律不回显（是否已配置看
+        // GET /api/llm/providers 的 api_key_set）。
+        for provider in &mut redacted.llm.providers {
+            provider.api_key.clear();
+        }
         Self {
             config: redacted,
             server_token_set,
@@ -936,6 +943,47 @@ mod tests {
             let cfg = state.config.read().await;
             assert_eq!(cfg.server.access_protection, AccessProtection::Token);
             assert_eq!(cfg.server.token, "s3cret");
+        }
+    }
+
+    // T-24：/api/config 的 GET/PUT 响应对 `[[llm.providers]].api_key` 同级脱敏
+    // （明文恒为空串；是否已配置经 GET /api/llm/providers 的 api_key_set 查询）
+    #[tokio::test]
+    async fn get_and_put_redact_llm_provider_api_keys() {
+        let state = seq_state("zh-CN");
+        {
+            let mut cfg = state.config.write().await;
+            cfg.llm.providers.push(ep_core::config::LlmProviderConfig {
+                id: "openai".into(),
+                name: "OpenAI".into(),
+                base_url: "https://api.openai.com".into(),
+                api_key: "s3cret-llm".into(),
+                timeout_secs: 30,
+                rpm: None,
+                concurrency: None,
+                proxy: None,
+                enabled: true,
+            });
+        }
+
+        let (status, _, json) = get_config_with_headers(state.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["llm"]["providers"][0]["id"], "openai");
+        assert_eq!(json["llm"]["providers"][0]["api_key"], "");
+        let body = serde_json::to_string(&json).unwrap();
+        assert!(!body.contains("s3cret-llm"), "llm api_key 明文不得出现在 GET /api/config 响应:\n{body}");
+
+        // PUT（含 llm 段以外字段）响应同样脱敏，且内存中的明文保留（不因脱敏丢失）
+        let (status, _, json) =
+            route_put_with_headers(state.clone(), r#"{"general":{"theme":"light"}}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["llm"]["providers"][0]["api_key"], "");
+        let body = serde_json::to_string(&json).unwrap();
+        assert!(!body.contains("s3cret-llm"));
+        {
+            let cfg = state.config.read().await;
+            assert_eq!(cfg.llm.providers[0].api_key, "s3cret-llm", "脱敏只影响响应，内存明文保留");
+            assert_eq!(cfg.general.theme, "light");
         }
     }
 }

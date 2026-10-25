@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useRef,
   useState,
@@ -6,6 +7,9 @@ import {
   type ReactNode,
 } from 'react'
 import {
+  Bot,
+  CircleCheck,
+  CircleX,
   Cpu,
   Database,
   GitBranch,
@@ -13,6 +17,7 @@ import {
   KeyRound,
   Loader2,
   Network,
+  Pencil,
   Plus,
   RotateCcw,
   Save,
@@ -21,13 +26,19 @@ import {
   SlidersHorizontal,
   TerminalSquare,
   Timer,
+  Trash2,
   TriangleAlert,
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
-import type { AppConfig } from '@/api/types'
+import type {
+  AppConfig,
+  LlmConnectionTestResult,
+  LlmProvider,
+} from '@/api/types'
 import {
   AUTH_REQUIRED_EVENT,
+  api,
   getApiToken,
   setApiToken,
 } from '@/api/client'
@@ -110,6 +121,88 @@ const DEFAULT_AUTO_RESTART: ModulesAutoRestartConfig = {
   enabled: false,
   max_backoff_secs: 30,
   circuit_breaker_after: 5,
+}
+
+/* ── LLM 提供商（T-24）──────────────────────────────────────────
+ * 后端 [llm] + [[llm.providers]]；与配置草稿分离，走专用
+ * /api/llm/providers CRUD（改动即时保存，不经上方保存按钮）。 */
+
+/** 与后端 LlmProviderConfig::DEFAULT_TIMEOUT_SECS 一致 */
+const DEFAULT_LLM_TIMEOUT_SECS = 60
+
+type LlmProviderDraft = {
+  id: string
+  name: string
+  base_url: string
+  /** 编辑态空串 = 服务端保留语义（脱敏回传不误清）；清除走 clearApiKey */
+  api_key: string
+  timeout_secs: number
+  /** 0 = 不限（提交时归一化为 null/undefined） */
+  rpm: number
+  concurrency: number
+  proxy: string
+  enabled: boolean
+}
+
+type LlmEditorState = {
+  mode: 'create' | 'edit'
+  draft: LlmProviderDraft
+  /** 编辑目标的 api_key_set（服务端脱敏视图）；create 恒 false */
+  apiKeySet: boolean
+  /** 显式清除已存密钥（保存时发 clear_api_key: true） */
+  clearApiKey: boolean
+  saving: boolean
+}
+
+/** 连接测试状态机：不存键 = 未测试 */
+type LlmTestState =
+  | { status: 'testing' }
+  | { status: 'ok'; result: LlmConnectionTestResult }
+  | { status: 'fail'; result: LlmConnectionTestResult }
+
+function emptyLlmDraft(): LlmProviderDraft {
+  return {
+    id: '',
+    name: '',
+    base_url: '',
+    api_key: '',
+    timeout_secs: DEFAULT_LLM_TIMEOUT_SECS,
+    rpm: 0,
+    concurrency: 0,
+    proxy: '',
+    enabled: true,
+  }
+}
+
+function draftFromProvider(p: LlmProvider): LlmProviderDraft {
+  return {
+    id: p.id,
+    name: p.name,
+    base_url: p.base_url,
+    api_key: '',
+    timeout_secs: p.timeout_secs,
+    rpm: p.rpm ?? 0,
+    concurrency: p.concurrency ?? 0,
+    proxy: p.proxy ?? '',
+    enabled: p.enabled,
+  }
+}
+
+/** id 规则与服务端一致：trim 非空、≤128、不含空白与 / \ # ? */
+function llmIdInvalid(id: string): boolean {
+  return (
+    id.trim() === '' || id.trim().length > 128 || /[/\s\\#?]/.test(id.trim())
+  )
+}
+
+/** base_url 必须以 http:// 或 https:// 开头且不含空白（与服务端一致） */
+function llmBaseUrlInvalid(url: string): boolean {
+  const v = url.trim()
+  return v === '' || /\s/.test(v) || !/^https?:\/\//.test(v)
+}
+
+function llmErrMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
 }
 
 /* ── 本地表单小组件 ─────────────────────────────────────────── */
@@ -624,6 +717,170 @@ export function SettingsPage() {
     }
   }
 
+  /* ── LLM 提供商（T-24）：专用 CRUD + 连接测试（即时保存） ────────── */
+
+  const [llmProviders, setLlmProviders] = useState<LlmProvider[]>([])
+  const [llmLoading, setLlmLoading] = useState(true)
+  const [llmEditor, setLlmEditor] = useState<LlmEditorState | null>(null)
+  const [llmDeleteTarget, setLlmDeleteTarget] = useState<LlmProvider | null>(
+    null,
+  )
+  const [llmTestStates, setLlmTestStates] = useState<
+    Record<string, LlmTestState>
+  >({})
+
+  const refreshLlmProviders = useCallback(async () => {
+    setLlmLoading(true)
+    try {
+      setLlmProviders(await api.listLlmProviders())
+    } catch (e) {
+      toast.error(t('llm.toast.loadFailed'), {
+        description: llmErrMessage(e),
+      })
+    } finally {
+      setLlmLoading(false)
+    }
+  }, [t])
+
+  useEffect(() => {
+    void refreshLlmProviders()
+  }, [refreshLlmProviders])
+
+  function openLlmCreate() {
+    setLlmEditor({
+      mode: 'create',
+      draft: emptyLlmDraft(),
+      apiKeySet: false,
+      clearApiKey: false,
+      saving: false,
+    })
+  }
+
+  function openLlmEdit(p: LlmProvider) {
+    setLlmEditor({
+      mode: 'edit',
+      draft: draftFromProvider(p),
+      apiKeySet: p.api_key_set,
+      clearApiKey: false,
+      saving: false,
+    })
+  }
+
+  function patchLlmDraft(patch: Partial<LlmProviderDraft>) {
+    setLlmEditor((prev) =>
+      prev ? { ...prev, draft: { ...prev.draft, ...patch } } : prev,
+    )
+  }
+
+  async function handleLlmSubmit() {
+    if (!llmEditor) return
+    const { mode, draft, clearApiKey } = llmEditor
+    // 与服务端同规则的前端校验（错误就地红字 + 提交拦截）
+    if (mode === 'create' && llmIdInvalid(draft.id)) {
+      toast.error(t('llm.validation.id'))
+      return
+    }
+    if (llmBaseUrlInvalid(draft.base_url)) {
+      toast.error(t('llm.validation.baseUrl'))
+      return
+    }
+    if (
+      !Number.isInteger(draft.timeout_secs) ||
+      draft.timeout_secs < 1 ||
+      draft.timeout_secs > 86400
+    ) {
+      toast.error(t('llm.validation.timeout'))
+      return
+    }
+    setLlmEditor((prev) => (prev ? { ...prev, saving: true } : prev))
+    try {
+      if (mode === 'create') {
+        await api.createLlmProvider({
+          id: draft.id.trim(),
+          name: draft.name.trim(),
+          base_url: draft.base_url.trim(),
+          api_key: draft.api_key.trim() || undefined,
+          timeout_secs: draft.timeout_secs,
+          rpm: draft.rpm > 0 ? draft.rpm : undefined,
+          concurrency: draft.concurrency > 0 ? draft.concurrency : undefined,
+          proxy: draft.proxy.trim() || undefined,
+          enabled: draft.enabled,
+        })
+        toast.success(t('llm.toast.created'))
+      } else {
+        await api.updateLlmProvider(draft.id, {
+          name: draft.name.trim(),
+          base_url: draft.base_url.trim(),
+          timeout_secs: draft.timeout_secs,
+          // 密钥三态：显式清除 > 覆盖 > 留空保留（服务端语义）
+          ...(clearApiKey
+            ? { clear_api_key: true }
+            : draft.api_key.trim()
+              ? { api_key: draft.api_key.trim() }
+              : {}),
+          rpm: draft.rpm > 0 ? draft.rpm : null,
+          concurrency: draft.concurrency > 0 ? draft.concurrency : null,
+          proxy: draft.proxy.trim() || null,
+          enabled: draft.enabled,
+        })
+        toast.success(t('llm.toast.saved'))
+      }
+      setLlmEditor(null)
+      await refreshLlmProviders()
+    } catch (e) {
+      toast.error(t('llm.toast.saveFailed'), {
+        description: llmErrMessage(e),
+      })
+      setLlmEditor((prev) => (prev ? { ...prev, saving: false } : prev))
+    }
+  }
+
+  async function handleLlmToggle(p: LlmProvider, enabled: boolean) {
+    try {
+      await api.updateLlmProvider(p.id, { enabled })
+      await refreshLlmProviders()
+    } catch (e) {
+      toast.error(t('llm.toast.saveFailed'), {
+        description: llmErrMessage(e),
+      })
+    }
+  }
+
+  async function handleLlmDelete() {
+    if (!llmDeleteTarget) return
+    try {
+      await api.deleteLlmProvider(llmDeleteTarget.id)
+      toast.success(t('llm.toast.deleted'))
+      setLlmDeleteTarget(null)
+      await refreshLlmProviders()
+    } catch (e) {
+      toast.error(t('llm.toast.saveFailed'), {
+        description: llmErrMessage(e),
+      })
+    }
+  }
+
+  async function handleLlmTest(p: LlmProvider) {
+    setLlmTestStates((prev) => ({ ...prev, [p.id]: { status: 'testing' } }))
+    try {
+      const result = await api.testLlmProvider(p.id)
+      setLlmTestStates((prev) => ({
+        ...prev,
+        [p.id]: result.ok
+          ? { status: 'ok', result }
+          : { status: 'fail', result },
+      }))
+    } catch (e) {
+      setLlmTestStates((prev) => ({
+        ...prev,
+        [p.id]: {
+          status: 'fail',
+          result: { ok: false, elapsed_ms: 0, error: llmErrMessage(e) },
+        },
+      }))
+    }
+  }
+
   return (
     <PageContainer
       title={t('title')}
@@ -855,6 +1112,369 @@ export function SettingsPage() {
                 {t('security.apiTokenHint')}
               </p>
             )}
+          </Section>
+
+          {/* ── LLM 提供商（T-24）：命名档案 + 连接测试，专用 CRUD 即时保存 ── */}
+          <Section
+            icon={Bot}
+            title={t('llm.title')}
+            description={t('llm.description')}
+          >
+            <div className="space-y-3 sm:col-span-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="text-sm font-medium">{t('llm.title')}</div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={llmEditor !== null}
+                  onClick={openLlmCreate}
+                >
+                  <Plus className="size-3.5" />
+                  {t('llm.add')}
+                </Button>
+              </div>
+
+              {llmLoading ? (
+                <Skeleton className="h-16 rounded-md" />
+              ) : llmProviders.length === 0 && !llmEditor ? (
+                <div className="rounded-md border border-dashed border-border px-4 py-3 text-xs text-muted-foreground">
+                  {t('llm.empty')}
+                </div>
+              ) : null}
+
+              {llmProviders.map((p) => {
+                const testState = llmTestStates[p.id]
+                // 测试按钮文案（两态摘要：成功带模型数/耗时，失败红字）
+                let testLabel: string = t('llm.test')
+                if (testState?.status === 'testing') {
+                  testLabel = t('llm.testing')
+                } else if (testState?.status === 'ok') {
+                  testLabel =
+                    testState.result.model_count != null
+                      ? t('llm.testOkModels', {
+                          models: testState.result.model_count,
+                          ms: testState.result.elapsed_ms,
+                        })
+                      : t('llm.testOkNoModels', {
+                          ms: testState.result.elapsed_ms,
+                        })
+                } else if (testState?.status === 'fail') {
+                  testLabel = t('llm.testFailed')
+                }
+                return (
+                  <div
+                    key={p.id}
+                    className="space-y-2 rounded-md border border-border px-3 py-3"
+                  >
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-sm font-medium">
+                        {p.name.trim() || p.id}
+                      </span>
+                      {p.name.trim() && (
+                        <span className="font-mono text-xs text-muted-foreground">
+                          {p.id}
+                        </span>
+                      )}
+                      <span
+                        className={cn(
+                          'flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs',
+                          p.enabled
+                            ? 'border-status-ready/30 bg-status-ready/10 text-status-ready'
+                            : 'border-border text-muted-foreground',
+                        )}
+                      >
+                        <CircleCheck className="size-3" />
+                        {p.api_key_set
+                          ? t('llm.apiKeyConfigured')
+                          : t('llm.apiKeyNotConfigured')}
+                      </span>
+                      <div className="ml-auto flex items-center gap-2">
+                        <Switch
+                          checked={p.enabled}
+                          aria-label={t('llm.enabled')}
+                          onCheckedChange={(v) => void handleLlmToggle(p, v)}
+                          className="shrink-0"
+                        />
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          disabled={
+                            testState?.status === 'testing' ||
+                            llmEditor !== null
+                          }
+                          className={cn(
+                            testState?.status === 'ok' &&
+                              'border-status-ready/40 text-status-ready hover:bg-status-ready/10',
+                            testState?.status === 'fail' &&
+                              'border-status-error/40 text-status-error hover:bg-status-error/10',
+                          )}
+                          onClick={() => void handleLlmTest(p)}
+                        >
+                          {testState?.status === 'testing' ? (
+                            <Loader2 className="size-3.5 animate-spin" />
+                          ) : testState?.status === 'ok' ? (
+                            <CircleCheck className="size-3.5" />
+                          ) : testState?.status === 'fail' ? (
+                            <CircleX className="size-3.5" />
+                          ) : (
+                            <Globe className="size-3.5" />
+                          )}
+                          {testLabel}
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          disabled={llmEditor !== null}
+                          onClick={() => openLlmEdit(p)}
+                        >
+                          <Pencil className="size-3.5" />
+                          {t('llm.edit')}
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          disabled={llmEditor !== null}
+                          onClick={() => setLlmDeleteTarget(p)}
+                        >
+                          <Trash2 className="size-3.5" />
+                          {t('common:action.delete')}
+                        </Button>
+                      </div>
+                    </div>
+                    <div className="font-mono text-xs text-muted-foreground">
+                      {p.base_url}
+                    </div>
+                    {testState?.status === 'fail' && (
+                      <div className="text-xs text-status-error">
+                        {t('llm.testFailedDetail', {
+                          error: testState.result.error ?? '',
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+
+              {llmEditor && (
+                <div className="space-y-3 rounded-md border border-primary/30 bg-muted/20 px-3 py-3">
+                  <div className="text-sm font-medium">
+                    {llmEditor.mode === 'create' ? t('llm.add') : t('llm.edit')}
+                  </div>
+                  <div className="grid gap-x-6 gap-y-4 sm:grid-cols-2">
+                    <Field
+                      label={t('llm.id')}
+                      description={t('llm.idHint')}
+                      error={
+                        llmEditor.mode === 'create' &&
+                        llmEditor.draft.id.trim() !== '' &&
+                        llmIdInvalid(llmEditor.draft.id)
+                          ? t('llm.validation.id')
+                          : undefined
+                      }
+                    >
+                      <Input
+                        value={llmEditor.draft.id}
+                        onChange={(e) =>
+                          patchLlmDraft({ id: e.target.value })
+                        }
+                        placeholder={t('llm.idPlaceholder')}
+                        disabled={llmEditor.mode === 'edit'}
+                        className="font-mono text-xs"
+                      />
+                    </Field>
+                    <Field label={t('llm.name')}>
+                      <Input
+                        value={llmEditor.draft.name}
+                        onChange={(e) =>
+                          patchLlmDraft({ name: e.target.value })
+                        }
+                        placeholder={t('llm.namePlaceholder')}
+                      />
+                    </Field>
+                    <Field
+                      label={t('llm.baseUrl')}
+                      description={t('llm.baseUrlHint')}
+                      error={
+                        llmEditor.draft.base_url.trim() !== '' &&
+                        llmBaseUrlInvalid(llmEditor.draft.base_url)
+                          ? t('llm.validation.baseUrl')
+                          : undefined
+                      }
+                      className="sm:col-span-2"
+                    >
+                      <Input
+                        value={llmEditor.draft.base_url}
+                        onChange={(e) =>
+                          patchLlmDraft({ base_url: e.target.value })
+                        }
+                        placeholder={t('llm.baseUrlPlaceholder')}
+                        aria-invalid={
+                          llmEditor.draft.base_url.trim() !== '' &&
+                          llmBaseUrlInvalid(llmEditor.draft.base_url) ||
+                          undefined
+                        }
+                        className="font-mono text-xs"
+                      />
+                    </Field>
+                    <Field
+                      label={t('llm.apiKey')}
+                      className="sm:col-span-2"
+                    >
+                      {/* 交互复刻访问令牌输入：已设置不回显、留空保持不变、显式清除 */}
+                      <div className="space-y-1.5">
+                        <div className="flex items-center gap-2">
+                          <Input
+                            type="password"
+                            autoComplete="new-password"
+                            value={
+                              llmEditor.clearApiKey
+                                ? ''
+                                : llmEditor.draft.api_key
+                            }
+                            onChange={(e) =>
+                              patchLlmDraft({ api_key: e.target.value })
+                            }
+                            placeholder={
+                              llmEditor.mode === 'edit' &&
+                              llmEditor.apiKeySet &&
+                              !llmEditor.clearApiKey
+                                ? t('llm.apiKeyKeepPlaceholder')
+                                : t('llm.apiKeyPlaceholder')
+                            }
+                            disabled={llmEditor.clearApiKey}
+                            className="font-mono text-xs"
+                          />
+                          {llmEditor.mode === 'edit' &&
+                            llmEditor.apiKeySet &&
+                            !llmEditor.clearApiKey && (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() =>
+                                  setLlmEditor((prev) =>
+                                    prev
+                                      ? {
+                                          ...prev,
+                                          clearApiKey: true,
+                                          draft: { ...prev.draft, api_key: '' },
+                                        }
+                                      : prev,
+                                  )
+                                }
+                              >
+                                {t('llm.clearApiKey')}
+                              </Button>
+                            )}
+                          {llmEditor.mode === 'edit' &&
+                            llmEditor.clearApiKey && (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() =>
+                                  setLlmEditor((prev) =>
+                                    prev ? { ...prev, clearApiKey: false } : prev,
+                                  )
+                                }
+                              >
+                                {t('common:action.cancel')}
+                              </Button>
+                            )}
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          {llmEditor.clearApiKey
+                            ? t('llm.apiKeyWillClear')
+                            : llmEditor.mode === 'edit' && llmEditor.apiKeySet
+                              ? t('llm.apiKeyConfigured')
+                              : t('llm.apiKeyNotConfigured')}
+                          {' · '}
+                          {t('llm.apiKeyHint')}
+                        </p>
+                      </div>
+                    </Field>
+                    <Field label={t('llm.timeout')}>
+                      <NumberField
+                        value={llmEditor.draft.timeout_secs}
+                        onValueChange={(v) =>
+                          patchLlmDraft({ timeout_secs: v })
+                        }
+                        min={1}
+                        max={86400}
+                        invalid={
+                          !Number.isInteger(llmEditor.draft.timeout_secs) ||
+                          llmEditor.draft.timeout_secs < 1 ||
+                          llmEditor.draft.timeout_secs > 86400
+                        }
+                      />
+                    </Field>
+                    <Field label={t('llm.rpm')}>
+                      <NumberField
+                        value={llmEditor.draft.rpm}
+                        onValueChange={(v) => patchLlmDraft({ rpm: v })}
+                        min={0}
+                        max={1_000_000}
+                      />
+                    </Field>
+                    <Field label={t('llm.concurrency')}>
+                      <NumberField
+                        value={llmEditor.draft.concurrency}
+                        onValueChange={(v) =>
+                          patchLlmDraft({ concurrency: v })
+                        }
+                        min={0}
+                        max={1024}
+                      />
+                    </Field>
+                    <Field label={t('llm.proxy')}>
+                      <Input
+                        value={llmEditor.draft.proxy}
+                        onChange={(e) =>
+                          patchLlmDraft({ proxy: e.target.value })
+                        }
+                        placeholder={t('llm.proxyPlaceholder')}
+                        className="font-mono text-xs"
+                      />
+                    </Field>
+                    <SwitchRow
+                      className="sm:col-span-2"
+                      label={t('llm.enabled')}
+                      description={t('llm.enabledDescription')}
+                      checked={llmEditor.draft.enabled}
+                      onCheckedChange={(v) => patchLlmDraft({ enabled: v })}
+                    />
+                  </div>
+                  <div className="flex justify-end gap-2">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled={llmEditor.saving}
+                      onClick={() => setLlmEditor(null)}
+                    >
+                      {t('common:action.cancel')}
+                    </Button>
+                    <Button
+                      size="sm"
+                      disabled={llmEditor.saving}
+                      onClick={() => void handleLlmSubmit()}
+                      className="glow-primary"
+                    >
+                      {llmEditor.saving ? (
+                        <Loader2 className="size-3.5 animate-spin" />
+                      ) : (
+                        <Save className="size-3.5" />
+                      )}
+                      {llmEditor.saving
+                        ? t('llm.saving')
+                        : t('common:action.confirm')}
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
           </Section>
 
           {/* ── 通用 ── */}
@@ -1567,6 +2187,40 @@ export function SettingsPage() {
               onClick={() => void handleAuthTokenSubmit()}
             >
               {t('authDialog.confirm')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ── LLM 提供商删除确认（T-24）── */}
+      <Dialog
+        open={llmDeleteTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setLlmDeleteTarget(null)
+        }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-status-error">
+              <TriangleAlert className="size-4" />
+              {t('llm.deleteTitle')}
+            </DialogTitle>
+            <DialogDescription>
+              {t('llm.deleteDescription', {
+                name:
+                  llmDeleteTarget?.name.trim() || llmDeleteTarget?.id || '',
+              })}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setLlmDeleteTarget(null)}>
+              {t('common:action.cancel')}
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => void handleLlmDelete()}
+            >
+              {t('common:action.delete')}
             </Button>
           </DialogFooter>
         </DialogContent>

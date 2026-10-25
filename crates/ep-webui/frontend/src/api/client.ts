@@ -9,6 +9,9 @@ import type {
   ExecutePipelineResponse,
   ImportRequest,
   ImportResponse,
+  LlmConnectionTestResult,
+  LlmProvider,
+  LlmProviderInput,
   ModelDetailResponse,
   ModelDownloadStatus,
   ModelListResponse,
@@ -584,4 +587,34 @@ export const api = {
   // 存储水位（T-11；仪表盘存储卡片）
   /** 三目录已用字节数 + 模型缓存盘剩余空间（GET /api/storage） */
   storage: () => apiFetch<StorageReport>('/storage'),
+
+  // LLM 提供商档案（T-24；设置页管理区，设置页独占消费）
+  /** 脱敏视图列表（api_key 恒空串，是否已配置看 api_key_set） */
+  listLlmProviders: () => apiFetch<LlmProvider[]>('/llm/providers'),
+  /** 创建（重名 id → 409；校验失败 → 400） */
+  createLlmProvider: (body: LlmProviderInput) =>
+    apiFetch<LlmProvider>('/llm/providers', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  /** 更新（id 不可改名；api_key 空串 = 保留，清除用 clear_api_key: true） */
+  updateLlmProvider: (id: string, body: LlmProviderInput) =>
+    apiFetch<LlmProvider>(`/llm/providers/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    }),
+  /** 删除（未知 id → 404） */
+  deleteLlmProvider: (id: string) =>
+    apiFetch<{ ok: boolean }>(`/llm/providers/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+  /**
+   * 测试连接：daemon 代调 GET {base_url}/v1/models（超时由 profile
+   * timeout_secs 决定，服务端恒返回 200 两态 → 不走客户端默认 30s 超时）。
+   */
+  testLlmProvider: (id: string) =>
+    apiFetch<LlmConnectionTestResult>(
+      `/llm/providers/${encodeURIComponent(id)}/test`,
+      { method: 'POST', timeoutMs: 0 },
+    ),
 }

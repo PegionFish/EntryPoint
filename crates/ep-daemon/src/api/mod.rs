@@ -8,6 +8,7 @@ pub mod events;
 pub mod execute;
 pub mod health;
 pub mod inference;
+pub mod llm;
 pub mod models;
 pub mod modules;
 pub mod module_import;
@@ -67,6 +68,8 @@ pub fn api_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .merge(storage::router())
         // 统一推理 API v1 门面（/v1/*，外部稳定契约；token 中间件仅作用其子路由）
         .merge(inference::router(state))
+        // T-24：命名 LLM 提供商档案（/api/llm/providers CRUD + 连接测试）
+        .merge(llm::router())
         // 未匹配的 /api/* → 404 + JSON，避免落入 SPA 的 HTML fallback
         .fallback(api_not_found)
 }
