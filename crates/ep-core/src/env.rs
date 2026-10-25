@@ -160,15 +160,25 @@ impl EnvManager {
     }
 
     /// 检测系统 PATH 中的 python（优先 python3，其次 python）
+    /// Windows 上 PATH 未命中时退而尝试 `py.exe` 官方启动器（T-30，POSIX 无此步）
     /// 若 PATH 中无兼容版本，则借助 uv python find 查找 uv 管理的 Python
     fn detect_python(uv: Option<&Path>) -> Option<PathBuf> {
+        Self::detect_python_with(&RealProber, uv)
+    }
+
+    /// detect_python 的可注入内核（T-30）：探测序列单测锚点——
+    /// 1. PATH 中的 python3 / python；
+    /// 2. Windows `py.exe` 启动器（`py -3`；py.exe 常驻 C:\Windows，
+    ///    兜底"装了 Python 但没加 PATH"的常见安装形态）；
+    /// 3. uv python find（优先 3.12，其次 3.11/3.10）。
+    ///
+    /// 探测/PATH 解析经 [`CommandProber`] 注入，无需真实环境即可 mock 单测。
+    fn detect_python_with(prober: &impl CommandProber, uv: Option<&Path>) -> Option<PathBuf> {
         // 1. 尝试 PATH 中的 python3 / python
         for name in ["python3", "python"] {
-            let mut probe = Command::new(name);
-            apply_no_window(&mut probe);
-            if let Ok(output) = probe.arg("--version").output() {
-                if output.status.success() {
-                    if let Some(path) = Self::which(name) {
+            if let Some(outcome) = prober.run(name, &["--version"]) {
+                if outcome.success {
+                    if let Some(path) = prober.which(name) {
                         debug!(python = %path.display(), "detected python in PATH");
                         return Some(path);
                     }
@@ -176,20 +186,25 @@ impl EnvManager {
             }
         }
 
-        // 2. 借助 uv python find 查找兼容版本（优先 3.12，其次 3.11/3.10）
+        // 2. Windows py.exe 启动器。cfg! 运行时分支而非 #[cfg] 属性——双臂均
+        //    参与类型检查（风格同 run_post_install_hook），py 启动器探测的 mock
+        //    单测因此在任意平台都可编译运行。
+        if cfg!(windows) {
+            if let Some(path) = Self::detect_python_via_py_launcher(prober) {
+                return Some(path);
+            }
+        }
+
+        // 3. 借助 uv python find 查找兼容版本（优先 3.12，其次 3.11/3.10）
         let uv_exe = uv.map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("uv"));
         for ver in ["3.12", "3.11", "3.10"] {
-            let mut probe = Command::new(&uv_exe);
-            apply_no_window(&mut probe);
-            if let Ok(output) = probe.args(["python", "find", ver]).output() {
-                if output.status.success() {
-                    let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    if !path_str.is_empty() {
-                        let p = PathBuf::from(&path_str);
-                        if p.is_file() {
-                            debug!(python = %p.display(), version = ver, "detected uv-managed python");
-                            return Some(p);
-                        }
+            let program = uv_exe.to_string_lossy().into_owned();
+            if let Some(outcome) = prober.run(&program, &["python", "find", ver]) {
+                if outcome.success && !outcome.stdout.is_empty() {
+                    let p = PathBuf::from(&outcome.stdout);
+                    if p.is_file() {
+                        debug!(python = %p.display(), version = ver, "detected uv-managed python");
+                        return Some(p);
                     }
                 }
             }
@@ -197,6 +212,25 @@ impl EnvManager {
 
         debug!("no compatible python found in PATH or uv");
         None
+    }
+
+    /// Windows `py.exe` 启动器探测（T-30）：执行
+    /// `py -3 -c "import sys; print(sys.executable)"` 取解释器绝对路径。
+    /// py 不存在 / 非零退出 / 输出为空 / 路径不是真实文件 → None
+    /// （交由后续 uv python find 兜底）。
+    fn detect_python_via_py_launcher(prober: &impl CommandProber) -> Option<PathBuf> {
+        let outcome = prober.run("py", &["-3", "-c", PY_EXECUTABLE_SNIPPET])?;
+        if !outcome.success || outcome.stdout.is_empty() {
+            return None;
+        }
+        let p = PathBuf::from(outcome.stdout);
+        if p.is_file() {
+            debug!(python = %p.display(), "detected python via py.exe launcher");
+            Some(p)
+        } else {
+            debug!(path = %p.display(), "py launcher reported non-existent python path");
+            None
+        }
     }
 
     /// 检测系统 PATH 中的 uv，并扫描 Windows 常见 Python Scripts 目录作为后备
@@ -959,6 +993,50 @@ impl EnvManager {
             }
         }
         result
+    }
+}
+
+// ─── 探测抽象（T-30：detect_python 序列的 mock 单测锚点）─────────────────────
+
+/// `py.exe` 启动器探测所用代码片段：打印当前解释器的真实绝对路径。
+const PY_EXECUTABLE_SNIPPET: &str = "import sys; print(sys.executable)";
+
+/// 单条命令的探测结果（对 `std::process::Output` 的最小化抽象，可 mock）。
+#[derive(Debug, Clone)]
+struct ProbeOutcome {
+    /// 退出码是否成功
+    success: bool,
+    /// stdout（已 trim）
+    stdout: String,
+}
+
+/// 命令探测抽象：真实实现执行子进程 + PATH 解析；测试注入预设结果，
+/// 使 [`EnvManager::detect_python`] 的整个候选序列（PATH → py 启动器 →
+/// uv find）无需真实环境即可单测。
+trait CommandProber {
+    /// 执行探测命令。`None` = 程序不存在 / spawn 失败（与真实 `output()` 的
+    /// Err 语义一致）。
+    fn run(&self, program: &str, args: &[&str]) -> Option<ProbeOutcome>;
+    /// PATH 解析（mock PATH 的注入点）。
+    fn which(&self, name: &str) -> Option<PathBuf>;
+}
+
+/// 真实探测：子进程执行（不弹控制台窗口）+ [`EnvManager::which`]。
+struct RealProber;
+
+impl CommandProber for RealProber {
+    fn run(&self, program: &str, args: &[&str]) -> Option<ProbeOutcome> {
+        let mut probe = Command::new(program);
+        apply_no_window(&mut probe);
+        let output = probe.args(args).output().ok()?;
+        Some(ProbeOutcome {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        })
+    }
+
+    fn which(&self, name: &str) -> Option<PathBuf> {
+        EnvManager::which(name)
     }
 }
 
@@ -2298,5 +2376,179 @@ mod tests {
         assert_eq!(mgr.venv_python_path_for_backend(mid, backend), new_layout_py);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── detect_python 探测序列（T-30：mock CommandProber，py.exe 启动器）────
+
+    /// 预设应答的 mock 探测器：run 仅命中脚本化 (program, args) 时返回预设
+    /// 结果，否则 None（= 程序不存在 / spawn 失败）；which 从注入表解析
+    /// （mock PATH 语义）。
+    struct MockProber {
+        responses: std::collections::HashMap<(String, String), ProbeOutcome>,
+        which_table: std::collections::HashMap<String, PathBuf>,
+    }
+
+    impl MockProber {
+        fn new() -> Self {
+            Self {
+                responses: std::collections::HashMap::new(),
+                which_table: std::collections::HashMap::new(),
+            }
+        }
+
+        fn respond(&mut self, program: &str, args: &[&str], success: bool, stdout: &str) {
+            self.responses.insert(
+                (program.to_string(), args.join("\u{1f}")),
+                ProbeOutcome {
+                    success,
+                    stdout: stdout.to_string(),
+                },
+            );
+        }
+
+        fn with_which(&mut self, name: &str, path: &str) {
+            self.which_table.insert(name.to_string(), PathBuf::from(path));
+        }
+    }
+
+    impl CommandProber for MockProber {
+        fn run(&self, program: &str, args: &[&str]) -> Option<ProbeOutcome> {
+            self.responses
+                .get(&(program.to_string(), args.join("\u{1f}")))
+                .cloned()
+        }
+
+        fn which(&self, name: &str) -> Option<PathBuf> {
+            self.which_table.get(name).cloned()
+        }
+    }
+
+    /// 测试辅助：造一个真实存在的假解释器文件（py 启动器 / uv find 返回的
+    /// 路径必须 is_file 才被采信）
+    fn fake_executable(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("ep_py_probe_{tag}_{}.exe", std::process::id()));
+        std::fs::write(&p, b"fake").unwrap();
+        p
+    }
+
+    /// PATH 中 python3 直接命中 → py 启动器与 uv find 都不应被咨询（顺序锚点）
+    #[test]
+    fn detect_python_path_hit_beats_py_launcher_and_uv() {
+        let py_path = fake_executable("py_unwanted");
+        let mut prober = MockProber::new();
+        prober.respond("python3", &["--version"], true, "Python 3.12.1");
+        prober.with_which("python3", "/fake/python3");
+        // py 启动器即便可用也不得被采用（PATH 优先）
+        prober.respond("py", &["-3", "-c", PY_EXECUTABLE_SNIPPET], true, &py_path.to_string_lossy());
+        prober.respond("uv", &["python", "find", "3.12"], true, &py_path.to_string_lossy());
+
+        let found = EnvManager::detect_python_with(&prober, None);
+        assert_eq!(
+            found,
+            Some(PathBuf::from("/fake/python3")),
+            "PATH 命中时必须直接返回 PATH 解析结果"
+        );
+
+        let _ = std::fs::remove_dir_all(&py_path);
+    }
+
+    /// py.exe 启动器探测的输出解析：真实文件路径采信；py 不存在 / 非零退出 /
+    /// 空输出 / 路径不存在 一律 None
+    #[test]
+    fn py_launcher_probe_parses_executable_path_only() {
+        let real_py = fake_executable("py_real");
+        let ghost = std::env::temp_dir().join(format!("ep_py_probe_ghost_{}.exe", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ghost);
+
+        // 1) py 可用且返回真实解释器路径 → 采信
+        let mut prober = MockProber::new();
+        prober.respond("py", &["-3", "-c", PY_EXECUTABLE_SNIPPET], true, &real_py.to_string_lossy());
+        assert_eq!(
+            EnvManager::detect_python_via_py_launcher(&prober),
+            Some(real_py.clone())
+        );
+
+        // 2) py 不存在（spawn 失败）→ None
+        let prober = MockProber::new();
+        assert_eq!(EnvManager::detect_python_via_py_launcher(&prober), None);
+
+        // 3) py 非零退出 → None
+        let mut prober = MockProber::new();
+        prober.respond("py", &["-3", "-c", PY_EXECUTABLE_SNIPPET], false, "");
+        assert_eq!(EnvManager::detect_python_via_py_launcher(&prober), None);
+
+        // 4) 输出为空 → None
+        let mut prober = MockProber::new();
+        prober.respond("py", &["-3", "-c", PY_EXECUTABLE_SNIPPET], true, "  ");
+        assert_eq!(EnvManager::detect_python_via_py_launcher(&prober), None);
+
+        // 5) 返回的路径不存在（伪造/异常输出）→ None
+        let mut prober = MockProber::new();
+        prober.respond("py", &["-3", "-c", PY_EXECUTABLE_SNIPPET], true, &ghost.to_string_lossy());
+        assert_eq!(EnvManager::detect_python_via_py_launcher(&prober), None);
+
+        let _ = std::fs::remove_dir_all(&real_py);
+    }
+
+    /// 序列锚点：PATH 全未命中时，Windows 先问 py 启动器、命中即不落 uv find；
+    /// POSIX 无 py 步骤、直接 uv find（POSIX 行为不变）
+    #[test]
+    fn detect_python_py_launcher_precedes_uv_find() {
+        let py_path = fake_executable("py_first");
+        let uv_path = fake_executable("uv_py");
+
+        let mut prober = MockProber::new();
+        // PATH 上 python3 / python 均未安装（未注册 → spawn 失败语义）
+        prober.respond("py", &["-3", "-c", PY_EXECUTABLE_SNIPPET], true, &py_path.to_string_lossy());
+        prober.respond("uv", &["python", "find", "3.12"], true, &uv_path.to_string_lossy());
+
+        let found = EnvManager::detect_python_with(&prober, None);
+        if cfg!(windows) {
+            assert_eq!(
+                found,
+                Some(py_path.clone()),
+                "Windows 上 PATH 未命中时应先于 uv find 使用 py.exe 启动器"
+            );
+        } else {
+            assert_eq!(
+                found,
+                Some(uv_path.clone()),
+                "POSIX 上不存在 py 启动器步骤，应直接 uv python find"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&py_path);
+        let _ = std::fs::remove_dir_all(&uv_path);
+    }
+
+    /// py 启动器不可用时回退 uv python find（Windows 侧兜底链完整性）
+    #[test]
+    fn detect_python_falls_back_to_uv_find_when_py_absent() {
+        let uv_path = fake_executable("uv_fallback");
+
+        let mut prober = MockProber::new();
+        // py 未注册 → py 启动器不可用
+        prober.respond("uv", &["python", "find", "3.12"], true, &uv_path.to_string_lossy());
+
+        let found = EnvManager::detect_python_with(&prober, None);
+        assert_eq!(found, Some(uv_path.clone()), "py 启动器缺失必须回退 uv python find");
+
+        let _ = std::fs::remove_dir_all(&uv_path);
+    }
+
+    /// uv find 候选顺序：3.12 → 3.11 → 3.10（首次成功即返回）
+    #[test]
+    fn detect_python_uv_find_version_order() {
+        let py311 = fake_executable("uv_311");
+
+        let mut prober = MockProber::new();
+        prober.respond("uv", &["python", "find", "3.12"], true, "   "); // 空输出 → 跳过
+        prober.respond("uv", &["python", "find", "3.11"], true, &py311.to_string_lossy());
+        prober.respond("uv", &["python", "find", "3.10"], true, "C:\\never\\consulted.exe");
+
+        let found = EnvManager::detect_python_with(&prober, None);
+        assert_eq!(found, Some(py311.clone()), "3.12 无效后应取 3.11 且不再咨询 3.10");
+
+        let _ = std::fs::remove_dir_all(&py311);
     }
 }

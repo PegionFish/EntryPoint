@@ -260,3 +260,29 @@ allow_public = false   # false=IP 过滤仅放行私有/回环地址；公网暴
 ```
 
 产物见 §1。源码树开发调试：`cargo run -p ep-daemon`（EP_ROOT 缺省取 cwd）。
+
+---
+
+## 14. Windows 构建（x64 / arm64）
+
+Windows 侧用 `build.ps1`（需 PowerShell，Rust 1.97+、Node.js 20+、uv 前置同 §13）：
+
+```powershell
+.\build.ps1 server                      # x64（历史默认行为，不变）
+.\build.ps1 server -Arch arm64          # arm64（T-30：交叉构建 aarch64-pc-windows-msvc）
+.\build.ps1 server -Arch arm64 -DryRun  # 干跑：只打印拼装的 cargo 命令与产物路径
+```
+
+**arm64 交叉构建要点**：
+
+- 前置：Visual Studio 2022 勾选 **"MSVC v143 - VS 2022 ARM64/x64 生成工具"**
+  （x64 主机上交叉构建 arm64 目标所需），`rustup target add aarch64-pc-windows-msvc`；
+- cargo 以 `--target aarch64-pc-windows-msvc` 构建，二进制落
+  `target\aarch64-pc-windows-msvc\<profile>\`；
+- 产物命名带 arch 后缀：`EntryPoint-vX-**win-arm64**-server.zip`（x64 保持
+  `EntryPoint-vX-win64-server.zip` 历史命名不变），VERSION.txt 标注 `Windows arm64`；
+- VC 运行库按目标架构附带（`...\arm64\Microsoft.VC14*.CRT`），VS 未装对应
+  Redist 时跳过——目标机需自装 Microsoft Visual C++ Redistributable (ARM64)；
+- clippy/测试仍在主机架构运行（只对产出二进制的 build 步骤做交叉）。
+
+---

@@ -1,7 +1,11 @@
 #!/usr/bin/env pwsh
 # EntryPoint 编译打包脚本（Windows）— server 模式（桌面端已于 2026-08-13 退役）
-# 用法: .\build.ps1 server [-Target debug|release] [-SkipTest] [-SkipClippy] [-SkipFrontend] [-Clean] [-OutputDir <dir>]
+# 用法: .\build.ps1 server [-Target debug|release] [-Arch x64|arm64] [-SkipTest] [-SkipClippy] [-SkipFrontend] [-Clean] [-DryRun] [-OutputDir <dir>]
 #   server — 服务器包（zip：ep-daemon + WebUI 静态资源 + 配置 + 模块）
+#
+# -Arch arm64（T-30）：交叉构建 aarch64-pc-windows-msvc，产物名带 win-arm64
+# 后缀；需 VS 安装 "MSVC v143 - VS 2022 ARM64/x64 生成工具"。x64 维持历史行为
+# （主机默认目标、win64 命名），逐字节不变。
 
 param(
     [Parameter(Mandatory, Position = 0)]
@@ -10,10 +14,18 @@ param(
     [ValidateSet("debug", "release")]
     [string]$Target = "release",
 
+    # 目标 CPU 架构（T-30）：x64 = 主机默认目标；arm64 = 交叉构建
+    [ValidateSet("x64", "arm64")]
+    [string]$Arch = "x64",
+
     [switch]$SkipTest,
     [switch]$SkipClippy,
     [switch]$SkipFrontend,
     [switch]$Clean,
+
+    # 干跑（T-30 验证锚点）：只打印拼装出的 cargo 命令与产物路径后退出，
+    # 不执行前端构建/测试/clippy/cargo——供参数解析与命令拼装路径快速验证
+    [switch]$DryRun,
 
     [string]$OutputDir = "dist"
 )
@@ -32,6 +44,55 @@ if ($Mode -eq "gui") {
 if ($Mode -ne "server") {
     Write-Host "`n[FAIL] 未知模式: $Mode（仅支持 server）`n" -ForegroundColor Red
     exit 1
+}
+
+# ── 构建计划拼装（纯函数，T-30）──
+# 所有随 Arch/Target 变化的派生值（cargo 参数、二进制目录、包名、显示标签）
+# 集中在此一处拼装：主流程只经由此函数取值（杜绝"参数解析对、主流程另拼一套"
+# 的漂移），-DryRun 直接打印本函数的输出做验证锚点。
+function Get-BuildPlan {
+    param(
+        [Parameter(Mandatory)] [string]$ProjectRoot,
+        [Parameter(Mandatory)] [string]$Version,
+        [Parameter(Mandatory)] [string]$Mode,
+        [Parameter(Mandatory)] [ValidateSet("debug", "release")] [string]$Target,
+        [Parameter(Mandatory)] [ValidateSet("x64", "arm64")] [string]$Arch
+    )
+
+    # Rust 目标三元组：空串 = 不传 --target（主机默认目标，x64 历史行为不变）
+    $rustTarget = ""
+    $archTag = "win64"          # 产物命名：x64 维持历史 "win64"
+    $archLabel = "Windows x64"  # VERSION.txt 显示标签
+    if ($Arch -eq "arm64") {
+        $rustTarget = "aarch64-pc-windows-msvc"
+        $archTag = "win-arm64"
+        $archLabel = "Windows arm64"
+    }
+
+    $profileDir = if ($Target -eq "release") { "release" } else { "debug" }
+
+    # cargo build 参数（顺序与历史一致：build --manifest-path <p> -p ep-daemon -p ep-pack-cli [--release] [--target <triplet>]）
+    $cargoBuildArgs = @("build", "--manifest-path", (Join-Path $ProjectRoot "Cargo.toml"), "-p", "ep-daemon", "-p", "ep-pack-cli")
+    if ($Target -eq "release") { $cargoBuildArgs += "--release" }
+    if ($rustTarget -ne "") { $cargoBuildArgs += @("--target", $rustTarget) }
+
+    # 二进制目录：主机目标在 target\<profile>\，交叉构建在 target\<triplet>\<profile>\
+    $binDir = Join-Path (Join-Path $ProjectRoot "target") $profileDir
+    if ($rustTarget -ne "") {
+        $binDir = Join-Path (Join-Path (Join-Path $ProjectRoot "target") $rustTarget) $profileDir
+    }
+
+    $packageBase = "EntryPoint-v${Version}-${archTag}-${Mode}"
+
+    [PSCustomObject]@{
+        Arch           = $Arch
+        RustTarget     = $rustTarget
+        ProfileDir     = $profileDir
+        CargoBuildArgs = $cargoBuildArgs
+        BinDir         = $binDir
+        PackageBase    = $packageBase
+        ArchLabel      = $archLabel
+    }
 }
 
 # ── 工具查找 ──
@@ -54,14 +115,28 @@ $VersionLine = Select-String -Path "$ProjectRoot\Cargo.toml" -Pattern '^version\
 $Version = if ($VersionLine) { $VersionLine.Matches[0].Groups[1].Value } else { "" }
 if ($Version -notmatch '^\d+\.\d+\.\d+') { Write-Error "无法从 Cargo.toml 解析版本号，拒绝打包（请检查 [workspace.package] version）"; exit 1 }
 $Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$ProfileDir = if ($Target -eq "release") { "release" } else { "debug" }
+$Plan = Get-BuildPlan -ProjectRoot $ProjectRoot -Version $Version -Mode $Mode -Target $Target -Arch $Arch
+$ProfileDir = $Plan.ProfileDir
 $CrateName = "ep-daemon"
-$PackageBase = "EntryPoint-v${Version}-win64-${Mode}"
+$PackageBase = $Plan.PackageBase
 
 function Write-Step { param($m) Write-Host "`n=== $m ===" -ForegroundColor Cyan }
 function Write-Ok   { param($m) Write-Host "  [OK] $m" -ForegroundColor Green }
 function Write-Err  { param($m) Write-Host "  [FAIL] $m" -ForegroundColor Red; exit 1 }
 function Write-Info { param($m) Write-Host "  $m" -ForegroundColor Yellow }
+
+# ── DryRun（T-30）：打印拼装结果即退出，不触碰 npm/cargo ──
+if ($DryRun) {
+    Write-Step "DryRun 构建计划（未执行任何构建动作）"
+    Write-Info "Arch:           $($Plan.Arch)"
+    Write-Info "RustTarget:     '$($Plan.RustTarget)'"
+    Write-Info "ProfileDir:     $($Plan.ProfileDir)"
+    Write-Info "BinDir:         $($Plan.BinDir)"
+    Write-Info "PackageBase:    $($Plan.PackageBase)"
+    Write-Info "CargoBuildArgs: $($Plan.CargoBuildArgs -join ' ')"
+    Write-Info "ArchLabel:      $($Plan.ArchLabel)"
+    exit 0
+}
 
 # ── 1. 环境检查 ──
 Write-Step "环境检查"
@@ -178,9 +253,8 @@ if (-not $SkipTest) {
 
 # ── 5. 编译 ──
 # 仲裁 #36：ep-pack-cli（bin 名 ep-pack）随主 crate 一并构建并纳入打包
-Write-Step "编译 ($Target) — $CrateName + ep-pack-cli"
-$buildArgs = @("build", "--manifest-path", "$ProjectRoot\Cargo.toml", "-p", $CrateName, "-p", "ep-pack-cli")
-if ($Target -eq "release") { $buildArgs += "--release" }
+Write-Step "编译 ($Target, $Arch) — $CrateName + ep-pack-cli"
+$buildArgs = $Plan.CargoBuildArgs
 $prevErr = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 $buildOutput = & $Cargo @buildArgs 2>&1
@@ -203,7 +277,7 @@ New-Item -ItemType Directory -Force -Path "$packageDir\bin" | Out-Null
 New-Item -ItemType Directory -Force -Path "$packageDir\config\pipelines" | Out-Null
 New-Item -ItemType Directory -Force -Path "$packageDir\workspace" | Out-Null
 
-$binSrc = Join-Path $ProjectRoot "target\$ProfileDir"
+$binSrc = $Plan.BinDir
 $exeName = "ep-daemon.exe"
 if (-not (Test-Path "$binSrc\$exeName")) { Write-Err "二进制不存在: $binSrc\$exeName（请先编译）" }
 Copy-Item "$binSrc\$exeName" "$packageDir\bin\" -Force
@@ -218,8 +292,11 @@ Write-Ok "ep-pack CLI: bin\ep-pack.exe"
 # 说明（§3.1/§15.3）：Windows 侧共享 CUDA 库目录 runtime\cuda-libs 的 PATH 前置
 # 由 daemon 运行时代码处理（ep-core process.rs 按 DLL 搜索序注入模块子进程），
 # 打包脚本无需在此注入 PATH；若存在 runtime\cuda-libs 则按存在性随包附带（见下）。
+# CRT 目录按目标架构取（T-30）：x64 → ...\x64\Microsoft.VC14*.CRT；
+# arm64 交叉构建 → ...\arm64\Microsoft.VC14*.CRT（需装 ARM64 生成工具）。
+$crtArchDir = if ($Arch -eq "arm64") { "arm64" } else { "x64" }
 $crtDir = Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Directory -Filter "Microsoft.VC14*.CRT" -ErrorAction SilentlyContinue |
-    Where-Object { $_.Parent.Name -eq "x64" -and $_.Parent.Parent.Name -match "^\d+\.\d+" } |
+    Where-Object { $_.Parent.Name -eq $crtArchDir -and $_.Parent.Parent.Name -match "^\d+\.\d+" } |
     ForEach-Object { [PSCustomObject]@{ Path = $_.FullName; Ver = [version]$_.Parent.Parent.Name } } |
     Sort-Object Ver -Descending | Select-Object -First 1
 if ($crtDir) {
@@ -284,7 +361,7 @@ Write-Ok "启动脚本已生成"
 # 文档 + 版本信息
 if (Test-Path "$ProjectRoot\README.md") { Copy-Item "$ProjectRoot\README.md" "$packageDir\" -Force }
 $versionInfo = @"
-EntryPoint $Version ($Mode, Windows x64)
+EntryPoint $Version ($Mode, $($Plan.ArchLabel))
 构建时间: $Timestamp
 Git 分支: $gitBranch
 Git Commit: $gitHash
