@@ -221,12 +221,27 @@ mod tests {
     #[test]
     fn test_allocate_sequential() {
         let _guard = lock_port_tests();
-        let start = find_free_window(3);
-        let mut pm = PortManager::new(start, start + 10);
-        assert_eq!(pm.allocate("mod-a").unwrap(), start);
-        assert_eq!(pm.allocate("mod-b").unwrap(), start + 1);
-        assert_eq!(pm.allocate("mod-c").unwrap(), start + 2);
-        assert_eq!(pm.allocated_count(), 3);
+        // TOCTOU：find_free_window 释放预约后、allocate 前，并行测试进程
+        //（不持 PORT_TEST_LOCK，同 test_release_and_reuse 注释）可能抢走
+        // 窗口端口，allocate 会跳号——此时重试而非误报。
+        for _attempt in 0..3 {
+            let start = find_free_window(3);
+            let mut pm = PortManager::new(start, start + 10);
+            let (a, b, c) = match (
+                pm.allocate("mod-a"),
+                pm.allocate("mod-b"),
+                pm.allocate("mod-c"),
+            ) {
+                (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+                _ => continue, // 窗口被并行测试抢占（分配失败），重试
+            };
+            if a != start || b != start + 1 || c != start + 2 {
+                continue; // 窗口被并行测试抢占（跳号），重试
+            }
+            assert_eq!(pm.allocated_count(), 3);
+            return;
+        }
+        panic!("port window kept being preempted by parallel tests after 3 attempts");
     }
 
     #[test]
@@ -374,26 +389,42 @@ mod tests {
     #[test]
     fn test_allocate_skips_os_occupied_and_takes_next() {
         let _guard = lock_port_tests();
-        let (_listener, occupied) = occupied_then_free_pair();
-        let mut pm = PortManager::new(occupied, occupied + 1);
+        // TOCTOU：occupied+1 的预约监听器在 pair 构造返回时释放，allocate 前
+        // 并行测试可能抢走它——窗口内已无空闲可跳（exhausted），重试而非误报
+        //（见 test_release_and_reuse 注释）。
+        for _attempt in 0..3 {
+            let (_listener, occupied) = occupied_then_free_pair();
+            let mut pm = PortManager::new(occupied, occupied + 1);
+            if pm.allocate("mod-a").unwrap_or(occupied) != occupied + 1 {
+                continue; // occupied+1 被并行测试抢走，重试
+            }
 
-        // occupied 被外部监听器占住，allocate 应跳过它并分配下一个空闲端口
-        assert_eq!(pm.allocate("mod-a").unwrap(), occupied + 1);
-        assert_eq!(pm.get_port("mod-a"), Some(occupied + 1));
-        assert_eq!(pm.allocated_count(), 1);
+            // occupied 被外部监听器占住，allocate 应跳过它并分配下一个空闲端口
+            assert_eq!(pm.get_port("mod-a"), Some(occupied + 1));
+            assert_eq!(pm.allocated_count(), 1);
+            return;
+        }
+        panic!("port pair kept being preempted by parallel tests after 3 attempts");
     }
 
     #[test]
     fn test_allocate_skips_wildcard_occupied_and_takes_next() {
         let _guard = lock_port_tests();
         // 0.0.0.0 被占（模块 adapter 的真实 bind 形态；Windows 上仅探回环
-        // 会误判该端口空闲）→ allocate 必须跳过被占端口取下一个
-        let (_listener, occupied) = wildcard_occupied_then_free_pair();
-        let mut pm = PortManager::new(occupied, occupied + 1);
+        // 会误判该端口空闲）→ allocate 必须跳过被占端口取下一个。
+        // TOCTOU 同 test_allocate_skips_os_occupied_and_takes_next：抢占时重试。
+        for _attempt in 0..3 {
+            let (_listener, occupied) = wildcard_occupied_then_free_pair();
+            let mut pm = PortManager::new(occupied, occupied + 1);
+            if pm.allocate("mod-a").unwrap_or(occupied) != occupied + 1 {
+                continue; // occupied+1 被并行测试抢走，重试
+            }
 
-        assert_eq!(pm.allocate("mod-a").unwrap(), occupied + 1);
-        assert_eq!(pm.get_port("mod-a"), Some(occupied + 1));
-        assert_eq!(pm.allocated_count(), 1);
+            assert_eq!(pm.get_port("mod-a"), Some(occupied + 1));
+            assert_eq!(pm.allocated_count(), 1);
+            return;
+        }
+        panic!("port pair kept being preempted by parallel tests after 3 attempts");
     }
 
     // ─── 复用语义回归：复用路径必须直接返回已持有端口 ──────────────────────
