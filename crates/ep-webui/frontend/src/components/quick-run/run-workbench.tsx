@@ -8,6 +8,13 @@ import type { CapabilityParamSchema, DeviceResponse } from '@/api/types'
 import { postExecuteSingle } from '@/hooks/use-direct-exec'
 import type { CatalogEntry } from '@/components/quick-run/capability-catalog'
 import { ParamField } from '@/components/quick-run/param-field'
+import { PoolPreflightCard } from '@/components/quick-run/preflight-card'
+import {
+  hasOverPool,
+  poolBalanceRows,
+  type PoolBalanceRow,
+} from '@/components/quick-run/pool-balance'
+import { confirmDialog } from '@/components/shared/confirm-dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
@@ -80,6 +87,10 @@ export function RunWorkbench({
   const [switching, setSwitching] = useState(false)
   /** T-16：本次直跑是否跳过结果缓存（不读不写） */
   const [bypassCache, setBypassCache] = useState(false)
+  /** T-21 pre-flight：提交前多池估算（估算 vs 实时余额）与失败原因 */
+  const [preflightRows, setPreflightRows] = useState<PoolBalanceRow[]>([])
+  const [preflightLoading, setPreflightLoading] = useState(false)
+  const [preflightError, setPreflightError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
 
   const capabilities = entry.capabilities
@@ -94,6 +105,9 @@ export function RunWorkbench({
     setText('')
     setDeviceSel('')
     setParamValues(defaultParamsOf(cap?.params))
+    // T-21：切换模块后旧估算不再适用，清空 pre-flight 卡
+    setPreflightRows([])
+    setPreflightError(null)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [entry.key, effectiveCapId])
 
@@ -162,10 +176,62 @@ export function RunWorkbench({
     }
   }
 
+  /**
+   * T-21 pre-flight：合成单节点管线 spec → vram-budget 多池估算，
+   * 实时余额另拉一次 /api/devices（GPU 指标端点）。
+   * 返回 true = 可继续提交（无超支，或用户「风险自理」确认）。
+   * 估算失败不阻断提交（best-effort 预检，不改变既有提交语义）。
+   */
+  async function runPreflight(): Promise<boolean> {
+    setPreflightLoading(true)
+    setPreflightError(null)
+    try {
+      const spec = {
+        pipeline: {
+          id: 'quick-run-budget',
+          name: 'quick-run-budget',
+          description: '',
+        },
+        nodes: [
+          {
+            id: 'quick-run',
+            label: entry.moduleName,
+            kind: 'module' as const,
+            module_id: entry.moduleId,
+            params: {},
+            device: deviceSel !== '' ? deviceSel : 'auto',
+          },
+        ],
+        edges: [],
+      }
+      const [report, liveDevices] = await Promise.all([
+        api.vramBudget({ spec }),
+        api.devices(),
+      ])
+      const rows = poolBalanceRows(report, liveDevices)
+      setPreflightRows(rows)
+      if (!hasOverPool(rows)) return true
+      // 超支：黄条警告已展示在卡内；「风险自理」确认后才继续（确认后照常排队提交）
+      return await confirmDialog({
+        title: t('preflight.riskTitle'),
+        description: t('preflight.riskDesc'),
+        confirmLabel: t('preflight.riskConfirm'),
+        variant: 'destructive',
+      })
+    } catch {
+      setPreflightRows([])
+      setPreflightError(t('preflight.failed'))
+      return true
+    } finally {
+      setPreflightLoading(false)
+    }
+  }
+
   async function handleSubmit() {
     if (switching || submitting || uploading) return
     setSubmitting(true)
     try {
+      if (!(await runPreflight())) return
       const resp = await postExecuteSingle(buildRequest())
       toast.success(t('accepted'), { description: resp.task_id })
       onSubmitted(resp.task_id, entry.moduleId)
@@ -198,6 +264,8 @@ export function RunWorkbench({
         await new Promise((r) => setTimeout(r, 400))
       }
       onModuleChanged()
+      // T-21：目标设备提交前同样跑多池 pre-flight（风险自理确认后照常提交）
+      if (!(await runPreflight())) return
       const resp = await postExecuteSingle(buildRequest())
       toast.success(t('accepted'), {
         description: `${resp.task_id} · ${deviceSel}`,
@@ -440,6 +508,24 @@ export function RunWorkbench({
           disabled={submitting || switching}
         />
       </div>
+
+      {/* 3.8 T-21 pre-flight 卡：提交前多池估算 vs 实时余额（提交时刷新） */}
+      {(preflightRows.length > 0 || preflightLoading || preflightError) && (
+        <div className="space-y-1.5">
+          <PoolPreflightCard
+            rows={preflightRows}
+            loading={preflightLoading}
+            error={preflightError}
+            title={t('preflight.title')}
+          />
+          {hasOverPool(preflightRows) && (
+            <div className="flex items-start gap-1.5 rounded-lg border border-status-starting/40 bg-status-starting/10 px-3 py-2 text-[11px] text-status-starting">
+              <TriangleAlert className="mt-px size-3.5 shrink-0" />
+              <span>{t('preflight.riskBanner')}</span>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* 4. 执行（冲突态 = 停止并切换设备执行） */}
       <div className="space-y-2">

@@ -122,6 +122,12 @@ import { confirmDialog } from '@/components/shared/confirm-dialog'
 import { PipelineSidebar } from '@/components/shared/pipeline-sidebar'
 import type { TemplateDragPayload } from '@/components/shared/pipeline-sidebar'
 import { PipelineToolbar } from '@/components/shared/pipeline-toolbar'
+// T-21 多池预算视图（poolBalanceRows/PoolPreflightCard 与 quick-run pre-flight 共用）
+import { PoolPreflightCard } from '@/components/quick-run/preflight-card'
+import {
+  poolBalanceRows,
+  type PoolBalanceRow,
+} from '@/components/quick-run/pool-balance'
 
 /** 媒体查询订阅 hook（lg = 64rem 为桌面三栏布局断点） */
 function useMediaQuery(query: string): boolean {
@@ -2465,6 +2471,8 @@ interface VramLedgerPanelProps {
   /** 节点 id → 画布标签（items 明细友好展示） */
   nodeLabels: Map<string, string>
   hasModuleNodes: boolean
+  /** T-21 当前选中节点 id：多池行内高亮其贡献（null = 无高亮） */
+  selectedNodeId: string | null
   onRefresh: () => void
   onClose: () => void
   className?: string
@@ -2477,6 +2485,7 @@ function VramLedgerPanel({
   deviceNames,
   nodeLabels,
   hasModuleNodes,
+  selectedNodeId,
   onRefresh,
   onClose,
   className,
@@ -2486,6 +2495,9 @@ function VramLedgerPanel({
   const blocked = !!report && !report.allow_overcommit && anyOver
 
   const labelFor = (nodeId: string) => nodeLabels.get(nodeId) ?? nodeId
+
+  // T-21 多池视图：报告 pools（T-20）→ 每池一行进度条；旧后端无 pools 时空集
+  const poolRows = useMemo(() => poolBalanceRows(report), [report])
 
   return (
     <aside
@@ -2538,6 +2550,31 @@ function VramLedgerPanel({
             <p className="text-xs text-muted-foreground">
               {t('vram.pending', { defaultValue: '正在等待首次估算…' })}
             </p>
+          )}
+
+          {/* T-21 多池预算（每池一行进度条；选中节点高亮其贡献）：
+              pools 来自 T-20 后端；旧后端缺 pools 时降级为提示，明细卡仍可用 */}
+          {!error && hasModuleNodes && report && (
+            <div className="space-y-1.5">
+              {poolRows.length > 0 ? (
+                <PoolPreflightCard
+                  rows={poolRows.map((row) => ({
+                    ...row,
+                    deviceName: deviceNames.get(row.deviceId) ?? row.deviceName,
+                  }))}
+                  highlightNode={selectedNodeId}
+                  title={t('vram.poolsTitle', { defaultValue: '算力预算（多池）' })}
+                />
+              ) : (
+                !loading && (
+                  <p className="text-[10px] text-muted-foreground">
+                    {t('vram.poolsUnavailable', {
+                      defaultValue: '后端未返回多池账本（旧版本服务），仅显示每设备明细。',
+                    })}
+                  </p>
+                )
+              )}
+            </div>
           )}
 
           {report &&
@@ -3169,6 +3206,10 @@ function ImportTomlDialog({
   const [id, setId] = useState('')
   const [attempted, setAttempted] = useState(false)
   const [pending, setPending] = useState(false)
+  // T-21：导入预览的多池预算估算（TOML/JSON 均在注册前给出量级提示）
+  const [budgetRows, setBudgetRows] = useState<PoolBalanceRow[]>([])
+  const [budgetLoading, setBudgetLoading] = useState(false)
+  const [budgetError, setBudgetError] = useState<string | null>(null)
 
   useEffect(() => {
     if (open && draft) {
@@ -3178,6 +3219,34 @@ function ImportTomlDialog({
       setPending(false)
     }
   }, [open, draft])
+
+  // T-21：打开预览时对导入管线算一次多池估算（失败不阻断导入）
+  useEffect(() => {
+    if (!open || !draft) return
+    let cancelled = false
+    setBudgetLoading(true)
+    setBudgetError(null)
+    setBudgetRows([])
+    api
+      .vramBudget({ spec: draft.spec })
+      .then((report) => {
+        if (!cancelled) setBudgetRows(poolBalanceRows(report))
+      })
+      .catch(() => {
+        if (!cancelled)
+          setBudgetError(
+            t('io.importBudgetFailed', {
+              defaultValue: '预算估算失败（不阻断导入）。',
+            }),
+          )
+      })
+      .finally(() => {
+        if (!cancelled) setBudgetLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [open, draft, t])
 
   if (!draft) return null
 
@@ -3220,6 +3289,14 @@ function ImportTomlDialog({
                 })}
               </p>
             </div>
+
+            {/* T-21 多池预算列：注册前给出该管线各池估算量级（含实时占用） */}
+            <PoolPreflightCard
+              rows={budgetRows}
+              loading={budgetLoading}
+              error={budgetError}
+              title={t('io.importBudgetTitle', { defaultValue: '多池预算估算' })}
+            />
 
             {draft.issues.length > 0 && (
               <div className="space-y-1.5">
@@ -3368,7 +3445,8 @@ function PipelineEditor() {
   const [activeModels, setActiveModels] = useState<Record<string, string> | null>(null)
 
   // ---- VRAM 每设备账本（§6.3） ----
-  const [vramOpen, setVramOpen] = useState(false)
+  // T-21：默认展开（常驻算力预算面板），用户仍可经画布右上 VRAM 按钮收起
+  const [vramOpen, setVramOpen] = useState(true)
   const [vramReport, setVramReport] = useState<VramBudgetResponse | null>(null)
   const [vramError, setVramError] = useState<string | null>(null)
   const [vramLoading, setVramLoading] = useState(false)
@@ -4004,23 +4082,51 @@ function PipelineEditor() {
     }
   }, [nodes, edges, currentId, name, description, t])
 
-  /** 选择 TOML 文件 → 解析 + 依赖校验 → 打开导入预览对话框 */
+  /** 选择 TOML/JSON 文件 → 解析 + 依赖校验 → 打开导入预览对话框
+   *  T-21：JSON 接受导出信封（entrypoint-pipeline/v1）或裸 spec */
   const handleImportFile = useCallback(
     async (file: File) => {
-      if (!file.name.toLowerCase().endsWith('.toml')) {
-        toast.error(t('io.invalidFile', { defaultValue: '请选择 .toml 管线文件' }))
+      const lower = file.name.toLowerCase()
+      if (!lower.endsWith('.toml') && !lower.endsWith('.json')) {
+        toast.error(
+          t('io.invalidFileType', { defaultValue: '请选择 .toml / .json 管线文件' }),
+        )
         return
       }
       try {
         const text = await file.text()
-        const spec = parsePipelineToml(text)
+        let spec: PipelineSpec
+        if (lower.endsWith('.json')) {
+          const parsed: unknown = JSON.parse(text)
+          const envelope = parsed as { format?: string; spec?: PipelineSpec }
+          const candidate =
+            envelope?.format === 'entrypoint-pipeline/v1' && envelope.spec
+              ? envelope.spec
+              : (parsed as PipelineSpec)
+          if (!candidate?.pipeline || !Array.isArray(candidate.nodes)) {
+            throw new Error(
+              t('io.importJsonInvalid', {
+                defaultValue:
+                  'JSON 不是可导入的管线描述（需 entrypoint-pipeline/v1 信封或裸 spec）。',
+              }),
+            )
+          }
+          spec = candidate
+        } else {
+          spec = parsePipelineToml(text)
+        }
         const issues = collectImportIssues(spec, moduleList, modelsList, t)
         setImportDraft({ fileName: file.name, spec, issues })
         setImportOpen(true)
       } catch (err) {
-        toast.error(t('io.importParseFailed', { defaultValue: 'TOML 解析失败' }), {
-          description: errMsg(err),
-        })
+        toast.error(
+          lower.endsWith('.json')
+            ? t('io.importParseFailed', { defaultValue: '管线文件解析失败' })
+            : t('io.importParseFailed', { defaultValue: 'TOML 解析失败' }),
+          {
+            description: errMsg(err),
+          },
+        )
       }
     },
     [moduleList, modelsList, t],
@@ -4745,6 +4851,7 @@ function PipelineEditor() {
             deviceNames={deviceNames}
             nodeLabels={nodeLabels}
             hasModuleNodes={hasModuleNodes}
+            selectedNodeId={selectedNodeId}
             onRefresh={fetchVramBudget}
             onClose={() => setVramOpen(false)}
             className={
@@ -4779,7 +4886,7 @@ function PipelineEditor() {
       <input
         ref={importFileRef}
         type="file"
-        accept=".toml,text/plain"
+        accept=".toml,.json,text/plain"
         className="hidden"
         aria-hidden="true"
         tabIndex={-1}
