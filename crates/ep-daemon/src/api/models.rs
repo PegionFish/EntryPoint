@@ -340,6 +340,7 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {
                     "pack_id": pack_id,
                     "tags": tags,
                     "vram_estimate_mb": model.vram_estimate_mb,
+                    "ram_estimate_mb": model.ram_estimate_mb,
                 })
             })
             .collect();
@@ -418,6 +419,7 @@ async fn module_models(
                 "pack_id": pack_id,
                 "tags": tags,
                 "vram_estimate_mb": decl.vram_estimate_mb,
+                "ram_estimate_mb": decl.ram_estimate_mb,
             })
         })
         .collect();
@@ -1608,6 +1610,7 @@ mod tests {
             sha256s: Default::default(),
             qualified_id: None,
             vram_estimate_mb: None,
+            ram_estimate_mb: None,
         }
     }
 
@@ -1627,6 +1630,7 @@ mod tests {
             sha256s: Default::default(),
             qualified_id: None,
             vram_estimate_mb: None,
+            ram_estimate_mb: None,
         }
     }
 
@@ -1657,6 +1661,7 @@ mod tests {
                 backends: vec![ComputeBackend::Cpu],
                 default_backend: None,
                 vram_estimate_mb: None,
+                ram_estimate_mb: None,
                 min_vram_mb: None,
                 max_concurrent: None,
                 env: None,

@@ -8,6 +8,11 @@
 > 新增 `vulkan` 备选后端；§2.6 `requirements_by_backend` 状态由"本期不实现"
 > 更新为"W1 落地消费（HETERO_DIST_PLAN M2/M3）"，schema 冻结描述不变。
 >
+> v1.3-draft 变更（T-20 多池账本）：§2.3 `[compute]` 与 §2.4 `[[models]]`
+> 新增可选 `ram_estimate_mb`（模块级 u32 / 变体级 u64）——CPU 后端模块的
+> 主开销或 GPU 模块的 CPU 侧驻留记入管线 RAM 池；与 `vram_estimate_mb`
+> **相互独立、互不回退**，管线预算接口按池分组消费（§6.3）。
+>
 > v1.2 变更（PACK_UNIFY_PLAN §4.3/§7）：`[[models]]` 新增 `qualified_id` 与
 > 变体级 `vram_estimate_mb`（§2.4）；`[runtime] requirements_by_backend` schema
 > 冻结声明（本期不实现，§2.6）；venv 命名演进方向 `<module>--<backend>`（§3.1）。
@@ -149,6 +154,7 @@ linux-aarch64 = "bin/linux-aarch64/deep-filter"
 | `backends` | string[] | ✅ | — | 支持的后端列表，按优先级排序 |
 | `default_backend` | string | ❌ | `backends[0]` | 默认后端 |
 | `vram_estimate_mb` | u32 | ❌ | — | 预估显存/内存占用（MB），用于调度参考 |
+| `ram_estimate_mb` | u32 | ❌ | — | 模块级 RAM 估算（MB，T-20）：CPU 后端模块的主开销或 GPU 模块的 CPU 侧驻留，计入管线 RAM 池。与 `vram_estimate_mb` **相互独立、互不回退**；缺失 = 未知 |
 | `min_vram_mb` | u32 | ❌ | — | 最低显存要求（低于此值警告）；**动态准入的每实例显存预算**（缺省回退 `vram_estimate_mb`，见 §6.8b） |
 | `max_concurrent` | u32 | ❌ | — | 模块进程可同时处理的推理请求数（缺省 1 = 适配器串行）。EP 准入器对引用本模块的并发任务按此封顶；适配器必须自身支撑该并发（如 worker 池），声明与实现必须一致 |
 
@@ -190,6 +196,7 @@ cpu = { TORCH_DEVICE = "cpu" }
 | `default` | bool | ❌ | `false` | 是否为默认选中模型 |
 | `qualified_id` | string | ❌ | — | 全限定模型 ID `<publisher>.<vendor>.<model>`（PACK_UNIFY_PLAN §4.3）。缺省时旧式简单 id 自动归一为 `ep.<vendor>.<model>`（向后兼容层）；整合包与管线节点 pin 统一消费 |
 | `vram_estimate_mb` | u64 | ❌ | — | **变体级**显存/内存估算（MB）。VRAM 预算按变体取数：本字段优先，缺省回退模块级 `[compute].vram_estimate_mb`（§2.3） |
+| `ram_estimate_mb` | u64 | ❌ | — | **变体级** RAM 估算（MB，T-20）。RAM 池按变体取数：本字段优先，缺省回退模块级 `[compute].ram_estimate_mb`（§2.3）；与 `vram_estimate_mb` 相互独立、**不互为回退**，两者皆缺 = 未知 |
 | `mirrors` | array | ❌ | `[]` | 备用下载源列表（见下方 `[[models.mirrors]]`） |
 | `sha256` | string | ❌ | — | **单文件模型**主文件的期望 sha256（小写 hex）。下载/导入完成后 EP 主程序校验：目标目录内载荷文件（排除 `.ep_meta.json`）须恰有一个且摘要一致，否则判失败并清理残缺文件 |
 | `sha256s` | table | ❌ | `{}` | **多文件模型**逐文件期望摘要：相对路径（正斜杠）→ sha256。声明的每个文件都必须存在且摘要一致（未声明的额外文件不失败，兼容 HF 仓库附带文件）。TOML 写法：`[models.sha256s]` 子表 |

@@ -912,6 +912,7 @@ mod tests {
                 backends: vec![ComputeBackend::Cuda, ComputeBackend::Cpu],
                 default_backend: Some(ComputeBackend::Cuda),
                 vram_estimate_mb: None,
+                ram_estimate_mb: None,
                 min_vram_mb: None,
                 max_concurrent: None,
                 env: None,
@@ -1790,6 +1791,7 @@ mod tests {
                 sha256s: Default::default(),
                 qualified_id: None,
                 vram_estimate_mb: None,
+                ram_estimate_mb: None,
             },
             ModelDecl {
                 id: "large".to_string(),
@@ -1806,6 +1808,7 @@ mod tests {
                 sha256s: Default::default(),
                 qualified_id: None,
                 vram_estimate_mb: None,
+                ram_estimate_mb: None,
             },
         ];
 

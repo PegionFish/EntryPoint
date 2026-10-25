@@ -94,6 +94,14 @@ pub struct ComputeConfig {
     pub backends: Vec<ComputeBackend>,
     pub default_backend: Option<ComputeBackend>,
     pub vram_estimate_mb: Option<u32>,
+    /// 模块级 RAM 估算（MB）— T-20 管线多池账本的 RAM 池模块级兜底。
+    ///
+    /// 面向 CPU 后端模块的主开销（模型/索引常驻主存），也可供 GPU 模块
+    /// 声明显存之外的 CPU 侧驻留。与 `vram_estimate_mb` **相互独立、互不
+    /// 回退**（显存声明不代表主存开销）；缺失 = 未知（`None`），由消费方
+    /// （[`ModuleManifest::resolve_ram_estimate`] → 管线 "ram" 池）自行决定
+    /// 展示/放行策略。
+    pub ram_estimate_mb: Option<u32>,
     pub min_vram_mb: Option<u32>,
     /// 模块进程可同时处理的推理请求数（调度契约，§6.8 动态并发）：
     /// EP 准入器对引用本模块的并发任务按此值封顶（缺省 1 = 适配器串行）。
@@ -183,6 +191,14 @@ pub struct ModelDecl {
     /// 见 [`ModuleManifest::resolve_vram_estimate`]（变体优先、模块兜底）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vram_estimate_mb: Option<u64>,
+    /// 变体级 RAM 估算（MB）— T-20 管线多池账本 RAM 池的数据源。
+    ///
+    /// 与 [`ModelDecl::vram_estimate_mb`] **同构但独立**（不互为回退）：
+    /// CPU 后端变体的主开销、或 GPU 变体的 CPU 侧驻留（tokenizer 等）
+    /// 都声明在这里。缺省时回退模块级 `[compute].ram_estimate_mb`，
+    /// 见 [`ModuleManifest::resolve_ram_estimate`]；两者皆缺 = `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ram_estimate_mb: Option<u64>,
     #[serde(default)]
     pub default: bool,
     /// 备用下载源列表（TOML 中为 `[[models.mirrors]]`）
@@ -338,6 +354,26 @@ impl ModuleManifest {
             .find(|m| m.id == variant_id)
             .and_then(|m| m.vram_estimate_mb);
         variant.or_else(|| self.compute.vram_estimate_mb.map(u64::from))
+    }
+
+    /// 解析指定变体的 RAM 估算（MB）— T-20 管线 RAM 池账本的数据源。
+    ///
+    /// 与 [`ModuleManifest::resolve_vram_estimate`] **同构但独立**，解析顺序：
+    /// 1. 变体级 `[[models]].ram_estimate_mb`（按 `variant_id` 匹配 `id`）优先；
+    /// 2. 变体未声明、或 `variant_id` 未命中任何变体时，回退模块级
+    ///    `[compute].ram_estimate_mb`（u32 → u64 无损加宽）；
+    /// 3. 两者皆缺返回 `None`（未知，由消费侧决定展示/放行策略）。
+    ///
+    /// 注意：**不回退** `vram_estimate_mb`——RAM 池与显存池是两个独立资源池，
+    /// 显存声明不构成主存开销的依据；调用方（`pipeline::vram` 的 "ram" 池）
+    /// 对 `None` 节点不计入账本即可。
+    pub fn resolve_ram_estimate(&self, variant_id: &str) -> Option<u64> {
+        let variant = self
+            .models
+            .iter()
+            .find(|m| m.id == variant_id)
+            .and_then(|m| m.ram_estimate_mb);
+        variant.or_else(|| self.compute.ram_estimate_mb.map(u64::from))
     }
 
     pub fn validate(&self) -> Result<(), Vec<String>> {
@@ -931,6 +967,113 @@ type = "http"
         // 变体与模块均未声明 → None（未知）
         assert_eq!(manifest.resolve_vram_estimate("large-v3"), None);
         assert_eq!(manifest.resolve_vram_estimate("medium"), None);
+    }
+
+    // ── 变体级/模块级 ram_estimate_mb（T-20 多池账本 RAM 池）────────────
+
+    const RAM_TOML: &str = r#"
+[module]
+id = "faster-whisper"
+name = "Faster-Whisper ASR"
+version = "1.1.0"
+description = "High-speed speech recognition"
+category = "asr"
+genre = "whisper"
+
+[runtime]
+type = "python"
+python_version = ">=3.10,<3.13"
+
+[compute]
+backends = ["cuda", "cpu"]
+vram_estimate_mb = 4096
+ram_estimate_mb = 2048
+
+[[models]]
+id = "large-v3"
+name = "Whisper Large V3"
+source = "huggingface"
+repo_id = "Systran/faster-whisper-large-v3"
+target_dir = "faster-whisper-large-v3"
+vram_estimate_mb = 8192
+ram_estimate_mb = 4096
+default = true
+
+[[models]]
+id = "medium"
+name = "Whisper Medium"
+source = "huggingface"
+repo_id = "Systran/faster-whisper-medium"
+target_dir = "faster-whisper-medium"
+
+[interface]
+type = "http"
+"#;
+
+    #[test]
+    fn test_parse_variant_ram_estimate() {
+        let manifest: ModuleManifest = toml::from_str(RAM_TOML).unwrap();
+        // 变体级声明
+        assert_eq!(manifest.models[0].ram_estimate_mb, Some(4096u64));
+        // 未声明变体 → serde default None（向后兼容）
+        assert_eq!(manifest.models[1].ram_estimate_mb, None);
+        // 旧清单（无任何 ram 字段）→ None
+        let legacy: ModuleManifest = toml::from_str(VALID_TOML).unwrap();
+        assert_eq!(legacy.compute.ram_estimate_mb, None);
+        assert_eq!(legacy.models[0].ram_estimate_mb, None);
+    }
+
+    #[test]
+    fn test_resolve_ram_estimate_variant_priority_and_module_fallback() {
+        let manifest: ModuleManifest = toml::from_str(RAM_TOML).unwrap();
+        // 变体级声明优先
+        assert_eq!(manifest.resolve_ram_estimate("large-v3"), Some(4096));
+        // 变体未声明 → 模块级兜底
+        assert_eq!(manifest.resolve_ram_estimate("medium"), Some(2048));
+        // 未知变体同样回退模块级（防御：pin 变体可能尚未下载）
+        assert_eq!(manifest.resolve_ram_estimate("no-such-variant"), Some(2048));
+    }
+
+    #[test]
+    fn test_resolve_ram_estimate_none_when_unknown() {
+        // 注意锚点带换行前缀："ram_estimate_mb = …" 是 "vram_estimate_mb = …"
+        // 的尾子串，裸子串替换会误伤显存行
+        let toml_str = RAM_TOML
+            .replace("\nram_estimate_mb = 4096", "")
+            .replace("\nram_estimate_mb = 2048", "");
+        let manifest: ModuleManifest = toml::from_str(&toml_str).unwrap();
+        // 变体与模块均未声明 → None（未知）；显存声明不受影响
+        assert_eq!(manifest.resolve_ram_estimate("large-v3"), None);
+        assert_eq!(manifest.resolve_ram_estimate("medium"), None);
+        assert_eq!(manifest.resolve_vram_estimate("large-v3"), Some(8192));
+    }
+
+    #[test]
+    fn test_resolve_ram_estimate_is_independent_of_vram() {
+        // RAM 池独立：只声明显存（VRAM_TOML）时 RAM 解析必须为 None，
+        // 绝不回退 vram_estimate_mb
+        let manifest: ModuleManifest = toml::from_str(VRAM_TOML).unwrap();
+        assert_eq!(manifest.resolve_vram_estimate("large-v3"), Some(8192));
+        assert_eq!(manifest.resolve_ram_estimate("large-v3"), None);
+        assert_eq!(manifest.resolve_ram_estimate("medium"), None);
+    }
+
+    #[test]
+    fn test_ram_estimate_serialization_roundtrip() {
+        // 整合包导出会序列化 manifest：声明了 ram_estimate_mb 时原样往返，
+        // 未声明时不落盘空键（与 vram_estimate_mb 同策略）
+        let manifest: ModuleManifest = toml::from_str(RAM_TOML).unwrap();
+        let serialized = toml::to_string_pretty(&manifest).unwrap();
+        assert!(serialized.contains("ram_estimate_mb"));
+        let reparsed: ModuleManifest = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.models[0].ram_estimate_mb, Some(4096));
+        assert_eq!(reparsed.compute.ram_estimate_mb, Some(2048));
+
+        let legacy: ModuleManifest = toml::from_str(VALID_TOML).unwrap();
+        // 注意锚点带换行：`ram_estimate_mb` 是 `vram_estimate_mb` 的尾子串
+        assert!(!toml::to_string_pretty(&legacy)
+            .unwrap()
+            .contains("\nram_estimate_mb"));
     }
 
     // ── requirements_by_backend（§2.6 冻结 schema，HETERO_DIST_PLAN M2）────

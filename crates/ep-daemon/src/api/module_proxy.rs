@@ -262,6 +262,7 @@ mod tests {
                 backends: vec![ComputeBackend::Cpu],
                 default_backend: None,
                 vram_estimate_mb: None,
+                ram_estimate_mb: None,
                 min_vram_mb: None,
                 max_concurrent: None,
                 env: None,

@@ -232,6 +232,11 @@ function formatWorkflowMtime(mtime: number): string {
   return new Date(ms).toLocaleString()
 }
 
+/** RAM 估算 MB → 「RAM ~N GB」档位（展示层向上取整取保守侧；内部数据保持 MB，T-20） */
+function ramEstimateTier(ramMb: number): string {
+  return `RAM ~${Math.ceil(ramMb / 1024)} GB`
+}
+
 /**
  * ComfyUI 工作流管理卡片（D4 / §3.6）：经 daemon 模块代理（§3.5）调用
  * 适配器工作流端点——GET / POST(FormData) / DELETE extra/workflows。
@@ -3575,6 +3580,9 @@ export function ModulesPage() {
                           {variant.vram_estimate_mb
                             ? ` · VRAM ${formatMB(variant.vram_estimate_mb)}`
                             : ''}
+                          {variant.ram_estimate_mb
+                            ? ` · ${ramEstimateTier(variant.ram_estimate_mb)}`
+                            : ''}
                         </SelectItem>
                       )
                     })}
@@ -3610,6 +3618,17 @@ export function ModulesPage() {
                       >
                         <Gauge className="size-3" />
                         {formatMB(activeModel.vram_estimate_mb)}
+                      </span>
+                    ) : null}
+                    {activeModel.ram_estimate_mb ? (
+                      <span
+                        className="flex items-center gap-1"
+                        title={t('models:card.ramEstimate', {
+                          defaultValue: 'RAM 估算',
+                        })}
+                      >
+                        <MemoryStick className="size-3" />
+                        {ramEstimateTier(activeModel.ram_estimate_mb)}
                       </span>
                     ) : null}
                     {activeModel.size_estimate_mb ? (

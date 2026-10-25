@@ -31,7 +31,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use ep_core::pipeline::vram::{self, DeviceCapacity, VramNodeEstimate};
+use ep_core::pipeline::vram::{self, DeviceCapacity, PoolNodeEstimate};
 use ep_core::task_registry::TaskState;
 
 use crate::api::err_response;
@@ -676,12 +676,19 @@ struct VramSpecNode {
 /// POST /api/pipelines/vram-budget — 每设备 VRAM 预算分解（§6.3）
 ///
 /// 算法在 ep-core `pipeline::vram`（纯计算，桌面端直连复用）；本 handler
-/// 负责数据拼装：节点 vram 取 `manifest.resolve_vram_estimate`（pin 变体
-/// 优先 → 激活变体 → 默认变体；变体级优先、模块级兜底，A6 数据源），
-/// 设备容量取 `state.devices`，`allow_overcommit` 取 `compute.allow_overcommit`。
+/// 负责数据拼装：节点 vram 取 `manifest.resolve_vram_estimate`、节点 ram 取
+/// `manifest.resolve_ram_estimate`（pin 变体优先 → 激活变体 → 默认变体；
+/// 变体级优先、模块级兜底，A6 数据源；RAM 与 VRAM 相互独立、不互为回退），
+/// 设备容量取 `state.devices`，RAM 池容量取快照中 CPU 条目的系统内存
+/// （`compute::cpu` 周期探测；无 CPU 条目/容量缺失 → `unknown = true`），
+/// `allow_overcommit` 取 `compute.allow_overcommit`。
 ///
-/// 响应形状（S2 前端提议，仲裁 #3）：
-/// `{devices:[{device_id,total_mb,used_mb,pipeline_mb,items:[{node_id,mb}],over}], unassigned:[{node_id,mb}], unassigned_mb, allow_overcommit}`
+/// 响应形状（S2 前端提议，仲裁 #3；T-20 多池扩展）：
+/// `{devices:[{device_id,total_mb,used_mb,pipeline_mb,items:[{node_id,mb}],over}],
+///   unassigned:[{node_id,mb}], unassigned_mb, allow_overcommit,
+///   pools:[{kind:"vram"|"ram", device_id, total_mb, committed_mb,
+///           entries:[{node,estimate_mb}], unknown}]}`
+/// `pools` 按池分组、**不做跨池总和**；旧字段 `devices` 形状不变（向后兼容）。
 async fn vram_budget(
     State(state): State<Arc<AppState>>,
     Json(req): Json<VramBudgetRequest>,
@@ -709,13 +716,13 @@ async fn vram_budget(
     };
     let allow_overcommit = state.config.read().await.compute.allow_overcommit;
 
-    // 节点 → VRAM 估算（module 节点查 manifest；builtin/未知模块 = None）
-    let estimates: Vec<VramNodeEstimate> = req
+    // 节点 → 多池估算（module 节点查 manifest；builtin/未知模块 = None）
+    let estimates: Vec<PoolNodeEstimate> = req
         .spec
         .nodes
         .iter()
         .map(|node| {
-            let (device, vram_mb) = match node.module_id.as_deref() {
+            let (device, vram_mb, ram_mb) = match node.module_id.as_deref() {
                 Some(module_id) => {
                     let variant = node
                         .model
@@ -724,7 +731,7 @@ async fn vram_budget(
                         .filter(|v| !v.is_empty())
                         .map(str::to_string)
                         .or_else(|| active_models.get(module_id).cloned());
-                    let mb = manifests.get(module_id).and_then(|mf| {
+                    let (vram_mb, ram_mb) = manifests.get(module_id).map_or((None, None), |mf| {
                         let variant_id = variant
                             .clone()
                             .or_else(|| {
@@ -735,16 +742,20 @@ async fn vram_budget(
                                     .map(|m| m.id.clone())
                             })
                             .unwrap_or_default();
-                        mf.resolve_vram_estimate(&variant_id)
+                        (
+                            mf.resolve_vram_estimate(&variant_id),
+                            mf.resolve_ram_estimate(&variant_id),
+                        )
                     });
-                    (node.device.clone().unwrap_or_else(|| "auto".into()), mb)
+                    (node.device.clone().unwrap_or_else(|| "auto".into()), vram_mb, ram_mb)
                 }
-                None => ("auto".to_string(), None),
+                None => ("auto".to_string(), None, None),
             };
-            VramNodeEstimate {
+            PoolNodeEstimate {
                 node_id: node.id.clone(),
                 device,
                 vram_mb,
+                ram_mb,
             }
         })
         .collect();
@@ -767,7 +778,14 @@ async fn vram_budget(
             .collect()
     };
 
-    match vram::compute_budget(&estimates, &edges, &devices, allow_overcommit) {
+    // RAM 池容量：设备快照中 CPU 条目的系统内存（探测不可用 → None → unknown）
+    let ram_total_mb = devices
+        .iter()
+        .find(|d| d.device_id.eq_ignore_ascii_case("cpu"))
+        .and_then(|d| d.total_mb);
+
+    match vram::compute_budget_multi_pool(&estimates, &edges, &devices, ram_total_mb, allow_overcommit)
+    {
         Ok(report) => (
             StatusCode::OK,
             Json(serde_json::to_value(&report).expect("VramBudgetReport serialization cannot fail")),
@@ -1319,7 +1337,21 @@ to = ["output", "input"]
         }
     }
 
-    /// fixture manifest：两个变体（small=2048 模块级兜底 4096）
+    /// CPU 设备条目（系统内存探测来源，T-20 ram 池容量）
+    fn cpu_device(total: Option<u32>, used: Option<u32>) -> ep_core::types::ComputeDevice {
+        ep_core::types::ComputeDevice {
+            id: ep_core::types::DeviceId::Cpu,
+            backend: ep_core::types::ComputeBackend::Cpu,
+            name: "Test CPU".to_string(),
+            total_memory_mb: total,
+            used_memory_mb: used,
+            utilization: None,
+            temperature: None,
+        }
+    }
+
+    /// fixture manifest：两个变体（small=2048 模块级兜底 4096）；
+    /// ram 估算：small=512 变体级、large 无声明回退模块级 1024（T-20）
     fn vram_manifest(module_id: &str) -> ep_core::module::manifest::ModuleManifest {
         toml::from_str(&format!(
             r#"
@@ -1338,6 +1370,7 @@ type = "python"
 [compute]
 backends = ["cuda"]
 vram_estimate_mb = 4096
+ram_estimate_mb = 1024
 
 [interface]
 type = "http"
@@ -1348,6 +1381,7 @@ name = "Small"
 source = "huggingface"
 target_dir = "{module_id}-small"
 vram_estimate_mb = 2048
+ram_estimate_mb = 512
 
 [[models]]
 id = "large"
@@ -1360,7 +1394,7 @@ default = true
         .unwrap()
     }
 
-    fn state_with_vram_module() -> Arc<AppState> {
+    fn state_with_devices(devices: Vec<ep_core::types::ComputeDevice>) -> Arc<AppState> {
         use ep_core::module::discovery::{DiscoveredModule, DiscoveryStatus};
         let manifest = vram_manifest("fixture-asr");
         let module = DiscoveredModule {
@@ -1375,10 +1409,14 @@ default = true
                 SEQ.fetch_add(1, Ordering::SeqCst)
             )),
             AppConfig::default(),
-            vec![gpu_device(0, Some(24576), Some(1024))],
+            devices,
             vec![module],
             PortManager::new(18000, 19000),
         ))
+    }
+
+    fn state_with_vram_module() -> Arc<AppState> {
+        state_with_devices(vec![gpu_device(0, Some(24576), Some(1024))])
     }
 
     #[tokio::test]
@@ -1500,6 +1538,121 @@ default = true
         let (status, _) =
             vram_budget(State(state), Json(serde_json::from_value(body).unwrap())).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // ── 多池账本（T-20）：pools 分组 + devices 向后兼容 ─────────────────────
+
+    #[tokio::test]
+    async fn test_vram_budget_pools_grouped_and_devices_compat() {
+        let state = state_with_vram_module(); // 仅 GPU 设备 → RAM 容量未知
+        let body = json!({
+            "spec": {
+                "nodes": [
+                    { "id": "input", "kind": "builtin", "builtin": "file_input" },
+                    { "id": "asr", "kind": "module", "module_id": "fixture-asr",
+                      "model": "ep.x.fixture-asr@small", "device": "cuda:0" }
+                ],
+                "edges": []
+            }
+        });
+        let (status, resp) =
+            vram_budget(State(state), Json(serde_json::from_value(body).unwrap())).await;
+        assert_eq!(status, StatusCode::OK);
+        let v = resp.0;
+
+        // 旧字段 devices 仍在且形状不变（向后兼容）
+        let devices = v["devices"].as_array().expect("devices 字段必须保留");
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0]["device_id"], "cuda:0");
+        assert_eq!(devices[0]["total_mb"], 24576);
+        assert_eq!(devices[0]["pipeline_mb"], 2048);
+        assert!(devices[0]["items"].is_array());
+        assert!(devices[0]["over"].is_boolean());
+        assert!(v["unassigned"].is_array());
+        assert!(v["unassigned_mb"].is_u64());
+        assert!(v["allow_overcommit"].is_boolean());
+
+        // pools：vram cuda:0 一池 + 单一 ram 池（不做跨池总和）
+        let pools = v["pools"].as_array().expect("pools 字段必须存在");
+        assert_eq!(pools.len(), 2, "vram cuda:0 + ram cpu");
+        let vram_pool = &pools[0];
+        assert_eq!(vram_pool["kind"], "vram");
+        assert_eq!(vram_pool["device_id"], "cuda:0");
+        assert_eq!(vram_pool["total_mb"], 24576);
+        assert_eq!(vram_pool["committed_mb"], 2048, "pin small 的变体级 vram");
+        assert_eq!(vram_pool["unknown"], false);
+        assert_eq!(vram_pool["entries"][0]["node"], "asr");
+        assert_eq!(vram_pool["entries"][0]["estimate_mb"], 2048);
+
+        let ram = &pools[1];
+        assert_eq!(ram["kind"], "ram");
+        assert_eq!(ram["device_id"], "cpu");
+        // 快照无 CPU 条目 → total 记 0 且 unknown=true
+        assert_eq!(ram["total_mb"], 0);
+        assert_eq!(ram["unknown"], true);
+        // ram 与 vram 相互独立：small 变体级 ram_estimate_mb=512
+        assert_eq!(ram["committed_mb"], 512);
+        assert_eq!(ram["entries"][0]["node"], "asr");
+        assert_eq!(ram["entries"][0]["estimate_mb"], 512);
+    }
+
+    #[tokio::test]
+    async fn test_vram_budget_ram_pool_total_from_cpu_device() {
+        // 快照含 CPU 条目（系统内存探测）→ ram 池容量取 total_memory_mb
+        let state = state_with_devices(vec![
+            gpu_device(0, Some(24576), Some(1024)),
+            cpu_device(Some(32768), Some(4096)),
+        ]);
+        // auto 节点：未 pin 变体 → 默认 large（无变体级 ram）→ 模块级 1024 兜底
+        let body = json!({
+            "spec": {
+                "nodes": [
+                    { "id": "asr", "kind": "module", "module_id": "fixture-asr" }
+                ],
+                "edges": []
+            }
+        });
+        let (status, resp) =
+            vram_budget(State(state), Json(serde_json::from_value(body).unwrap())).await;
+        assert_eq!(status, StatusCode::OK);
+        let v = resp.0;
+        let pools = v["pools"].as_array().unwrap();
+        let ram = pools
+            .iter()
+            .find(|p| p["kind"] == "ram")
+            .expect("单一 ram 池");
+        assert_eq!(ram["device_id"], "cpu");
+        assert_eq!(ram["total_mb"], 32768, "取 CPU 条目的系统内存总量");
+        assert_eq!(ram["unknown"], false);
+        assert_eq!(ram["committed_mb"], 1024, "变体未声明 → 模块级 ram 兜底");
+        assert_eq!(ram["entries"][0]["node"], "asr");
+        // vram 池与 ram 池不混算：auto 节点的 vram 4096 在 unassigned，不在 ram 池
+        assert_eq!(v["unassigned_mb"], 4096);
+        assert_eq!(ram["entries"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_vram_budget_ram_pool_excludes_non_module_nodes() {
+        // builtin/未知模块节点无 ram 声明 → 不入 ram 池（entries 为空）
+        let state = state_with_devices(vec![cpu_device(Some(32768), None)]);
+        let body = json!({
+            "spec": {
+                "nodes": [
+                    { "id": "input", "kind": "builtin", "builtin": "file_input" },
+                    { "id": "ghost", "kind": "module", "module_id": "no-such-module" }
+                ],
+                "edges": []
+            }
+        });
+        let (status, resp) =
+            vram_budget(State(state), Json(serde_json::from_value(body).unwrap())).await;
+        assert_eq!(status, StatusCode::OK);
+        let pools = resp.0["pools"].as_array().unwrap();
+        let ram = pools.iter().find(|p| p["kind"] == "ram").unwrap();
+        assert_eq!(ram["committed_mb"], 0);
+        assert_eq!(ram["entries"].as_array().unwrap().len(), 0);
+        assert_eq!(ram["total_mb"], 32768);
+        assert_eq!(ram["unknown"], false);
     }
 
     // ── POST /tasks/{task_id}/cancel ────────────────────────────────────────

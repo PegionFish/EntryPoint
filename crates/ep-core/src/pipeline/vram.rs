@@ -9,6 +9,13 @@
 //! 3. 每设备峰值即该管线的预算需求 `pipeline_mb`，叠加设备当前占用与容量
 //!    得出 `over` 标记；`allow_overcommit` 由调用方传入（执行放行策略）。
 //!
+//! ## 多池账本（T-20 扩展）
+//!
+//! [`compute_budget_multi_pool`] 在设备账本之上追加按池分组的 `pools`
+//! 视图：vram 每设备一池 + 单一 ram 池（节点经 manifest
+//! `resolve_ram_estimate` 声明的主存开销，容量取系统内存探测），不做跨池
+//! 总和；`devices` 字段保持原形状（向后兼容）。
+//!
 //! 数据源约定（A6）：节点 vram 值来自
 //! [`crate::module::manifest::ModuleManifest::resolve_vram_estimate`]
 //! （pin 变体级优先、模块级兜底）；估算缺失的节点不参与求和
@@ -71,6 +78,11 @@ pub struct DeviceBudget {
 
 /// VRAM 预算报告（S2 前端形状，仲裁 #3）：
 /// `{devices:[{device_id,total_mb,used_mb,pipeline_mb,items:[{node_id,mb}]}], unassigned:[...]}`
+///
+/// T-20 多池扩展：[`Self::pools`] 携带按池分组的账本（vram 每设备一池 +
+/// ram 单池），**不做跨池总和**；`devices` 字段保持原形状（向后兼容）。
+/// 旧入口 [`compute_budget`] 不填充该字段（序列化时省略 `pools` 键，旧
+/// 响应字节级不变）；新入口 [`compute_budget_multi_pool`] 恒产出。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VramBudgetReport {
     pub devices: Vec<DeviceBudget>,
@@ -80,6 +92,87 @@ pub struct VramBudgetReport {
     pub unassigned_mb: u64,
     /// 是否允许超额提交（`compute.allow_overcommit`，放行策略由执行层决定）
     pub allow_overcommit: bool,
+    /// 多池账本（T-20）：按池分组，不做跨池总和
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pools: Vec<PoolBudget>,
+}
+
+// ─── 多池账本（T-20：vram 每设备一池 + ram 单池）─────────────────────────────
+
+/// 池种类（T-20 多池账本）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PoolKind {
+    /// 独立显存池（每设备一池，`device_id` 如 `"cuda:0"`）
+    Vram,
+    /// 系统内存池（单一池，`device_id` 固定 `"cpu"`）
+    Ram,
+    /// 统一内存架构池（CPU/GPU 共享同一物理内存的平台；**预留种类**，
+    /// 当前检测器无 UMA 判定，不产出）
+    Uma,
+}
+
+/// 池账本条目：单个节点在某池的估算
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolItem {
+    pub node: String,
+    pub estimate_mb: u64,
+}
+
+/// 单个资源池的账本（多池视图）。
+///
+/// 与 [`DeviceBudget`] 的差异：条目字段为 `node`/`estimate_mb`，容量
+/// `total_mb` 为非可空 u64（未知记 0 并置 `unknown = true`，区别于
+/// 「零容量」），不含 `over` 判定（放行语义仍以 `devices[].over` 为准）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PoolBudget {
+    pub kind: PoolKind,
+    pub device_id: String,
+    /// 池容量（MB）；未知记 0 并置 [`Self::unknown`]
+    pub total_mb: u64,
+    /// 管线在该池的承诺开销（MB）
+    pub committed_mb: u64,
+    /// 承诺明细
+    pub entries: Vec<PoolItem>,
+    /// 容量未知（`total_mb` 仅为占位 0）
+    #[serde(default)]
+    pub unknown: bool,
+}
+
+/// 节点多池估算（T-20）：在 [`VramNodeEstimate`] 基础上追加 RAM 维度。
+///
+/// `vram_mb` 与 `ram_mb` 相互独立：各自为 `Some` 即计入对应池；两者同时
+/// 为 `Some` 时同一节点计入两个池（如 GPU 模块的显存开销 + 主存驻留）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PoolNodeEstimate {
+    pub node_id: String,
+    /// 设备绑定（vram 池用）：`"auto"` / 空串 = 未分配池；`"cuda:0"` 等 = 具体设备
+    pub device: String,
+    /// VRAM 估算（MB）；None = 未知（不参与 vram 求和）
+    pub vram_mb: Option<u64>,
+    /// RAM 估算（MB）；None = 未声明（不参与 ram 池）
+    pub ram_mb: Option<u64>,
+}
+
+impl PoolNodeEstimate {
+    /// 从纯 VRAM 估算构造（RAM 未声明）。
+    pub fn from_vram(v: &VramNodeEstimate) -> Self {
+        Self {
+            node_id: v.node_id.clone(),
+            device: v.device.clone(),
+            vram_mb: v.vram_mb,
+            ram_mb: None,
+        }
+    }
+
+    /// 投影为纯 VRAM 估算（喂给既有 [`compute_budget`] 设备账本）。
+    fn as_vram_estimate(&self) -> VramNodeEstimate {
+        VramNodeEstimate {
+            node_id: self.node_id.clone(),
+            device: self.device.clone(),
+            vram_mb: self.vram_mb,
+        }
+    }
 }
 
 /// 预算计算错误
@@ -260,7 +353,78 @@ pub fn compute_budget(
         unassigned: unassigned_peak.1,
         unassigned_mb: unassigned_peak.0,
         allow_overcommit,
+        pools: Vec::new(),
     })
+}
+
+/// 计算管线多池预算（§6.3 多池扩展，T-20）。
+///
+/// 设备账本部分与 [`compute_budget`] 完全同一算法（分层峰值 / over 判定 /
+/// `unassigned` 池），并在其上追加池视图 `pools`：
+///
+/// - **vram 池**：`devices[]` 每条目一池（kind = vram），`committed_mb` 即
+///   该设备峰值 `pipeline_mb`，`entries` 为峰值层明细；
+/// - **ram 池**：单一池（kind = ram，`device_id = "cpu"`），声明了
+///   `ram_estimate_mb` 的节点全部计入；`committed_mb` 为**求和**而非峰值
+///   （主存驻留在管线生命周期内常驻，无跨层释放语义）；`total_mb` 取
+///   `ram_total_mb`（来源：设备快照 CPU 条目的系统内存探测），`None` →
+///   记 0 并置 `unknown = true`；
+/// - **uma 池**：预留种类，当前不产出。
+///
+/// 池之间**不做跨池总和**；ram 节点即使同时声明了 vram 也照常进入设备
+/// 账本（两池各自独立计量）。旧字段 `devices` 原样保留（向后兼容）。
+pub fn compute_budget_multi_pool(
+    nodes: &[PoolNodeEstimate],
+    edges: &[(String, String)],
+    devices: &[DeviceCapacity],
+    ram_total_mb: Option<u64>,
+    allow_overcommit: bool,
+) -> Result<VramBudgetReport, VramBudgetError> {
+    let vram_nodes: Vec<VramNodeEstimate> = nodes.iter().map(|n| n.as_vram_estimate()).collect();
+    let mut report = compute_budget(&vram_nodes, edges, devices, allow_overcommit)?;
+
+    let mut pools: Vec<PoolBudget> = report
+        .devices
+        .iter()
+        .map(|d| PoolBudget {
+            kind: PoolKind::Vram,
+            device_id: d.device_id.clone(),
+            total_mb: d.total_mb.unwrap_or(0),
+            committed_mb: d.pipeline_mb,
+            entries: d
+                .items
+                .iter()
+                .map(|i| PoolItem {
+                    node: i.node_id.clone(),
+                    estimate_mb: i.mb,
+                })
+                .collect(),
+            unknown: d.total_mb.is_none(),
+        })
+        .collect();
+
+    // 单一 ram 池：声明即计入（含仅声明 ram 的节点），求和语义
+    let ram_entries: Vec<PoolItem> = nodes
+        .iter()
+        .filter_map(|n| {
+            n.ram_mb.map(|mb| PoolItem {
+                node: n.node_id.clone(),
+                estimate_mb: mb,
+            })
+        })
+        .collect();
+    let ram_committed = ram_entries.iter().map(|e| e.estimate_mb).sum();
+    pools.push(PoolBudget {
+        kind: PoolKind::Ram,
+        device_id: "cpu".to_string(),
+        total_mb: ram_total_mb.unwrap_or(0),
+        committed_mb: ram_committed,
+        entries: ram_entries,
+        unknown: ram_total_mb.is_none(),
+    });
+
+    report.pools = pools;
+    Ok(report)
 }
 
 // ─── 管线 TOML 辅助读取（§6.8） ──────────────────────────────────────────────
@@ -519,5 +683,143 @@ mod tests {
             None
         );
         assert_eq!(parse_max_instances("this is [[ not toml"), None);
+    }
+
+    // ── 多池账本（T-20）────────────────────────────────────────────────────
+
+    fn pool_node(id: &str, device: &str, vram: Option<u64>, ram: Option<u64>) -> PoolNodeEstimate {
+        PoolNodeEstimate {
+            node_id: id.to_string(),
+            device: device.to_string(),
+            vram_mb: vram,
+            ram_mb: ram,
+        }
+    }
+
+    #[test]
+    fn multi_pool_groups_vram_per_device_and_single_ram_pool() {
+        // 同层：cuda:0 显存节点 + cpu 主存节点（仅声明 ram）
+        let nodes = vec![
+            pool_node("asr", "cuda:0", Some(8192), Some(512)),
+            pool_node("index", "auto", None, Some(2048)),
+            pool_node("embed", "cpu", None, Some(1024)),
+        ];
+        let report = compute_budget_multi_pool(
+            &nodes,
+            &[],
+            &[
+                device("cuda:0", Some(24576), Some(1024)),
+                device("cpu", Some(32768), Some(8192)),
+            ],
+            Some(32768),
+            false,
+        )
+        .unwrap();
+
+        // 旧字段 devices 仍在（向后兼容）：vram 节点照常入设备账本
+        let d0 = report.devices.iter().find(|d| d.device_id == "cuda:0").unwrap();
+        assert_eq!(d0.pipeline_mb, 8192);
+
+        // pools：vram 每设备一池 + 单一 ram 池
+        assert_eq!(report.pools.len(), 3, "vram cuda:0 + vram cpu + ram cpu");
+        let vram_pool = report
+            .pools
+            .iter()
+            .find(|p| p.kind == PoolKind::Vram && p.device_id == "cuda:0")
+            .expect("cuda:0 vram 池");
+        assert_eq!(vram_pool.total_mb, 24576);
+        assert_eq!(vram_pool.committed_mb, 8192);
+        assert_eq!(
+            vram_pool.entries,
+            vec![PoolItem { node: "asr".into(), estimate_mb: 8192 }]
+        );
+        assert!(!vram_pool.unknown);
+
+        // ram 池：全部 ram 声明求和（512+2048+1024=3584），不回退 vram
+        let ram = report
+            .pools
+            .iter()
+            .find(|p| p.kind == PoolKind::Ram)
+            .expect("单一 ram 池");
+        assert_eq!(ram.device_id, "cpu");
+        assert_eq!(ram.total_mb, 32768);
+        assert!(!ram.unknown);
+        assert_eq!(ram.committed_mb, 3584);
+        assert_eq!(ram.entries.len(), 3);
+        assert!(ram.entries.iter().any(|e| e.node == "index" && e.estimate_mb == 2048));
+        assert!(ram.entries.iter().any(|e| e.node == "asr" && e.estimate_mb == 512),
+            "同一节点可同时计入 vram 与 ram 两池");
+    }
+
+    #[test]
+    fn multi_pool_ram_total_unknown_marks_unknown() {
+        let nodes = vec![pool_node("n", "auto", None, Some(1024))];
+        // ram_total_mb = None（探测不可用）→ total 记 0 + unknown = true
+        let report = compute_budget_multi_pool(&nodes, &[], &[], None, true).unwrap();
+        let ram = report.pools.iter().find(|p| p.kind == PoolKind::Ram).unwrap();
+        assert_eq!(ram.total_mb, 0);
+        assert!(ram.unknown, "容量未知须显式标注，区别于零容量");
+        assert_eq!(ram.committed_mb, 1024, "容量未知不影响承诺求和");
+
+        // vram 池同样按容量快照缺失置 unknown
+        let nodes = vec![pool_node("g", "cuda:0", Some(512), None)];
+        let report = compute_budget_multi_pool(
+            &nodes,
+            &[],
+            &[device("cuda:0", None, None)],
+            Some(16384),
+            true,
+        )
+        .unwrap();
+        let vram_pool = &report.pools[0];
+        assert_eq!(vram_pool.kind, PoolKind::Vram);
+        assert_eq!(vram_pool.total_mb, 0);
+        assert!(vram_pool.unknown);
+        // ram 池即便无条目也恒在（稳定形状），容量已知时 unknown=false
+        let ram = report.pools.iter().find(|p| p.kind == PoolKind::Ram).unwrap();
+        assert!(ram.entries.is_empty());
+        assert_eq!(ram.committed_mb, 0);
+        assert!(!ram.unknown);
+    }
+
+    #[test]
+    fn multi_pool_cycle_and_legacy_budget_compat() {
+        // 环检测与 compute_budget 同款
+        let nodes = vec![
+            pool_node("a", "cuda:0", Some(1), None),
+            pool_node("b", "cuda:0", Some(1), None),
+        ];
+        let edges = vec![edge("a", "b"), edge("b", "a")];
+        let err = compute_budget_multi_pool(&nodes, &edges, &[], None, true).unwrap_err();
+        assert_eq!(err, VramBudgetError::CycleDetected);
+
+        // 旧入口产物不含 pools：序列化后无 pools 键（旧响应字节级不变），
+        // 反序列化旧 JSON（无 pools 键）也合法（serde default）
+        let report = compute_budget(
+            &[node("n", "cuda:0", Some(100))],
+            &[],
+            &[device("cuda:0", Some(8192), None)],
+            true,
+        )
+        .unwrap();
+        assert!(report.pools.is_empty());
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json.get("pools").is_none(), "旧产物不得序列化出 pools 键");
+        let reparsed: VramBudgetReport = serde_json::from_value(json).unwrap();
+        assert!(reparsed.pools.is_empty());
+
+        // 新入口产物恒含 pools 键（含空 ram 池场景）
+        let multi = compute_budget_multi_pool(
+            &[pool_node("n", "cuda:0", Some(100), None)],
+            &[],
+            &[device("cuda:0", Some(8192), None)],
+            Some(16384),
+            true,
+        )
+        .unwrap();
+        let json = serde_json::to_value(&multi).unwrap();
+        assert!(json.get("pools").is_some(), "多池产物必须携带 pools 键");
+        // devices 与 pools 并存（响应向后兼容断言的纯计算层版本）
+        assert!(json.get("devices").is_some());
     }
 }

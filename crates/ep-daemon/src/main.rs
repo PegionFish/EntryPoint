@@ -1590,6 +1590,7 @@ mod tests {
                 backends: vec![ep_core::types::ComputeBackend::Cpu],
                 default_backend: Some(ep_core::types::ComputeBackend::Cpu),
                 vram_estimate_mb: None,
+                ram_estimate_mb: None,
                 min_vram_mb: None,
                 max_concurrent: None,
                 env: None,

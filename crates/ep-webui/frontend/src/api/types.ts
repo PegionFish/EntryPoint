@@ -192,6 +192,8 @@ export interface ModelInfo {
   pack_id?: string | null
   /** 变体级 VRAM 估算 MB（§6.3；模块级兜底） */
   vram_estimate_mb?: number | null
+  /** 变体级 RAM 估算 MB（T-20 多池账本；与 VRAM 独立，模块级兜底，过渡期可能缺失） */
+  ram_estimate_mb?: number | null
 }
 
 /** 进行中的模型下载任务（GET /api/models/downloads） */
@@ -573,6 +575,34 @@ export interface VramBudgetResponse {
   unassigned_mb: number
   /** 是否允许超额提交（compute.allow_overcommit，放行策略由执行层决定） */
   allow_overcommit: boolean
+  /** 多池账本（T-20 扩展）：按池分组、不做跨池总和；过渡期后端可能缺失 */
+  pools?: VramPoolBudget[]
+}
+
+/** 多池账本池种类（T-20）：vram 独显显存 / ram 系统内存 / uma 统一内存（预留） */
+export type VramPoolKind = 'vram' | 'ram' | 'uma'
+
+/** 多池账本条目：单个节点在某池的估算 */
+export interface VramPoolItem {
+  node: string
+  estimate_mb: number
+}
+
+/**
+ * 多池账本单池视图（T-20）：与 VramDeviceBudget 并存的按池分组视角，
+ * 不含 over 判定（放行语义仍以 devices[].over 为准）。
+ */
+export interface VramPoolBudget {
+  kind: VramPoolKind
+  /** 池标识：vram 为设备 id（如 "cuda:0"）；ram 固定 "cpu" */
+  device_id: string
+  /** 池容量 MB；未知记 0 并置 unknown = true（区别于零容量） */
+  total_mb: number
+  /** 管线在该池的承诺开销 MB（ram 池为求和语义，非峰值） */
+  committed_mb: number
+  entries: VramPoolItem[]
+  /** 容量未知（total_mb 仅为占位 0） */
+  unknown: boolean
 }
 
 // ===== 模型扩展操作（§5.2 / §8.1）=====

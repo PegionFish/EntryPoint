@@ -73,6 +73,7 @@
   "pack.failed": "Pack operation failed",
   "card.variant": "Variant",
   "card.downloadVariant": "Download selected variant",
+  "card.ramEstimate": "RAM estimate (resident memory, rounded up)",
   "page.descriptionV2": "Models as modules: pick variants, download, start/stop and direct-run right on the cards; pack import / export / management live in the \"Packs\" drawer",
   "empty.title": "No modules yet",
   "modelUpload.title": "Upload / import model \"{{name}}\"",
