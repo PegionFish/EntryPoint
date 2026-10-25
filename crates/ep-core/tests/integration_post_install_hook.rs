@@ -200,12 +200,21 @@ fn legacy_layout_hook_receives_empty_ep_backend() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// 真实用例：faster-whisper 的 ROCm 覆盖钩子必须通过 bash -n 语法检查
+/// 真实用例：faster-whisper 的 ROCm 覆盖钩子必须通过 bash -n 语法检查。
+///
+/// modules/ 为 gitignore 的适配层独立仓（主仓只携带调度引擎）：fresh clone
+/// 与 CI 检出没有该目录，此时跳过——语法检查只对检出适配层的开发机有意义。
 #[test]
 fn faster_whisper_rocm_hook_passes_bash_syntax_check() {
     let hook = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../modules/faster-whisper/scripts/post-install.sh");
-    assert!(hook.is_file(), "真实用例钩子必须存在: {}", hook.display());
+    if !hook.is_file() {
+        eprintln!(
+            "skipped: modules/faster-whisper 未检出（适配层独立仓不入主仓，CI/fresh clone 无此目录）: {}",
+            hook.display()
+        );
+        return;
+    }
 
     let out = Command::new("bash")
         .arg("-n")
