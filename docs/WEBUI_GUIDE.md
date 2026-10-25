@@ -306,7 +306,44 @@ EntryPoint 的日志分四类，位置、查看方式与保留策略各异：
 
 ---
 
-## 12. 相关文档
+## 12. 安装到桌面（PWA）
+
+WebUI 支持「安装」为桌面应用（PWA，T-29）：像本地程序一样从开始菜单 /
+应用列表启动，拥有独立窗口与 EntryPoint 图标。
+
+### 12.1 安装步骤
+
+1. 用 Chrome / Edge 打开 WebUI（`http://127.0.0.1:9800`，以
+   `config/app.toml [server]` 为准）；
+2. 地址栏右侧会出现「安装」图标（⊕ / 显示为显示器小图标）；
+   也可以走菜单：**设置 → 应用 → 将此站点作为应用安装**（Edge）/
+   **Cast、保存并分享 → 安装页面为应用**（Chrome）；
+3. 确认后即可在开始菜单（Windows）或应用列表（Linux/macOS）找到
+   「EntryPoint」，点击即以独立窗口打开。
+
+> 安装入口由 manifest + Service Worker 提供，静态资源不受访问令牌保护，
+> 因此 `access_protection = "token"` 模式下同样可安装；已安装应用内的
+> API 调用仍照常携带令牌。
+
+### 12.2 缓存边界（重要）
+
+Service Worker 只缓存**静态资产**（`/assets/*` 构建产物、图标、字体），
+HTML 导航请求 network-first；**`/api/*` 与 `/ws*` 一律不缓存**——daemon
+场景下缓存业务接口会造成任务状态错乱（看到旧快照）。因此离线时应用壳
+可以打开，但页面数据仍需 daemon 在线；请勿把 PWA 当离线客户端使用。
+
+### 12.3 升级与卸载
+
+- **升级**：前端发版后（`public/sw.js` 内 `CACHE_VERSION` bump），
+  Service Worker 自动后台更新，刷新页面即进入新版本；如遇缓存异常，
+  在 DevTools → Application → Service workers 点击 *Unregister*，
+  并清除 Cache Storage 后刷新；
+- **卸载**：已安装窗口地址栏的「卸载」入口，或浏览器
+  `edge://apps` / `chrome://apps` 中右键移除。
+
+---
+
+## 13. 相关文档
 
 - [MODULE_SPEC.md](MODULE_SPEC.md) — 模块接入规范（module.toml 全字段）
 - [ADAPTER_API.md](ADAPTER_API.md) — adapter REST 接口契约
