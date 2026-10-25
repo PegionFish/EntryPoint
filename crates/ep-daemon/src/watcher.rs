@@ -26,13 +26,16 @@
 //!
 //! ## 产物登记表（T-25，自我触发防护）
 //!
-//! daemon 直调任务（`pipeline_id = "watcher/<rule_id>"`）的归档产物落盘时，
-//! execution.rs 在 `record_artifact` 挂钩登记「产物绝对路径 + 来源规则 id +
-//! task_id + 时间」到 `runtime/processed_registry.json`（与水位线
-//! `watchers.json` 同目录惯例）。扫描侧（[`collect_watch_events`]）对登记
-//! 命中的路径整条剔除——**系统产物永不自我触发**（watch 目录 = 产物目录
-//! 场景不再死循环；管线模式规则的管线若把 `file_archive` 指向 watch 目录，
-//! 本登记表是创建期校验覆盖不到时的运行期安全网）。
+//! daemon watcher 触发任务的产物落盘时，execution.rs 在 `record_artifact`
+//! 挂钩登记「产物绝对路径 + 来源规则 id + task_id + 时间」到
+//! `runtime/processed_registry.json`（与水位线 `watchers.json` 同目录惯例）。
+//! 来源判定：直调任务取 `pipeline_id = "watcher/<rule_id>"` 前缀（仅 archive
+//! 节点）；管线模式规则的任务经 [`remember_watcher_pipeline_task`] 在提交时
+//! 记下 task_id → rule_id 映射（管线产物节点 id 命名不固定，全部登记）。
+//! 扫描侧（[`collect_watch_events`]）对登记命中的路径整条剔除——**系统产物
+//! 永不自我触发**（watch 目录 = 产物目录场景不再死循环；管线模式把
+//! `file_archive` 指向 watch 目录时，本登记表是创建期校验覆盖不到时的
+//! 运行期安全网）。
 //!
 //! 语义边界（T-25 冻结）：登记表只记 daemon 自己落盘的产物**路径**——
 //! 用户手改/新增的文件仍照常触发；同一路径的原位手改不再触发（路径级登记
@@ -502,6 +505,42 @@ pub(crate) fn record_processed_product(path: &Path, rule_id: &str, task_id: &str
 /// 初始化时此调用即完成惰性加载）。
 fn processed_path_keys() -> HashSet<String> {
     with_processed(|st| st.registry.path_keys())
+}
+
+// ─── 管线模式规则的 task 归属映射（W2-1 审查 P1-1）──────────────────────────
+//
+// 管线模式 watcher 规则经 `submit_pipeline_for_schedule` 提交，任务的
+// `pipeline_id` 是用户真实管线 id——`record_artifact` 挂钩无法像直调任务
+// （`watcher/<rule_id>` 前缀）那样从记录本身判出来源。提交侧（main.rs 巡检
+// 循环）在提交成功时记下 task_id → rule_id，挂钩侧查此映射；管线产物节点
+// id 命名不固定，映射在册任务的**全部**产物节点都登记。映射仅进程内存存活：
+// 任务不跨重启继续运行（重启中断改判 failed），无持久化必要；表大小以本
+// 进程内 watcher 管线任务数为上界。
+
+static WATCHER_PIPELINE_TASKS: OnceLock<Mutex<std::collections::HashMap<String, String>>> =
+    OnceLock::new();
+
+fn watcher_pipeline_tasks_cell() -> &'static Mutex<std::collections::HashMap<String, String>> {
+    WATCHER_PIPELINE_TASKS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 提交侧登记（main.rs 巡检循环，管线模式规则提交成功时调用一次）。
+pub(crate) fn remember_watcher_pipeline_task(task_id: &str, rule_id: &str) {
+    watcher_pipeline_tasks_cell()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(task_id.to_string(), rule_id.to_string());
+}
+
+/// 挂钩侧查询（execution.rs `record_artifact`）：该 task 是否 watcher 管线
+/// 任务；是则返回来源规则 id。映射不随查询清除——同一任务的多个产物节点
+/// 都要登记。
+pub(crate) fn watcher_pipeline_task_rule(task_id: &str) -> Option<String> {
+    watcher_pipeline_tasks_cell()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(task_id)
+        .cloned()
 }
 
 #[cfg(test)]

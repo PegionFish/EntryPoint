@@ -643,6 +643,12 @@ async fn run_server(root: PathBuf, cfg: AppConfig) -> anyhow::Result<()> {
                     };
                     match submit {
                         Ok(task_id) => {
+                            // 审查 P1-1：管线模式规则的任务 pipeline_id 是用户
+                            // 管线 id，产物登记挂钩无法自判来源——此处记下
+                            // task 归属（直调任务走 watcher/ 前缀，无需登记）。
+                            if hit.rule.pipeline.is_some() {
+                                watcher::remember_watcher_pipeline_task(&task_id, &hit.rule_id);
+                            }
                             info!(rule_id = %hit.rule_id, file = %hit.path, task_id = %task_id, "watcher 触发已提交");
                             eventlog::write_watcher_trigger(
                                 &state.root,

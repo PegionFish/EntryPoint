@@ -186,6 +186,50 @@ fn take_token_value(patch: &mut Value, section: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// 审查 P1-2：把现网 llm 密钥按 id 回注进 patch 的 `llm.providers` 数组。
+///
+/// `merge_partial` 对数组是整体替换语义，而 GET /api/config 返回的是脱敏后
+/// 的 `api_key` 空串——客户端「GET → 改一个字段 → PUT 全量回传」会把已存
+/// 密钥静默清空（`LlmProviderConfig.api_key` 带 serde default，字段缺省同样
+/// 落成空串）。合并前按 id 回注：字段缺省 / 空串 / null = 保留旧值；非空
+/// 字符串 = 作为新值覆盖；显式清除走 `/api/llm/providers/{id}`（PUT
+/// `api_key: null`）。形状非法的 api_key 不在此处理，交由合并后的既有
+/// 校验报 400。
+fn preserve_llm_provider_keys(
+    patch: &mut Value,
+    existing: &std::collections::HashMap<String, String>,
+) {
+    let Some(providers) = patch
+        .get_mut("llm")
+        .and_then(|llm| llm.get_mut("providers"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for provider in providers {
+        let Some(obj) = provider.as_object_mut() else {
+            continue;
+        };
+        let Some(id) = obj.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(old_key) = existing.get(id) else {
+            continue;
+        };
+        if old_key.is_empty() {
+            continue;
+        }
+        let keeps_old = match obj.get("api_key") {
+            None | Some(Value::Null) => true,
+            Some(Value::String(s)) => s.is_empty(),
+            Some(_) => false,
+        };
+        if keeps_old {
+            obj.insert("api_key".to_string(), Value::String(old_key.clone()));
+        }
+    }
+}
+
 /// PUT /api/config — 深度合并 JSON patch、持久化并更新内存共享配置（P1-9）。
 ///
 /// 泛型请求体：路由注册为 `put_config::<Value>`（任意 patch 形状）；
@@ -225,6 +269,17 @@ where
     let clear_api_token = take_control_bool(&mut patch, "clear_api_token");
     let new_server_token = take_token_value(&mut patch, "server");
     let new_api_token = take_token_value(&mut patch, "api");
+
+    // 审查 P1-2：短临界区读快照现有 llm 密钥（不跨 await），供合并前回注
+    let llm_existing_keys: std::collections::HashMap<String, String> = {
+        let cfg = state.config.read().await;
+        cfg.llm
+            .providers
+            .iter()
+            .map(|p| (p.id.clone(), p.api_key.clone()))
+            .collect()
+    };
+    preserve_llm_provider_keys(&mut patch, &llm_existing_keys);
 
     let config_dir = state.root.join("config");
 
@@ -984,6 +1039,67 @@ mod tests {
             let cfg = state.config.read().await;
             assert_eq!(cfg.llm.providers[0].api_key, "s3cret-llm", "脱敏只影响响应，内存明文保留");
             assert_eq!(cfg.general.theme, "light");
+        }
+    }
+
+    // 审查 P1-2：PUT 全量回传（api_key 为 GET 返回的脱敏空串、字段缺省或
+    // null）不得清空已存密钥；非空字符串作为新值生效，响应仍脱敏
+    #[tokio::test]
+    async fn put_config_preserves_llm_provider_api_keys_on_roundtrip() {
+        let state = seq_state("zh-CN");
+        {
+            let mut cfg = state.config.write().await;
+            cfg.llm.providers.push(ep_core::config::LlmProviderConfig {
+                id: "openai".into(),
+                name: "OpenAI".into(),
+                base_url: "https://api.openai.com".into(),
+                api_key: "s3cret-llm".into(),
+                timeout_secs: 30,
+                rpm: None,
+                concurrency: None,
+                proxy: None,
+                enabled: true,
+            });
+        }
+
+        // 全量回传形状：api_key 为 GET 返回的空串 → 旧密钥保留
+        let (status, _, _) = route_put_with_headers(
+            state.clone(),
+            r#"{"llm":{"providers":[{"id":"openai","name":"OpenAI","base_url":"https://api.openai.com","api_key":"","timeout_secs":30,"enabled":true}]}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        {
+            let cfg = state.config.read().await;
+            assert_eq!(
+                cfg.llm.providers[0].api_key, "s3cret-llm",
+                "空串回传不得清空已存密钥"
+            );
+        }
+
+        // api_key 字段整个缺省（serde default 落空串的形状）→ 同样保留
+        let (status, _, _) = route_put_with_headers(
+            state.clone(),
+            r#"{"llm":{"providers":[{"id":"openai","name":"OpenAI","base_url":"https://api.openai.com","timeout_secs":30,"enabled":true}]}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        {
+            let cfg = state.config.read().await;
+            assert_eq!(cfg.llm.providers[0].api_key, "s3cret-llm");
+        }
+
+        // 非空字符串 = 显式设置新值；响应仍脱敏
+        let (status, _, json) = route_put_with_headers(
+            state.clone(),
+            r#"{"llm":{"providers":[{"id":"openai","name":"OpenAI","base_url":"https://api.openai.com","api_key":"rotated","timeout_secs":30,"enabled":true}]}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["llm"]["providers"][0]["api_key"], "", "响应仍须脱敏");
+        {
+            let cfg = state.config.read().await;
+            assert_eq!(cfg.llm.providers[0].api_key, "rotated");
         }
     }
 }

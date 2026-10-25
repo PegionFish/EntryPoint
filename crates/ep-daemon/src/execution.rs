@@ -2768,13 +2768,21 @@ fn record_artifact(task_id: &str, node_id: &str, path: &Path) {
         record
             .artifacts
             .insert(node_id.to_string(), path.to_path_buf());
-        // T-25 产物登记（execution.rs 唯一挂钩）：watcher 直调任务
-        // （pipeline_id = "watcher/<rule_id>"）的 archive 产物落盘即登记进
-        // watcher.rs 产物登记表，扫描侧据此排除——系统产物永不自我触发
-        // （watch 目录 = 产物目录场景不再死循环；skip 冲突透传的既有目标
-        // 路径同样登记，无害）。非 watcher 任务 / 非 archive 节点不登记。
-        if node_id == "archive" && record.pipeline_id.starts_with("watcher/") {
-            let rule_id = record.pipeline_id["watcher/".len()..].to_string();
+        // T-25 产物登记（execution.rs 唯一挂钩）：watcher 触发任务的产物
+        // 落盘即登记进 watcher.rs 产物登记表，扫描侧据此排除——系统产物永不
+        // 自我触发（watch 目录 = 产物目录场景不再死循环）。两类来源：
+        // - 直调任务：pipeline_id = "watcher/<rule_id>"，仅 archive 节点；
+        // - 管线模式规则：提交时经 watcher::remember_watcher_pipeline_task
+        //   记下 task_id → rule_id（审查 P1-1；管线产物节点 id 任意，全部
+        //   登记；映射仅进程内存存活，任务不跨重启运行故无需持久化）。
+        // 非 watcher 任务不登记。skip 冲突透传的既有目标路径同样登记（无害）。
+        let processed_rule_id = if node_id == "archive" && record.pipeline_id.starts_with("watcher/")
+        {
+            Some(record.pipeline_id["watcher/".len()..].to_string())
+        } else {
+            crate::watcher::watcher_pipeline_task_rule(task_id)
+        };
+        if let Some(rule_id) = processed_rule_id {
             drop(reg); // 先放注册表锁再做磁盘 IO
             crate::watcher::record_processed_product(path, &rule_id, task_id);
         }
@@ -5823,6 +5831,39 @@ mod watcher_direct_tests {
         assert!(saved.contains_path(&product));
         assert_eq!(saved.entries[0].rule_id, "r1");
         assert_eq!(saved.entries[0].task_id, "wt-1");
+
+        crate::watcher::processed_reset_for_tests(None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 审查 P1-1：管线模式规则任务（pipeline_id 为用户管线 id）经提交侧映射
+    // 判定来源——映射在册任务的任意产物节点都登记；未在册的同 pipeline_id
+    // 任务不登记。
+    #[test]
+    fn test_record_artifact_registers_watcher_pipeline_products() {
+        let _guard = lock_for_tests();
+        let _p_guard = crate::watcher::processed_test_lock();
+        clear_registry_for_tests();
+
+        let root = unique_root("processed-pipeline");
+        let product = root.join("final.mkv");
+        std::fs::write(&product, b"result").unwrap();
+        let disk = root.join("runtime").join("processed_registry.json");
+        crate::watcher::processed_reset_for_tests(Some(disk.clone()));
+
+        seed_record("wp-1", "user-archive-pipeline");
+        crate::watcher::remember_watcher_pipeline_task("wp-1", "r-pipe");
+        seed_record("mp-1", "user-archive-pipeline");
+
+        // 管线产物节点 id 命名不固定：任意节点都登记；映射缺失则不登记
+        record_artifact("wp-1", "save_output", &product);
+        record_artifact("mp-1", "save_output", &root.join("other.mkv"));
+
+        let saved = crate::watcher::ProcessedRegistry::load(&disk);
+        assert_eq!(saved.entries.len(), 1, "仅映射在册的管线任务产物登记");
+        assert!(saved.contains_path(&product));
+        assert_eq!(saved.entries[0].rule_id, "r-pipe");
+        assert_eq!(saved.entries[0].task_id, "wp-1");
 
         crate::watcher::processed_reset_for_tests(None);
         let _ = std::fs::remove_dir_all(&root);

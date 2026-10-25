@@ -211,10 +211,12 @@ Windows PowerShell + FileSystemWatcher 双版本，含提交与回调接收骨�
 
 ### 4.5 产物登记表（自我触发防护，T-25）
 
-daemon 直调任务（任务 `pipeline_id = "watcher/<rule_id>"`）的归档产物落盘时，
-登记「产物绝对路径 + 来源规则 id + task_id + 时间」到
-`runtime/processed_registry.json`（与 `watchers.json` 同目录惯例，tmp+rename
-原子落盘）。触发器扫描时，**登记命中的路径被整条剔除**——不触发、不进入
+daemon watcher 触发任务的产物落盘时，登记「产物绝对路径 + 来源规则 id +
+task_id + 时间」到 `runtime/processed_registry.json`（与 `watchers.json`
+同目录惯例，tmp+rename 原子落盘）。两类来源都在覆盖范围内：直调任务
+（任务 `pipeline_id = "watcher/<rule_id>"`）的 archive 产物；管线模式规则的
+任务（提交时记下 task → 规则映射，管线产物节点 id 命名不固定，全部产物
+节点登记）。触发器扫描时，**登记命中的路径被整条剔除**——不触发、不进入
 在途表、不阻塞水位线。效果：
 
 - **系统产物永不自我触发**：watch 目录与产物目录重叠的历史规则、或管线模式
