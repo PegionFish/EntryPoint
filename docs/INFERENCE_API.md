@@ -249,7 +249,7 @@ folder 准入与错误语义：
 
 | code | HTTP | 含义 |
 |---|---|---|
-| `UNAUTHORIZED` | 401 | token 缺失或不匹配（配置了 `[api].token` 时） |
+| `UNAUTHORIZED` | 401 | token 缺失或不匹配（配置了 `[api].token` 时；未配置时全局令牌模式回退 `[server].token` 校验，两令牌皆空则失败关闭） |
 | `MODULE_NOT_FOUND` | 404 | 模块未安装/未发现 |
 | `CAPABILITY_NOT_FOUND` | 404 | 模块无此 capability |
 | `TASK_NOT_FOUND` | 404 | 任务不存在（详情查询/取消） |
@@ -344,12 +344,16 @@ curl $BASE/api/v1/capabilities -H 'Authorization: Bearer <token>'
 
 ```toml
 [api]
-enabled = true          # 缺省 true；false 时 v1 端点无鉴权要求
-token = "长随机串"      # 缺省不设 = 直通（与历史行为一致）
+enabled = true          # 缺省 true；false 时跳过 v1 自身鉴权（令牌模式下仍回退 [server].token 校验）
+token = "长随机串"      # 缺省不设 = 令牌模式下回退 [server].token 校验，非令牌模式直通
 ```
 
 - 配置 token 后，v1 端点要求 `Authorization: Bearer <token>` 或
   `X-API-Key: <token>`（常量时间比较），不匹配返回 `401 UNAUTHORIZED`；
+- `[api].token` 未配置且 `[server].access_protection = "token"` 时，v1 回退使用
+  `[server].token` 校验（含 `enabled = false` 的情形）；两个令牌都为空时失败
+  关闭，所有 v1 请求返回 `401 UNAUTHORIZED`。显式配置 `[api].token` 可恢复
+  v1 独立鉴权语义（全局令牌不被 v1 接受）；
 - token **仅保护 `/api/v1/*`**，不影响 WebUI 内部端点；
 - `[server] allow_public = true` 且未配 token 时，daemon 启动日志打印
   未认证公网暴露风险告警——公网部署必须同时配置 token，并在前置反向代理

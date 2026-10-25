@@ -247,13 +247,14 @@ async fn run_server(root: PathBuf, cfg: AppConfig) -> anyhow::Result<()> {
         } else {
             tracing::info!("public access blocked — only private/loopback IPs allowed (set allow_public=true to change)");
         }
-        // 访问保护开启但 v1 无独立令牌：/api/v1 不受 access_protection 覆盖，
-        // 推理提交/任务查询/批量入口仍匿名可达（含私网 LAN），启动即告警。
+        // 访问保护开启但 v1 无独立令牌：v1 中间件将回退使用 [server].token
+        // 校验（盲区已关闭），此处提示回退生效；需要 v1 独立凭据时显式配置
+        // [api].token 即可恢复独立鉴权语义。
         if matches!(cfg.server.access_protection, AccessProtection::Token)
-            && (!cfg.api.enabled || cfg.api.token.as_deref().unwrap_or("").is_empty())
+            && cfg.api.token.as_deref().unwrap_or("").is_empty()
         {
-            tracing::warn!(
-                "access protection (token) ENABLED but [api].token is empty — /api/v1/* (inference, tasks, batches) remains unauthenticated; set [api].token in config/app.toml"
+            tracing::info!(
+                "access protection (token): [api].token is empty — /api/v1/* will be authenticated with [server].token as fallback; set [api].token for independent v1 credentials"
             );
         }
     }

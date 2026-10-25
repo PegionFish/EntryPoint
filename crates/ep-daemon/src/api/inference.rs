@@ -36,6 +36,7 @@ use http_body_util::{BodyExt, Limited};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use ep_core::config::AccessProtection;
 use ep_core::module::manifest::CapabilityDecl;
 
 use crate::api::autostart::{self, AutoStartError};
@@ -202,6 +203,15 @@ pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Bearer / X-API-Key 鉴权中间件：仅挂 v1 子 Router。
 ///
+/// 鉴权口径：
+/// - 显式配置的 `[api].token` 优先（v1 独立鉴权语义不变，即使与全局令牌不同）；
+/// - `[api].token` 未配置且全局访问保护为 token 模式时，回退使用
+///   `[server].token`（关闭「全局 token 模式下 v1 仍匿名可达」盲区，含
+///   `[api].enabled = false` 的情形）；全局模式开启但两个令牌都为空 →
+///   失败关闭（401），与全局中间件口径一致；
+/// - 非全局 token 模式且 `[api].token` 未配置 → 维持既有直通（独立启用
+///   v1 门面但未配鉴权，`[api].enabled` 决定是否校验）。
+///
 /// 经 [`axum::middleware::from_fn_with_state`] 注入 state（与 main.rs
 /// ip_filter 同惯例）：`from_fn` 的层状态为 `()`，其 `State<S>` 提取器
 /// 类型上无法匹配路由 state，故 router 装配时显式传入 state 实例。
@@ -211,20 +221,39 @@ async fn require_token(
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    // C1 修复：先拷出 (enabled, token) 并 drop 读守卫，再判断放行——
+    // C1 修复：先拷出所需字段并 drop 读守卫，再判断放行——
     // 此前两个直通分支在 config 读锁守卫存活期间 `await next.run(request)`，
     // 缺省配置（token 未配置）下每个 v1 请求（wait=true 可达 630s+）全程持
     // 读锁；tokio RwLock 写优先排队，一次 PUT /api/config 写锁到来后会阻塞
     // 全 daemon 所有 config 读取。
-    let (enabled, token) = {
+    let (enabled, api_token, global_mode, global_token) = {
         let cfg = state.config.read().await;
-        (cfg.api.enabled, cfg.api.token.clone())
+        (
+            cfg.api.enabled,
+            cfg.api.token.clone(),
+            matches!(cfg.server.access_protection, AccessProtection::Token),
+            cfg.server.token.clone(),
+        )
     };
-    // enabled=false 视为门面未启用鉴权要求（直通）；token 未配置/空亦直通
-    if !enabled {
+    // enabled=false 视为门面未启用鉴权要求；但全局 token 模式下 v1 仍须校验
+    // （回退全局令牌），否则全局保护对 /api/v1 存在匿名盲区。
+    if !enabled && !global_mode {
         return next.run(request).await;
     }
-    let Some(token) = token.filter(|t| !t.is_empty()) else {
+    let effective_token = api_token
+        .filter(|t| !t.is_empty())
+        .or_else(|| global_mode.then_some(global_token).filter(|t| !t.is_empty()));
+    let Some(token) = effective_token else {
+        if global_mode {
+            // 全局 token 模式但 [api].token 与 [server].token 均为空：
+            // 配置不完整，失败关闭（绝不静默放行）
+            return v1_error(
+                StatusCode::UNAUTHORIZED,
+                "UNAUTHORIZED",
+                "access protection (token) is enabled but no token is configured: set [server].token or [api].token in config/app.toml",
+            )
+            .into_response();
+        }
         return next.run(request).await;
     };
 
@@ -1001,7 +1030,7 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    use ep_core::config::{ApiConfig, AppConfig};
+    use ep_core::config::{AccessProtection, ApiConfig, AppConfig};
     use ep_core::port::PortManager;
 
     static SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -1066,6 +1095,122 @@ mod tests {
     async fn token_unset_passes_through() {
         let state = test_state(unique_root("no-token"), AppConfig::default(), vec![]);
         let resp = app(state).oneshot(get("/v1/capabilities")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // F2 回退：全局 token 模式 + [api].token 未配置 → v1 回退用 [server].token
+    // 校验（原「全局保护对 /api/v1 匿名可达」盲区关闭）
+    #[tokio::test]
+    async fn global_token_mode_falls_back_to_server_token() {
+        let mut config = AppConfig::default();
+        config.server.access_protection = AccessProtection::Token;
+        config.server.token = "srv-token".into();
+        config.api = ApiConfig {
+            enabled: true,
+            token: None,
+            ..Default::default()
+        };
+        let state = test_state(unique_root("v1-fallback"), config, vec![]);
+        // 无凭据 → 401
+        let resp = app(state.clone())
+            .oneshot(get("/v1/capabilities"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // Bearer [server].token → 放行
+        let resp = app(state.clone())
+            .oneshot(get_with_headers(
+                "/v1/capabilities",
+                vec![("authorization", "Bearer srv-token")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // X-API-Key 亦可
+        let resp = app(state)
+            .oneshot(get_with_headers(
+                "/v1/capabilities",
+                vec![("x-api-key", "srv-token")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // F2 回退：全局 token 模式但 [api].token 与 [server].token 均为空 →
+    // 失败关闭（401），与全局中间件口径一致
+    #[tokio::test]
+    async fn global_token_mode_with_no_tokens_fails_closed() {
+        let mut config = AppConfig::default();
+        config.server.access_protection = AccessProtection::Token;
+        config.api = ApiConfig {
+            enabled: true,
+            token: None,
+            ..Default::default()
+        };
+        let state = test_state(unique_root("v1-fail-closed"), config, vec![]);
+        let resp = app(state).oneshot(get("/v1/capabilities")).await.unwrap();
+        let (status, body) = json_of(resp).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_error_code(&body, "UNAUTHORIZED");
+    }
+
+    // F2：显式 [api].token 优先——全局模式下 [server].token 不被 v1 接受
+    // （v1 独立鉴权语义保留）
+    #[tokio::test]
+    async fn explicit_api_token_stays_independent_under_global_mode() {
+        let mut config = AppConfig::default();
+        config.server.access_protection = AccessProtection::Token;
+        config.server.token = "srv-token".into();
+        config.api = ApiConfig {
+            enabled: true,
+            token: Some("v1-token".into()),
+            ..Default::default()
+        };
+        let state = test_state(unique_root("v1-independent"), config, vec![]);
+        let resp = app(state.clone())
+            .oneshot(get_with_headers(
+                "/v1/capabilities",
+                vec![("authorization", "Bearer v1-token")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = app(state)
+            .oneshot(get_with_headers(
+                "/v1/capabilities",
+                vec![("authorization", "Bearer srv-token")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // F2：[api].enabled = false 在全局 token 模式下同样回退校验
+    //（原盲区场景之一：门面关掉鉴权要求但全局保护已开启）
+    #[tokio::test]
+    async fn api_disabled_with_global_token_mode_still_requires_fallback_token() {
+        let mut config = AppConfig::default();
+        config.server.access_protection = AccessProtection::Token;
+        config.server.token = "srv-token".into();
+        config.api = ApiConfig {
+            enabled: false,
+            token: None,
+            ..Default::default()
+        };
+        let state = test_state(unique_root("v1-disabled-fallback"), config, vec![]);
+        let resp = app(state.clone())
+            .oneshot(get("/v1/capabilities"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let resp = app(state)
+            .oneshot(get_with_headers(
+                "/v1/capabilities",
+                vec![("authorization", "Bearer srv-token")],
+            ))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 

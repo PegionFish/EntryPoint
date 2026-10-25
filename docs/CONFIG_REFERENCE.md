@@ -178,7 +178,7 @@ workspace_dir = "workspace"
 | `host` | string | 代码缺省 `"0.0.0.0"`；仓库自带配置模板为 `"127.0.0.1"`（仅本机） | 监听地址 |
 | `port` | u16 | `9800` | 监听端口（WebUI 与 REST API） |
 | `allow_public` | bool | `false` | 是否允许公网访问。`false` 时启用 IP 过滤，仅放行 RFC 1918 私有地址 |
-| `access_protection` | `"none"` \| `"token"` | `"none"` | 访问保护模式。`token` 时 `/api/*` 与 `/ws*` 需提供共享令牌；`/api/v1`（自带 token 校验）与页面/静态资源不受影响 |
+| `access_protection` | `"none"` \| `"token"` | `"none"` | 访问保护模式。`token` 时 `/api/*` 与 `/ws*` 需提供共享令牌；`/api/v1` 不重复校验——由 `[api].token` 守护，未配置时回退使用本令牌（两者皆空则返回 `401`）。页面/静态资源不受影响 |
 | `token` | string | `""` | `token` 模式使用的共享令牌。建议随机长字符串；为空时拒绝所有受保护请求（失败关闭） |
 
 ```toml
@@ -192,7 +192,7 @@ token = ""
 
 令牌可经 `Authorization: Bearer <token>` 或 `X-API-Key: <token>` 提供；WebSocket 握手与 GET/HEAD 原生加载（图片/视频/下载链接）额外支持 `?token=`，POST/PUT/DELETE 不接受 query token。**令牌进入 URL 可能被访问日志、浏览器历史或 Referer 泄漏，仅建议在内网或反向代理 + TLS 下使用。** 公网暴露前建议配置随机长令牌。
 
-**`/api/v1` 独立鉴权（重要）：** `access_protection` 不覆盖 `/api/v1`——该前缀由 `[api].token` 单独守护（见 `[api]` 一节）。只开启 `access_protection` 而未配置 `[api].token` 时，v1 的推理提交、任务查询/取消与批量入口仍可匿名访问（含私网 LAN），daemon 启动时会打印告警；WebUI 设置页在令牌模式且 v1 未配置令牌时也会给出提示。
+**`/api/v1` 鉴权（重要）：** `access_protection` 不重复校验 `/api/v1`——该前缀优先由 `[api].token` 单独守护（见 `[api]` 一节，全局令牌不被 v1 接受）。令牌模式下若 `[api].token` 未配置，v1 回退使用 `[server].token` 校验（含 `[api].enabled = false` 的情形），匿名盲区已关闭；此时若两个令牌都为空，所有 v1 请求失败关闭（返回 `401`）。非令牌模式且未配置 `[api].token` 时，v1 维持直通。需要 v1 独立凭据时，显式配置 `[api].token` 即可恢复独立鉴权语义。
 
 ### 1.8 `[network]` — 网络代理
 
@@ -256,8 +256,8 @@ qwen3-tts = "default"
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `enabled` | bool | `true` | v1 门面总开关。`false` 时不强制鉴权（直通） |
-| `token` | string | 无（不启用鉴权） | 可选 Bearer token。配置后 `/api/v1/*` 端点要求 `Authorization: Bearer <token>` 或 `X-API-Key: <token>`，不匹配返回 `401` |
+| `enabled` | bool | `true` | v1 门面总开关。`false` 时跳过 v1 自身鉴权（直通）；但全局令牌模式下仍回退使用 `[server].token` 校验（见 `[server].access_protection`） |
+| `token` | string | 无（不启用鉴权） | 可选 Bearer token。配置后 `/api/v1/*` 端点要求 `Authorization: Bearer <token>` 或 `X-API-Key: <token>`，不匹配返回 `401`；未配置时，全局令牌模式下回退使用 `[server].token` 校验，非令牌模式则维持直通 |
 | `batches_allow_external_folders` | bool | `false` | 批量端点（`POST /api/v1/batches`）的 folder 准入范围。`false` = 仅限 workspace/uploads 内；`true` = 允许任意服务器可读目录（单机/可信局域网部署的便捷开关） |
 
 仅保护 `/api/v1/*` 外部契约层；`/api` 其余 WebUI 内部端点不受影响。

@@ -460,7 +460,9 @@ fn default_circuit_breaker_after() -> u32 {
 /// - `token`：`/api/*` 与 `/ws*` 要求 `Authorization: Bearer <token>` /
 ///   `X-API-Key: <token>`，WebSocket 握手额外接受 `?token=`。
 ///
-/// `/api/v1/*` 不受本开关影响（其自带 `[api].token` 校验，避免双重鉴权）。
+/// `/api/v1/*` 不重复校验全局令牌（避免双重鉴权）：其自带 `[api].token` 校验；
+/// `[api].token` 未配置时 v1 中间件**回退使用 `[server].token`**（全局 token
+/// 模式下 v1 不允许匿名访问）；显式配置 `[api].token` 则维持 v1 独立鉴权语义。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AccessProtection {
