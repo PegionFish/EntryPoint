@@ -199,6 +199,13 @@ struct TaskSummaryOut {
     /// 任务详情标注“来自缓存”；正常执行/历史任务省略。
     #[serde(skip_serializing_if = "Option::is_none")]
     cached_from: Option<String>,
+    /// §6.8b force 提交元数据（T-22）：force 提交的任务带
+    /// `forced_overcommit = true` + `accepted_risk = "user"`（跳过动态 VRAM
+    /// 准入排队等待、显式接受超支风险）；普通任务两字段均省略（响应零变化）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forced_overcommit: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accepted_risk: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -227,6 +234,8 @@ struct ArtifactOut {
 }
 
 fn summary_out(record: &TaskRecord) -> TaskSummaryOut {
+    // T-22：force 提交元数据（进程内侧表；普通任务 None → 字段省略）
+    let forced_overcommit = execution::task_forced_overcommit(&record.id);
     TaskSummaryOut {
         id: record.id.clone(),
         // 与引擎 TaskSummary.pipeline_name 语义一致（= pipeline.id）
@@ -243,6 +252,8 @@ fn summary_out(record: &TaskRecord) -> TaskSummaryOut {
         pipeline_id: Some(record.pipeline_id.clone()),
         kind: None,
         cached_from: record.cached_from.clone(),
+        forced_overcommit: forced_overcommit.then_some(true),
+        accepted_risk: forced_overcommit.then_some(execution::FORCE_ACCEPTED_RISK),
     }
 }
 
@@ -274,6 +285,9 @@ fn group_summary_out(group_id: &str, members: &[TaskRecord]) -> TaskSummaryOut {
         pipeline_id: Some(format!("batch/{module_id}")),
         kind: Some("group"),
         cached_from: None,
+        // 批量接入不开放 force（batches.rs），组条目恒不带 force 元数据
+        forced_overcommit: None,
+        accepted_risk: None,
     }
 }
 
@@ -1744,5 +1758,71 @@ to = ["output", "input"]
             .await
             .unwrap();
         assert_eq!(&body[..], b"<script>alert(1)</script>");
+    }
+
+    // ── 10. force 提交元数据透出（T-22）：forced 任务详情带
+    //        forced_overcommit/accepted_risk，普通任务两字段省略 ──────────────
+
+    #[tokio::test]
+    async fn test_task_summary_force_metadata_exposure() {
+        let _guard = lock_for_tests();
+        execution::clear_registry_for_tests();
+
+        let root = unique_root("force-summary");
+        let state = test_state(root.clone());
+        let src = root.join("fs-in.txt");
+        std::fs::write(&src, "force-summary").unwrap();
+        let dest = root.join("fs-out.txt");
+
+        let pipeline = Pipeline::from_toml_str(&copy_toml("force-summary-pipe", &src, &dest))
+            .unwrap();
+        let forced = execution::submit_pipeline_full(
+            &state,
+            pipeline,
+            None,
+            SubmitOptions {
+                force: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .task_id;
+        let normal_pipeline =
+            Pipeline::from_toml_str(&copy_toml("normal-summary-pipe", &src, &dest)).unwrap();
+        let normal = execution::submit_pipeline_full(&state, normal_pipeline, None, Default::default())
+            .await
+            .unwrap()
+            .task_id;
+        for _ in 0..300 {
+            if execution::snapshot(&forced).is_some_and(|r| r.status.is_terminal())
+                && execution::snapshot(&normal).is_some_and(|r| r.status.is_terminal())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // force 任务：详情携带 forced_overcommit + accepted_risk
+        let record = execution::snapshot(&forced).expect("force 任务应在案");
+        let value = serde_json::to_value(detail_out(&record)).unwrap();
+        assert_eq!(value["forced_overcommit"], serde_json::json!(true));
+        assert_eq!(value["accepted_risk"], "user");
+
+        // 普通任务：两字段均省略（不传 force 零副作用，回归锚点）
+        let record = execution::snapshot(&normal).expect("普通任务应在案");
+        let value = serde_json::to_value(detail_out(&record)).unwrap();
+        assert!(value.get("forced_overcommit").is_none(), "普通任务不得出现 forced_overcommit");
+        assert!(value.get("accepted_risk").is_none(), "普通任务不得出现 accepted_risk");
+
+        // 任务列表同口径
+        let list = list_tasks().await.0;
+        assert!(list.iter().all(|s| {
+            if s.id == forced {
+                s.forced_overcommit == Some(true) && s.accepted_risk == Some("user")
+            } else {
+                s.forced_overcommit.is_none() && s.accepted_risk.is_none()
+            }
+        }));
     }
 }

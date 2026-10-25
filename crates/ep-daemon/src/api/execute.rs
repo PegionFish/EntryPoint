@@ -75,6 +75,11 @@ pub(crate) struct ExecuteRequest {
     /// T-16 直跑缓存旁路（仅 /execute/single 消费；管线执行忽略）
     #[serde(default)]
     bypass_cache: bool,
+    /// §6.8b force（T-22）：true 时跳过动态 VRAM 准入的排队等待直接执行；
+    /// 任务元数据带 `forced_overcommit = true` + `accepted_risk = "user"`，
+    /// 提交响应附带 force 附加字段（缺省/不传时响应形状零变化）
+    #[serde(default)]
+    force: bool,
 }
 
 /// POST /api/pipelines/{pipeline_id}/runs — 提交管线执行（run 资源化端点，
@@ -149,6 +154,9 @@ async fn execute_pipeline(
         },
     };
 
+    // T-22：force 提交响应的各池超支投影需要模块表（提交会移走 pipeline，
+    // 先行取好）
+    let module_ids = execution::pipeline_module_ids(&pipeline);
     // §6.5：wait 同步模式与 callback_url 经完整选项版提交入口接线
     let options = execution::SubmitOptions {
         wait: req.wait.unwrap_or(false),
@@ -156,6 +164,7 @@ async fn execute_pipeline(
         group: None,
         priority: req.priority,
         bypass_cache: req.bypass_cache,
+        force: req.force,
     };
     match execution::submit_pipeline_full(&state, pipeline, req.inputs, options).await {
         Ok(outcome) => {
@@ -171,19 +180,17 @@ async fn execute_pipeline(
                         })
                     })
                     .collect();
-                (
-                    StatusCode::OK,
-                    Json(json!({
-                        "task_id": outcome.task_id,
-                        "status": record.status.as_str(),
-                        "artifacts": artifacts,
-                    })),
-                )
+                let mut body = json!({
+                    "task_id": outcome.task_id,
+                    "status": record.status.as_str(),
+                    "artifacts": artifacts,
+                });
+                apply_force_response_fields(&state, &mut body, req.force, &module_ids).await;
+                (StatusCode::OK, Json(body))
             } else {
-                (
-                    StatusCode::ACCEPTED,
-                    Json(json!({ "task_id": outcome.task_id })),
-                )
+                let mut body = json!({ "task_id": outcome.task_id });
+                apply_force_response_fields(&state, &mut body, req.force, &module_ids).await;
+                (StatusCode::ACCEPTED, Json(body))
             }
         }
         Err(execution::SubmitError::UnknownInputNode(node_id)) => {
@@ -416,6 +423,28 @@ fn single_input_present(raw: Option<&str>) -> bool {
     raw.map(str::trim).filter(|s| !s.is_empty()).is_some()
 }
 
+/// 调度优先级统一解析口径（T-22，执行报告 §7.9 的 T-15 follow-up）：
+/// 4 个提交入口共用——宽容语义，数值可无损表示为 u8 才采用，任何失败
+/// （缺失/非数字/越界）→ `None` = 按缺省优先级 50 调度，绝不因 priority
+/// 字段拒绝请求。
+///
+/// 各入口的介质适配：
+/// - JSON 数值路径（本函数直收 `&Value`，execute_single）：`as_u64` 后核域；
+/// - 表单文本路径（inference multipart）：`str::parse::<u64>` 后调本 helper
+///   的核心 [`parse_priority_u64`]（`parse::<u8>` 与「u64 解析 + u8 核域」
+///   对一切输入等价）；
+/// - serde 强类型路径（`ExecuteRequest` / `InferenceJsonRequest` 的
+///   `#[serde(default)] priority: Option<u8>`）：0-255 域由反序列化强制，
+///   越域整体 400——口径本就严格，不经本 helper（行为保持不变）。
+pub(crate) fn parse_priority(value: Option<&Value>) -> Option<u8> {
+    parse_priority_u64(value.and_then(Value::as_u64))
+}
+
+/// [`parse_priority`] 的数值核心（文本路径先 parse::<u64> 再复用）。
+pub(crate) fn parse_priority_u64(raw: Option<u64>) -> Option<u8> {
+    raw.and_then(|v| u8::try_from(v).ok())
+}
+
 /// `input_path` / `input_text` 二选一判定（D2，纯函数单测直接断言）：
 /// 均缺失或同时给出 → [`SingleInputError`]；文本原样保留（不做 trim）。
 pub(crate) fn choose_single_input(
@@ -598,16 +627,16 @@ async fn execute_single(
         .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto"))
         .map(str::to_string);
     // priority（T-15）：可选调度优先级；缺省 50。非数字/越界宽容按缺省处理
-    // （与本 handler 其余可选字段的宽松口径一致）。
-    let priority: Option<u8> = body
-        .get("priority")
-        .and_then(|v| v.as_u64())
-        .and_then(|v| u8::try_from(v).ok());
+    // （与本 handler 其余可选字段的宽松口径一致；解析口径统一走 parse_priority）
+    let priority: Option<u8> = parse_priority(body.get("priority"));
     // bypass_cache（T-16）：true 时跳过直跑缓存的读取与写入；缺省 false
     let bypass_cache = body
         .get("bypass_cache")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // §6.8b force（T-22）：true 时跳过动态 VRAM 准入排队等待；缺省 false。
+    // 非 bool 值宽容按缺省处理（与本 handler 其余可选 bool 字段口径一致）
+    let force = body.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
     let request_params = match body.get("params") {
         None | Some(Value::Null) => json!({}),
         Some(p) if p.is_object() => p.clone(),
@@ -746,12 +775,17 @@ async fn execute_single(
         execution::SubmitOptions {
             priority,
             bypass_cache,
+            force,
             ..Default::default()
         },
     )
     .await
     {
-        Ok(outcome) => (StatusCode::ACCEPTED, Json(json!({ "task_id": outcome.task_id }))),
+        Ok(outcome) => {
+            let mut body = json!({ "task_id": outcome.task_id });
+            apply_force_response_fields(&state, &mut body, force, &[module_id]).await;
+            (StatusCode::ACCEPTED, Json(body))
+        }
         Err(e) => {
             err_response(
                 &state,
@@ -760,6 +794,32 @@ async fn execute_single(
                 &[("detail", e.to_string())],
             )
             .await
+        }
+    }
+}
+
+/// §6.8b force 提交响应附加字段（T-22；`pub(crate)`：inference.rs v1 门面
+/// 复用同一响应形状）。
+///
+/// 仅 `force = true` 时写入——缺省/不传 force 的响应字节级不变（硬验收）：
+/// - `forced_overcommit: true` + `accepted_risk: "user"`：提交模式元数据；
+/// - `overcommit_pools`：各池超支明细（复用 T-20 pools 形状，
+///   `execution::forced_overcommit_pools` 投影），无超支时字段缺省不出。
+pub(crate) async fn apply_force_response_fields(
+    state: &Arc<AppState>,
+    body: &mut Value,
+    force: bool,
+    module_ids: &[String],
+) {
+    if !force {
+        return;
+    }
+    body["forced_overcommit"] = json!(true);
+    body["accepted_risk"] = json!(execution::FORCE_ACCEPTED_RISK);
+    let pools = execution::forced_overcommit_pools(state, module_ids).await;
+    if !pools.is_empty() {
+        if let Ok(v) = serde_json::to_value(&pools) {
+            body["overcommit_pools"] = v;
         }
     }
 }
@@ -2093,5 +2153,149 @@ mode = {{ type = "string", default = "fast", enum = ["fast", "slow"] }}
         let task_id = json["task_id"].as_str().unwrap().to_string();
         let record = execution::snapshot(&task_id).expect("任务应已入册");
         assert_eq!(record.pipeline_id, "direct/direct-mod");
+    }
+
+    // ── §6.8b force 提交（T-22）：响应附加字段仅 force 请求出现 ─────────────
+
+    /// 不传 force → 202 响应恰为 `{"task_id"}`（逐字节回归锚点：无任何新字段）
+    #[tokio::test]
+    async fn test_execute_without_force_response_is_unchanged() {
+        let _guard = execution::lock_for_tests();
+        execution::clear_registry_for_tests();
+
+        let root = unique_root("noforce");
+        let src = root.join("nf-in.txt");
+        let dest = root.join("nf-out.txt");
+        std::fs::write(&src, "no force").unwrap();
+        let dir = root.join("config").join("pipelines");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("copy.toml"),
+            r#"[pipeline]
+id = "nf-pipe"
+name = "无 force 管线"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+
+[[nodes]]
+id = "output"
+kind = "builtin"
+builtin = "file_output"
+
+[[edges]]
+from = ["input", "output"]
+to = ["output", "input"]
+"#,
+        )
+        .unwrap();
+
+        let state = test_state(root);
+        let (status, body) = execute_pipeline(
+            State(state),
+            Json(exec_request(json!({
+                "pipeline_id": "nf-pipe",
+                "inputs": {
+                    "input": { "path": src.display().to_string() },
+                    "output": { "path": dest.display().to_string() }
+                }
+            }))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            body.0,
+            json!({ "task_id": body.0["task_id"] }),
+            "不传 force 的响应不得出现 force 相关新字段: {}",
+            body.0
+        );
+        assert!(body.0.get("forced_overcommit").is_none());
+        assert!(body.0.get("accepted_risk").is_none());
+        assert!(body.0.get("overcommit_pools").is_none());
+    }
+
+    /// force=true → 202 带 forced_overcommit + accepted_risk；无超支时不带
+    /// overcommit_pools（纯 builtin 管线无模块预算，必然无池超支）
+    #[tokio::test]
+    async fn test_execute_with_force_response_fields() {
+        let _guard = execution::lock_for_tests();
+        execution::clear_registry_for_tests();
+
+        let root = unique_root("force-ok");
+        let src = root.join("f-in.txt");
+        let dest = root.join("f-out.txt");
+        std::fs::write(&src, "force submit").unwrap();
+        let dir = root.join("config").join("pipelines");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("copy.toml"),
+            r#"[pipeline]
+id = "f-pipe"
+name = "force 管线"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+
+[[nodes]]
+id = "output"
+kind = "builtin"
+builtin = "file_output"
+
+[[edges]]
+from = ["input", "output"]
+to = ["output", "input"]
+"#,
+        )
+        .unwrap();
+
+        let state = test_state(root);
+        let (status, body) = execute_pipeline(
+            State(state),
+            Json(exec_request(json!({
+                "pipeline_id": "f-pipe",
+                "force": true,
+                "inputs": {
+                    "input": { "path": src.display().to_string() },
+                    "output": { "path": dest.display().to_string() }
+                }
+            }))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body.0["forced_overcommit"], json!(true));
+        assert_eq!(body.0["accepted_risk"], "user");
+        assert!(
+            body.0.get("overcommit_pools").is_none(),
+            "无模块预算 → 无超支池 → 字段缺省不出: {}",
+            body.0
+        );
+        // 任务元数据已登记（任务详情可见）
+        let task_id = body.0["task_id"].as_str().unwrap().to_string();
+        assert!(execution::task_forced_overcommit(&task_id));
+    }
+
+    // ── priority 统一解析 helper（T-22 §7.9 follow-up）：宽容口径行为不变 ────
+
+    #[test]
+    fn parse_priority_lenient_semantics_unchanged() {
+        use super::{parse_priority, parse_priority_u64};
+        // 有效域 0..=255
+        assert_eq!(parse_priority(Some(&json!(10))), Some(10));
+        assert_eq!(parse_priority(Some(&json!(0))), Some(0));
+        assert_eq!(parse_priority(Some(&json!(255))), Some(255));
+        // 越界 / 非数字 / 负数 / 字符串 / 缺失 → None（缺省 50，不拒绝请求）
+        assert_eq!(parse_priority(Some(&json!(256))), None);
+        assert_eq!(parse_priority(Some(&json!(-1))), None);
+        assert_eq!(parse_priority(Some(&json!("5"))), None);
+        assert_eq!(parse_priority(Some(&json!(null))), None);
+        assert_eq!(parse_priority(None), None);
+        // u64 核心（multipart 文本路径）：parse::<u64> 成功后同一核域
+        assert_eq!(parse_priority_u64(Some(50)), Some(50));
+        assert_eq!(parse_priority_u64(Some(300)), None);
+        assert_eq!(parse_priority_u64(None), None);
     }
 }

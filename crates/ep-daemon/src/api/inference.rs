@@ -385,6 +385,11 @@ struct InferenceJsonRequest {
     /// T-16 缓存旁路：true 时跳过直跑结果缓存读取与写入
     #[serde(default)]
     bypass_cache: bool,
+    /// §6.8b force（T-22）：true 时跳过动态 VRAM 准入的排队等待直接执行；
+    /// 任务元数据带 `forced_overcommit = true` + `accepted_risk = "user"`，
+    /// 提交响应附带 force 附加字段（缺省/不传时响应形状零变化）
+    #[serde(default)]
+    force: bool,
 }
 
 /// 提交推理（双形态）：按 Content-Type 分流。
@@ -489,6 +494,8 @@ async fn submit_multipart(
     let mut priority: Option<u8> = None;
     // T-16：直跑缓存旁路开关；缺省 false（参与缓存）
     let mut bypass_cache = false;
+    // T-22：§6.8b force（跳过动态准入排队等待）；缺省 false
+    let mut force = false;
 
     loop {
         let field = match multipart.next_field().await {
@@ -596,9 +603,12 @@ async fn submit_multipart(
                 };
             }
             "priority" => {
-                // 宽容口径：非数字/越界视为未指定（与 execute_single 一致）
+                // 宽容口径：非数字/越界视为未指定（T-22 统一走 parse_priority
+                // 核心 helper，与 execute_single 同一语义）
                 priority = match field.text().await {
-                    Ok(text) => text.trim().parse::<u8>().ok(),
+                    Ok(text) => {
+                        crate::api::execute::parse_priority_u64(text.trim().parse::<u64>().ok())
+                    }
                     Err(e) => {
                         cleanup_staged(&file_staged).await;
                         return multipart_field_error("priority", &e, Some(TEXT_FIELD_LIMIT));
@@ -618,6 +628,16 @@ async fn submit_multipart(
                             &e,
                             Some(TEXT_FIELD_LIMIT),
                         );
+                    }
+                };
+            }
+            "force" => {
+                // §6.8b force（T-22）：口径与 wait 字段一致（严格 "true"/"false"）
+                force = match field.text().await {
+                    Ok(text) => text.trim() == "true",
+                    Err(e) => {
+                        cleanup_staged(&file_staged).await;
+                        return multipart_field_error("force", &e, Some(TEXT_FIELD_LIMIT));
                     }
                 };
             }
@@ -651,6 +671,7 @@ async fn submit_multipart(
             callback_url: None,
             priority,
             bypass_cache,
+            force,
         },
     )
     .await
@@ -806,17 +827,20 @@ async fn submit_json(
             callback_url: req.callback_url,
             priority: req.priority,
             bypass_cache: req.bypass_cache,
+            force: req.force,
         },
     )
     .await
 }
 
-/// 推理提交选项（T-15/T-16）：wait / callback / priority / 缓存旁路一并透传给直跑执行器
+/// 推理提交选项（T-15/T-16/T-22）：wait / callback / priority / 缓存旁路 /
+/// force 一并透传给直跑执行器
 struct InferenceRunOptions {
     wait: bool,
     callback_url: Option<String>,
     priority: Option<u8>,
     bypass_cache: bool,
+    force: bool,
 }
 
 /// 公共执行序列（对齐 execute_single 校验顺序）：参数 schema 校验与默认值
@@ -845,14 +869,18 @@ async fn run_inference(
         return autostart_error_response(e);
     }
 
-    // 3. 提交（wait/callback 语义镜像 submit_pipeline_full；T-15 priority 透传）
+    // 3. 提交（wait/callback 语义镜像 submit_pipeline_full；T-15 priority、
+    //    T-22 force 透传）
     let wait = options.wait;
+    let force = options.force;
+    let module_ids = vec![module_id.to_string()];
     let options = SubmitOptions {
         wait,
         callback_url: options.callback_url,
         group: None,
         priority: options.priority,
         bypass_cache: options.bypass_cache,
+        force,
     };
     match execution::submit_direct_full(
         state,
@@ -870,7 +898,15 @@ async fn run_inference(
                 let record = outcome
                     .record
                     .expect("wait=true 时 submit_direct_full 必携带终态快照");
-                (StatusCode::OK, Json(wait_response(&outcome.task_id, &record)))
+                let mut body = wait_response(&outcome.task_id, &record);
+                crate::api::execute::apply_force_response_fields(
+                    state,
+                    &mut body,
+                    force,
+                    &module_ids,
+                )
+                .await;
+                (StatusCode::OK, Json(body))
             } else {
                 // 提交后立即快照：仍在排队则附带队列位置
                 let mut body = json!({ "task_id": outcome.task_id });
@@ -879,6 +915,13 @@ async fn run_inference(
                         body["queue_position"] = json!(pos);
                     }
                 }
+                crate::api::execute::apply_force_response_fields(
+                    state,
+                    &mut body,
+                    force,
+                    &module_ids,
+                )
+                .await;
                 (StatusCode::ACCEPTED, Json(body))
             }
         }
@@ -964,6 +1007,11 @@ async fn get_result(
     });
     if let Some(pos) = record.queue_position {
         body["queue_position"] = json!(pos);
+    }
+    // T-22：force 提交元数据透出（普通任务字段缺省不出，响应形状不变）
+    if execution::task_forced_overcommit(&task_id) {
+        body["forced_overcommit"] = json!(true);
+        body["accepted_risk"] = json!(execution::FORCE_ACCEPTED_RISK);
     }
     if let Some(err) = &record.error {
         body["error"] = json!(err);
@@ -1430,5 +1478,49 @@ output_type = "text"
         let (status, body) = json_of(resp).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_error_code(&body, "INPUT_INVALID");
+    }
+
+    // i) T-22：force 字段解析——缺省 false、显式 true、非 bool 不整拒（serde
+    //    严格 bool 与 wait/bypass_cache 同口径，这里验证请求体反序列化形状）
+    #[test]
+    fn inference_json_request_force_defaults_false_and_parses() {
+        let parsed: InferenceJsonRequest =
+            serde_json::from_value(json!({ "input_text": "hi" })).unwrap();
+        assert!(!parsed.force, "缺省 force 必须 false");
+        assert!(!parsed.wait);
+        assert_eq!(parsed.priority, None);
+
+        let parsed: InferenceJsonRequest = serde_json::from_value(json!({
+            "input_text": "hi",
+            "force": true,
+            "priority": 10,
+            "bypass_cache": true,
+        }))
+        .unwrap();
+        assert!(parsed.force);
+        assert_eq!(parsed.priority, Some(10));
+        assert!(parsed.bypass_cache);
+
+        // serde 严格 bool：非 bool 值整体拒绝（与 wait/bypass_cache 口径一致）
+        let parsed: Result<InferenceJsonRequest, _> =
+            serde_json::from_value(json!({ "input_text": "hi", "force": "yes" }));
+        assert!(parsed.is_err(), "force 非 bool 应反序列化失败");
+    }
+
+    #[test]
+    fn parse_priority_u64_core_matches_legacy_parse_u8_semantics() {
+        // T-22 统一 helper 后 multipart 文本路径行为不变（legacy:
+        // text.trim().parse::<u8>().ok()）
+        let legacy = |text: &str| text.trim().parse::<u8>().ok();
+        let unified = |text: &str| {
+            crate::api::execute::parse_priority_u64(text.trim().parse::<u64>().ok())
+        };
+        for text in ["5", "0", "255", "256", "-1", "abc", "", " 42 ", "999999999999999999999"] {
+            assert_eq!(
+                unified(text),
+                legacy(text),
+                "文本 '{text}' 的统一解析须与旧 parse::<u8> 等价"
+            );
+        }
     }
 }

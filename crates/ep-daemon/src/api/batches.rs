@@ -195,6 +195,10 @@ async fn submit_batch(
         // 批量接入缺省优先级（T-15：50 = 与既有纯 FIFO 行为一致）
         priority: None,
         bypass_cache: false,
+        // T-22：批量接入不开放 force——批量本为无人值守整目录吞吐设计，
+        // 逐成员跳过显存准入会使队列容量预检与超支面失控（如适用性评估：
+        // 不适用；单任务 force 走 /execute/single 或 /v1/inference）
+        force: false,
     };
     let mut task_ids = Vec::with_capacity(files.len());
     let mut failed_submissions: Vec<String> = Vec::new();

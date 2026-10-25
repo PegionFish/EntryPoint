@@ -107,8 +107,9 @@ pub enum PoolKind {
     Vram,
     /// 系统内存池（单一池，`device_id` 固定 `"cpu"`）
     Ram,
-    /// 统一内存架构池（CPU/GPU 共享同一物理内存的平台；**预留种类**，
-    /// 当前检测器无 UMA 判定，不产出）
+    /// 统一内存架构池（CPU/GPU 共享同一物理内存的平台；T-22 起由
+    /// `compute::uma` 识别产出——物理上界视图，`device_id = "uma"`；
+    /// 识别失败/非 UMA 平台不产出）
     Uma,
 }
 
@@ -369,15 +370,23 @@ pub fn compute_budget(
 ///   （主存驻留在管线生命周期内常驻，无跨层释放语义）；`total_mb` 取
 ///   `ram_total_mb`（来源：设备快照 CPU 条目的系统内存探测），`None` →
 ///   记 0 并置 `unknown = true`；
-/// - **uma 池**：预留种类，当前不产出。
+/// - **uma 池**（T-22）：统一内存架构（GB10 等 CPU/GPU 共享物理内存）平台
+///   的**物理上界视图**——`uma_total_mb` 为 `Some`（平台识别成功）时产出：
+///   `kind = uma`、`device_id = "uma"`，`committed_mb` = 全部 vram 估算 +
+///   全部 ram 估算之和（管线生命周期内这些开销都落在同一物理内存池），
+///   条目为带估算的节点明细。既有 vram/ram 池照常产出（分维度视图）；
+///   `None`（非 UMA / 探测失败静默降级）不产出——零行为差异。
 ///
-/// 池之间**不做跨池总和**；ram 节点即使同时声明了 vram 也照常进入设备
-/// 账本（两池各自独立计量）。旧字段 `devices` 原样保留（向后兼容）。
+/// 池之间**不做跨池总和**；uma 池是包含性物理约束视图（UMA 平台上全部
+/// 估算共享同一物理内存），并非把其他池加总出的新约束面。ram 节点即使
+/// 同时声明了 vram 也照常进入设备账本（两池各自独立计量）。旧字段
+/// `devices` 原样保留（向后兼容）。
 pub fn compute_budget_multi_pool(
     nodes: &[PoolNodeEstimate],
     edges: &[(String, String)],
     devices: &[DeviceCapacity],
     ram_total_mb: Option<u64>,
+    uma_total_mb: Option<u64>,
     allow_overcommit: bool,
 ) -> Result<VramBudgetReport, VramBudgetError> {
     let vram_nodes: Vec<VramNodeEstimate> = nodes.iter().map(|n| n.as_vram_estimate()).collect();
@@ -422,6 +431,38 @@ pub fn compute_budget_multi_pool(
         entries: ram_entries,
         unknown: ram_total_mb.is_none(),
     });
+
+    // UMA 池（T-22）：统一内存平台的物理上界视图。容量已知时照常给出
+    // （total_mb = 物理总量）；未知按惯例记 0 + unknown。承诺 = 全部
+    // vram 估算 + 全部 ram 估算（同一物理内存池，求和语义；条目按节点
+    // 汇总一次，同一节点同时声明 vram/ram 时两笔都入账）。
+    if let Some(uma_total) = uma_total_mb {
+        let mut uma_entries: Vec<PoolItem> = Vec::new();
+        for n in nodes {
+            if let Some(mb) = n.vram_mb {
+                uma_entries.push(PoolItem {
+                    node: n.node_id.clone(),
+                    estimate_mb: mb,
+                });
+            }
+            if let Some(mb) = n.ram_mb {
+                uma_entries.push(PoolItem {
+                    node: n.node_id.clone(),
+                    estimate_mb: mb,
+                });
+            }
+        }
+        let uma_committed: u64 = uma_entries.iter().map(|e| e.estimate_mb).sum();
+        pools.push(PoolBudget {
+            kind: PoolKind::Uma,
+            device_id: "uma".to_string(),
+            total_mb: uma_total,
+            committed_mb: uma_committed,
+            entries: uma_entries,
+            // Some = 容量已知（与 ram 池同约定：Some(0) 只是零容量非未知）
+            unknown: false,
+        });
+    }
 
     report.pools = pools;
     Ok(report)
@@ -712,6 +753,7 @@ mod tests {
                 device("cpu", Some(32768), Some(8192)),
             ],
             Some(32768),
+            None,
             false,
         )
         .unwrap();
@@ -755,7 +797,7 @@ mod tests {
     fn multi_pool_ram_total_unknown_marks_unknown() {
         let nodes = vec![pool_node("n", "auto", None, Some(1024))];
         // ram_total_mb = None（探测不可用）→ total 记 0 + unknown = true
-        let report = compute_budget_multi_pool(&nodes, &[], &[], None, true).unwrap();
+        let report = compute_budget_multi_pool(&nodes, &[], &[], None, None, true).unwrap();
         let ram = report.pools.iter().find(|p| p.kind == PoolKind::Ram).unwrap();
         assert_eq!(ram.total_mb, 0);
         assert!(ram.unknown, "容量未知须显式标注，区别于零容量");
@@ -768,6 +810,7 @@ mod tests {
             &[],
             &[device("cuda:0", None, None)],
             Some(16384),
+            None,
             true,
         )
         .unwrap();
@@ -790,7 +833,7 @@ mod tests {
             pool_node("b", "cuda:0", Some(1), None),
         ];
         let edges = vec![edge("a", "b"), edge("b", "a")];
-        let err = compute_budget_multi_pool(&nodes, &edges, &[], None, true).unwrap_err();
+        let err = compute_budget_multi_pool(&nodes, &edges, &[], None, None, true).unwrap_err();
         assert_eq!(err, VramBudgetError::CycleDetected);
 
         // 旧入口产物不含 pools：序列化后无 pools 键（旧响应字节级不变），
@@ -814,6 +857,7 @@ mod tests {
             &[],
             &[device("cuda:0", Some(8192), None)],
             Some(16384),
+            None,
             true,
         )
         .unwrap();
@@ -821,5 +865,83 @@ mod tests {
         assert!(json.get("pools").is_some(), "多池产物必须携带 pools 键");
         // devices 与 pools 并存（响应向后兼容断言的纯计算层版本）
         assert!(json.get("devices").is_some());
+    }
+
+    // ── UMA 池（T-22）：识别到统一内存时产出物理上界视图 ────────────────────
+
+    #[test]
+    fn multi_pool_uma_pool_emitted_when_capacity_known() {
+        let nodes = vec![
+            pool_node("asr", "cuda:0", Some(8192), Some(512)),
+            pool_node("index", "auto", None, Some(2048)),
+        ];
+        let report = compute_budget_multi_pool(
+            &nodes,
+            &[],
+            &[device("cuda:0", Some(24576), Some(1024))],
+            Some(32768),
+            Some(128 * 1024),
+            false,
+        )
+        .unwrap();
+
+        // uma 池追加在末尾：物理上界视图 = 全部 vram 估算 + 全部 ram 估算
+        assert_eq!(report.pools.len(), 3, "vram cuda:0 + ram + uma");
+        let uma = report
+            .pools
+            .iter()
+            .find(|p| p.kind == PoolKind::Uma)
+            .expect("识别到 UMA 时必须产出 uma 池");
+        assert_eq!(uma.device_id, "uma");
+        assert_eq!(uma.total_mb, 128 * 1024);
+        assert!(!uma.unknown);
+        // 求和：8192(asr vram) + 512(asr ram) + 2048(index ram) = 10752
+        assert_eq!(uma.committed_mb, 10_752);
+        assert_eq!(uma.entries.len(), 3);
+        assert!(uma.entries.iter().any(|e| e.node == "asr" && e.estimate_mb == 8192));
+        assert!(uma.entries.iter().any(|e| e.node == "asr" && e.estimate_mb == 512),
+            "同一节点 vram/ram 两笔都计入物理池");
+        assert!(uma.entries.iter().any(|e| e.node == "index" && e.estimate_mb == 2048));
+
+        // 既有 vram/ram 分维度视图不受影响（照常产出）
+        assert!(report.pools.iter().any(|p| p.kind == PoolKind::Vram && p.device_id == "cuda:0"));
+        assert!(report.pools.iter().any(|p| p.kind == PoolKind::Ram));        // 序列化词表：kind = "uma"（serde 小写）
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["pools"].as_array().unwrap().last().unwrap()["kind"],
+            serde_json::json!("uma")
+        );
+    }
+
+    #[test]
+    fn multi_pool_uma_absent_when_not_detected() {
+        // uma_total_mb = None（非 UMA / 探测失败静默降级）→ 不产出 uma 池，
+        // 其余池形状与既有行为逐字节一致（T-22 零行为差异验收）
+        let nodes = vec![pool_node("asr", "cuda:0", Some(8192), Some(512))];
+        let report = compute_budget_multi_pool(
+            &nodes,
+            &[],
+            &[device("cuda:0", Some(24576), Some(1024))],
+            Some(32768),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(report.pools.len(), 2, "vram cuda:0 + ram");
+        assert!(!report.pools.iter().any(|p| p.kind == PoolKind::Uma));
+
+        // None + 无 ram 声明：仍是稳定两池形状（既有回归语义）
+        let nodes = vec![pool_node("g", "cuda:0", Some(512), None)];
+        let report = compute_budget_multi_pool(
+            &nodes,
+            &[],
+            &[device("cuda:0", Some(8192), None)],
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(report.pools.len(), 2);
+        assert!(!report.pools.iter().any(|p| p.kind == PoolKind::Uma));
     }
 }

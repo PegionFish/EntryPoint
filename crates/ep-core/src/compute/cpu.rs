@@ -251,8 +251,10 @@ pub(crate) fn parse_percent_number(output: &str) -> Option<u8> {
 // ─── 内存 ────────────────────────────────────────────────────────────────────
 
 /// (总内存, 已用内存) MB
+///
+/// `pub(crate)`：`uma.rs`（T-22 UMA 池容量探测）复用同源物理内存读数。
 #[cfg(windows)]
-fn memory_status_mb() -> Option<(u32, u32)> {
+pub(crate) fn memory_status_mb() -> Option<(u32, u32)> {
     use std::mem;
 
     #[repr(C)]

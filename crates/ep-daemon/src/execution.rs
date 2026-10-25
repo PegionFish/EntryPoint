@@ -224,11 +224,19 @@ pub fn bind_persistence(root: &Path) {
 }
 
 /// 调度器：优先级队列（同优先级 FIFO）+ 两级闸门计数（§6.8）+ 动态 VRAM 准入账本（§6.8b）
+///
+/// T-22 force 语义：force 任务在队列中**插队**（先于全部非 force 任务出队，
+/// 同为 force 时按优先级 + FIFO），且出队判定**跳过 §6.8b 动态准入检查**
+/// （模块并发上限 + 设备显存余额）；静态两级闸门（全局 max_parallel +
+/// 管线 max_instances）与全局暂停**不受影响**（安全上限不放行）。插队导致
+/// 的账本超支即为用户显式接受的 overcommit（任务元数据 `forced_overcommit`
+/// / `accepted_risk = "user"`，经 [`task_forced_overcommit`] 对外透出）。
 #[derive(Debug, Default)]
 struct Scheduler {
-    /// 等待闸门的任务（按优先级出队；同优先级保持入队顺序）
+    /// 等待闸门的任务（按优先级出队；同优先级保持入队顺序；force 插队）
     queue: VecDeque<QueuedEntry>,
     /// 全局暂停标志（T-15）：只挡新任务准入，运行中照常完成、排队保留
+    /// （force 任务同样被暂停拦截——暂停是管理面安全控制，不是 §6.8b 准入等待）
     paused: bool,
     /// 全局运行中任务数（≤ max_parallel）
     running_count: usize,
@@ -239,7 +247,9 @@ struct Scheduler {
     /// 每模块运行中任务数（动态准入：≤ manifest `[compute] max_concurrent`，缺省 1）
     running_by_module: HashMap<String, usize>,
     /// 每设备已提交显存预算（动态准入账本，MB）：Σ 已准入任务的每实例预算；
-    /// 与实时占用取 max 消费——指标刷新（2s）滞后窗口内由账本兜住，防超发
+    /// 与实时占用取 max 消费——指标刷新（2s）滞后窗口内由账本兜住，防超发。
+    /// UMA 平台（T-22）全部 GPU 预算记入单一 `"uma"` 键（单池共享语义）；
+    /// force 准入可使该账本超过设备总量——超支部分即被接受的 overcommit。
     vram_committed: HashMap<String, u32>,
     /// 已准入任务的显存计划（task_id → [(device_key, cost_mb)]），终结时精确销账
     vram_plans: HashMap<String, Vec<(String, u32)>>,
@@ -253,6 +263,36 @@ struct QueuedEntry {
     priority: u8,
     /// 任务引用的模块 id（去重；动态准入消费，提交时随载荷登记）
     module_ids: Vec<String>,
+    /// §6.8b force（T-22）：true 时插队 + 跳过动态准入检查（静态闸门与
+    /// 暂停不受影响；账本照常记账）
+    force: bool,
+}
+
+/// T-22：force 提交（§6.8b 准入跳过 + 插队）的任务 id 集。
+///
+/// 提交模式元数据的进程内侧表（`TaskRecord` 形状冻结，不为其增字段）：
+/// 提交时登记，任务在案期间保留（与 FINALIZED 同生命周期语义——终态后
+/// 任务详情仍可展示提交模式），仅 `clear_registry_for_tests` 清空。
+/// 不跨重启存活：重启后遗留任务一律改判 failed，提交模式随之失传（可接受）。
+static FORCED_TASKS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+fn forced_tasks() -> &'static Mutex<std::collections::HashSet<String>> {
+    FORCED_TASKS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// force 提交的任务元数据（T-22）：`accepted_risk` 固定取值。
+///
+/// 与任务详情/提交响应的 `accepted_risk` 字段同源；语义 = 用户显式接受
+/// 跳过 §6.8b 动态准入等待可能带来的显存超支风险。
+pub const FORCE_ACCEPTED_RISK: &str = "user";
+
+/// 任务是否为 force 提交（§6.8b）：任务详情/任务列表据此透出
+/// `forced_overcommit: true` + `accepted_risk: "user"`。
+pub fn task_forced_overcommit(task_id: &str) -> bool {
+    forced_tasks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(task_id)
 }
 
 static SCHEDULER: OnceLock<Mutex<Scheduler>> = OnceLock::new();
@@ -554,8 +594,15 @@ pub fn resume_queue(state: &Arc<AppState>) -> QueueStatus {
     queue_status()
 }
 
-/// 排队任务的“派发序位”（1 起）：按出队规则（优先级升序，同优先级 FIFO）
-/// 计算前面还有多少任务，供任务中心展示真实等待顺序。
+/// T-22 出队排序键（越小越先出队）：**force 插队**（T-22：先于全部非 force
+/// 任务）→ 优先级升序（T-15）→ 入队 FIFO。[`pick_next_index`] 与
+/// [`queued_position_in`] 共用同一键，保证展示序位与实际派发顺序一致。
+fn dispatch_rank(entry: &QueuedEntry, idx: usize) -> (std::cmp::Reverse<bool>, u8, usize) {
+    (std::cmp::Reverse(entry.force), entry.priority, idx)
+}
+
+/// 排队任务的“派发序位”（1 起）：按出队规则（force 插队 → 优先级升序，
+/// 同优先级 FIFO）计算前面还有多少任务，供任务中心展示真实等待顺序。
 fn queued_position_in(sched: &Scheduler, task_id: &str) -> Option<usize> {
     let idx = sched.queue.iter().position(|e| e.task_id == task_id)?;
     let target = &sched.queue[idx];
@@ -563,7 +610,7 @@ fn queued_position_in(sched: &Scheduler, task_id: &str) -> Option<usize> {
         .queue
         .iter()
         .enumerate()
-        .filter(|(i, e)| (e.priority, *i) < (target.priority, idx))
+        .filter(|(i, e)| dispatch_rank(e, *i) < dispatch_rank(target, idx))
         .count();
     Some(ahead + 1)
 }
@@ -773,6 +820,13 @@ pub struct SubmitOptions {
     /// 直跑缓存旁路（T-16）：true 时既不读缓存也不写缓存；
     /// 仅直跑入口（`submit_direct_full`）消费，管线提交忽略
     pub bypass_cache: bool,
+    /// §6.8b force（T-22）：true 时跳过动态 VRAM 准入的排队等待直接执行
+    /// （模块并发上限 + 显存余额不参与判定，队列中插队）；静态两级闸门
+    /// （max_parallel / max_instances）与全局暂停不受影响。任务元数据登记
+    /// `forced_overcommit = true` + `accepted_risk = "user"`（见
+    /// [`task_forced_overcommit`] / [`FORCE_ACCEPTED_RISK`]）。缺省 false
+    /// 时提交行为与此字段加入前逐字节一致。
+    pub force: bool,
 }
 
 /// 提交结果
@@ -884,14 +938,7 @@ async fn submit_pipeline_full_inner(
     let staging_dir = staged.path.clone();
 
     // 空闲自动释放：任务关联模块即刻视为活跃（回收器据此豁免）
-    let task_module_ids: Vec<String> = pipeline
-        .nodes
-        .iter()
-        .filter_map(|n| match &n.kind {
-            NodeKind::Module { module_id, .. } => Some(module_id.clone()),
-            _ => None,
-        })
-        .collect();
+    let task_module_ids: Vec<String> = pipeline_module_ids(&pipeline);
     {
         let now = chrono::Utc::now().timestamp();
         let mut act = state.module_activity.lock().unwrap_or_else(|p| p.into_inner());
@@ -960,7 +1007,16 @@ async fn submit_pipeline_full_inner(
             pipeline_id: pipeline_id.clone(),
             priority,
             module_ids,
+            force: options.force,
         });
+    }
+    // T-22：force 提交登记（§6.8b 元数据，任务详情/提交响应透出）
+    if options.force {
+        forced_tasks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(task_id.clone());
+        info!(task_id = %task_id, "force submit: dynamic VRAM admission wait skipped (§6.8b), accepted_risk = user");
     }
     pending().lock().unwrap_or_else(|e| e.into_inner()).insert(
         task_id.clone(),
@@ -1048,7 +1104,17 @@ fn resolve_max_instances(root: &Path, pipeline_id: &str) -> Option<u32> {
 //    时（如 waifu2x 声明 6000 实测 ~1300）由账本一致性地约束，声明高于
 //    实际只会少并发不会超发；
 // 3. **fail-open**：设备无指标 / 模块无显存声明 / CPU 设备 → 不设显存限
-//    （start_task 路径自有设备选择与 overcommit 兜底）。
+//    （start_task 路径自有设备选择与 overcommit 兜底）；
+// 4. **UMA 单池**（T-22）：统一内存架构平台（GB10 等，`compute::uma` 识别）
+//    上全部 GPU 设备共享同一物理内存——账本把涉足 GPU 的模块预算统一记入
+//    单一 `"uma"` 键（容量 = 物理内存总量，实时占用 = 系统内存占用），
+//    杜绝「每设备独立池」在共享内存上重复计额。**GPU 切分预留（carve-out）
+//    语义**：驱动为 GPU 划出的预留额度不单独建模（配置项预留、不实现），
+//    池容量取物理总量、由实时占用的 max 口径吸收预留差异；识别失败静默
+//    降级为逐设备池（现行为，零差异）。
+
+/// UMA 单池的账本键（T-22）：统一内存平台上全部 GPU 预算汇入此键。
+const UMA_POOL_KEY: &str = "uma";
 
 /// 单设备准入账目（纯数据；快照判定可单测）
 #[derive(Debug, Default, Clone)]
@@ -1118,6 +1184,85 @@ impl AdmissionSnapshot {
     }
 }
 
+/// 管线引用的模块 id 列表（module 节点序，不去重——去重在调度器入队处）。
+/// `pub`：force 提交响应的各池超支投影（[`forced_overcommit_pools`]）由
+/// API handler 以同一口径提供模块表。
+pub fn pipeline_module_ids(pipeline: &Pipeline) -> Vec<String> {
+    pipeline
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.kind {
+            NodeKind::Module { module_id, .. } => Some(module_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// §6.8b force 提交的各池超支投影（T-22；async 只因准入快照读 state）。
+///
+/// 以**当前瞬时**的准入快照 + 调度账本推演本任务准入后的每池账目，返回
+/// `max(实时占用, 已承诺) + 本任务预算 > 池容量` 的超支池（复用 T-20
+/// [`vram::PoolBudget`] 形状：`committed_mb` = 准入后投影值，`entries` 以
+/// 模块 id 记账——准入在模块粒度而非节点粒度）。返回空 = 无超支（force
+/// 仅插队/跳过并发上限等待）。供提交响应的 `overcommit_pools` 字段消费
+/// （仅 force 请求附带，缺省响应不出现该字段）；投影与实际准入之间存在
+/// 竞态窗口，属提交瞬间的 advisory 信息。
+pub async fn forced_overcommit_pools(
+    state: &Arc<AppState>,
+    module_ids: &[String],
+) -> Vec<vram::PoolBudget> {
+    let snapshot = admission_snapshot(state).await;
+    let committed_now: HashMap<String, u32> = scheduler()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .vram_committed
+        .clone();
+
+    // 本任务按池归集预算（去重模块；与 admits() 同口径）
+    let mut need: std::collections::BTreeMap<String, (u32, Vec<(String, u32)>)> =
+        std::collections::BTreeMap::new();
+    for mid in module_ids.iter().collect::<std::collections::BTreeSet<_>>() {
+        if let Some(m) = snapshot.modules.get(mid) {
+            if let (Some(dev), true) = (&m.device, m.cost_mb > 0) {
+                let entry = need.entry(dev.clone()).or_insert_with(|| (0, Vec::new()));
+                entry.0 += m.cost_mb;
+                entry.1.push((mid.clone(), m.cost_mb));
+            }
+        }
+    }
+
+    let mut pools = Vec::new();
+    for (dev, (cost_total, entries)) in need {
+        let Some(ledger) = snapshot.devices.get(&dev) else {
+            continue; // 设备无指标 → fail-open，无超支可言
+        };
+        let committed = committed_now.get(&dev).copied().unwrap_or(0);
+        let projected = ledger.used_live_mb.max(committed).saturating_add(cost_total);
+        if projected <= ledger.total_mb {
+            continue; // 未超支 → 不出池
+        }
+        pools.push(vram::PoolBudget {
+            kind: if dev == UMA_POOL_KEY {
+                vram::PoolKind::Uma
+            } else {
+                vram::PoolKind::Vram
+            },
+            device_id: dev,
+            total_mb: u64::from(ledger.total_mb),
+            committed_mb: u64::from(projected),
+            entries: entries
+                .into_iter()
+                .map(|(module, cost)| vram::PoolItem {
+                    node: module,
+                    estimate_mb: u64::from(cost),
+                })
+                .collect(),
+            unknown: false,
+        });
+    }
+    pools
+}
+
 /// 构建准入快照（async：读 devices / process_manager / modules / config）。
 async fn admission_snapshot(state: &Arc<AppState>) -> AdmissionSnapshot {
     let devices_snap = state.devices.read().await.clone();
@@ -1142,10 +1287,33 @@ async fn admission_snapshot(state: &Arc<AppState>) -> AdmissionSnapshot {
         .collect();
 
     let mut snap = AdmissionSnapshot::default();
+    // T-22 UMA 单池：统一内存平台识别（探测失败 → None → 逐设备池，零差异）
+    let uma_total_mb = ep_core::compute::uma::unified_memory_total_mb();
+    // UMA 池实时占用：系统内存占用（CPU 条目的 used）优先——UMA 上 GPU 的
+    // "显存" 就是系统内存；无 CPU 条目时回退 GPU 设备占用的最大值
+    let mut uma_used_live_mb = 0u32;
+    for d in &devices_snap {
+        if matches!(d.id, DeviceId::Cpu) {
+            uma_used_live_mb = uma_used_live_mb.max(d.used_memory_mb.unwrap_or(0));
+        }
+    }
     for d in &devices_snap {
         // CPU 不做显存记账（total = 系统内存，语义不同）；无总量指标的
         // 设备（vulkan/directml 常态）无法核算 → fail-open
         if matches!(d.id, DeviceId::Cpu) || d.total_memory_mb.is_none() {
+            continue;
+        }
+        if let Some(uma_total) = uma_total_mb {
+            // UMA 单池：所有 GPU 设备账本折叠为单一 "uma" 键（容量相同、
+            // 取占用最大者）；个别设备条目不再独立记账
+            uma_used_live_mb = uma_used_live_mb.max(d.used_memory_mb.unwrap_or(0));
+            snap.devices.insert(
+                UMA_POOL_KEY.to_string(),
+                DeviceLedger {
+                    total_mb: uma_total,
+                    used_live_mb: uma_used_live_mb,
+                },
+            );
             continue;
         }
         snap.devices.insert(
@@ -1174,6 +1342,15 @@ async fn admission_snapshot(state: &Arc<AppState>) -> AdmissionSnapshot {
         } else {
             None
         };
+        // T-22 UMA 单池：GPU 落位设备的预算统一记入 "uma" 键（与上方设备
+        // 账本折叠键一致；CPU/None 落位本就不设显存限，保持原状）
+        let device = device.map(|dev| {
+            if uma_total_mb.is_some() {
+                UMA_POOL_KEY.to_string()
+            } else {
+                dev
+            }
+        });
         snap.modules.insert(
             mid,
             ModuleAdmission {
@@ -1186,8 +1363,28 @@ async fn admission_snapshot(state: &Arc<AppState>) -> AdmissionSnapshot {
     snap
 }
 
-/// T-15 出队选择：在通过两级闸门的排队任务中取优先级最小者；
-/// 同优先级保持 FIFO（取队列中最靠前者）。准入判定本身不变，仅改变排序。
+/// 单任务出队资格判定（try_promote 每轮消费；纯函数可单测）：
+/// 1. 管线级闸门（§6.8）：同一管线运行数 < max_instances；
+/// 2. §6.8b 动态准入：模块并发上限 + 设备显存余额——**force 任务跳过本项**
+///    （T-22：跳过的即是“动态准入排队等待”；静态管线闸门不受影响）。
+fn entry_admissible(
+    entry: &QueuedEntry,
+    snapshot: &AdmissionSnapshot,
+    pipeline_limit: usize,
+    pipeline_running: usize,
+    running_by_module: &HashMap<String, usize>,
+    vram_committed: &HashMap<String, u32>,
+) -> bool {
+    if pipeline_running >= pipeline_limit {
+        return false;
+    }
+    entry.force
+        || snapshot.admits(&entry.module_ids, running_by_module, vram_committed)
+}
+
+/// T-15 出队选择：在通过两级闸门的排队任务中取排序键最小者
+/// （force 插队 → 优先级升序 → 同优先级 FIFO，见 [`dispatch_rank`]）。
+/// 准入判定本身不变，仅改变排序。
 fn pick_next_index<F>(queue: &VecDeque<QueuedEntry>, mut eligible: F) -> Option<usize>
 where
     F: FnMut(&QueuedEntry) -> bool,
@@ -1198,8 +1395,8 @@ where
             continue;
         }
         match best {
-            // 已选中者优先级更高（或同优先级且更靠前）→ 保持
-            Some(best_idx) if queue[best_idx].priority <= entry.priority => {}
+            // 已选中者排序键更小（或同键且更靠前）→ 保持
+            Some(best_idx) if dispatch_rank(&queue[best_idx], best_idx) <= dispatch_rank(entry, idx) => {}
             _ => best = Some(idx),
         }
     }
@@ -1241,12 +1438,12 @@ async fn try_promote(state: Arc<AppState>) {
                     .get(&entry.pipeline_id)
                     .copied()
                     .unwrap_or(0);
-                if running >= limit {
-                    return false;
-                }
-                // §6.8b 动态准入：模块并发上限 + 设备显存余额
-                snapshot.admits(
-                    &entry.module_ids,
+                // 管线闸门 + §6.8b 动态准入（force 跳过后者，T-22）
+                entry_admissible(
+                    entry,
+                    &snapshot,
+                    limit,
+                    running,
                     &sched.running_by_module,
                     &sched.vram_committed,
                 )
@@ -2873,6 +3070,7 @@ pub fn clear_registry_for_tests() {
     cache_pending().lock().unwrap_or_else(|e| e.into_inner()).clear();
     extras().lock().unwrap_or_else(|e| e.into_inner()).clear();
     finalized().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    forced_tasks().lock().unwrap_or_else(|e| e.into_inner()).clear();
     set_test_run_hook(None);
 }
 
@@ -3730,11 +3928,17 @@ builtin = "file_output"
     // ── 10b. 优先级出队与全局暂停/恢复（T-15） ──────────────────────────────
 
     fn queued_entry(task_id: &str, priority: u8) -> QueuedEntry {
+        queued_entry_force(task_id, priority, false)
+    }
+
+    /// T-22：带 force 标记的排队条目夹具
+    fn queued_entry_force(task_id: &str, priority: u8, force: bool) -> QueuedEntry {
         QueuedEntry {
             task_id: task_id.to_string(),
             pipeline_id: "p".to_string(),
             priority,
             module_ids: Vec::new(),
+            force,
         }
     }
 
@@ -3803,6 +4007,7 @@ builtin = "file_output"
                 group: None,
                 priority: Some(10),
                 bypass_cache: false,
+                force: false,
             },
         )
         .await
@@ -3874,6 +4079,7 @@ builtin = "file_output"
                     group: None,
                     priority: Some(priority),
                     bypass_cache: false,
+                    force: false,
                 },
             )
             .await
@@ -4197,6 +4403,7 @@ builtin = "file_output"
                 group: None,
                 priority: None,
                 bypass_cache: false,
+                force: false,
                 },
         )
         .await
@@ -4276,6 +4483,7 @@ builtin = "file_output"
                 group: None,
                 priority: None,
                 bypass_cache: false,
+                force: false,
                 },
         )
         .await
@@ -4595,6 +4803,7 @@ output_type = "json"
                 group: None,
                 priority: None,
                 bypass_cache: false,
+                force: false,
                 },
         )
         .await
@@ -5971,5 +6180,401 @@ mod watcher_direct_tests {
         let mut committed2 = committed.clone();
         committed2.insert("cuda:1".to_string(), 2000);
         assert!(!snap.admits(&["mod-a".into(), "mod-b".into()], &ledger, &committed2));
+    }
+
+    // ── §6.8b force 通路（T-22） ────────────────────────────────────────────
+
+    // 本模块本地夹具（`mod tests` 的同名 helper 跨模块不可见）
+    fn queued_entry(task_id: &str, priority: u8) -> QueuedEntry {
+        queued_entry_force(task_id, priority, false)
+    }
+
+    fn queued_entry_force(task_id: &str, priority: u8, force: bool) -> QueuedEntry {
+        QueuedEntry {
+            task_id: task_id.to_string(),
+            pipeline_id: "p".to_string(),
+            priority,
+            module_ids: Vec::new(),
+            force,
+        }
+    }
+
+    /// 路径转义为 TOML basic string（本地副本，`mod tests::toml_path` 不可见）
+    fn wtoml_path(p: &Path) -> String {
+        p.display().to_string().replace('\\', "\\\\").replace('"', "\\\"")
+    }
+
+    /// file_input → file_output 复制管线（真实可执行；`mod tests::copy_pipeline`
+    /// 的本地副本）
+    fn wcopy_pipeline(id: &str, src: &Path, dest: &Path) -> Pipeline {
+        let toml = format!(
+            r#"
+[pipeline]
+id = "{id}"
+name = "复制测试"
+
+[[nodes]]
+id = "input"
+kind = "builtin"
+builtin = "file_input"
+params = {{ path = "{}" }}
+
+[[nodes]]
+id = "output"
+kind = "builtin"
+builtin = "file_output"
+params = {{ path = "{}" }}
+
+[[edges]]
+from = ["input", "output"]
+to = ["output", "input"]
+"#,
+            wtoml_path(src),
+            wtoml_path(dest),
+        );
+        Pipeline::from_toml_str(&toml).unwrap()
+    }
+
+    #[test]
+    fn pick_next_index_prefers_force_over_priority_then_fifo() {
+        // force 任务插队：即便普通高优先级任务先入队，force 也先出队
+        let queue = VecDeque::from([
+            queued_entry("normal-1", 50),
+            queued_entry("high", 10),
+            queued_entry_force("forced", 50, true),
+        ]);
+        assert_eq!(pick_next_index(&queue, |_| true), Some(2));
+
+        // force 任务之间按优先级 + FIFO
+        let queue = VecDeque::from([
+            queued_entry_force("forced-a", 50, true),
+            queued_entry_force("forced-b", 10, true),
+        ]);
+        assert_eq!(pick_next_index(&queue, |_| true), Some(1));
+
+        // force 不受 eligible 限制豁免：不可准入的 force 任务仍被跳过
+        let queue = VecDeque::from([queued_entry_force("forced", 50, true)]);
+        assert_eq!(pick_next_index(&queue, |_| false), None);
+
+        // 全员非 force → 行为与 T-15 完全一致（回归锚点）
+        let queue = VecDeque::from([
+            queued_entry("normal-1", 50),
+            queued_entry("normal-2", 50),
+            queued_entry("high", 10),
+        ]);
+        assert_eq!(pick_next_index(&queue, |_| true), Some(2));
+        assert_eq!(pick_next_index(&queue, |e| e.task_id != "high"), Some(0));
+    }
+
+    #[test]
+    fn queued_position_reflects_force_precedence() {
+        let sched = Scheduler {
+            queue: VecDeque::from([
+                queued_entry("normal-1", 50),
+                queued_entry_force("forced", 50, true),
+                queued_entry("high", 10),
+            ]),
+            ..Scheduler::default()
+        };
+        // 展示序位与派发序一致：force=1，普通任务（含高优先级）依次后移
+        assert_eq!(queued_position_in(&sched, "forced"), Some(1));
+        assert_eq!(queued_position_in(&sched, "high"), Some(2));
+        assert_eq!(queued_position_in(&sched, "normal-1"), Some(3));
+    }
+
+    #[test]
+    fn entry_admissible_force_bypasses_dynamic_admission_only() {
+        let snap = snapshot_with(admission(3000, 1, Some("cuda:0")));
+        let ledger: TestMap<String, usize> = TestMap::new();
+        // 显存账本超支（承诺 8000 + 预算 3000 > 8192）：普通任务被动态准入拦截
+        let mut committed: TestMap<String, u32> = TestMap::new();
+        committed.insert("cuda:0".to_string(), 8000);
+        let mut normal = queued_entry("normal", 50);
+        normal.module_ids = vec!["waifu2x".to_string()];
+        assert!(
+            !super::entry_admissible(&normal, &snap, 4, 0, &ledger, &committed),
+            "显存超支时普通任务不得准入"
+        );
+        // force 任务跳过动态准入（§6.8b 排队等待被绕过；模块表同上，
+        // 证明差异来自 force 而非空模块表的 vacuous pass）
+        let mut forced = queued_entry_force("forced", 50, true);
+        forced.module_ids = vec!["waifu2x".to_string()];
+        assert!(super::entry_admissible(&forced, &snap, 4, 0, &ledger, &committed));
+        // 静态管线闸门不被 force 绕过（安全上限语义保持）
+        assert!(
+            !super::entry_admissible(&forced, &snap, 1, 1, &ledger, &committed),
+            "管线 max_instances 已满时 force 也不得准入"
+        );
+    }
+
+    #[test]
+    fn admission_uma_single_pool_sums_shared_budgets() {
+        // T-22 UMA 单池语义：全部 GPU 预算折叠进同一 "uma" 键——两个模块
+        // 的预算在同一物理池内累加，而不是各设备独立池各算各的
+        let mut snap = super::AdmissionSnapshot::default();
+        snap.devices.insert(
+            super::UMA_POOL_KEY.to_string(),
+            super::DeviceLedger { total_mb: 120_000, used_live_mb: 30_000 },
+        );
+        snap.modules.insert("mod-a".to_string(), admission(60_000, 1, Some("uma")));
+        snap.modules.insert("mod-b".to_string(), admission(60_000, 1, Some("uma")));
+        let ledger: TestMap<String, usize> = TestMap::new();
+        let committed: TestMap<String, u32> = TestMap::new();
+        assert!(
+            snap.admits(&["mod-a".into()], &ledger, &committed),
+            "单模块预算（30k+60k=90k）< 120k 应放行"
+        );
+        assert!(
+            !snap.admits(&["mod-a".into(), "mod-b".into()], &ledger, &committed),
+            "两模块预算累加（30k+60k+60k=150k）> 120k 须拒绝——单池重复计额防线"
+        );
+    }
+
+    /// busy 场景插队（T-22 验收）：max_parallel=1、首任务持闸时，普通任务
+    /// 与 force 任务都排队；释放后 force 任务先于先入队的普通任务执行。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn force_task_overtakes_queued_normal_task_when_busy() {
+        let _guard = lock_for_tests();
+        clear_registry_for_tests();
+
+        let root = unique_root("force-order");
+        let mut config = AppConfig::default();
+        config.pipeline.max_parallel = 1;
+        config.pipeline.default_timeout_secs = 120;
+        let state = Arc::new(AppState::new(
+            root.clone(),
+            config,
+            vec![],
+            vec![],
+            PortManager::new(18000, 19000),
+        ));
+
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        RELEASE.store(false, Ordering::SeqCst);
+        let order: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let order_hook = order.clone();
+        set_test_run_hook(Some(Arc::new(move |task_id| {
+            order_hook
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(task_id.to_string());
+            // 首个任务持闸到测试放行，制造 busy 排队窗口
+            let n = order_hook
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len();
+            if n == 1 {
+                while !RELEASE.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        })));
+
+        // 1. 首任务占住唯一闸门
+        let (src0, dest0) = (root.join("f-src-0.txt"), root.join("f-out-0.txt"));
+        std::fs::write(&src0, "busy holder").unwrap();
+        let holder = submit_pipeline(&state, wcopy_pipeline("force-holder", &src0, &dest0), None)
+            .await
+            .unwrap();
+        // 2. 普通任务先入队
+        let (src1, dest1) = (root.join("f-src-1.txt"), root.join("f-out-1.txt"));
+        std::fs::write(&src1, "normal").unwrap();
+        let normal = submit_pipeline(&state, wcopy_pipeline("force-normal", &src1, &dest1), None)
+            .await
+            .unwrap();
+        // 3. force 任务后入队（插队）
+        let (src2, dest2) = (root.join("f-src-2.txt"), root.join("f-out-2.txt"));
+        std::fs::write(&src2, "forced").unwrap();
+        let forced = submit_pipeline_full(
+            &state,
+            wcopy_pipeline("force-jump", &src2, &dest2),
+            None,
+            SubmitOptions {
+                wait: false,
+                callback_url: None,
+                group: None,
+                priority: None,
+                bypass_cache: false,
+                force: true,
+            },
+        )
+        .await
+        .unwrap()
+        .task_id;
+
+        // busy 窗口：holder running，normal 与 forced 均 queued；
+        // 展示序位 force=1、normal=2（插队生效）
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(snapshot(&holder).unwrap().status, TaskState::Running);
+        assert_eq!(snapshot(&normal).unwrap().status, TaskState::Queued);
+        assert_eq!(snapshot(&forced).unwrap().status, TaskState::Queued);
+        assert_eq!(snapshot(&forced).unwrap().queue_position, Some(1));
+        assert_eq!(snapshot(&normal).unwrap().queue_position, Some(2));
+
+        RELEASE.store(true, Ordering::SeqCst);
+        for id in [&holder, &normal, &forced] {
+            wait_terminal(id).await.expect("任务应终结");
+        }
+        set_test_run_hook(None);
+
+        let started = order.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(started.len(), 3);
+        assert_eq!(started[0], holder, "持闸任务最先执行");
+        assert_eq!(
+            started[1], forced,
+            "busy 时排队的 force 任务应先于先入队的普通任务执行"
+        );
+        assert_eq!(started[2], normal);
+    }
+
+    /// force 提交元数据登记（T-22）：force 任务可查、普通任务零副作用。
+    #[tokio::test]
+    async fn force_submit_records_metadata_normal_submit_does_not() {
+        let _guard = lock_for_tests();
+        clear_registry_for_tests();
+
+        let root = unique_root("force-meta");
+        let state = wtest_state(root.clone());
+        let src = root.join("meta-src.txt");
+        let dest = root.join("meta-out.txt");
+        std::fs::write(&src, "meta").unwrap();
+
+        let forced = submit_pipeline_full(
+            &state,
+            wcopy_pipeline("force-meta-pipe", &src, &dest),
+            None,
+            SubmitOptions {
+                wait: false,
+                callback_url: None,
+                group: None,
+                priority: None,
+                bypass_cache: false,
+                force: true,
+            },
+        )
+        .await
+        .unwrap()
+        .task_id;
+        let normal = submit_pipeline_full(
+            &state,
+            wcopy_pipeline("normal-meta-pipe", &src, &dest),
+            None,
+            SubmitOptions {
+                wait: false,
+                callback_url: None,
+                group: None,
+                priority: None,
+                bypass_cache: false,
+                force: false,
+            },
+        )
+        .await
+        .unwrap()
+        .task_id;
+
+        assert!(task_forced_overcommit(&forced), "force 任务应登记元数据");
+        assert_eq!(FORCE_ACCEPTED_RISK, "user");
+        assert!(
+            !task_forced_overcommit(&normal),
+            "不传 force 的提交不得产生元数据副作用（回归锚点）"
+        );
+
+        for id in [&forced, &normal] {
+            wait_terminal(id).await.expect("任务应终结");
+        }
+        // 终态后元数据保留（任务在案期间可审计提交模式）
+        assert!(task_forced_overcommit(&forced));
+        assert!(!task_forced_overcommit(&normal));
+    }
+
+    /// 构造带显存声明的 GPU 模块夹具（mock-waifu：min_vram_mb = 3000）
+    fn mock_gpu_module(root: &Path, id: &str) -> ep_core::module::discovery::DiscoveredModule {
+        let toml = format!(
+            r#"
+[module]
+id = "{id}"
+name = "Mock GPU"
+version = "0.1.0"
+description = "test"
+category = "image"
+genre = "test"
+license = "MIT"
+
+[runtime]
+type = "python"
+
+[compute]
+backends = ["cuda"]
+min_vram_mb = 3000
+
+[interface]
+type = "http"
+
+[[interface.capabilities]]
+name = "process"
+description = "处理"
+input_type = "image"
+output_type = "image"
+"#,
+            id = id
+        );
+        ep_core::module::discovery::DiscoveredModule {
+            manifest: Some(toml::from_str(&toml).unwrap()),
+            path: root.join("modules").join(id),
+            status: ep_core::module::discovery::DiscoveryStatus::Valid,
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_overcommit_pools_reports_only_oversubscribed_pool() {
+        let _guard = lock_for_tests();
+        clear_registry_for_tests();
+
+        let root = unique_root("force-pools");
+        let module = mock_gpu_module(&root, "mock-waifu");
+        let device = ep_core::types::ComputeDevice {
+            id: DeviceId::Cuda(0),
+            backend: ep_core::types::ComputeBackend::Cuda,
+            name: "Mock GPU".into(),
+            total_memory_mb: Some(8192),
+            used_memory_mb: Some(6000),
+            utilization: None,
+            temperature: None,
+        };
+        let state = Arc::new(AppState::new(
+            root.clone(),
+            AppConfig::default(),
+            vec![device],
+            vec![module],
+            PortManager::new(18000, 19000),
+        ));
+
+        // 净空：6000(实时) + 3000(预算) = 9000 > 8192 → 唯一池超支
+        let pools = forced_overcommit_pools(&state, &["mock-waifu".to_string()]).await;
+        assert_eq!(pools.len(), 1, "仅超支池入投影");
+        let pool = &pools[0];
+        assert_eq!(pool.kind, vram::PoolKind::Vram);
+        assert_eq!(pool.device_id, "cuda:0");
+        assert_eq!(pool.total_mb, 8192);
+        assert_eq!(pool.committed_mb, 9000, "committed = max(实时, 账本) + 预算");
+        assert_eq!(
+            pool.entries,
+            vec![vram::PoolItem { node: "mock-waifu".into(), estimate_mb: 3000 }]
+        );
+        assert!(!pool.unknown);
+
+        // 降容场景：实时占用清零、无账本承诺 → 3000 < 8192 无超支 → 空投影
+        {
+            let mut devs = state.devices.write().await;
+            devs[0].used_memory_mb = Some(0);
+        }
+        let pools = forced_overcommit_pools(&state, &["mock-waifu".to_string()]).await;
+        assert!(pools.is_empty(), "未超支时不出任何池");
+
+        // 未知模块（无准入条目）→ 无预算无超支
+        let pools = forced_overcommit_pools(&state, &["ghost-mod".to_string()]).await;
+        assert!(pools.is_empty());
     }
 }

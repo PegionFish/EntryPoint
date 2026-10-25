@@ -683,12 +683,14 @@ struct VramSpecNode {
 /// （`compute::cpu` 周期探测；无 CPU 条目/容量缺失 → `unknown = true`），
 /// `allow_overcommit` 取 `compute.allow_overcommit`。
 ///
-/// 响应形状（S2 前端提议，仲裁 #3；T-20 多池扩展）：
+/// 响应形状（S2 前端提议，仲裁 #3；T-20 多池扩展；T-22 uma 池）：
 /// `{devices:[{device_id,total_mb,used_mb,pipeline_mb,items:[{node_id,mb}],over}],
 ///   unassigned:[{node_id,mb}], unassigned_mb, allow_overcommit,
-///   pools:[{kind:"vram"|"ram", device_id, total_mb, committed_mb,
+///   pools:[{kind:"vram"|"ram"|"uma", device_id, total_mb, committed_mb,
 ///           entries:[{node,estimate_mb}], unknown}]}`
 /// `pools` 按池分组、**不做跨池总和**；旧字段 `devices` 形状不变（向后兼容）。
+/// `kind:"uma"` 仅在统一内存架构识别成功（`compute::uma`，T-22）时追加，
+/// 识别失败/非 UMA 平台不产出（响应零变化）。
 async fn vram_budget(
     State(state): State<Arc<AppState>>,
     Json(req): Json<VramBudgetRequest>,
@@ -784,8 +786,18 @@ async fn vram_budget(
         .find(|d| d.device_id.eq_ignore_ascii_case("cpu"))
         .and_then(|d| d.total_mb);
 
-    match vram::compute_budget_multi_pool(&estimates, &edges, &devices, ram_total_mb, allow_overcommit)
-    {
+    // UMA 池容量（T-22）：统一内存架构识别（GB10/Windows；探测失败静默
+    // 降级为 None → 不产出 uma 池，响应零变化）
+    let uma_total_mb = ep_core::compute::uma::unified_memory_total_mb().map(u64::from);
+
+    match vram::compute_budget_multi_pool(
+        &estimates,
+        &edges,
+        &devices,
+        ram_total_mb,
+        uma_total_mb,
+        allow_overcommit,
+    ) {
         Ok(report) => (
             StatusCode::OK,
             Json(serde_json::to_value(&report).expect("VramBudgetReport serialization cannot fail")),

@@ -134,6 +134,17 @@ spawn 前检查模型缓存盘空间，需求按 `size_estimate_mb × 1.05` 估�
 请求体可选 `bypass_cache: true`（multipart 为文本字段）单次旁路；`[cache] enabled=false`
 全局关闭。管线执行（`/api/pipelines/execute`、`/pipelines/{id}/runs`）不参与缓存。
 
+**force 超支提交（T-22）**：执行系端点（`/api/pipelines/execute`、`/pipelines/runs` 系、
+`/api/execute/single`、`/api/modules/{module_id}/runs`、`/v1/inference/{module}/{capability}`
+JSON 与 multipart）请求体增可选 `force: true`（缺省 false；multipart 为文本字段
+`"true"`）：跳过 §6.8b 动态 VRAM 准入的排队等待（模块并发上限与显存余额不参与判定，
+队列中插队先于普通任务出队）；静态闸门（`max_parallel` / `max_instances`）与全局暂停
+不受影响，安全上限之外不绕过任何清理/安全逻辑。force 任务的提交响应附加
+`forced_overcommit: true` + `accepted_risk: "user"`，并按需附 `overcommit_pools`
+（复用 vram-budget `pools` 形状的超支池明细，仅存在超支时出现）；`GET /api/tasks` 与
+任务详情同步透出这两字段。**不传 force 时请求与响应行为逐字节不变**。
+`POST /v1/batches` 不开放 force（批量本为无人值守整目录吞吐设计）。
+
 ### 其他
 
 | 方法 | 路径 |

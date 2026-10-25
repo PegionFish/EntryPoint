@@ -60,6 +60,7 @@ WebUI 内部端点分离：本文件描述的请求/响应形状与错误码属�
 | `wait` | 否 | `"true"` 同步等待终态；缺省异步；字段上限 1MB |
 | `priority` | 否 | 任务优先级 `0`–`255`（十进制字符串）：`0`–`49` 高于缺省、`50` 缺省、同优先级先入先出；字段上限 1MB |
 | `bypass_cache` | 否 | `"true"` 时本次直跑既**不读也不写**结果缓存（缺省参与缓存）；字段上限 1MB |
+| `force` | 否 | `"true"` 时跳过 §6.8b 动态 VRAM 准入的排队等待直接执行（T-22，见下方 JSON 形态说明）；缺省 `"false"`；字段上限 1MB |
 
 重复 `file` 字段以最后一个为准（先前已接收的文件会被清理）。
 
@@ -73,6 +74,7 @@ WebUI 内部端点分离：本文件描述的请求/响应形状与错误码属�
   "wait": false,
   "priority": 10,
   "bypass_cache": false,
+  "force": false,
   "callback_url": "http://your-host/done"
 }
 ```
@@ -80,6 +82,14 @@ WebUI 内部端点分离：本文件描述的请求/响应形状与错误码属�
 `priority` 可省略（缺省 50）；数值越小越先出队，同等优先级按提交顺序
 派发。全局队列暂停/恢复见 `POST /api/queue/pause`、`POST /api/queue/resume`
 （暂停只阻止新任务派发，运行中任务不受影响，排队任务保留）。
+
+`force` 可省略（缺省 `false`）。`force: true`（T-22）跳过 §6.8b 动态 VRAM
+准入的排队等待（模块并发上限与显存余额不参与判定，队列中插队先于普通
+任务出队）；静态闸门（`max_parallel` / `max_instances`）与全局暂停不受影响。
+force 提交的 202/200 响应附加 `forced_overcommit: true` +
+`accepted_risk: "user"`，存在超支池时另附 `overcommit_pools`（复用
+vram-budget `pools` 形状的明细）；`GET /v1/tasks/{task_id}` 同步透出
+`forced_overcommit`。不传 `force` 时响应形状不变。
 
 `bypass_cache` 可省略（缺省 `false`）。直跑结果默认按
 `sha256(module + capability + 规范化 params + 输入指纹)` 做内容寻址缓存：

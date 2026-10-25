@@ -560,6 +560,19 @@ condition = "input.language != 'zh'"   # 仅非中文时翻译
   - 同一模块的多个节点串行（避免并发访问同一服务）
   - 可配置全局最大并行数（`app.toml [pipeline].max_parallel`）
 - 不同模块的节点可真正并行（各自独立进程/端口）
+- **动态 VRAM 准入（§6.8b）**：在静态两级闸门之上，按模块声明的
+  `[compute].min_vram_mb`（缺省回退 `vram_estimate_mb`）与设备实时显存
+  余额自动安排并发；`[compute].max_concurrent` 封顶单模块并发任务数。
+- **force 超支提交（T-22）**：执行系提交端点可选 `force: true`——跳过
+  §6.8b 动态准入的排队等待（插队先于普通任务出队），任务元数据带
+  `forced_overcommit: true` / `accepted_risk: "user"`；静态两级闸门与
+  全局暂停不受影响（不绕过安全上限之外的任何清理/安全逻辑）。
+- **统一内存架构（UMA，T-22）**：GB10 等 CPU/GPU 共享物理内存的平台上
+  （`EP_UMA_TOTAL_MB` 显式声明或 Windows 注册表平台识别，识别失败静默
+  降级为逐设备记账），§6.8b 准入账本把全部 GPU 预算记入**单一共享池**
+  （容量 = 物理内存总量）；`POST /api/pipelines/vram-budget` 的 `pools`
+  相应产出 `kind: "uma"` 池（物理上界视图）。驱动侧 GPU 切分预留
+  （carve-out）额度为预留语义、暂不建模为配置。
 
 ---
 

@@ -17,6 +17,7 @@ pub mod openvino;
 pub mod physical;
 pub mod rocm;
 pub mod scheduler;
+pub mod uma;
 pub mod vulkan;
 
 pub use cpu::CpuDetector;
