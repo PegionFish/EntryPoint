@@ -1166,7 +1166,10 @@ impl AdmissionSnapshot {
         for mid in module_ids {
             if let Some(m) = self.modules.get(mid) {
                 if let (Some(dev), true) = (&m.device, m.cost_mb > 0) {
-                    *need.entry(dev.as_str()).or_insert(0) += m.cost_mb;
+                    // 审查 P3-1：极端 manifest（min_vram_mb 上亿）× 多模块累加
+                    // 可能溢出 u32——饱和而非 panic（debug）/环绕（release）
+                    let slot = need.entry(dev.as_str()).or_insert(0);
+                    *slot = slot.saturating_add(m.cost_mb);
                 }
             }
         }
@@ -1225,7 +1228,7 @@ pub async fn forced_overcommit_pools(
         if let Some(m) = snapshot.modules.get(mid) {
             if let (Some(dev), true) = (&m.device, m.cost_mb > 0) {
                 let entry = need.entry(dev.clone()).or_insert_with(|| (0, Vec::new()));
-                entry.0 += m.cost_mb;
+                entry.0 = entry.0.saturating_add(m.cost_mb);
                 entry.1.push((mid.clone(), m.cost_mb));
             }
         }
@@ -1475,8 +1478,10 @@ async fn try_promote(state: Arc<AppState>) {
                         }
                     }
                     for (dev, cost) in &plan {
-                        *sched.vram_committed.entry(dev.clone()).or_insert(0) +=
-                            *cost;
+                        // 审查 P3-1：force 超支记账可超池总量，饱和累加防
+                        // debug panic / release 环绕致账本错
+                        let slot = sched.vram_committed.entry(dev.clone()).or_insert(0);
+                        *slot = slot.saturating_add(*cost);
                     }
                     if !plan.is_empty() {
                         sched.vram_plans.insert(entry.task_id.clone(), plan);

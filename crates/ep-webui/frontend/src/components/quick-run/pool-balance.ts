@@ -46,7 +46,9 @@ export function formatMbCompact(mb: number | null | undefined): string {
  * 多池响应 → 「估算 vs 实时余额」行集（纯函数）。
  *
  * 实时占用 join：vram 池按 device_id 对 `/api/devices`（或报告内
- * devices[].used_mb，同源快照）；ram 池固定取 CPU 条目。容量未知
+ * devices[].used_mb，同源快照）；ram 池固定取 CPU 条目；uma 池与后端
+ * 准入账本同口径取 CPU 条目（uma 不是设备 id，join 需显式回退，否则
+ * GB10 目标平台上最关键的池恒无实时占用、超支系统性漏报）。容量未知
  * （pools[].unknown）记 totalMb=null 且不判超支。
  */
 export function poolBalanceRows(
@@ -55,7 +57,8 @@ export function poolBalanceRows(
 ): PoolBalanceRow[] {
   const pools = report?.pools
   if (!pools || pools.length === 0) return []
-  const usedOf = (deviceId: string): number | null => {
+  const usedOf = (deviceId: string, kind: VramPoolKind): number | null => {
+    if (kind === 'uma') deviceId = 'cpu'
     const fromDevices = devices?.find((d) => d.id === deviceId)
     if (fromDevices) return fromDevices.used_memory_mb
     const fromReport = report?.devices.find((d) => d.device_id === deviceId)
@@ -65,7 +68,7 @@ export function poolBalanceRows(
     devices?.find((d) => d.id === deviceId)?.name ?? deviceId
   return pools.map((p) => {
     const totalMb = p.unknown ? null : p.total_mb
-    const usedMb = usedOf(p.device_id)
+    const usedMb = usedOf(p.device_id, p.kind)
     const over =
       totalMb !== null &&
       (usedMb ?? 0) + p.committed_mb > totalMb &&
