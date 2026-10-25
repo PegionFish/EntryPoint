@@ -1,0 +1,23 @@
+[package]
+name = "ep-tray"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "EntryPoint Windows 托盘管理器 — ep-daemon sidecar 壳（托盘图标/菜单/守护进程托管，零 webview）"
+
+# T-33 编译策略（spike）：全部 tray 依赖收进 cfg(windows) 门——非 Windows 目标
+# 只编译空壳（纯逻辑模块 + 打印提示退出的 main），Linux/CI 无需 GTK/系统库
+# 即可 `cargo check`。源码侧对应 `#[cfg(windows)]` / `cfg!(windows)` 门控。
+[target.'cfg(windows)'.dependencies]
+# 托盘图标与原生菜单（Windows 后端无需 GTK；需要配套事件循环线程 → tao）
+tray-icon = "0.26"
+# 事件循环：tray-icon 官方示例的 Windows 消息泵宿主（tao.rs example 同款用法）
+tao = "0.37"
+# HKCU\Software\Microsoft\Windows\CurrentVersion\Run 读写（开机自启开关）
+winreg = "0.56"
+# 命名互斥体（单实例锁；仅 Win32_Foundation + Win32_System_Threading 两个特性面）
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }

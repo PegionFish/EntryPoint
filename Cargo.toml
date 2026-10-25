@@ -5,6 +5,7 @@ members = [
     "crates/ep-daemon",
     "crates/ep-pack",
     "crates/ep-pack-cli",
+    "crates/ep-tray",
     "crates/ep-webui",
 ]
 # runtime/.uv-cache 下的 sdist 构建（如 deepfilterlib 经 maturin 调 cargo）

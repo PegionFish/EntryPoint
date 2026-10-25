@@ -286,3 +286,38 @@ Windows 侧用 `build.ps1`（需 PowerShell，Rust 1.97+、Node.js 20+、uv 前�
 - clippy/测试仍在主机架构运行（只对产出二进制的 build 步骤做交叉）。
 
 ---
+
+## 15. ep-tray 托盘管理器（Windows）
+
+`crates/ep-tray`：单 exe 托盘壳（`tray-icon` + `tao`，零 webview 依赖），
+托管同目录的 `ep-daemon.exe` sidecar。壳不承载业务功能——业务能力全部经
+WebUI（菜单"打开 WebUI" → 默认浏览器打开 `http://127.0.0.1:9800`）。
+
+**构建与部署**：
+
+```powershell
+cargo build -p ep-tray --release   # 与 ep-daemon.exe 放同一目录后双击即可
+```
+
+**行为要点**：
+
+- 托盘三色：绿=运行中（TCP 端口探活通过）/ 黄=启动中·已停止 / 红=异常；
+- 启动即自动拉起同目录 `ep-daemon.exe`（端口已有 daemon 则采纳显示，
+  不重复拉起）；崩溃自动重启**一次**，再失败转红标、停止自动重启；
+- 菜单：状态行（只读）/ 打开 WebUI / 重启 daemon / 停止 daemon /
+  开机自启 / 退出（并停止托盘托管的 daemon）；
+- **开机自启**：菜单勾选即写 `HKCU\...\CurrentVersion\Run`
+  值 `EntryPointTray = "<ep-tray.exe 路径>" --minimized`（登录静默启动、
+  不自动开浏览器；仅当前用户，无需管理员）；
+- **单实例**：命名互斥体（`Local\EntryPoint.ep-tray.singleton`），双开时
+  第二实例静默退出；端口可用 `--port=<n>` 覆盖（缺省 9800，须与
+  `config/app.toml` 的 `[server] port` 一致）。
+
+**已知限制与风险**：
+
+- **杀毒软件误报（已知长期风险）**：托盘 + 拉起子进程 + 写 Run 键 +
+  命名互斥体的组合特征可能被部分杀软启发式误报。全部源码在仓库内可审计，
+  被隔离时恢复并加白名单即可；
+- "停止 daemon"/退出为强制终止（daemon 无 HTTP 停机端点）；建议停机前
+  先在 WebUI 停掉运行中的推理任务；
+- 采纳的外部 daemon（非托盘拉起）无子进程句柄，"停止"对其无效。
