@@ -130,6 +130,10 @@ pub fn active_task_module_ids() -> std::collections::HashSet<String> {
 /// 定时调度触发入口：按管线 id 从磁盘加载 spec → 提交执行。
 /// inputs/params 来自 schedule 条目模板；管线缺失或校验失败即报错
 /// （调度错误进日志与 last_task_id 缺省，不影响巡检循环存活）。
+///
+/// 字符串错误面（cron 巡检循环消费）；typed 变体见
+/// [`submit_pipeline_for_schedule_typed`]（T-27 webhook 触发链路据此映射
+/// 422/429 等语义）。
 #[allow(dead_code)] // e2e 测试独立编译本文件时无 main 循环消费方
 pub async fn submit_pipeline_for_schedule(
     state: &Arc<AppState>,
@@ -137,6 +141,20 @@ pub async fn submit_pipeline_for_schedule(
     inputs: std::collections::HashMap<String, serde_json::Value>,
     params: serde_json::Value,
 ) -> Result<String, String> {
+    submit_pipeline_for_schedule_typed(state, pipeline_id, inputs, params)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// [`submit_pipeline_for_schedule`] 的 typed 错误版（T-27）：webhook 触发
+/// 链路消费——管线缺失/无效 → 400、缺 store → 422、队列满 → 429。
+#[allow(dead_code)] // e2e 测试独立编译本文件时无 main 循环消费方
+pub async fn submit_pipeline_for_schedule_typed(
+    state: &Arc<AppState>,
+    pipeline_id: &str,
+    inputs: std::collections::HashMap<String, serde_json::Value>,
+    params: serde_json::Value,
+) -> Result<String, SubmitError> {
     let dir = state.root.join("config").join("pipelines");
     let spec = crate::api::pipelines::pipeline_bridge::load_spec(&dir.join(format!(
         "{}.toml",
@@ -155,9 +173,9 @@ pub async fn submit_pipeline_for_schedule(
             Err(anyhow::anyhow!("pipeline '{pipeline_id}' not found"))
         })
     })
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| SubmitError::InvalidPipeline(e.to_string()))?;
     let mut pipeline = crate::api::pipelines::pipeline_bridge::spec_to_pipeline(&spec)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| SubmitError::InvalidPipeline(e.to_string()))?;
     if !params.is_null() {
         if let Some(obj) = params.as_object() {
             for (node_id, patch) in obj {
@@ -176,7 +194,6 @@ pub async fn submit_pipeline_for_schedule(
     submit_pipeline_full(state, pipeline, Some(inputs), SubmitOptions::default())
         .await
         .map(|o| o.task_id)
-        .map_err(|e| e.to_string())
 }
 
 /// 调度巡检消费：注册表全量快照
@@ -710,6 +727,9 @@ pub enum SubmitError {
     ModuleStartFailed(String),
     /// 内部错误（工作目录创建失败等）→ 500（英文技术细节）
     Internal(String),
+    /// T-26：文件入口的 `store:` 逻辑名引用解析失败 → 422（缺池/禁用，§6.4
+    /// 缺依赖同款语义）/ 400（穿越注入）。提交在改写阶段拒绝，不建目录不入队。
+    StoreRef(ep_core::config::StoreRefError),
 }
 
 impl std::fmt::Display for SubmitError {
@@ -741,6 +761,7 @@ impl std::fmt::Display for SubmitError {
                 write!(f, "failed to auto-start module: {detail}")
             }
             Self::Internal(msg) => f.write_str(msg),
+            Self::StoreRef(e) => write!(f, "store reference invalid: {e}"),
         }
     }
 }
@@ -885,6 +906,16 @@ async fn submit_pipeline_full_inner(
 ) -> Result<SubmitOutcome, SubmitError> {
     if let Some(inputs) = inputs.as_ref() {
         apply_inputs(&mut pipeline, inputs)?;
+    }
+
+    // T-26：文件入口（file_input.path / file_output.path / file_archive.dest_dir）
+    // 的 `store:` 逻辑名引用统一在此解析为物理路径——cron（submit_pipeline_for_schedule）、
+    // watcher 管线模式、API 执行三条提交链共用本函数。缺池/禁用 → 422 语义拒绝
+    //（StoreRef 变体，handler 映射）；物理路径原样保留（向后兼容）。
+    {
+        let config = state.config.read().await.clone();
+        crate::api::stores::rewrite_pipeline_store_refs(&config, &state.root, &mut pipeline)
+            .map_err(SubmitError::StoreRef)?;
     }
 
     // P2-11：提交前调用 dag validate（环 + 重复节点 + 孤儿边 + 缺 file_input）。

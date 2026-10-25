@@ -286,6 +286,39 @@ async fn execute_pipeline(
             )
             .await
         }
+        // T-26：文件入口 `store:` 逻辑名引用解析失败——缺池/禁用 → 422
+        //（§6.4 缺依赖同款"补配置"提示语义）；穿越/注入 → 400
+        Err(execution::SubmitError::StoreRef(
+            ep_core::config::StoreRefError::UnknownStore(name),
+        )) => {
+            err_response(
+                &state,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "apiCore.store.notFound",
+                &[("name", name)],
+            )
+            .await
+        }
+        Err(execution::SubmitError::StoreRef(
+            ep_core::config::StoreRefError::StoreDisabled(name),
+        )) => {
+            err_response(
+                &state,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "apiCore.store.disabled",
+                &[("name", name)],
+            )
+            .await
+        }
+        Err(execution::SubmitError::StoreRef(ep_core::config::StoreRefError::UnsafeRel(raw))) => {
+            err_response(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "apiCore.store.unsafePath",
+                &[("detail", raw)],
+            )
+            .await
+        }
     }
 }
 
@@ -732,17 +765,25 @@ async fn execute_single(
     // ── 5. 输入落位：Path 校验既有存在性；Text 物化为 uploads 下 .txt（D2）──
     let input_path = match &input_choice {
         SingleInput::Path(p) => {
+            // T-26：`store:<name>/<相对路径>` 逻辑名引用先解析为物理路径
+            //（缺池/禁用 → 422、注入 → 400）；普通物理路径原样透传（向后兼容）
+            let resolved = match super::stores::resolve_entry_path(&state, &p.to_string_lossy())
+                .await
+            {
+                Ok(path) => path,
+                Err(resp) => return resp,
+            };
             // 输入文件必须已存在于服务器本地（含 workspace/uploads 暂存）
-            if !p.is_file() {
+            if !resolved.is_file() {
                 return err_response(
                     &state,
                     StatusCode::BAD_REQUEST,
                     "apiPipelines.single.inputNotFound",
-                    &[("path", p.display().to_string())],
+                    &[("path", resolved.display().to_string())],
                 )
                 .await;
             }
-            p.clone()
+            resolved
         }
         SingleInput::Text(text) => {
             match materialize_input_text(&state, &module_id, &capability, text).await {

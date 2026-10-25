@@ -24,5 +24,21 @@
   "watcher.saveFailed": "Failed to save watch rules: {{detail}}",
   "watcher.pathOverlap": "Watch directory and destination directory must not be the same or nested inside each other",
   "accessProtection.unauthorized": "Missing or invalid access token: provide Authorization: Bearer <token> or X-API-Key: <token> (WebSocket and native previews may use ?token=)",
-  "storage.scanFailed": "Failed to scan storage directories: {{detail}}"
+  "storage.scanFailed": "Failed to scan storage directories: {{detail}}",
+  "store.notFound": "Storage store not configured: {{name}}",
+  "store.disabled": "Storage store is disabled: {{name}}",
+  "store.unsafePath": "Unsafe path (traversal and absolute injection are rejected): {{detail}}",
+  "store.valueRequired": "Missing path value to resolve",
+  "store.notStoreRef": "Value is not a store reference (must start with store:)",
+  "store.dirNotFound": "Directory not found: {{detail}}",
+  "store.notADirectory": "Path is not a directory: {{detail}}",
+  "store.browseFailed": "Failed to browse directory: {{detail}}",
+  "hook.nameRequired": "Webhook name is required",
+  "hook.targetRequired": "A trigger target is required: pipeline or direct run",
+  "hook.targetConflict": "Pipeline target and direct target are mutually exclusive: configure exactly one",
+  "hook.targetInvalid": "Invalid trigger target: {{detail}}",
+  "hook.notFound": "Webhook not found: {{id}}",
+  "hook.saveFailed": "Failed to save webhooks: {{detail}}",
+  "hook.disabled": "Webhook is disabled: {{id}}",
+  "hook.inputPathRequired": "Direct target requires a non-empty input_path"
 }

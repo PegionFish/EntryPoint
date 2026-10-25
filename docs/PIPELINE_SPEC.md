@@ -207,9 +207,13 @@ params = { path = "C:/Videos/input.mp4" }
 
 | 参数 | 类型 | 必须 | 说明 |
 |---|---|---|---|
-| `path` | string | ✅ | 服务器本地输入文件路径；`POST /api/pipelines/{pipeline_id}/runs` 的 `inputs` 可按节点覆盖（见 AUTOMATION.md） |
+| `path` | string | ✅ | 服务器本地输入文件路径；也接受存储池逻辑名引用 `store:<名称>/<相对路径>`（服务端解析为物理路径，缺池/禁用 → 422）；`POST /api/pipelines/{pipeline_id}/runs` 的 `inputs` 可按节点覆盖（见 AUTOMATION.md） |
 
 输出端口：`output`（文件路径）
+
+> **`store:` 逻辑名（T-26）**：`file_input.path` / `file_output.path` /
+> `file_archive.dest_dir` 三个文件入口参数均接受 `store:` 引用，物理路径始终
+> 向后兼容。池配置见 `docs/CONFIG_REFERENCE.md` §1.17 `[storage.stores]`。
 
 ### 5.2 `file_output` — 文件输出
 
@@ -792,6 +796,15 @@ to = ["save", "input"]
 ```
 
 ---
+
+## 9.x 导出与迁移契约（T-26 store: 逻辑名）
+
+管线导出（`GET /api/pipelines/{id}/export` 分享 JSON、编辑器 TOML 导出）时，
+三个文件入口参数中**落在已启用存储池内的物理路径**自动改写为 `store:<名称>/<相对路径>`
+逻辑名引用；池外路径与已是 `store:` 的值原样保留。导入时 `store:` 值**原样透传**，
+由导入方的 daemon 按其本机 `[storage.stores]` 解析——换机迁移时只需在新机把同名
+逻辑名重绑到新物理路径，无需改管线文件；目标机器缺该逻辑名时，相关提交以 422
+「缺存储池」提示补配置（§6.4 缺依赖同款引导语义）。
 
 ## 10. 管线验证规则
 

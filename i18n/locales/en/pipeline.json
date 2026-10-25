@@ -298,5 +298,15 @@
   "builtinTemplate.watermark.description": "Overlay an image watermark (position/opacity/margin)",
   "builtinTemplate.watermark.params.position": "Position (position)",
   "builtinTemplate.watermark.params.opacity": "Opacity (opacity)",
-  "builtinTemplate.watermark.params.margin": "Margin px (margin)"
+  "builtinTemplate.watermark.params.margin": "Margin px (margin)",
+  "storeBrowser.title": "Browse storage store",
+  "storeBrowser.store": "Store",
+  "storeBrowser.storePlaceholder": "Select a store",
+  "storeBrowser.noStores": "No enabled stores (configure [storage.stores] in the daemon config)",
+  "storeBrowser.empty": "Directory is empty",
+  "storeBrowser.hint": "Will be saved as: {{value}}",
+  "storeBrowser.serverHint": "Only server-side directories are listed; after migrating machines, rebind the physical path under the same logical name in [storage.stores].",
+  "storeBrowser.pick": "Pick this directory",
+  "storeBrowser.browse": "Browse...",
+  "storeBrowser.loadFailed": "Failed to browse directory"
 }

@@ -308,10 +308,14 @@ async fn validate_rule_body(state: &Arc<AppState>, body: &Value) -> Result<RuleD
     }
 
     // 2. watch_dir 非空 + 绝对路径（目录暂不存在仅告警不拒绝）
+    //    T-26：`store:<name>/<相对路径>` 逻辑名引用先解析为物理绝对路径
+    //    （缺池/禁用 → 422、穿越注入 → 400）。注册表按冻结契约 §5.1 存
+    //    绝对路径——`store:` 形式仅在 API 入口接受，落盘前归一。
     let watch_dir = get_str(body, "watch_dir").unwrap_or_default();
     if watch_dir.trim().is_empty() {
         return Err(err_response(state, StatusCode::BAD_REQUEST, "apiCore.watcher.watchDirRequired", &[]).await);
     }
+    let watch_dir = super::stores::resolve_entry_value(state, watch_dir.trim()).await?;
     if !Path::new(&watch_dir).is_absolute() {
         return Err(err_response(state, StatusCode::BAD_REQUEST, "apiCore.watcher.watchDirNotAbsolute", &[]).await);
     }
@@ -370,10 +374,17 @@ async fn validate_rule_body(state: &Arc<AppState>, body: &Value) -> Result<RuleD
     }
 
     // 6. direct 模式：output 必填且 dest_dir 绝对
-    let output: Option<OutputConfig> = get_opt(body, "output");
+    //    T-26：dest_dir 同样接受 `store:` 逻辑名引用（先解析为物理绝对路径，
+    //    缺池/禁用 → 422），第 8 步重叠校验消费解析后的物理值。
+    let mut output: Option<OutputConfig> = get_opt(body, "output");
     if direct.is_some() {
-        match &output {
-            Some(o) if Path::new(&o.dest_dir).is_absolute() => {}
+        match output.as_mut() {
+            Some(o) => {
+                o.dest_dir = super::stores::resolve_entry_value(state, o.dest_dir.trim()).await?;
+                if !Path::new(&o.dest_dir).is_absolute() {
+                    return Err(err_response(state, StatusCode::BAD_REQUEST, "apiCore.watcher.outputRequired", &[]).await);
+                }
+            }
             _ => {
                 return Err(err_response(state, StatusCode::BAD_REQUEST, "apiCore.watcher.outputRequired", &[]).await);
             }
@@ -459,6 +470,73 @@ mod tests {
             vec![],
             ep_core::port::PortManager::new(49000, 49500),
         ))
+    }
+
+    /// T-26：带存储池的 state（media 启用 / ghost 缺失对照）
+    fn state_with_store(root: std::path::PathBuf) -> Arc<AppState> {
+        let mut config = ep_core::config::AppConfig::default();
+        config.storage = ep_core::config::StorageConfig {
+            stores: vec![ep_core::config::StoreConfig {
+                name: "media".into(),
+                store_type: ep_core::config::StoreType::Local,
+                path: root.join("media-root").to_string_lossy().into_owned(),
+                enabled: true,
+            }],
+        };
+        std::fs::create_dir_all(root.join("media-root").join("incoming")).unwrap();
+        Arc::new(AppState::new(
+            root,
+            config,
+            vec![],
+            vec![],
+            ep_core::port::PortManager::new(49000, 49500),
+        ))
+    }
+
+    /// T-26：watch_dir / dest_dir 接受 `store:` 逻辑名——解析为物理绝对路径
+    /// 落注册表（冻结契约 §5.1「绝对路径」不变）；缺池 → 422。
+    #[tokio::test]
+    async fn create_accepts_store_refs_and_rejects_unknown_store() {
+        let root = test_root("storeref");
+        let state = state_with_store(root.clone());
+
+        // store: 引用创建成功 → 注册表存解析后的物理路径
+        let mut body = valid_direct_body("storeref");
+        body["watch_dir"] = json!("store:media/incoming");
+        body["output"]["dest_dir"] = json!("store:media/out");
+        let app = super::router().with_state(state.clone());
+        let resp = app.oneshot(req("POST", "/watchers", Some(body))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "store: 引用应被解析接受");
+        let id = collect(resp).await["id"].as_str().unwrap().to_string();
+
+        let registry = crate::watcher::WatchRegistry::load(&crate::watcher::default_registry_path(&root));
+        let rule = registry.rules.get(&id).expect("rule saved");
+        let media_root = root.join("media-root");
+        assert_eq!(
+            rule.watch_dir,
+            media_root.join("incoming").to_string_lossy().into_owned(),
+            "注册表必须存物理绝对路径（§5.1 冻结契约）"
+        );
+        assert_eq!(
+            rule.output.as_ref().unwrap().dest_dir,
+            media_root.join("out").to_string_lossy().into_owned()
+        );
+
+        // 缺池 → 422（§6.4 缺依赖同款语义）
+        let mut body = valid_direct_body("ghost");
+        body["watch_dir"] = json!("store:ghost/x");
+        let app = super::router().with_state(state.clone());
+        let resp = app.oneshot(req("POST", "/watchers", Some(body))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "缺 store 必须 422");
+
+        // 穿越注入 → 400
+        let mut body = valid_direct_body("traverse");
+        body["watch_dir"] = json!("store:media/../etc");
+        let app = super::router().with_state(state);
+        let resp = app.oneshot(req("POST", "/watchers", Some(body))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "穿越注入拒绝");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn req(method: &str, uri: &str, body: Option<Value>) -> Request<Body> {

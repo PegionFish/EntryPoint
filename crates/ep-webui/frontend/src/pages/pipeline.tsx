@@ -122,6 +122,7 @@ import { confirmDialog } from '@/components/shared/confirm-dialog'
 import { PipelineSidebar } from '@/components/shared/pipeline-sidebar'
 import type { TemplateDragPayload } from '@/components/shared/pipeline-sidebar'
 import { PipelineToolbar } from '@/components/shared/pipeline-toolbar'
+import { StoreBrowserDialog } from '@/components/shared/store-browser'
 // T-21 多池预算视图（poolBalanceRows/PoolPreflightCard 与 quick-run pre-flight 共用）
 import { PoolPreflightCard } from '@/components/quick-run/preflight-card'
 import {
@@ -1641,6 +1642,52 @@ function collectMissingRequired(nodes: PipelineFlowNode[]): MissingRequiredParam
 // 执行对话框字段
 // ============================================================
 
+/**
+ * T-26 文件入口参数位（builtin → param 名）：
+ * 「浏览」按钮（服务端目录浏览 API）与 TOML 导出 store: 逻辑名改写共用。
+ * 与后端 `api::stores::FILE_ENTRY_PARAMS` 同表（单一语义两处投影）。
+ */
+const FILE_ENTRY_PARAMS: Record<string, string> = {
+  file_input: 'path',
+  file_output: 'path',
+  file_archive: 'dest_dir',
+}
+
+/**
+ * T-26 导出改写：spec 内文件入口参数的池内物理路径批量改写为 `store:` 逻辑名
+ * 引用（服务端 POST /api/stores/locate 一次往返；换机迁移时接收方只需在其
+ * `[storage.stores]` 重绑物理路径）。池外路径与已是 `store:` 的值保持原样；
+ * locate 调用失败不阻断导出（降级为原值导出，与旧版本行为一致）。
+ */
+async function rewriteSpecFileEntriesToStoreRefs(spec: PipelineSpec): Promise<void> {
+  const targets: { node: PipelineSpec['nodes'][number]; param: string }[] = []
+  for (const node of spec.nodes) {
+    if (node.kind !== 'builtin') continue
+    const param = FILE_ENTRY_PARAMS[node.builtin ?? '']
+    if (!param) continue
+    const value = node.params[param]
+    if (
+      typeof value === 'string' &&
+      value.trim() &&
+      !value.trim().startsWith('store:')
+    ) {
+      targets.push({ node, param })
+    }
+  }
+  if (targets.length === 0) return
+  try {
+    const resp = await api.locateStorePaths(
+      targets.map((target) => String(target.node.params[target.param]).trim()),
+    )
+    resp.values.forEach((value, idx) => {
+      const target = targets[idx]
+      if (target && value) target.node.params[target.param] = value
+    })
+  } catch {
+    // locate 不可用（网络错误等）：按原值导出（物理路径始终向后兼容）
+  }
+}
+
 interface ExecField {
   /** `${nodeId}:${paramName}` */
   key: string
@@ -1740,6 +1787,8 @@ function NodeParamsPanel({
   const status = NODE_STATUS_META[node.data.status]
   const moduleData = node.data.kind === 'module' ? node.data : null
   const binding = getModuleBinding(node.data)
+  // T-26：目录浏览对话框（null = 关闭；非 null = 待回填的文件入口参数名）
+  const [browseParam, setBrowseParam] = useState<string | null>(null)
 
   // 变体 pin 即时提示：与激活变体不一致（执行前将阻断并给出切换引导，§5.2）
   const pinnedVariant = binding.model?.trim() ? parseModelPin(binding.model)?.variant : null
@@ -1835,14 +1884,43 @@ function NodeParamsPanel({
             {specs.length === 0 ? (
               <p className="text-xs text-muted-foreground">{t('nodePanel.noParams')}</p>
             ) : (
-              specs.map((spec) => (
-                <ParamSpecField
-                  key={spec.name}
-                  spec={spec}
-                  value={node.data.params[spec.name] ?? spec.defaultValue}
-                  onChange={(v) => onParamsChange({ [spec.name]: v })}
-                />
-              ))
+              specs.map((spec) => {
+                // T-26：文件入口参数（file_input.path / file_output.path /
+                // file_archive.dest_dir）附「浏览」——服务端目录浏览选择对话框，
+                // 产出 store: 逻辑名引用（物理路径手填仍向后兼容）
+                const entryParam =
+                  node.data.kind === 'builtin'
+                    ? FILE_ENTRY_PARAMS[node.data.builtin]
+                    : undefined
+                if (spec.name === entryParam) {
+                  return (
+                    <div key={spec.name} className="space-y-1.5">
+                      <ParamSpecField
+                        spec={spec}
+                        value={node.data.params[spec.name] ?? spec.defaultValue}
+                        onChange={(v) => onParamsChange({ [spec.name]: v })}
+                      />
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="w-full"
+                        onClick={() => setBrowseParam(spec.name)}
+                      >
+                        <FolderOpen className="h-3.5 w-3.5" />
+                        {t('storeBrowser.browse')}
+                      </Button>
+                    </div>
+                  )
+                }
+                return (
+                  <ParamSpecField
+                    key={spec.name}
+                    spec={spec}
+                    value={node.data.params[spec.name] ?? spec.defaultValue}
+                    onChange={(v) => onParamsChange({ [spec.name]: v })}
+                  />
+                )
+              })
             )}
           </section>
 
@@ -1859,6 +1937,18 @@ function NodeParamsPanel({
           </section>
         </div>
       </ScrollArea>
+
+      {/* T-26：存储池目录浏览（产出 store: 逻辑名引用回填当前参数） */}
+      <StoreBrowserDialog
+        open={browseParam !== null}
+        onOpenChange={(open) => {
+          if (!open) setBrowseParam(null)
+        }}
+        onPicked={(storeRef) => {
+          if (browseParam) onParamsChange({ [browseParam]: storeRef })
+          setBrowseParam(null)
+        }}
+      />
     </aside>
   )
 }
@@ -2317,6 +2407,8 @@ function ExecuteDialog({ open, onOpenChange, fields, submitting, onSubmit }: Exe
   const [attempted, setAttempted] = useState(false)
   const [wait, setWait] = useState(false)
   const [callbackUrl, setCallbackUrl] = useState('')
+  // T-26：目录浏览（null = 关闭；非 null = 待回填的 field key，仅 isInputPath 字段）
+  const [browseKey, setBrowseKey] = useState<string | null>(null)
 
   useEffect(() => {
     if (open) {
@@ -2393,6 +2485,18 @@ function ExecuteDialog({ open, onOpenChange, fields, submitting, onSubmit }: Exe
                         value={values[f.key]}
                         onChange={(v) => setValues((prev) => ({ ...prev, [f.key]: v }))}
                       />
+                      {/* T-26：文件输入附「浏览」（store: 逻辑名或物理路径均可执行） */}
+                      {f.isInputPath && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="mt-1.5 w-full"
+                          onClick={() => setBrowseKey(f.key)}
+                        >
+                          <FolderOpen className="h-3.5 w-3.5" />
+                          {t('storeBrowser.browse')}
+                        </Button>
+                      )}
                       {empty && (
                         <p className="mt-1 text-[11px] text-status-error">
                           {t('execute.requiredHint')}
@@ -2453,6 +2557,18 @@ function ExecuteDialog({ open, onOpenChange, fields, submitting, onSubmit }: Exe
             {t('execute.submit')}
           </Button>
         </DialogFooter>
+
+        {/* T-26：存储池目录浏览（产出 store: 逻辑名引用回填当前输入字段） */}
+        <StoreBrowserDialog
+          open={browseKey !== null}
+          onOpenChange={(next) => {
+            if (!next) setBrowseKey(null)
+          }}
+          onPicked={(storeRef) => {
+            if (browseKey) setValues((prev) => ({ ...prev, [browseKey]: storeRef }))
+            setBrowseKey(null)
+          }}
+        />
       </DialogContent>
     </Dialog>
   )
@@ -4048,8 +4164,8 @@ function PipelineEditor() {
 
   // ---- 管线 TOML 导出 / 导入（§6.4） ----
 
-  /** 导出当前画布为管线 TOML（含头部注释依赖清单）并触发下载 */
-  const handleExportToml = useCallback(() => {
+  /** 导出当前画布为管线 TOML（含头部注释依赖清单 + T-26 store: 逻辑名改写）并触发下载 */
+  const handleExportToml = useCallback(async () => {
     if (nodes.length === 0) {
       toast.info(t('io.exportEmpty', { defaultValue: '画布为空，无法导出' }))
       return
@@ -4060,6 +4176,9 @@ function PipelineEditor() {
         name,
         description,
       })
+      // T-26：文件入口参数的池内物理路径改写为 store: 逻辑名（服务端 locate；
+      // 导入时原样透传由服务端解析——换机重绑物理路径的关键）
+      await rewriteSpecFileEntriesToStoreRefs(spec)
       const toml = specToToml(spec, collectDependencyLines(nodes))
       const blob = new Blob([toml], { type: 'text/plain;charset=utf-8' })
       const url = URL.createObjectURL(blob)

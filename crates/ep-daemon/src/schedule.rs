@@ -157,6 +157,112 @@ pub fn default_registry_path(root: &Path) -> PathBuf {
     root.join("runtime").join("schedules.json")
 }
 
+// ─── Webhook 注册表（T-27：统一自动化中心）──────────────────────────────────
+//
+// 与 cron 注册表同款持久化惯例（`runtime/webhooks.json`，tmp+rename 原子落盘，
+// load 失败按空表启动并告警）。hook_id 由服务端生成（8 位小写十六进制），
+// 作为 URL 路径段供外部系统 POST 触发（`POST /api/hooks/{hook_id}`）。
+
+/// Webhook 触发目标（pipeline / direct 二选一，tagged serde）。
+///
+/// - `pipeline`：复用 cron 的提交入口（`submit_pipeline_for_schedule`），
+///   inputs/params 模板同 /schedule 契约；
+/// - `direct`：复用 `/api/execute/single` 语义（模块自动拉起、参数校验、
+///   直跑缓存全套），`input_path` 接受 `store:` 逻辑名引用（T-26）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WebhookTarget {
+    /// 管线目标：按 pipeline_id 提交（管线缺失在创建期校验，运行期报错）
+    Pipeline {
+        pipeline_id: String,
+        /// 输入模板（节点 id → 参数对象）；`store:` 引用由提交链解析（T-26）
+        #[serde(default)]
+        inputs: serde_json::Value,
+        /// 追加参数模板（透传 execute 的 params 面）
+        #[serde(default)]
+        params: serde_json::Value,
+    },
+    /// 直跑目标：module + capability（+ 可选 input_path / params）
+    Direct {
+        module_id: String,
+        capability: String,
+        /// 直跑输入文件路径（`store:` 逻辑名引用或服务器物理路径）
+        #[serde(default)]
+        input_path: String,
+        /// 直跑参数模板（透传 execute_single 的 params 面）
+        #[serde(default)]
+        params: serde_json::Value,
+    },
+}
+
+/// 单条 Webhook 注册
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WebhookEntry {
+    /// 服务端生成的 8 位小写十六进制 id（URL 路径段 = hook_id）
+    pub id: String,
+    /// 显示名（触发器页列表展示）
+    pub name: String,
+    /// 停用后保留配置（UI 可见可改），POST 触发 → 409
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 触发目标（pipeline / direct 恰好一个）
+    pub target: WebhookTarget,
+}
+
+/// 全量注册表：hook_id → 条目
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WebhookRegistry {
+    #[serde(flatten)]
+    pub entries: HashMap<String, WebhookEntry>,
+}
+
+impl WebhookRegistry {
+    pub fn load(path: &Path) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
+                tracing::warn!(file = %path.display(), error = %e, "webhooks.json 解析失败，按空表启动");
+                Self::default()
+            }),
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// tmp + rename 原子落盘（复刻 ScheduleRegistry::save 惯例）
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(self).unwrap_or_default())?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// 生成 8 位小写十六进制 id（与 watcher 同款混合算法，碰撞重试）
+    pub fn generate_hook_id(&mut self) -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        loop {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() ^ (d.as_secs() as u32))
+                .unwrap_or(0);
+            let mixed = nanos
+                .wrapping_mul(0x9E37_79B9)
+                ^ SEQ.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x85EB_CA6B);
+            let id = format!("{mixed:08x}");
+            if !self.entries.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+}
+
+/// Webhook 注册表文件默认路径：`<root>/runtime/webhooks.json`
+pub fn default_webhook_registry_path(root: &Path) -> PathBuf {
+    root.join("runtime").join("webhooks.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +343,68 @@ mod tests {
         let (due, next) = collect_due(&r, now, &Default::default());
         assert!(due.is_empty());
         assert_eq!(next.entries["bad"].last_checked, now);
+    }
+
+    // ── T-27：Webhook 注册表（持久化惯例 + id 生成）────────────────────────
+
+    #[test]
+    fn webhook_registry_roundtrip_and_id_generation() {
+        let path = std::env::temp_dir().join(format!("ep-webhook-reg-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        // 空载加载
+        let reg = WebhookRegistry::load(&path);
+        assert!(reg.entries.is_empty());
+
+        // 写入两种目标形态 → 原子落盘 → 重载逐字段一致
+        let mut reg = WebhookRegistry::default();
+        let id = reg.generate_hook_id();
+        assert_eq!(id.len(), 8, "8 位小写十六进制");
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        reg.entries.insert(
+            id.clone(),
+            WebhookEntry {
+                id: id.clone(),
+                name: "下载完成钩子".into(),
+                enabled: true,
+                target: WebhookTarget::Pipeline {
+                    pipeline_id: "video-to-srt".into(),
+                    inputs: serde_json::json!({"input": {"path": "store:media/in.avi"}}),
+                    params: serde_json::Value::Null,
+                },
+            },
+        );
+        let id2 = reg.generate_hook_id();
+        reg.entries.insert(
+            id2.clone(),
+            WebhookEntry {
+                id: id2.clone(),
+                name: "直跑钩子".into(),
+                enabled: false,
+                target: WebhookTarget::Direct {
+                    module_id: "faster-whisper".into(),
+                    capability: "transcribe".into(),
+                    input_path: "store:media/a.wav".into(),
+                    params: serde_json::json!({"language": "zh"}),
+                },
+            },
+        );
+        reg.save(&path).expect("save");
+
+        let reloaded = WebhookRegistry::load(&path);
+        assert_eq!(reloaded, reg, "JSON 往返逐字段一致");
+        assert_eq!(reloaded.entries[&id].target,
+            WebhookTarget::Pipeline {
+                pipeline_id: "video-to-srt".into(),
+                inputs: serde_json::json!({"input": {"path": "store:media/in.avi"}}),
+                params: serde_json::Value::Null,
+            });
+
+        // 损坏文件 → 空表启动（与 schedules.json 同款容错）
+        std::fs::write(&path, "{broken").unwrap();
+        let reg = WebhookRegistry::load(&path);
+        assert!(reg.entries.is_empty());
+
+        let _ = std::fs::remove_file(&path);
     }
 }

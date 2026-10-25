@@ -118,6 +118,8 @@ pub fn router() -> Router<Arc<AppState>> {
             "/pipelines/{pipeline_id}/schedule",
             put(put_schedule).get(get_schedule).delete(delete_schedule),
         )
+        // T-27：全部定时计划一览（触发器页「定时」tab 的数据源）
+        .route("/schedules", get(list_schedules))
         // 运行资源（docs/API_DESIGN.md §运行资源）：POST 建 run、GET 列 run。
         // 集合级创建 POST /pipelines/runs（body 带 pipeline_id 或内联 spec）
         // 与旧别名 POST /pipelines/execute 由 execute.rs router 注册（handler
@@ -182,6 +184,33 @@ async fn get_pipeline(
 
 fn schedules_path(state: &AppState) -> PathBuf {
     crate::schedule::default_registry_path(&state.root)
+}
+
+/// GET /api/schedules — 全部定时计划一览（T-27 统一自动化中心）。
+///
+/// `[{pipeline_id, cron, enabled, last_task_id?}]`，按 pipeline_id 排序；
+/// 触发器页「定时」tab 的数据源（cron 双入口：pipeline.tsx ScheduleDialog
+/// 保持不动，触发器页复用同一 PUT/DELETE /schedule API 创建与管理）。
+async fn list_schedules(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
+    let registry = crate::schedule::ScheduleRegistry::load(&schedules_path(&state));
+    let mut ids: Vec<&String> = registry.entries.keys().collect();
+    ids.sort();
+    let list: Vec<Value> = ids
+        .iter()
+        .filter_map(|id| {
+            let e = registry.entries.get(*id)?;
+            let mut v = json!({
+                "pipeline_id": id,
+                "cron": e.cron,
+                "enabled": e.enabled,
+            });
+            if let Some(task_id) = &e.last_task_id {
+                v["last_task_id"] = json!(task_id);
+            }
+            Some(v)
+        })
+        .collect();
+    (StatusCode::OK, Json(json!({ "schedules": list })))
 }
 
 /// PUT /api/pipelines/:id/schedule — 注册/更新定时计划。
@@ -298,12 +327,20 @@ async fn export_pipeline(
     AxumPath(id): AxumPath<String>,
 ) -> axum::response::Response {
     let dir = pipelines_dir(&state);
-    let Some((_, spec)) = find_spec_file(&dir, &id) else {
+    let Some((_, mut spec)) = find_spec_file(&dir, &id) else {
         let (code, body) =
             err_response(&state, StatusCode::NOT_FOUND, "apiPipelines.pipelines.notFound", &[])
                 .await;
         return (code, body).into_response();
     };
+    // T-26 换机迁移契约：导出时文件入口（file_input.path / file_output.path /
+    // file_archive.dest_dir）的池内物理路径改写为 `store:` 逻辑名——接收方导入
+    // 后由服务端按其本机 `[storage.stores]` 解析，重绑物理路径即可迁移；
+    // 池外路径与已是 `store:` 的值原样保留。
+    {
+        let config = state.config.read().await.clone();
+        super::stores::rewrite_spec_nodes_to_store_refs(&config, &state.root, &mut spec.nodes);
+    }
     let body = json!({
         "format": "entrypoint-pipeline/v1",
         "exported_at": chrono::Utc::now().to_rfc3339(),

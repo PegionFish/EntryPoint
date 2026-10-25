@@ -666,6 +666,88 @@ impl LlmConfig {
     }
 }
 
+// ─── StorageConfig（T-26：存储池逻辑名 S0）─────────────────────────────────
+
+/// 存储类型（`[[storage.stores]].type`，T-26 计划 7）。
+///
+/// MVP（S0）**全部按 local 语义处理**：smb / nfs 仅作标记，不做挂载管理——
+/// 要求物理路径已在 OS 层挂载可达（Windows UNC / Linux fstab 由部署方负责）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StoreType {
+    /// 本地路径（缺省）
+    #[default]
+    Local,
+    /// SMB 共享（已挂载；S0 按 local 语义处理）
+    Smb,
+    /// NFS 导出（已挂载；S0 按 local 语义处理）
+    Nfs,
+}
+
+/// 单个存储池（`[[storage.stores]]`，T-26）。
+///
+/// 所有字段 serde 全缺省：旧配置文件无本段时行为零变化；只写 `name` +
+/// `path` 亦可解析（type=local、enabled=true）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreConfig {
+    /// 唯一逻辑名（`store:<name>/<相对路径>` 引用形式中的 `<name>`）
+    pub name: String,
+    /// 存储类型；S0 全按 local 语义处理（不做挂载管理）
+    #[serde(rename = "type", default)]
+    pub store_type: StoreType,
+    /// 物理路径（已挂载即可达；相对路径基于 root 解析，与 cache_dir 同口径）
+    #[serde(default)]
+    pub path: String,
+    /// 启用开关；缺省 true。禁用的池在解析 `store:` 引用时按缺依赖拒绝
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl StoreConfig {
+    /// 物理路径的 `resolve(root)` 只读视图（相对基于 root，绝对原样返回）。
+    pub fn resolve_path(&self, root: &Path) -> PathBuf {
+        AppConfig::absolutize(root, &self.path)
+    }
+}
+
+/// 存储池配置（`[storage]`，T-26）。
+///
+/// 旧配置无本段时经 `#[serde(default)]` 照常解析（`stores` 为空），行为零变化。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageConfig {
+    /// 命名存储池列表（TOML `[[storage.stores]]` 数组；merge_partial 整体替换）
+    #[serde(default)]
+    pub stores: Vec<StoreConfig>,
+}
+
+/// `store:` 逻辑名引用解析错误（T-26）。
+///
+/// 状态码映射约定（api/stores.rs 与提交链共用）：`UnknownStore` /
+/// `StoreDisabled` → 422（§6.4 缺依赖同款"补配置"提示语义）；`UnsafeRel` → 400。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreRefError {
+    /// 逻辑名未配置（含拼写错误）——换机迁移后需在 `[storage.stores]` 重绑
+    UnknownStore(String),
+    /// 逻辑名已配置但 `enabled = false`
+    StoreDisabled(String),
+    /// 相对部分非法：`..` 穿越、绝对路径注入（POSIX `/`、Windows 盘符 / UNC /
+    /// 反斜杠前缀）
+    UnsafeRel(String),
+}
+
+impl std::fmt::Display for StoreRefError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownStore(name) => write!(f, "store '{name}' is not configured"),
+            Self::StoreDisabled(name) => write!(f, "store '{name}' is disabled"),
+            Self::UnsafeRel(rel) => write!(f, "unsafe path segment in '{rel}'"),
+        }
+    }
+}
+
+/// `store:` 引用前缀（`store:<name>/<相对路径>`）。
+pub const STORE_REF_PREFIX: &str = "store:";
+
 // ─── AppConfig ──────────────────────────────────────────────────────────────
 
 /// 整合包配置（§8.3）
@@ -750,6 +832,9 @@ pub struct AppConfig {
     /// 命名 LLM 提供商档案（`[llm]` + `[[llm.providers]]`，T-24）
     #[serde(default)]
     pub llm: LlmConfig,
+    /// 存储池逻辑名（`[storage]` + `[[storage.stores]]`，T-26）
+    #[serde(default)]
+    pub storage: StorageConfig,
     /// 每模块激活模型变体（单槽位语义 §5.2）：module_id → model_id；A6 消费
     #[serde(default)]
     pub active_models: std::collections::HashMap<String, String>,
@@ -906,6 +991,124 @@ impl AppConfig {
 
     pub fn port_range(&self) -> (u16, u16) {
         (self.ports.range_start, self.ports.range_end)
+    }
+
+    // ── 存储池逻辑名解析（T-26 S0）───────────────────────────────────────
+
+    /// 按**逻辑名**查找**已启用**的存储池（禁用池视同不存在）。
+    pub fn store(&self, name: &str) -> Option<&StoreConfig> {
+        self.storage
+            .stores
+            .iter()
+            .find(|s| s.name == name && s.enabled)
+    }
+
+    /// 解析 `store:<name>/<相对路径>` 引用为物理路径（T-26）。
+    ///
+    /// - 非 `store:` 前缀 → `Ok(None)`：调用方保持原值（物理路径向后兼容）；
+    /// - 逻辑名缺失 → `Err(UnknownStore)`；池已禁用 → `Err(StoreDisabled)`；
+    /// - 相对部分含 `..` 分段、绝对路径注入（POSIX `/`、Windows 盘符 / UNC /
+    ///   反斜杠前缀）→ `Err(UnsafeRel)`（与 upload.rs `sanitize_relative_path`
+    ///   先例同款拒绝集）；`.` 分段与冗余分隔符归一化丢弃；
+    /// - `store:<name>`（无相对部分）解析为池根目录本身。
+    ///
+    /// 纯词法解析（不触盘不 stat）；存在性校验由调用方负责。
+    pub fn resolve_store_ref(&self, root: &Path, raw: &str) -> Result<Option<PathBuf>, StoreRefError> {
+        let raw = raw.trim();
+        let Some(rel) = raw.strip_prefix(STORE_REF_PREFIX) else {
+            return Ok(None);
+        };
+        let (name, sub) = match rel.split_once(['/', '\\']) {
+            Some((name, sub)) => (name, Some(sub)),
+            None => (rel, None),
+        };
+        if name.is_empty() || name == "." || name == ".." || name.contains(':') {
+            // `store:/etc`（空名）、`store:../x`、`store:C:\x`（盘符注入）
+            return Err(StoreRefError::UnsafeRel(raw.to_string()));
+        }
+        let Some(store) = self.storage.stores.iter().find(|s| s.name == name) else {
+            return Err(StoreRefError::UnknownStore(name.to_string()));
+        };
+        if !store.enabled {
+            return Err(StoreRefError::StoreDisabled(name.to_string()));
+        }
+        let mut out = store.resolve_path(root);
+        if let Some(sub) = sub {
+            // 相对部分清洗（upload.rs sanitize_relative_path 同款拒绝集）：
+            // 绝对注入已在 split 后的子串上复查（如 `store:nas//etc/x`、
+            // `store:nas/C:\x` 的子段首段可能是绝对形态）
+            let sub = sub.replace('\\', "/");
+            for seg in sub.split('/') {
+                match seg {
+                    "" | "." => {}
+                    ".." => return Err(StoreRefError::UnsafeRel(raw.to_string())),
+                    s => out.push(s),
+                }
+            }
+        }
+        // 纵深防御：拼接结果必须仍落在池物理路径内（词法前缀）
+        let base = store.resolve_path(root);
+        if !out.starts_with(&base) {
+            return Err(StoreRefError::UnsafeRel(raw.to_string()));
+        }
+        Ok(Some(out))
+    }
+
+    /// 物理路径 → `store:<name>/<相对路径>` 反向改写（T-26 导出契约）。
+    ///
+    /// 路径（词法、不触盘）落在某**已启用**池内时返回 `store:` 形式
+    ///（相对部分统一 `/` 分隔；恰为池根时返回 `store:<name>`）；
+    /// 不在任何池内 → `None`（保持物理路径）。多池前缀重叠时取**配置顺序**
+    /// 首个（最长前缀交由配置者保证，与 TOML 数组顺序一致）。
+    /// Windows 形状路径（盘符 / UNC）大小写不敏感比较，其余平台敏感。
+    pub fn to_store_ref(&self, root: &Path, physical: &Path) -> Option<String> {
+        let absolute = if physical.is_absolute() {
+            physical.to_path_buf()
+        } else {
+            root.join(physical)
+        };
+        let win = cfg!(windows);
+        for store in self.storage.stores.iter().filter(|s| s.enabled) {
+            let base = store.resolve_path(root);
+            let base_parts: Vec<String> = base
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            let path_parts: Vec<String> = absolute
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            // 比较键：Windows 形状（盘符 / 大小写不敏感文件系统）段折叠小写、
+            // 盘符统一大写；其余平台原样（大小写敏感）。相对部分输出保留原大小写。
+            let fold = |parts: &[String], fold_case: bool| -> Vec<String> {
+                parts
+                    .iter()
+                    .map(|p| {
+                        if !fold_case {
+                            p.clone()
+                        } else if p.len() >= 2 && p.as_bytes()[1] == b':' {
+                            let mut c = p.chars();
+                            let drive = c.next().unwrap_or_default().to_ascii_uppercase();
+                            format!("{drive}:{}", c.as_str().to_lowercase())
+                        } else {
+                            p.to_lowercase()
+                        }
+                    })
+                    .collect()
+            };
+            let base_key = fold(&base_parts, win);
+            let path_key = fold(&path_parts, win);
+            if path_key.len() < base_key.len() || path_key[..base_key.len()] != base_key[..] {
+                continue;
+            }
+            let rel = &path_parts[base_parts.len()..];
+            return if rel.is_empty() {
+                Some(format!("{STORE_REF_PREFIX}{}", store.name))
+            } else {
+                Some(format!("{STORE_REF_PREFIX}{}/{}", store.name, rel.join("/")))
+            };
+        }
+        None
     }
 
     /// 深度合并部分配置补丁（P1-9：PUT /api/config 合并语义的 config 层支持）。
@@ -2099,5 +2302,293 @@ base_url = "https://api.openai.com"
         );
         // 其它段不受影响
         assert_eq!(config.general.language, "zh-CN");
+    }
+
+    // ── T-26：[storage] + [[storage.stores]] ───────────────────────────
+
+    /// 旧配置无 `[storage]` 段照常解析（serde 默认 stores 为空，行为零变化）；
+    /// 字段省略时按缺省值填充（type=local、enabled=true）。
+    #[test]
+    fn storage_stores_defaults_and_partial_parse() {
+        // 空配置 / 旧配置 → stores 为空
+        let config: AppConfig = toml::from_str("[server]\nport = 9800\n").expect("parse legacy");
+        assert!(config.storage.stores.is_empty());
+        assert_eq!(config.storage, StorageConfig::default());
+
+        // [storage] 段存在但 stores 省略 → 空
+        let config: AppConfig = toml::from_str("[storage]\n").expect("parse empty storage");
+        assert!(config.storage.stores.is_empty());
+
+        // 只写必填字段（name + path），可选字段省略 → local / enabled
+        let config: AppConfig = toml::from_str(
+            r#"
+[[storage.stores]]
+name = "media"
+path = "/mnt/nas/media"
+"#,
+        )
+        .expect("parse partial store");
+        assert_eq!(config.storage.stores.len(), 1);
+        let s = &config.storage.stores[0];
+        assert_eq!(s.name, "media");
+        assert_eq!(s.store_type, StoreType::Local);
+        assert_eq!(s.path, "/mnt/nas/media");
+        assert!(s.enabled);
+
+        // smb/nfs 词形可解析（S0 全按 local 语义处理，仅作标记）
+        let config: AppConfig = toml::from_str(
+            r#"
+[[storage.stores]]
+name = "nas"
+type = "smb"
+path = "//nas/share"
+
+[[storage.stores]]
+name = "nfs"
+type = "nfs"
+path = "/mnt/nfs"
+enabled = false
+"#,
+        )
+        .expect("parse store types");
+        assert_eq!(config.storage.stores[0].store_type, StoreType::Smb);
+        assert_eq!(config.storage.stores[1].store_type, StoreType::Nfs);
+        assert!(!config.storage.stores[1].enabled);
+
+        // 按 name 查找助手：禁用池不可见
+        assert!(config.store("nas").is_some());
+        assert!(config.store("nfs").is_none(), "禁用池按缺依赖语义视同不存在");
+        assert!(config.store("nope").is_none());
+
+        // 非法 type 值拒绝（PUT patch 同样经 serde 重建，不会被静默吞掉）
+        assert!(toml::from_str::<AppConfig>(
+            "[[storage.stores]]\nname = \"x\"\ntype = \"usb\"\n"
+        )
+        .is_err());
+    }
+
+    /// 完整 `[[storage.stores]]` TOML 往返 + merge_partial 数组整体替换
+    #[test]
+    fn storage_stores_toml_roundtrip_and_merge() {
+        let config = AppConfig {
+            storage: StorageConfig {
+                stores: vec![
+                    StoreConfig {
+                        name: "media".into(),
+                        store_type: StoreType::Smb,
+                        path: "//nas/media".into(),
+                        enabled: true,
+                    },
+                    StoreConfig {
+                        name: "local-nvme".into(),
+                        store_type: StoreType::Local,
+                        path: "models-data".into(),
+                        enabled: false,
+                    },
+                ],
+            },
+            ..AppConfig::default()
+        };
+
+        let toml_str = toml::to_string_pretty(&config).expect("serialize");
+        let restored: AppConfig = toml::from_str(&toml_str).expect("deserialize");
+        assert_eq!(restored.storage, config.storage, "TOML 往返逐字段一致");
+        assert!(
+            toml_str.contains("type = \"smb\""),
+            "store_type 序列化为 type 键:\n{toml_str}"
+        );
+
+        // merge_partial：stores 数组整体替换（与 providers/cache_paths 同语义）
+        let mut config = AppConfig::default();
+        config.storage.stores.push(StoreConfig {
+            name: "old".into(),
+            store_type: StoreType::Local,
+            path: "/old".into(),
+            enabled: true,
+        });
+        config
+            .merge_partial(&serde_json::json!({
+                "storage": { "stores": [ { "name": "new", "path": "/new" } ] }
+            }))
+            .expect("merge");
+        assert_eq!(config.storage.stores.len(), 1, "数组整体替换");
+        assert_eq!(config.storage.stores[0].name, "new");
+        assert_eq!(config.storage.stores[0].store_type, StoreType::Local);
+        assert!(config.storage.stores[0].enabled);
+        // 其它段不受影响
+        assert_eq!(config.general.language, "zh-CN");
+    }
+
+    /// 逻辑名解析：round-trip（resolve ↔ to_store_ref 恒等）、缺池/禁用拒绝
+    #[test]
+    fn resolve_store_ref_roundtrip_and_missing() {
+        let (root, media_abs) = if cfg!(windows) {
+            (PathBuf::from("F:/EP"), PathBuf::from("D:/data/media"))
+        } else {
+            (PathBuf::from("/opt/ep"), PathBuf::from("/mnt/nas/media"))
+        };
+        let config = AppConfig {
+            storage: StorageConfig {
+                stores: vec![
+                    StoreConfig {
+                        name: "media".into(),
+                        store_type: StoreType::Smb,
+                        path: if cfg!(windows) { "D:/data/media".into() } else { "/mnt/nas/media".into() },
+                        enabled: true,
+                    },
+                    StoreConfig {
+                        name: "off".into(),
+                        store_type: StoreType::Local,
+                        path: "/tmp/off".into(),
+                        enabled: false,
+                    },
+                ],
+            },
+            ..AppConfig::default()
+        };
+
+        // 非 store: 前缀 → Ok(None)（物理路径向后兼容）
+        assert_eq!(config.resolve_store_ref(&root, "D:/other/a.wav"), Ok(None));
+
+        // 解析：store:media/incoming/a.wav → <media_abs>/incoming/a.wav
+        let resolved = config
+            .resolve_store_ref(&root, "store:media/incoming/a.wav")
+            .expect("resolve")
+            .expect("store ref");
+        assert_eq!(resolved, media_abs.join("incoming").join("a.wav"));
+
+        // round-trip：to_store_ref 反向改写回同一引用串
+        let back = config.to_store_ref(&root, &resolved).expect("rewrite");
+        assert_eq!(back, "store:media/incoming/a.wav");
+
+        // 池根引用（无相对部分）↔ 改写
+        let root_ref = config.resolve_store_ref(&root, "store:media").unwrap().unwrap();
+        assert_eq!(root_ref, media_abs);
+        assert_eq!(
+            config.to_store_ref(&root, &media_abs).as_deref(),
+            Some("store:media")
+        );
+
+        // 冗余分隔符与 . 段归一化（与 upload sanitize 同款宽容）
+        let r = config
+            .resolve_store_ref(&root, "store:media/./in//a.wav")
+            .unwrap()
+            .unwrap();
+        assert_eq!(r, media_abs.join("in").join("a.wav"));
+
+        // 缺池 → UnknownStore（§6.4 缺依赖同款 422 语义）
+        assert_eq!(
+            config.resolve_store_ref(&root, "store:nope/a.wav"),
+            Err(StoreRefError::UnknownStore("nope".into()))
+        );
+        // 禁用池 → StoreDisabled
+        assert_eq!(
+            config.resolve_store_ref(&root, "store:off/a.wav"),
+            Err(StoreRefError::StoreDisabled("off".into()))
+        );
+    }
+
+    /// 逻辑名解析：穿越拒绝（`..` 与绝对路径注入全拒绝）
+    #[test]
+    fn resolve_store_ref_rejects_traversal_and_injection() {
+        let root = if cfg!(windows) { PathBuf::from("F:/EP") } else { PathBuf::from("/opt/ep") };
+        let config = AppConfig {
+            storage: StorageConfig {
+                stores: vec![StoreConfig {
+                    name: "nas".into(),
+                    store_type: StoreType::Local,
+                    path: if cfg!(windows) { "D:/share".into() } else { "/srv/share".into() },
+                    enabled: true,
+                }],
+            },
+            ..AppConfig::default()
+        };
+
+        // `..` 穿越：开头 / 中段 / 混合分隔符
+        for raw in ["store:nas/../secret", "store:nas/a/../b", "store:nas\\..\\x"] {
+            assert_eq!(
+                config.resolve_store_ref(&root, raw),
+                Err(StoreRefError::UnsafeRel(raw.to_string())),
+                "必须拒绝穿越: {raw}"
+            );
+        }
+        // 绝对路径注入：POSIX 根、Windows 盘符、UNC（名字段 / 子路径段）
+        for raw in [
+            "store:/etc/passwd",
+            "store:C:\\Windows\\system32",
+            "store:C:/Windows",
+            "store:nas//etc/x",
+        ] {
+            // nas//etc/x 在 Windows 上经 push 前缀替换触发越界，Unix 上留在池内；
+            // 统一断言：绝不逃出池根（或被拒绝）
+            match config.resolve_store_ref(&root, raw) {
+                Ok(Some(p)) => {
+                    let base = config.store("nas").unwrap().resolve_path(&root);
+                    assert!(
+                        p.starts_with(&base),
+                        "{raw} 不得逃出池根，实际 {p:?}"
+                    );
+                }
+                Ok(None) => panic!("{raw} 是 store: 引用却返回 None"),
+                Err(StoreRefError::UnsafeRel(_)) => {}
+                Err(other) => panic!("{raw} 应为 UnsafeRel 或池内路径，实际 {other:?}"),
+            }
+        }
+        // 逻辑名段注入：`..`、`.`、盘符形态的名字
+        for raw in ["store:../x", "store:./x", "store:C:/x"] {
+            assert!(
+                matches!(
+                    config.resolve_store_ref(&root, raw),
+                    Err(StoreRefError::UnsafeRel(_)) | Err(StoreRefError::UnknownStore(_))
+                ),
+                "逻辑名段注入必须拒绝: {raw}"
+            );
+        }
+    }
+
+    /// 反向改写：池外物理路径 → None；相对路径基于 root 参与；Windows 大小写不敏感
+    #[test]
+    fn to_store_ref_outside_paths_and_case_insensitivity() {
+        let (root, outside) = if cfg!(windows) {
+            (PathBuf::from("F:/EP"), PathBuf::from("E:/elsewhere/a.wav"))
+        } else {
+            (PathBuf::from("/opt/ep"), PathBuf::from("/elsewhere/a.wav"))
+        };
+        let config = AppConfig {
+            storage: StorageConfig {
+                stores: vec![StoreConfig {
+                    name: "nas".into(),
+                    store_type: StoreType::Local,
+                    path: if cfg!(windows) { "D:/share".into() } else { "/srv/share".into() },
+                    enabled: true,
+                }],
+            },
+            ..AppConfig::default()
+        };
+
+        // 池外 → None（保持物理路径，向后兼容）
+        assert_eq!(config.to_store_ref(&root, &outside), None);
+        // 相对路径（root 下）同样不在池内 → None
+        assert_eq!(config.to_store_ref(&root, Path::new("workspace/x")), None);
+
+        // Windows 形状：大小写不敏感命中（盘符与目录段均不敏感）
+        if cfg!(windows) {
+            let config = AppConfig {
+                storage: StorageConfig {
+                    stores: vec![StoreConfig {
+                        name: "nas".into(),
+                        store_type: StoreType::Local,
+                        path: "D:/Share/Media".into(),
+                        enabled: true,
+                    }],
+                },
+                ..AppConfig::default()
+            };
+            assert_eq!(
+                config.to_store_ref(&root, Path::new("D:\\SHARE\\media\\SUB\\Clip.MP4")),
+                Some("store:nas/SUB/Clip.MP4".to_string()),
+                "池段大小写不敏感命中，相对部分保留原大小写"
+            );
+        }
     }
 }

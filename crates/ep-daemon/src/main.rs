@@ -1438,6 +1438,74 @@ mod tests {
         assert_eq!(body, "console.log(1);");
     }
 
+    // T-27：Webhook 端点鉴权覆盖断言（token 模式下无凭据 POST → 401，
+    // 凭据有效 → 进入业务层 404）。置于本文件：依赖 build_app_router 的
+    // 完整中间件栈（require_access + ip_filter）；api/hooks.rs 的路由级
+    // 测试不感知全局中间件（e2e 独立编译单元无 build_app_router）。
+    #[tokio::test]
+    async fn webhook_endpoints_covered_by_global_access_protection() {
+        let state = test_state();
+        {
+            let mut cfg = state.config.write().await;
+            cfg.general.language = "zh-CN".into();
+            cfg.server.access_protection = ep_core::config::AccessProtection::Token;
+            cfg.server.token = "s3cret-hook-token".into();
+        }
+        let static_dir = state.root.join("static");
+        std::fs::create_dir_all(&static_dir).unwrap();
+        std::fs::write(static_dir.join("index.html"), "<html>index</html>").unwrap();
+        let app = crate::build_app_router(state.clone(), &static_dir);
+
+        let post_with_peer = |uri: &str, body: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .extension(axum::extract::ConnectInfo(SocketAddr::from((
+                    [127, 0, 0, 1],
+                    54321,
+                ))))
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        // 无凭据 POST /api/hooks/{id} → 401（在路由匹配之前被中间件拒绝）
+        let resp = app
+            .clone()
+            .oneshot(post_with_peer("/api/hooks/deadbeef", "{}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "无凭据触发必须 401");
+
+        // 管理端点同样被覆盖：无凭据 GET /api/hooks → 401
+        let resp = app.clone().oneshot(request("/api/hooks")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // 带正确凭据 → 通过中间件进入业务层（hook 不存在 → 404 而非 401）
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/hooks/deadbeef")
+            .header("authorization", "Bearer s3cret-hook-token")
+            .header("content-type", "application/json")
+            .extension(axum::extract::ConnectInfo(SocketAddr::from((
+                [127, 0, 0, 1],
+                54321,
+            ))))
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "凭据有效时进入业务层: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+
+        let _ = std::fs::remove_dir_all(&state.root);
+    }
+
     // 12. /api/unknown → 404 + JSON（不落入 HTML fallback）
     #[tokio::test]
     async fn test_api_unknown_route_returns_404_json() {

@@ -31,6 +31,11 @@ EntryPoint daemon（/api，默认 :9800）
 | **同步模式** | 提交请求可选 `wait: true` → 阻塞至终态，响应直接带 status + artifacts |
 | **完成回调** | 可选 `callback_url` → 终态时 `POST {task_id, status, artifacts}`（best-effort，失败仅 warn） |
 
+**内建自动化三型入口（T-27 统一自动化中心）**：WebUI「触发器」页提供
+目录监控（§4）/ 定时 cron（§4.6）/ Webhook（§4.7）三型 tab 与统一事件历史；
+三型的结构化触发记录均写统一事件日志（`watcher_trigger` / `task_terminal` /
+`webhook_trigger`）。
+
 ---
 
 ## 2. 提交执行
@@ -136,6 +141,8 @@ multipart 单文件（字段名 `file`）→ 暂存 `workspace/uploads`，响应
 命中即自动提交任务（直接模式或管线模式），简单需求无需外部脚本、也无需先造管线。
 规则注册表存于 `runtime/watchers.json`（tmp+rename 原子落盘），REST 管理走
 `/api/watchers`（增删改查 + 启停；错误响应走 i18n `apiCore.watcher.*` 键）。
+监控目录与输出目录均接受存储池逻辑名引用 `store:<名称>/<相对路径>`（T-26，
+API 入口解析为物理路径落注册表；物理路径向后兼容）。
 
 ### 4.1 触发语义（轮询 10s + 稳定窗口 + 水位线）
 
@@ -242,16 +249,54 @@ task_id + 时间」到 `runtime/processed_registry.json`（与 `watchers.json`
 
 ---
 
+### 4.6 定时 cron（双入口，T-27）
+
+cron 计划任务的创建/管理契约不变：`PUT/GET/DELETE /api/pipelines/{pipeline_id}/schedule`，
+巡检循环每 30s 计算命中即提交。T-27 起 WebUI 提供两个等价入口——管线编辑器的
+「定时调度」对话框（原有，保持不动）与触发器页「定时」tab（新增，复用同一 API）；
+一览走 `GET /api/schedules`（`[{pipeline_id, cron, enabled, last_task_id?}]`）。
+
+### 4.7 Webhook 触发器（T-27）
+
+在触发器页「Webhook」tab 创建（注册表 `runtime/webhooks.json`，与 cron 同款
+tmp+rename 原子落盘惯例），REST 管理走 `/api/hooks`（增删改查 + 启停；
+错误响应走 i18n `apiCore.hook.*` 键）。
+
+- **触发入口**：`POST /api/hooks/{hook_id}`（hook_id 为服务端生成的 8 位
+  十六进制）。可选 JSON body 逐次覆盖模板：`{"inputs": {...}, "params": {...}}`
+  （pipeline 目标）/ `{"input_path": "...", "params": {...}}`（direct 目标）；
+  成功 → 202 `{ok, task_id}`；未配置 → 404；已停用 → 409；
+- **触发目标**（二选一）：
+  - `pipeline`：`{type, pipeline_id, inputs?, params?}`——复用 cron 提交链
+    （`inputs` 模板语义同 §2.1；`store:` 逻辑名引用由提交链解析）；
+  - `direct`：`{type, module_id, capability, input_path, params?}`——复用
+    `/api/execute/single` 语义（模块自动拉起、参数 schema 校验、直跑缓存全套；
+    lazy_start 快速提交，拉起失败计入任务错误）；
+- **目标存在性**：创建/更新期校验——管线不存在 → 404；模块不存在 → 404；
+  capability 不在 manifest → 400；direct 缺 `input_path` → 400；
+- **鉴权（不可绕过）**：`/api/hooks/*` 位于 `/api` 前缀下，落入全局访问保护域
+  （`[server].access_protection = "token"` 时要求 `Authorization: Bearer` /
+  `X-API-Key`，无凭据 → 401；默认 `none` 直通）。**对外暴露 webhook 时建议
+  同时启用 token 模式或前置反向代理**——hook_id 本身是能力位，不承担鉴权；
+- **触发记录**：每次触发写统一事件日志 `webhook_trigger` 事件
+  （`rule` 字段 = hook_id，`GET /api/events?rule={hook_id}&type=webhook_trigger`
+  精确过滤；`submitted` / `rejected`）；任务终态仍由执行链路统一写 `task_terminal`。
+
+---
+
 ## 5. 边界与安全声明
 
 - **契约分层**：`/api/v1/*`（统一推理门面，见 `docs/INFERENCE_API.md`）为
   **外部稳定契约**，请求/响应形状与错误码变更走版本演进；`/api/*` 其余端点
   为 **WebUI 内部契约**（含 i18n 本地化错误文案），集成方不应依赖其形状；
-- **输入路径**：WebUI 内部端点的 `path` / `input_path` 均为**服务器本地路径**，
-  跨机器先上传或挂载；v1 门面的 `input_path` 则**仅限 workspace/uploads 前缀
+- **输入路径**：WebUI 内部端点的 `path` / `input_path` 均为**服务器本地路径**
+  （或 `store:` 逻辑名引用，T-26——由服务端解析为 `[storage.stores]` 中的
+  物理路径），跨机器先上传或挂载；v1 门面的 `input_path` 则**仅限 workspace/uploads 前缀
   路径**（服务端做 canonicalize 前缀校验），跨机器一律走 multipart 上传；
-- **认证**：已提供可选的 `[api].token` 认证（**仅保护 `/api/v1/*`**，其余
-  端点不受影响）：在 `config/app.toml` 配置 `[api] token = "<长随机串>"` 后，
+- **认证**：全局访问保护（T-06，`[server].access_protection = "token"` +
+  `[server].token`）覆盖 `/api/*` 与 `/ws*` 全部端点（含 Webhook 触发入口
+  `/api/hooks/*` 与存储池浏览 `/api/stores/*`）；另有可选的 `[api].token`
+  认证（**仅保护 `/api/v1/*`**）：在 `config/app.toml` 配置 `[api] token = "<长随机串>"` 后，
   v1 端点要求 `Authorization: Bearer <token>` 或 `X-API-Key: <token>`，缺失/
   不匹配返回 `401 {"error":{"code":"UNAUTHORIZED",...}}`；未配置 token 时行为
   不变（直通）。除 token 外仍只有 IP 过滤（`[server] allow_public = false`

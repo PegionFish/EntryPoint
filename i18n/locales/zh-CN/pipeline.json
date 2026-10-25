@@ -298,5 +298,15 @@
   "builtinTemplate.watermark.description": "在视频上叠加图片水印（位置/透明度/边距）",
   "builtinTemplate.watermark.params.position": "位置 (position)",
   "builtinTemplate.watermark.params.opacity": "不透明度 (opacity)",
-  "builtinTemplate.watermark.params.margin": "边距 px (margin)"
+  "builtinTemplate.watermark.params.margin": "边距 px (margin)",
+  "storeBrowser.title": "浏览存储池目录",
+  "storeBrowser.store": "存储池",
+  "storeBrowser.storePlaceholder": "选择存储池",
+  "storeBrowser.noStores": "暂无已启用的存储池（请在 config 的 [storage.stores] 配置）",
+  "storeBrowser.empty": "目录为空",
+  "storeBrowser.hint": "将写入：{{value}}",
+  "storeBrowser.serverHint": "仅服务端可见的目录可浏览；换机部署时在 [storage.stores] 重绑同名逻辑名的物理路径即可。",
+  "storeBrowser.pick": "选择当前目录",
+  "storeBrowser.browse": "浏览…",
+  "storeBrowser.loadFailed": "浏览目录失败"
 }

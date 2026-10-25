@@ -39,9 +39,17 @@ import type {
   UploadInputResponse,
   VramBudgetRequest,
   VramBudgetResponse,
+  StoreBrowseResponse,
+  StoreListResponse,
+  StoreLocateResponse,
+  StoreResolveResponse,
+  ScheduleListEntry,
   UnifiedEvent,
   WatchRule,
   WatchRuleInput,
+  WebhookEntry,
+  WebhookTargetInput,
+  WebhookTriggerResponse,
 } from './types'
 
 /** apiFetch 默认超时（毫秒）：防挂死请求（如慢响应下的轮询堆积） */
@@ -587,6 +595,73 @@ export const api = {
   // 存储水位（T-11；仪表盘存储卡片）
   /** 三目录已用字节数 + 模型缓存盘剩余空间（GET /api/storage） */
   storage: () => apiFetch<StorageReport>('/storage'),
+
+  // 存储池逻辑名（T-26；计划 7 S0）
+  /** 存储池列表（GET /api/stores；含解析后物理路径） */
+  listStores: () => apiFetch<StoreListResponse>('/stores'),
+  /** 目录浏览（GET /api/stores/{name}/browse?path=；单层，防穿越） */
+  browseStore: (name: string, path = '') =>
+    apiFetch<StoreBrowseResponse>(
+      `/stores/${encodeURIComponent(name)}/browse?path=${encodeURIComponent(path)}`,
+    ),
+  /** store: 引用解析（POST /api/stores/resolve；缺池/禁用 → 422） */
+  resolveStoreRef: (value: string) =>
+    apiFetch<StoreResolveResponse>('/stores/resolve', {
+      method: 'POST',
+      body: JSON.stringify({ value }),
+    }),
+  /** 物理路径 → store: 逻辑名批量反向改写（TOML 导出前调用；池外为 null） */
+  locateStorePaths: (paths: string[]) =>
+    apiFetch<StoreLocateResponse>('/stores/locate', {
+      method: 'POST',
+      body: JSON.stringify({ paths }),
+    }),
+
+  // 定时计划一览（T-27 cron 双入口；管理仍走 /pipelines/{id}/schedule）
+  /** 全部定时计划（GET /api/schedules） */
+  listSchedules: () =>
+    apiFetch<{ schedules: ScheduleListEntry[] }>('/schedules'),
+
+  // Webhook 触发器（T-27；触发入口 POST /hooks/{id} 受全局访问保护覆盖）
+  /** 全部 Webhook（GET /api/hooks） */
+  listHooks: async () => {
+    const resp = await apiFetch<WebhookEntry[] | { hooks?: WebhookEntry[] }>(
+      '/hooks',
+    )
+    return Array.isArray(resp) ? resp : (resp.hooks ?? [])
+  },
+  /** 创建 Webhook（服务端生成 hook_id），返回 {ok, id} */
+  createHook: (body: { name: string; enabled: boolean; target: WebhookTargetInput }) =>
+    apiFetch<{ ok: boolean; id: string }>('/hooks', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  /** 单条 Webhook（未配置 → 404） */
+  getHook: (id: string) =>
+    apiFetch<WebhookEntry>(`/hooks/${encodeURIComponent(id)}`),
+  /** 全量更新（校验同 POST） */
+  updateHook: (
+    id: string,
+    body: { name: string; enabled: boolean; target: WebhookTargetInput },
+  ) =>
+    apiFetch<{ ok: boolean }>(`/hooks/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    }),
+  /** 删除（幂等） */
+  deleteHook: (id: string) =>
+    apiFetch<{ ok: boolean }>(`/hooks/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+  /** 触发（POST /api/hooks/{id}；可选逐次覆盖 inputs/params/input_path） */
+  triggerHook: (
+    id: string,
+    body?: { inputs?: Record<string, unknown>; params?: Record<string, unknown>; input_path?: string },
+  ) =>
+    apiFetch<WebhookTriggerResponse>(`/hooks/${encodeURIComponent(id)}`, {
+      method: 'POST',
+      body: JSON.stringify(body ?? {}),
+    }),
 
   // LLM 提供商档案（T-24；设置页管理区，设置页独占消费）
   /** 脱敏视图列表（api_key 恒空串，是否已配置看 api_key_set） */

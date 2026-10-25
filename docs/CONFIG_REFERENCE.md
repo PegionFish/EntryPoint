@@ -1,6 +1,13 @@
 # 配置参考 (Configuration Reference)
 
-> 版本：1.4 | 适用于 EntryPoint v0.x
+> 版本：1.5 | 适用于 EntryPoint v0.x
+>
+> v1.5 变更（T-26）：新增 `[storage]` + `[[storage.stores]]`——存储池逻辑名
+> （计划 7 S0）。文件入口（file_input.path / file_output.path /
+> file_archive.dest_dir / watcher 的 watch_dir·dest_dir / 直跑 input_path）
+> 可用 `store:<逻辑名>/<相对路径>` 引用，服务端解析为物理路径；配套目录浏览
+> API（`GET /api/stores/{name}/browse`）。旧配置文件无此段时照常解析（行为零变化）。
+> 另：T-27 新增 `runtime/webhooks.json`（Webhook 触发器注册表，见 §4）。
 >
 > v1.4 变更（T-24）：新增 `[llm]` + `[[llm.providers]]`——命名 LLM 提供商档案
 > （OpenAI 兼容 base_url + api_key + 超时/限速/代理/开关），经 WebUI 设置页或
@@ -453,6 +460,58 @@ base_url = "http://127.0.0.1:11434"
 
 ---
 
+### 1.17 `[storage]` — 存储池逻辑名（T-26，计划 7 S0）
+
+给服务器上的物理目录起**逻辑名**，文件入口按 `store:<逻辑名>/<相对路径>` 引用，
+服务端解析为物理路径——换机/重装时只需在新机的 `[storage.stores]` 里把同名
+逻辑名重绑到新物理路径，管线/触发器/定时计划原样可用（迁移关键：**导出**
+管线时池内物理路径自动改写为 `store:` 逻辑名，见 `docs/PIPELINE_SPEC.md` §导出）。
+
+| 字段（`[[storage.stores]]`） | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `name` | string | —（必填） | 唯一逻辑名（`store:` 引用形式中的 `<name>`） |
+| `type` | string | `"local"` | `local` / `smb` / `nfs`。**S0 全部按 local 语义处理**——不做挂载管理，要求物理路径已在 OS 层挂载可达（Windows UNC / Linux fstab 由部署方负责）；smb/nfs 仅作标记 |
+| `path` | string | `""` | 物理路径（相对路径基于应用根目录解析，与 `models.cache_dir` 同口径） |
+| `enabled` | bool | `true` | 启用开关；禁用的池在解析 `store:` 引用时按「缺依赖」拒绝（422） |
+
+```toml
+[storage]
+
+[[storage.stores]]
+name = "media"
+type = "smb"          # 已挂载的 NAS 共享（S0 按 local 语义处理）
+path = "/mnt/nas/media"
+
+[[storage.stores]]
+name = "local-nvme"
+path = "D:/data"      # Windows 本地盘
+enabled = true
+```
+
+**`store:` 引用解析规则**：
+
+- `store:media/incoming/a.wav` → `<media.path>/incoming/a.wav`；
+  `store:media`（无相对部分）→ 池根本身；
+- 相对部分含 `..` 分段、绝对路径注入（POSIX `/`、Windows 盘符 / UNC / 反斜杠
+  前缀）→ 拒绝（400）；`.` 分段与冗余分隔符归一化丢弃；
+- 逻辑名未配置 / 已禁用 → 422（§6.4 缺依赖同款「补配置」提示语义）；
+- **物理路径始终向后兼容**：所有文件入口照常接受物理路径，`store:` 纯增量。
+
+**目录浏览 API**（WebUI 选择器的数据源，返回条目名/类型/大小）：
+
+- `GET /api/stores` — 存储池列表（含解析后物理路径）；
+- `GET /api/stores/{name}/browse?path=<相对路径>` — 单层浏览；`path` 先经
+  `sanitize_relative_path` 清洗（拒绝 `..` / 绝对注入），再校验拼接结果仍在
+  池物理路径内（纵深防御）；目录不存在 → 404；
+- `POST /api/stores/resolve` — `store:` 引用解析（缺池/禁用 → 422）；
+- `POST /api/stores/locate` — 物理路径批量反向改写为 `store:` 逻辑名
+  （池外为 `null`；管线 TOML 导出前的改写数据源）。
+
+> **旧配置兼容**：配置文件无 `[storage]` 段时照常解析（`stores` 为空列表），
+> 行为零变化。
+
+---
+
 ## 2. 完整 app.toml 示例
 
 ```toml
@@ -745,10 +804,12 @@ EntryPoint/                        ← 应用根目录
 │   ├── packs/                     ← 已装整合包注册表（<pack-id>.json）
 │   ├── tasks/                     ← 任务注册表（原子落盘；重启后非终态任务改判 failed）
 │   ├── watchers.json              ← 触发器规则注册表（原子落盘；WebUI 触发器页 CRUD）
+│   ├── schedules.json             ← cron 定时计划注册表（原子落盘；管线编辑器与触发器页共用）
+│   ├── webhooks.json              ← Webhook 触发器注册表（T-27；hook_id → 触发目标，原子落盘）
 │   └── logs/                      ← 模块日志（<module>*.log）+ 统一事件日志
 │       ├── <module>*.log          ←   daemon 捕获的模块子进程输出（WebUI 日志抽屉展示）
 │       └── events-YYYY-MM.jsonl   ←   统一事件日志（watcher_trigger / task_terminal /
-│                                        task_retention_cleanup，单行 JSON 追加、按月滚动；
+│                                        webhook_trigger，单行 JSON 追加、按月滚动；
 │                                        log_retention_days 清理）
 ├── .pack-staging/                 ← 整合包导入/构建暂存（[packs].staging_dir，随用随清）
 ├── workspace/                     ← 管线任务工作目录

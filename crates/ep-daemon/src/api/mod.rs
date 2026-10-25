@@ -7,6 +7,7 @@ pub mod devices;
 pub mod events;
 pub mod execute;
 pub mod health;
+pub mod hooks;
 pub mod inference;
 pub mod llm;
 pub mod models;
@@ -17,6 +18,7 @@ pub mod packs;
 pub mod pipelines;
 pub mod scheduler;
 pub mod storage;
+pub mod stores;
 pub mod tasks;
 pub mod upload;
 pub mod watchers;
@@ -66,6 +68,11 @@ pub fn api_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         ))
         // T-11：存储水位（仪表盘存储卡片 + 下载前空间预检的可观测面）
         .merge(storage::router())
+        // T-26：存储池逻辑名 + 目录浏览（计划 7 S0）
+        .merge(stores::router())
+        // T-27：Webhook 触发器（统一自动化中心；触发入口 POST /hooks/{id}
+        // 位于 /api 前缀下，受 auth.rs 全局访问保护覆盖）
+        .merge(hooks::router())
         // 统一推理 API v1 门面（/v1/*，外部稳定契约；token 中间件仅作用其子路由）
         .merge(inference::router(state))
         // T-24：命名 LLM 提供商档案（/api/llm/providers CRUD + 连接测试）

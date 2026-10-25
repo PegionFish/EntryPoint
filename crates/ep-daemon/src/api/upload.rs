@@ -664,7 +664,9 @@ pub(crate) async fn target_blocked(target: &Path) -> bool {
 /// 拒绝：空路径、绝对路径（POSIX `/` 与 Windows `C:`、`\` 前缀）、
 /// 任何 `..` 分段。`.` 分段与冗余分隔符会被归一化去掉。
 /// 合法时返回清洗后的相对路径。
-fn sanitize_relative_path(raw: &str) -> Option<PathBuf> {
+///
+/// `pub(crate)`：T-26 存储池目录浏览（api/stores.rs）复用同一清洗先例。
+pub(crate) fn sanitize_relative_path(raw: &str) -> Option<PathBuf> {
     if raw.is_empty() {
         return None;
     }
@@ -697,7 +699,9 @@ fn sanitize_relative_path(raw: &str) -> Option<PathBuf> {
 ///
 /// `starts_with` 是词法前缀比较，不会归一化 `..`，因此先显式拒绝
 /// 绝对路径与含 `..` 分段的 rel，再做前缀校验。
-fn resolve_within(base: &Path, rel: &Path) -> Option<PathBuf> {
+///
+/// `pub(crate)`：T-26 存储池目录浏览（api/stores.rs）复用同一越界防御先例。
+pub(crate) fn resolve_within(base: &Path, rel: &Path) -> Option<PathBuf> {
     if rel.is_absolute()
         || rel
             .components()

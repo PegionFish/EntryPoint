@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   BellRing,
+  Clock,
+  Copy,
   History,
   Loader2,
   Pencil,
   Plus,
   RefreshCw,
   Trash2,
+  Webhook,
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import type { TFunction } from 'i18next'
@@ -16,14 +19,18 @@ import type {
   ModuleResponse,
   PipelineNodeSpec,
   PipelineSummary,
+  ScheduleListEntry,
   UnifiedEvent,
   WatcherConflictPolicy,
   WatcherDirectAction,
   WatchRule,
   WatchRuleInput,
+  WebhookEntry,
+  WebhookTargetInput,
 } from '@/api/types'
 import { PageContainer } from '@/components/layout/page-container'
 import { SegmentedTabs } from '@/components/shared/segmented-tabs'
+import { StoreBrowserDialog } from '@/components/shared/store-browser'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -902,10 +909,1015 @@ function HistoryDialog({
   )
 }
 
+// ── 统一事件历史（T-27：GET /api/events 聚合展示；preset 给定时按钩子/规则过滤）──
+
+type EventTypeFilter = '' | 'watcher_trigger' | 'task_terminal' | 'webhook_trigger'
+
+function EventsDialog({
+  preset,
+  presetLabel,
+  onOpenChange,
+}: {
+  /** 给定时不显示类型筛选（按 rule+type 精确过滤） */
+  preset?: { rule?: string; type?: string } | null
+  presetLabel?: string
+  onOpenChange: (open: boolean) => void
+}) {
+  const { t, i18n } = useTranslation('triggers')
+  const [typeFilter, setTypeFilter] = useState<EventTypeFilter>('')
+  const [events, setEvents] = useState<UnifiedEvent[] | null>(null)
+  const [loading, setLoading] = useState(false)
+
+  const query = preset ?? { type: typeFilter || undefined }
+
+  const load = useCallback(() => {
+    setLoading(true)
+    api
+      .events({ ...query, limit: 200 })
+      .then((resp) => setEvents(resp.events ?? []))
+      .catch(() => {
+        setEvents([])
+        toast.error(t('events.loadFailed'))
+      })
+      .finally(() => setLoading(false))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [t, query.rule, query.type])
+
+  useEffect(() => {
+    load()
+  }, [load])
+
+  return (
+    <Dialog
+      open
+      onOpenChange={(v) => {
+        if (!v) onOpenChange(false)
+      }}
+    >
+      <DialogContent className="sm:max-w-3xl">
+        <DialogHeader>
+          <DialogTitle>
+            {t('events.title')}
+            {presetLabel ? (
+              <span className="ml-2 font-mono text-xs text-muted-foreground">
+                {presetLabel}
+              </span>
+            ) : null}
+          </DialogTitle>
+          <DialogDescription className="sr-only">{t('events.title')}</DialogDescription>
+        </DialogHeader>
+        {!preset ? (
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-muted-foreground">{t('events.filter.label')}</span>
+            <Select
+              value={typeFilter || 'all'}
+              onValueChange={(v) => setTypeFilter(v === 'all' ? '' : (v as EventTypeFilter))}
+            >
+              <SelectTrigger className="w-48">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">{t('events.filter.all')}</SelectItem>
+                <SelectItem value="watcher_trigger">{t('events.filter.watcher')}</SelectItem>
+                <SelectItem value="task_terminal">{t('events.filter.task')}</SelectItem>
+                <SelectItem value="webhook_trigger">{t('events.filter.webhook')}</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+        ) : null}
+        <div className="max-h-[55vh] overflow-y-auto">
+          {loading && events === null ? (
+            <div className="flex items-center justify-center py-10 text-muted-foreground">
+              <Loader2 className="h-5 w-5 animate-spin" />
+            </div>
+          ) : events !== null && events.length === 0 ? (
+            <p className="py-10 text-center text-sm text-muted-foreground">
+              {t('events.empty')}
+            </p>
+          ) : events !== null ? (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="w-40">{t('events.col.time')}</TableHead>
+                  <TableHead className="w-32">{t('events.col.type')}</TableHead>
+                  <TableHead>{t('events.col.source')}</TableHead>
+                  <TableHead className="w-24">{t('events.col.status')}</TableHead>
+                  <TableHead className="w-40">{t('events.col.task')}</TableHead>
+                  <TableHead>{t('events.col.detail')}</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {events.map((e, idx) => (
+                  <TableRow key={idx}>
+                    <TableCell className="whitespace-nowrap text-xs">
+                      {formatTs(e.ts, i18n.language)}
+                    </TableCell>
+                    <TableCell className="text-xs">{t(`events.type.${e.type}`, { defaultValue: e.type })}</TableCell>
+                    <TableCell className="max-w-40">
+                      <span
+                        className="block truncate font-mono text-xs text-muted-foreground"
+                        title={e.rule ?? e.pipeline_id}
+                      >
+                        {e.rule ?? e.pipeline_id ?? '—'}
+                      </span>
+                    </TableCell>
+                    <TableCell>
+                      <span className="flex items-center gap-1.5 text-xs">
+                        <span
+                          className={cn('h-1.5 w-1.5 shrink-0 rounded-full', statusDotClass(e.status))}
+                        />
+                        {e.status
+                          ? t(`status.${e.status}`, { defaultValue: e.status })
+                          : '—'}
+                      </span>
+                    </TableCell>
+                    <TableCell className="max-w-40">
+                      <span
+                        className="block truncate font-mono text-[11px] text-muted-foreground"
+                        title={e.task_id}
+                      >
+                        {e.task_id ?? '—'}
+                      </span>
+                    </TableCell>
+                    <TableCell className="max-w-48">
+                      <span
+                        className="block truncate text-xs text-muted-foreground"
+                        title={e.detail ?? e.file ?? e.error}
+                      >
+                        {e.detail ?? e.file ?? e.error ?? '—'}
+                      </span>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          ) : null}
+        </div>
+        <DialogFooter className="gap-2">
+          <Button variant="ghost" size="sm" onClick={load} disabled={loading}>
+            <RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} />
+            {t('events.refresh')}
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => onOpenChange(false)}>
+            {i18n.t('common:action.close')}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// ── 定时计划（T-27 cron 双入口：本面板与 pipeline.tsx ScheduleDialog 共用
+//    同一 PUT/DELETE /pipelines/{id}/schedule API，物理迁移不做）────────────
+
+function CronDialog({
+  open,
+  onOpenChange,
+  editing,
+  onSaved,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  /** 编辑目标（pipeline_id 固定）；null = 新建 */
+  editing: ScheduleListEntry | null
+  onSaved: () => void
+}) {
+  const { t } = useTranslation('triggers')
+  const [pipelineId, setPipelineId] = useState('')
+  const [cron, setCron] = useState('0 3 * * *')
+  const [enabled, setEnabled] = useState(true)
+  const [pipelines, setPipelines] = useState<PipelineSummary[] | null>(null)
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    if (!open) return
+    setPipelineId(editing?.pipeline_id ?? '')
+    setCron(editing?.cron ?? '0 3 * * *')
+    setEnabled(editing?.enabled ?? true)
+    setPipelines(null)
+    api
+      .listPipelines()
+      .then(setPipelines)
+      .catch(() => setPipelines([]))
+  }, [open, editing])
+
+  const handleSave = useCallback(async () => {
+    if (!pipelineId.trim()) {
+      toast.error(t('sched.validation.pipelineRequired'))
+      return
+    }
+    if (!cron.trim()) {
+      toast.error(t('sched.validation.cronRequired'))
+      return
+    }
+    setSaving(true)
+    try {
+      await api.putSchedule(pipelineId, { cron: cron.trim(), enabled })
+      toast.success(t('sched.saved'))
+      onOpenChange(false)
+      onSaved()
+    } catch (err) {
+      toast.error(t('sched.saveFailed'), { description: displayBackendError(err, t) })
+    } finally {
+      setSaving(false)
+    }
+  }, [pipelineId, cron, enabled, t, onOpenChange, onSaved])
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>{editing ? t('sched.edit') : t('sched.create')}</DialogTitle>
+          <DialogDescription className="sr-only">{t('sched.create')}</DialogDescription>
+        </DialogHeader>
+        <div className="space-y-4 py-1">
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium">{t('sched.pipeline')}</label>
+            <Select
+              value={pipelineId || undefined}
+              onValueChange={setPipelineId}
+              disabled={editing !== null}
+            >
+              <SelectTrigger className="w-full">
+                <SelectValue placeholder={t('sched.pipelinePlaceholder')} />
+              </SelectTrigger>
+              <SelectContent>
+                {(pipelines ?? []).map((p) => (
+                  <SelectItem key={p.id} value={p.id}>
+                    {p.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {pipelines !== null && pipelines.length === 0 ? (
+              <p className="text-[11px] text-muted-foreground">{t('sched.pipelineNone')}</p>
+            ) : (
+              <p className="text-[11px] text-muted-foreground">{t('sched.pipelineHint')}</p>
+            )}
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium">{t('sched.cron')}</label>
+            <Input
+              value={cron}
+              onChange={(e) => setCron(e.target.value)}
+              placeholder="0 3 * * *"
+              className="font-mono text-xs"
+            />
+            <p className="text-[11px] text-muted-foreground">{t('sched.cronHint')}</p>
+          </div>
+          <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2.5">
+            <p className="text-sm">{t('sched.enabled')}</p>
+            <Switch checked={enabled} onCheckedChange={setEnabled} aria-label={t('sched.enabled')} />
+          </div>
+        </div>
+        <DialogFooter className="gap-2">
+          <Button variant="ghost" size="sm" onClick={() => onOpenChange(false)} disabled={saving}>
+            {t('common:action.cancel')}
+          </Button>
+          <Button size="sm" onClick={() => void handleSave()} disabled={saving}>
+            {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+            {t('dialog.save')}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function SchedulesPanel({ refreshSignal = 0 }: { refreshSignal?: number }) {
+  const { t } = useTranslation('triggers')
+  const [list, setList] = useState<ScheduleListEntry[] | null>(null)
+  const [reloadKey, setReloadKey] = useState(0)
+  const [editorOpen, setEditorOpen] = useState(false)
+  const [editing, setEditing] = useState<ScheduleListEntry | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<ScheduleListEntry | null>(null)
+  const [deleting, setDeleting] = useState(false)
+
+  const reload = useCallback(() => setReloadKey((k) => k + 1), [])
+
+  useEffect(() => {
+    let cancelled = false
+    setList(null)
+    api
+      .listSchedules()
+      .then((resp) => !cancelled && setList(resp.schedules ?? []))
+      .catch(() => !cancelled && setList([]))
+    return () => {
+      cancelled = true
+    }
+  }, [reloadKey, refreshSignal])
+
+  const handleToggle = async (entry: ScheduleListEntry, enabled: boolean) => {
+    try {
+      await api.putSchedule(entry.pipeline_id, { cron: entry.cron, enabled })
+      reload()
+    } catch (err) {
+      toast.error(t('sched.saveFailed'), { description: displayBackendError(err, t) })
+    }
+  }
+
+  const handleDelete = async () => {
+    if (!deleteTarget) return
+    setDeleting(true)
+    try {
+      await api.deleteSchedule(deleteTarget.pipeline_id)
+      toast.success(t('sched.deleted'))
+      setDeleteTarget(null)
+      reload()
+    } catch (err) {
+      toast.error(t('sched.deleteFailed'), { description: displayBackendError(err, t) })
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  if (list === null) {
+    return (
+      <div className="space-y-2">
+        {Array.from({ length: 3 }).map((_, i) => (
+          <Skeleton key={i} className="h-14 w-full" />
+        ))}
+      </div>
+    )
+  }
+  if (list.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-border py-16 text-center">
+        <Clock className="h-10 w-10 text-muted-foreground/50" />
+        <div>
+          <p className="font-medium">{t('sched.empty')}</p>
+          <p className="mt-1 text-sm text-muted-foreground">{t('sched.emptyDescription')}</p>
+        </div>
+        <Button
+          size="sm"
+          onClick={() => {
+            setEditing(null)
+            setEditorOpen(true)
+          }}
+        >
+          <Plus className="h-4 w-4" />
+          {t('sched.create')}
+        </Button>
+      </div>
+    )
+  }
+  return (
+    <>
+      <div className="mb-3 flex justify-end">
+        <Button
+          size="sm"
+          onClick={() => {
+            setEditing(null)
+            setEditorOpen(true)
+          }}
+        >
+          <Plus className="h-4 w-4" />
+          {t('sched.create')}
+        </Button>
+      </div>
+      <div className="overflow-x-auto rounded-lg border border-border">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>{t('sched.col.pipeline')}</TableHead>
+              <TableHead>{t('sched.col.cron')}</TableHead>
+              <TableHead className="w-20">{t('table.enabled')}</TableHead>
+              <TableHead>{t('sched.col.lastTask')}</TableHead>
+              <TableHead className="w-24 text-right">{t('table.actions')}</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {list.map((entry) => (
+              <TableRow key={entry.pipeline_id}>
+                <TableCell className="font-medium">{entry.pipeline_id}</TableCell>
+                <TableCell>
+                  <span className="font-mono text-xs text-muted-foreground">{entry.cron}</span>
+                </TableCell>
+                <TableCell>
+                  <Switch
+                    checked={entry.enabled}
+                    onCheckedChange={(v) => void handleToggle(entry, v)}
+                    aria-label={`${t('table.enabled')}: ${entry.pipeline_id}`}
+                  />
+                </TableCell>
+                <TableCell className="max-w-44">
+                  <span
+                    className="block truncate font-mono text-[11px] text-muted-foreground"
+                    title={entry.last_task_id}
+                  >
+                    {entry.last_task_id ?? '—'}
+                  </span>
+                </TableCell>
+                <TableCell className="text-right">
+                  <div className="flex items-center justify-end gap-1">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => {
+                        setEditing(entry)
+                        setEditorOpen(true)
+                      }}
+                      aria-label={t('action.edit')}
+                      title={t('action.edit')}
+                    >
+                      <Pencil className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => setDeleteTarget(entry)}
+                      aria-label={t('action.delete')}
+                      title={t('action.delete')}
+                      className="text-destructive hover:text-destructive"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  </div>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+
+      <CronDialog
+        open={editorOpen}
+        onOpenChange={setEditorOpen}
+        editing={editing}
+        onSaved={reload}
+      />
+
+      <Dialog
+        open={deleteTarget !== null}
+        onOpenChange={(v) => {
+          if (!v) setDeleteTarget(null)
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>{t('sched.deleteTitle')}</DialogTitle>
+            <DialogDescription>
+              {t('sched.deleteMessage', { id: deleteTarget?.pipeline_id ?? '' })}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2">
+            <Button variant="ghost" size="sm" onClick={() => setDeleteTarget(null)} disabled={deleting}>
+              {t('common:action.cancel')}
+            </Button>
+            <Button size="sm" variant="destructive" onClick={() => void handleDelete()} disabled={deleting}>
+              {deleting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+              {t('action.delete')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  )
+}
+
+// ── Webhook 触发器（T-27：hook_id 触发入口；鉴权由 /api 全局访问保护覆盖）──
+
+/** 列表/对话框共用的目标摘要（含模块能力 / 管线 id 附加信息） */
+function hookTargetSummary(target: WebhookTargetInput, t: TFunction): string {
+  if (target.type === 'pipeline') {
+    return `${t('mode.pipeline')} · ${target.pipeline_id}`
+  }
+  return `${t('hook.direct')} · ${target.module_id}/${target.capability}`
+}
+
+interface HookForm {
+  name: string
+  enabled: boolean
+  mode: 'pipeline' | 'direct'
+  pipelineId: string
+  moduleId: string
+  capability: string
+  input_path: string
+}
+
+const DEFAULT_HOOK_FORM: HookForm = {
+  name: '',
+  enabled: true,
+  mode: 'pipeline',
+  pipelineId: '',
+  moduleId: '',
+  capability: '',
+  input_path: '',
+}
+
+function HookDialog({
+  open,
+  onOpenChange,
+  hook,
+  onSaved,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  /** 编辑目标；null = 新建 */
+  hook: WebhookEntry | null
+  onSaved: () => void
+}) {
+  const { t } = useTranslation('triggers')
+  const [form, setForm] = useState<HookForm>(DEFAULT_HOOK_FORM)
+  const [saving, setSaving] = useState(false)
+  const [pipelines, setPipelines] = useState<PipelineSummary[] | null>(null)
+  const [modules, setModules] = useState<ModuleResponse[] | null>(null)
+  const [browserOpen, setBrowserOpen] = useState(false)
+
+  const set = <K extends keyof HookForm>(key: K, value: HookForm[K]) =>
+    setForm((prev) => ({ ...prev, [key]: value }))
+
+  useEffect(() => {
+    if (!open) return
+    if (hook) {
+      setForm({
+        name: hook.name,
+        enabled: hook.enabled,
+        mode: hook.target.type,
+        pipelineId: hook.target.type === 'pipeline' ? hook.target.pipeline_id : '',
+        moduleId: hook.target.type === 'direct' ? hook.target.module_id : '',
+        capability: hook.target.type === 'direct' ? hook.target.capability : '',
+        input_path: hook.target.type === 'direct' ? hook.target.input_path : '',
+      })
+    } else {
+      setForm(DEFAULT_HOOK_FORM)
+    }
+    setPipelines(null)
+    setModules(null)
+    api
+      .listPipelines()
+      .then(setPipelines)
+      .catch(() => setPipelines([]))
+    api
+      .modules()
+      .then((list) => setModules(list.filter((m) => (m.capabilities ?? []).length > 0)))
+      .catch(() => setModules([]))
+  }, [open, hook])
+
+  const selectedModule = useMemo(
+    () => modules?.find((m) => m.id === form.moduleId) ?? null,
+    [modules, form.moduleId],
+  )
+
+  const formToInput = (): { name: string; enabled: boolean; target: WebhookTargetInput } => {
+    const target: WebhookTargetInput =
+      form.mode === 'pipeline'
+        ? { type: 'pipeline', pipeline_id: form.pipelineId, inputs: {}, params: {} }
+        : {
+            type: 'direct',
+            module_id: form.moduleId,
+            capability: form.capability,
+            input_path: form.input_path.trim(),
+            params: {},
+          }
+    return { name: form.name.trim(), enabled: form.enabled, target }
+  }
+
+  const handleSave = useCallback(async () => {
+    if (!form.name.trim()) {
+      toast.error(t('hook.validation.nameRequired'))
+      return
+    }
+    if (form.mode === 'pipeline' && !form.pipelineId) {
+      toast.error(t('hook.validation.pipelineRequired'))
+      return
+    }
+    if (form.mode === 'direct') {
+      if (!form.moduleId || !form.capability) {
+        toast.error(t('hook.validation.capabilityRequired'))
+        return
+      }
+      if (!form.input_path.trim()) {
+        toast.error(t('hook.validation.inputPathRequired'))
+        return
+      }
+    }
+    setSaving(true)
+    try {
+      const body = formToInput()
+      if (hook) {
+        await api.updateHook(hook.id, body)
+      } else {
+        await api.createHook(body)
+      }
+      toast.success(t('hook.saved'))
+      onOpenChange(false)
+      onSaved()
+    } catch (err) {
+      toast.error(t('hook.saveFailed'), { description: displayBackendError(err, t) })
+    } finally {
+      setSaving(false)
+    }
+    // formToInput 读取同一 form 闭包
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form, hook, t, onOpenChange, onSaved])
+
+  const modeItems = [
+    { value: 'pipeline' as const, label: t('hook.mode.pipeline') },
+    { value: 'direct' as const, label: t('hook.mode.direct') },
+  ]
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-xl">
+        <DialogHeader>
+          <DialogTitle>
+            {hook ? t('hook.editTitle') : t('hook.createTitle')}
+            {hook ? (
+              <span className="ml-2 font-mono text-xs text-muted-foreground">{hook.id}</span>
+            ) : null}
+          </DialogTitle>
+          <DialogDescription className="sr-only">{t('hook.createTitle')}</DialogDescription>
+        </DialogHeader>
+        <div className="max-h-[70vh] space-y-4 overflow-y-auto py-2 pr-1">
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium">{t('hook.name')}</label>
+              <Input
+                value={form.name}
+                onChange={(e) => set('name', e.target.value)}
+                placeholder={t('hook.namePlaceholder')}
+              />
+            </div>
+            <div className="flex items-end justify-between rounded-lg border border-border px-3 py-2.5">
+              <p className="text-sm">{t('hook.enabled')}</p>
+              <Switch checked={form.enabled} onCheckedChange={(v) => set('enabled', v)} aria-label={t('hook.enabled')} />
+            </div>
+          </div>
+
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium">{t('hook.targetMode')}</label>
+            <SegmentedTabs
+              items={modeItems}
+              value={form.mode}
+              onChange={(v) => set('mode', v)}
+              ariaLabel={t('hook.targetMode')}
+              className="w-fit"
+            />
+            <p className="text-[11px] text-muted-foreground">
+              {form.mode === 'pipeline' ? t('hook.mode.pipelineDesc') : t('hook.mode.directDesc')}
+            </p>
+          </div>
+
+          {form.mode === 'pipeline' ? (
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium">{t('sched.pipeline')}</label>
+              <Select value={form.pipelineId || undefined} onValueChange={(v) => set('pipelineId', v)}>
+                <SelectTrigger className="w-full">
+                  <SelectValue placeholder={t('sched.pipelinePlaceholder')} />
+                </SelectTrigger>
+                <SelectContent>
+                  {(pipelines ?? []).map((p) => (
+                    <SelectItem key={p.id} value={p.id}>
+                      {p.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-[11px] text-muted-foreground">{t('hook.pipelineHint')}</p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="space-y-1.5">
+                  <label className="text-sm font-medium">{t('dialog.module')}</label>
+                  <Select
+                    value={form.moduleId || undefined}
+                    onValueChange={(v) => {
+                      set('moduleId', v)
+                      set('capability', '')
+                    }}
+                  >
+                    <SelectTrigger className="w-full">
+                      <SelectValue placeholder={t('dialog.modulePlaceholder')} />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {(modules ?? []).map((m) => (
+                        <SelectItem key={m.id} value={m.id}>
+                          {m.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-1.5">
+                  <label className="text-sm font-medium">{t('dialog.capability')}</label>
+                  <Select
+                    value={form.capability || undefined}
+                    onValueChange={(v) => set('capability', v)}
+                    disabled={!form.moduleId}
+                  >
+                    <SelectTrigger className="w-full">
+                      <SelectValue placeholder={t('dialog.capabilityPlaceholder')} />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {(selectedModule?.capabilities ?? []).map((cap) => (
+                        <SelectItem key={cap.name} value={cap.name}>
+                          {cap.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium">{t('hook.inputPath')}</label>
+                <Input
+                  value={form.input_path}
+                  onChange={(e) => set('input_path', e.target.value)}
+                  placeholder={t('hook.inputPathPlaceholder')}
+                  className="font-mono text-xs"
+                />
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-[11px] text-muted-foreground">{t('hook.inputPathHint')}</p>
+                  <Button variant="outline" size="sm" onClick={() => setBrowserOpen(true)}>
+                    {t('storeBrowser.browse', { ns: 'pipeline' })}
+                  </Button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+        <DialogFooter className="gap-2">
+          <Button variant="ghost" size="sm" onClick={() => onOpenChange(false)} disabled={saving}>
+            {t('common:action.cancel')}
+          </Button>
+          <Button size="sm" onClick={() => void handleSave()} disabled={saving}>
+            {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+            {t('dialog.save')}
+          </Button>
+        </DialogFooter>
+
+        <StoreBrowserDialog
+          open={browserOpen}
+          onOpenChange={setBrowserOpen}
+          onPicked={(storeRef) => set('input_path', storeRef)}
+        />
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function WebhooksPanel({ refreshSignal = 0 }: { refreshSignal?: number }) {
+  const { t } = useTranslation('triggers')
+  const [list, setList] = useState<WebhookEntry[] | null>(null)
+  const [reloadKey, setReloadKey] = useState(0)
+  const [editorOpen, setEditorOpen] = useState(false)
+  const [editing, setEditing] = useState<WebhookEntry | null>(null)
+  const [historyHook, setHistoryHook] = useState<WebhookEntry | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<WebhookEntry | null>(null)
+  const [deleting, setDeleting] = useState(false)
+  const [triggering, setTriggering] = useState<string | null>(null)
+
+  const reload = useCallback(() => setReloadKey((k) => k + 1), [])
+
+  useEffect(() => {
+    let cancelled = false
+    setList(null)
+    api
+      .listHooks()
+      .then((resp) => !cancelled && setList(resp))
+      .catch(() => !cancelled && setList([]))
+    return () => {
+      cancelled = true
+    }
+  }, [reloadKey, refreshSignal])
+
+  const handleToggle = async (hook: WebhookEntry, enabled: boolean) => {
+    try {
+      await api.updateHook(hook.id, { name: hook.name, enabled, target: hook.target })
+      reload()
+    } catch (err) {
+      toast.error(t('hook.saveFailed'), { description: displayBackendError(err, t) })
+    }
+  }
+
+  const handleDelete = async () => {
+    if (!deleteTarget) return
+    setDeleting(true)
+    try {
+      await api.deleteHook(deleteTarget.id)
+      toast.success(t('hook.deleted'))
+      setDeleteTarget(null)
+      reload()
+    } catch (err) {
+      toast.error(t('hook.deleteFailed'), { description: displayBackendError(err, t) })
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  const handleTrigger = async (hook: WebhookEntry) => {
+    setTriggering(hook.id)
+    try {
+      const resp = await api.triggerHook(hook.id)
+      toast.success(t('hook.triggered'), { description: resp.task_id })
+      reload()
+    } catch (err) {
+      toast.error(t('hook.triggerFailed'), { description: displayBackendError(err, t) })
+    } finally {
+      setTriggering(null)
+    }
+  }
+
+  if (list === null) {
+    return (
+      <div className="space-y-2">
+        {Array.from({ length: 3 }).map((_, i) => (
+          <Skeleton key={i} className="h-14 w-full" />
+        ))}
+      </div>
+    )
+  }
+  if (list.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-border py-16 text-center">
+        <Webhook className="h-10 w-10 text-muted-foreground/50" />
+        <div>
+          <p className="font-medium">{t('hook.empty')}</p>
+          <p className="mt-1 text-sm text-muted-foreground">{t('hook.emptyDescription')}</p>
+        </div>
+        <Button
+          size="sm"
+          onClick={() => {
+            setEditing(null)
+            setEditorOpen(true)
+          }}
+        >
+          <Plus className="h-4 w-4" />
+          {t('hook.createTitle')}
+        </Button>
+      </div>
+    )
+  }
+  return (
+    <>
+      <div className="mb-3 flex justify-end">
+        <Button
+          size="sm"
+          onClick={() => {
+            setEditing(null)
+            setEditorOpen(true)
+          }}
+        >
+          <Plus className="h-4 w-4" />
+          {t('hook.createTitle')}
+        </Button>
+      </div>
+      <div className="overflow-x-auto rounded-lg border border-border">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>{t('table.name')}</TableHead>
+              <TableHead>{t('hook.col.hookId')}</TableHead>
+              <TableHead>{t('table.action')}</TableHead>
+              <TableHead className="w-20">{t('table.enabled')}</TableHead>
+              <TableHead className="w-52 text-right">{t('table.actions')}</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {list.map((hook) => (
+              <TableRow key={hook.id}>
+                <TableCell>
+                  <span className="font-medium">{hook.name}</span>
+                </TableCell>
+                <TableCell>
+                  <button
+                    type="button"
+                    onClick={() => void copyHookUrl(hook.id, t)}
+                    className="flex items-center gap-1 font-mono text-xs text-muted-foreground underline-offset-2 hover:underline"
+                    title={t('hook.copyHint')}
+                  >
+                    <Copy className="h-3 w-3" />
+                    {hook.id}
+                  </button>
+                </TableCell>
+                <TableCell>
+                  <Badge variant="outline" className="max-w-64 font-normal">
+                    <span className="truncate">{hookTargetSummary(hook.target, t)}</span>
+                  </Badge>
+                </TableCell>
+                <TableCell>
+                  <Switch
+                    checked={hook.enabled}
+                    onCheckedChange={(v) => void handleToggle(hook, v)}
+                    aria-label={`${t('table.enabled')}: ${hook.name}`}
+                  />
+                </TableCell>
+                <TableCell className="text-right">
+                  <div className="flex items-center justify-end gap-1">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => void handleTrigger(hook)}
+                      disabled={!hook.enabled || triggering === hook.id}
+                      title={t('hook.trigger')}
+                    >
+                      {triggering === hook.id ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : null}
+                      {t('hook.trigger')}
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => setHistoryHook(hook)}
+                      aria-label={t('action.history')}
+                      title={t('action.history')}
+                    >
+                      <History className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => {
+                        setEditing(hook)
+                        setEditorOpen(true)
+                      }}
+                      aria-label={t('action.edit')}
+                      title={t('action.edit')}
+                    >
+                      <Pencil className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => setDeleteTarget(hook)}
+                      aria-label={t('action.delete')}
+                      title={t('action.delete')}
+                      className="text-destructive hover:text-destructive"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  </div>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+
+      <HookDialog
+        open={editorOpen}
+        onOpenChange={setEditorOpen}
+        hook={editing}
+        onSaved={reload}
+      />
+      {historyHook ? (
+        <EventsDialog
+          preset={{ rule: historyHook.id, type: 'webhook_trigger' }}
+          presetLabel={historyHook.name}
+          onOpenChange={() => setHistoryHook(null)}
+        />
+      ) : null}
+
+      <Dialog
+        open={deleteTarget !== null}
+        onOpenChange={(v) => {
+          if (!v) setDeleteTarget(null)
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>{t('hook.deleteTitle')}</DialogTitle>
+            <DialogDescription>
+              {t('hook.deleteMessage', { name: deleteTarget?.name ?? '' })}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2">
+            <Button variant="ghost" size="sm" onClick={() => setDeleteTarget(null)} disabled={deleting}>
+              {t('common:action.cancel')}
+            </Button>
+            <Button size="sm" variant="destructive" onClick={() => void handleDelete()} disabled={deleting}>
+              {deleting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+              {t('action.delete')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  )
+}
+
+/** 复制 hook 触发 URL（模块级函数避免在行内反复绑定） */
+async function copyHookUrl(id: string, t: TFunction): Promise<void> {
+  const url = `${window.location.origin}/api/hooks/${id}`
+  try {
+    await navigator.clipboard.writeText(url)
+    toast.success(t('hook.copied'), { description: url })
+  } catch {
+    toast.error(t('hook.copyFailed'), { description: url })
+  }
+}
+
 // ── 触发器页 ────────────────────────────────────────────────────────────
+
+/** 触发器页 tab（T-27 三型入口：目录监控 / 定时 cron / webhook） */
+type TriggersTab = 'watchers' | 'schedules' | 'webhooks'
 
 export function TriggersPage() {
   const { t } = useTranslation('triggers')
+  const [tab, setTab] = useState<TriggersTab>('watchers')
   const [rules, setRules] = useState<WatchRule[] | null>(null)
   const [reloadKey, setReloadKey] = useState(0)
   const [editorOpen, setEditorOpen] = useState(false)
@@ -913,10 +1925,18 @@ export function TriggersPage() {
   const [historyRule, setHistoryRule] = useState<WatchRule | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<WatchRule | null>(null)
   const [deleting, setDeleting] = useState(false)
+  // T-27：面板刷新信号（schedules/webhooks 面板各自消费）与统一事件历史
+  const [panelRefresh, setPanelRefresh] = useState(0)
+  const [eventsOpen, setEventsOpen] = useState(false)
 
   const reload = useCallback(() => setReloadKey((k) => k + 1), [])
+  const refreshCurrent = useCallback(() => {
+    setReloadKey((k) => k + 1)
+    setPanelRefresh((k) => k + 1)
+  }, [])
 
   useEffect(() => {
+    if (tab !== 'watchers') return
     let cancelled = false
     setRules(null)
     api
@@ -926,7 +1946,7 @@ export function TriggersPage() {
     return () => {
       cancelled = true
     }
-  }, [reloadKey])
+  }, [reloadKey, tab])
 
   const openCreate = () => {
     setEditing(null)
@@ -991,24 +2011,51 @@ export function TriggersPage() {
     }
   }
 
+  const tabItems = [
+    { value: 'watchers' as TriggersTab, label: t('tabs.watchers') },
+    { value: 'schedules' as TriggersTab, label: t('tabs.schedules') },
+    { value: 'webhooks' as TriggersTab, label: t('tabs.webhooks') },
+  ]
+
   return (
     <PageContainer
       title={t('title')}
       description={t('description')}
       actions={
         <>
-          <Button variant="outline" size="sm" onClick={reload}>
+          <Button variant="outline" size="sm" onClick={refreshCurrent}>
             <RefreshCw className="h-4 w-4" />
             {t('action.refresh')}
           </Button>
-          <Button size="sm" onClick={openCreate}>
-            <Plus className="h-4 w-4" />
-            {t('action.new')}
+          {/* T-27：统一事件历史（三型触发器的结构化记录聚合视图） */}
+          <Button variant="outline" size="sm" onClick={() => setEventsOpen(true)}>
+            <History className="h-4 w-4" />
+            {t('events.button')}
           </Button>
+          {tab === 'watchers' ? (
+            <Button size="sm" onClick={openCreate}>
+              <Plus className="h-4 w-4" />
+              {t('action.new')}
+            </Button>
+          ) : null}
         </>
       }
     >
-      {rules === null ? (
+      <SegmentedTabs
+        items={tabItems}
+        value={tab}
+        onChange={(v) => setTab(v)}
+        ariaLabel={t('tabs.aria')}
+        className="mb-4 w-fit"
+      />
+
+      {tab !== 'watchers' ? (
+        tab === 'schedules' ? (
+          <SchedulesPanel refreshSignal={panelRefresh} />
+        ) : (
+          <WebhooksPanel refreshSignal={panelRefresh} />
+        )
+      ) : rules === null ? (
         <div className="space-y-2">
           {Array.from({ length: 3 }).map((_, i) => (
             <Skeleton key={i} className="h-14 w-full" />
@@ -1161,6 +2208,9 @@ export function TriggersPage() {
           if (!open) setHistoryRule(null)
         }}
       />
+      {eventsOpen ? (
+        <EventsDialog preset={null} onOpenChange={() => setEventsOpen(false)} />
+      ) : null}
 
       {/* 删除确认 */}
       <Dialog

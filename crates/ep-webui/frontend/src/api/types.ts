@@ -727,6 +727,94 @@ export interface UnifiedEvent {
   error?: string
 }
 
+// ===== 存储池逻辑名（T-26；计划 7 S0）=====
+
+/** 存储池类型（S0 全按 local 语义处理，smb/nfs 仅作标记） */
+export type StoreType = 'local' | 'smb' | 'nfs'
+
+/** GET /api/stores 列表项（path 为服务端解析后的物理路径） */
+export interface StoreInfo {
+  name: string
+  type: StoreType
+  path: string
+  enabled: boolean
+}
+
+export interface StoreListResponse {
+  stores: StoreInfo[]
+}
+
+/** GET /api/stores/{name}/browse?path= 条目 */
+export interface StoreBrowseEntry {
+  name: string
+  /** dir | file */
+  kind: 'dir' | 'file'
+  /** 文件字节数（目录恒 0） */
+  size: number
+}
+
+export interface StoreBrowseResponse {
+  store: string
+  /** 相对池根的当前路径（空串 = 池根） */
+  path: string
+  entries: StoreBrowseEntry[]
+}
+
+/** POST /api/stores/locate 响应：与请求 paths 等长；池外为 null（保持原值） */
+export interface StoreLocateResponse {
+  values: (string | null)[]
+}
+
+/** POST /api/stores/resolve 响应 */
+export interface StoreResolveResponse {
+  ok: boolean
+  store: string
+  path: string
+}
+
+// ===== 定时计划一览 / Webhook（T-27：统一自动化中心）=====
+
+/** GET /api/schedules 列表项（cron 双入口：pipeline.tsx ScheduleDialog 与触发器页共用同一 API） */
+export interface ScheduleListEntry {
+  pipeline_id: string
+  cron: string
+  enabled: boolean
+  last_task_id?: string
+}
+
+/** Webhook 触发目标（pipeline / direct 二选一，tagged serde rename_all=snake_case） */
+export type WebhookTargetInput =
+  | {
+      type: 'pipeline'
+      pipeline_id: string
+      /** 输入模板（节点 id → 参数对象；文件入口接受 store: 逻辑名引用） */
+      inputs?: Record<string, unknown> | null
+      /** 追加参数模板 */
+      params?: Record<string, unknown> | null
+    }
+  | {
+      type: 'direct'
+      module_id: string
+      capability: string
+      /** 直跑输入（store: 逻辑名引用或物理路径） */
+      input_path: string
+      params?: Record<string, unknown> | null
+    }
+
+/** Webhook 条目（GET /api/hooks 列表项；hook_id 即 URL 路径段） */
+export interface WebhookEntry {
+  id: string
+  name: string
+  enabled: boolean
+  target: WebhookTargetInput
+}
+
+/** POST /api/hooks/{id} 触发响应 */
+export interface WebhookTriggerResponse {
+  ok: boolean
+  task_id?: string
+}
+
 // ===== 模块标准档案导入 / 导出（HETERO_DIST_PLAN §2.2/§2.3，WS-A-api）=====
 
 /** POST /api/modules/import 响应中的模块摘要（manifest 回显） */

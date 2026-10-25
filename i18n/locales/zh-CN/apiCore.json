@@ -24,5 +24,21 @@
   "watcher.saveFailed": "保存触发规则失败：{{detail}}",
   "watcher.pathOverlap": "监控目录与输出目录不能相同或存在嵌套包含关系",
   "accessProtection.unauthorized": "访问令牌缺失或无效：请提供 Authorization: Bearer <令牌> 或 X-API-Key: <令牌>（WebSocket 与原生预览可用 ?token=）",
-  "storage.scanFailed": "扫描存储目录失败：{{detail}}"
+  "storage.scanFailed": "扫描存储目录失败：{{detail}}",
+  "store.notFound": "存储池不存在或未配置：{{name}}",
+  "store.disabled": "存储池已停用：{{name}}",
+  "store.unsafePath": "路径非法（拒绝 .. 穿越与绝对路径注入）：{{detail}}",
+  "store.valueRequired": "缺少待解析的路径值",
+  "store.notStoreRef": "值不是存储池逻辑名引用（应以 store: 开头）",
+  "store.dirNotFound": "目录不存在：{{detail}}",
+  "store.notADirectory": "路径不是目录：{{detail}}",
+  "store.browseFailed": "浏览目录失败：{{detail}}",
+  "hook.nameRequired": "Webhook 名称不能为空",
+  "hook.targetRequired": "必须配置触发目标：管线或直跑二选一",
+  "hook.targetConflict": "管线目标与直跑目标互斥，只能配置其一",
+  "hook.targetInvalid": "触发目标无效：{{detail}}",
+  "hook.notFound": "Webhook 不存在：{{id}}",
+  "hook.saveFailed": "保存 Webhook 失败：{{detail}}",
+  "hook.disabled": "Webhook 已停用：{{id}}",
+  "hook.inputPathRequired": "直跑目标必须提供 input_path 输入路径"
 }
