@@ -19,6 +19,10 @@
 //!    否则 `capabilityInvalid`
 //! 6. direct 模式：`output` 必填且 `dest_dir` 绝对 → `outputRequired`
 //! 7. `stability_secs` 钳制 ≥ 5；`extensions` 去点转小写归一
+//! 8. （T-25）direct 模式：`dest_dir` 与 `watch_dir` 相等或一方递归包含
+//!    另一方 → 400 `apiCore.watcher.pathOverlap`（产物回流监控目录会自我
+//!    触发；「风险自理」确认通道留后续票）。跨平台归一比较见
+//!    `crate::watcher::paths_overlap`。
 //!
 //! 错误响应统一走 `err_response` + i18n 键；注册表落盘失败 → 500
 //! `watcher.saveFailed`。
@@ -237,7 +241,7 @@ async fn delete_watcher(
     (StatusCode::OK, Json(json!({ "ok": ok })))
 }
 
-// ─── §5.3 七步校验链（顺序冻结）─────────────────────────────────────────────
+// ─── §5.3 七步校验链（顺序冻结）+ T-25 重叠校验（第 8 步，追加不重排） ──────
 
 /// 校验后的规则草稿（未分配运行态字段）
 struct RuleDraft {
@@ -380,6 +384,20 @@ async fn validate_rule_body(state: &Arc<AppState>, body: &Value) -> Result<RuleD
     let stability_secs = get_u64(body, "stability_secs", 30).max(5);
     let max_batch = get_usize(body, "max_batch", 16).max(1);
     let extensions = normalize_extensions(&get_string_vec(body, "extensions"));
+
+    // 8. （T-25）direct 模式：dest_dir 与 watch_dir 相等或一方递归包含另一方
+    //    → 400 pathOverlap。归档产物会以"新文件"身份回流监控目录造成自我
+    //    触发循环，创建/更新期直接拒绝（「风险自理」确认通道留后续票）；
+    //    跨平台归一（Windows 大小写不敏感、统一分隔符、\\?\ 剥离）见
+    //    crate::watcher::paths_overlap。管线模式无 dest_dir，不适用。
+    if let Some(o) = &output {
+        if direct.is_some() && crate::watcher::paths_overlap(&watch_dir, &o.dest_dir) {
+            return Err(
+                err_response(state, StatusCode::BAD_REQUEST, "apiCore.watcher.pathOverlap", &[])
+                    .await,
+            );
+        }
+    }
 
     Ok(RuleDraft {
         name,
@@ -737,6 +755,75 @@ max_file_size_mb = 100
         assert_eq!(
             collect(resp).await["error"],
             ep_core::i18n::t("zh-CN", "apiCore.watcher.outputRequired", &[])
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 6b. T-25 重叠校验（第 8 步）：dest_dir 与 watch_dir 相等 / 一方递归包含
+    //     另一方 → 400 pathOverlap；无关路径放行；PUT 同样拦截
+    #[tokio::test]
+    async fn create_and_update_reject_overlap_between_watch_and_dest() {
+        let root = test_root("overlap");
+        let state = state_at(root.clone());
+
+        let base = test_abs("ov-root");
+        let overlap_cases: Vec<(&str, String, String)> = vec![
+            ("equal", format!("{base}/src"), format!("{base}/src")),
+            // dest 包含 watch（watch 是 dest 的子目录）
+            ("dest-covers", format!("{base}/src/sub"), base.clone()),
+            // watch 包含 dest
+            ("watch-covers", base.clone(), format!("{base}/in/dest")),
+        ];
+        for (tag, watch_dir, dest_dir) in overlap_cases {
+            let app = super::router().with_state(state.clone());
+            let mut body = valid_direct_body(tag);
+            body["watch_dir"] = json!(watch_dir);
+            body["output"]["dest_dir"] = json!(dest_dir);
+            let resp = app.oneshot(req("POST", "/watchers", Some(body))).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "重叠场景 {tag} 必须拒绝"
+            );
+            assert_eq!(
+                collect(resp).await["error"],
+                ep_core::i18n::t("zh-CN", "apiCore.watcher.pathOverlap", &[]),
+                "重叠场景 {tag} 文案必须是 pathOverlap"
+            );
+        }
+
+        // Windows：大小写不敏感 + 分隔符变体同样判重叠
+        if cfg!(windows) {
+            let app = super::router().with_state(state.clone());
+            let mut body = valid_direct_body("case");
+            body["watch_dir"] = json!(format!("{base}/SRC"));
+            body["output"]["dest_dir"] = json!(format!("{base}\\src"));
+            let resp = app.oneshot(req("POST", "/watchers", Some(body))).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "大小写/分隔符变体必须判重叠");
+        }
+
+        // 无关路径放行（创建成功）
+        let app = super::router().with_state(state.clone());
+        let mut ok = valid_direct_body("ok");
+        ok["watch_dir"] = json!(format!("{base}/watch"));
+        ok["output"]["dest_dir"] = json!(format!("{base}/dest"));
+        let resp = app.oneshot(req("POST", "/watchers", Some(ok))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "无关目录必须放行");
+        let id = collect(resp).await["id"].as_str().unwrap().to_string();
+
+        // PUT 更新为重叠配置 → 同样拦截
+        let app = super::router().with_state(state.clone());
+        let mut upd = valid_direct_body("upd");
+        upd["watch_dir"] = json!(format!("{base}/watch"));
+        upd["output"]["dest_dir"] = json!(format!("{base}/watch"));
+        let resp = app
+            .oneshot(req("PUT", &format!("/watchers/{id}"), Some(upd)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "PUT 重叠必须拒绝");
+        assert_eq!(
+            collect(resp).await["error"],
+            ep_core::i18n::t("zh-CN", "apiCore.watcher.pathOverlap", &[])
         );
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -23,9 +23,26 @@
 //! "已解决" = 已提交触发（本批次内）、被过滤规则排除（黑名单/白名单）、
 //! 或 `include_modified=false` 下签名变化。`in_flight` 中未决文件阻塞
 //! 其后的水位推进；目录中已消失的 `in_flight` 条目剪除。
+//!
+//! ## 产物登记表（T-25，自我触发防护）
+//!
+//! daemon 直调任务（`pipeline_id = "watcher/<rule_id>"`）的归档产物落盘时，
+//! execution.rs 在 `record_artifact` 挂钩登记「产物绝对路径 + 来源规则 id +
+//! task_id + 时间」到 `runtime/processed_registry.json`（与水位线
+//! `watchers.json` 同目录惯例）。扫描侧（[`collect_watch_events`]）对登记
+//! 命中的路径整条剔除——**系统产物永不自我触发**（watch 目录 = 产物目录
+//! 场景不再死循环；管线模式规则的管线若把 `file_archive` 指向 watch 目录，
+//! 本登记表是创建期校验覆盖不到时的运行期安全网）。
+//!
+//! 语义边界（T-25 冻结）：登记表只记 daemon 自己落盘的产物**路径**——
+//! 用户手改/新增的文件仍照常触发；同一路径的原位手改不再触发（路径级登记
+//! 的已知边界）；**不做内容级去重**（sha256 内容指纹与 exclude glob 留
+//! follow-up）。自防膨胀：条目上限 10000（LRU 淘汰最旧）+ 加载时丢弃已
+//! 不存在路径的条目；登记文件损坏按空表启动并告警。
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
@@ -225,6 +242,285 @@ pub fn default_registry_path(root: &Path) -> PathBuf {
     root.join("runtime").join("watchers.json")
 }
 
+// ─── 路径归一化与重叠判定（T-25 创建期校验 + 产物登记比较共用）──────────────
+
+/// 路径归一键（T-25；**仅供比较，不得当真实路径使用**）：
+///
+/// - 剥离 Windows 扩展长度前缀 `\\?\`（`\\?\UNC\server\share` 先还原为
+///   `\\server\share` 形状再统一处理）；
+/// - 分隔符统一为 `/`；丢弃空段与 `.` 段；`..` 做词法上浮；
+/// - 保留 POSIX 根标记（`/` 开头的归一键以 `/` 开头，使 `/` 与 `/data`
+///   的包含关系可判定）；
+/// - Windows（`cfg!(windows)`）整体小写折叠——Win32/NTFS 路径大小写不敏感；
+///   POSIX 保持原样（大小写敏感）。
+pub(crate) fn normalize_path_key(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let s = match trimmed.strip_prefix(r"\\?\") {
+        Some(rest) => match rest.strip_prefix("UNC\\") {
+            Some(unc) => format!(r"\\{unc}"),
+            None => rest.to_string(),
+        },
+        None => trimmed.to_string(),
+    };
+    let unified = s.replace('\\', "/");
+    let leading_root = unified.starts_with('/');
+    let mut comps: Vec<&str> = Vec::new();
+    for seg in unified.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                comps.pop();
+            }
+            other => comps.push(other),
+        }
+    }
+    let joined = comps.join("/");
+    let key = if leading_root {
+        format!("/{joined}")
+    } else {
+        joined
+    };
+    if cfg!(windows) {
+        key.to_lowercase()
+    } else {
+        key
+    }
+}
+
+/// 目录重叠判定（T-25 创建期校验核心）：两路径经 [`normalize_path_key`]
+/// 归一后，相等或一方为另一方的组件级前缀即视为重叠（一方递归包含另一方）。
+///
+/// 局限（有意为之，注释留档）：本判定是**词法**比较，不解析 junction /
+/// 符号链接别名——如 watch 目录经 junction 指向 dest_dir 内部时检测不到。
+/// 不采用 `canonicalize` 的原因：创建期目录可能尚不存在，且解析会跨
+/// junction 改写形状、行为随挂载状态漂移；该场景留待后续票（配合
+/// 「风险自理」确认通道）一并考虑。
+pub(crate) fn paths_overlap(a: &str, b: &str) -> bool {
+    let na = normalize_path_key(a);
+    let nb = normalize_path_key(b);
+    if na.is_empty() || nb.is_empty() {
+        return false;
+    }
+    // POSIX 根 `/` 包含一切绝对路径
+    if na == "/" || nb == "/" {
+        return true;
+    }
+    na == nb || na.starts_with(&format!("{nb}/")) || nb.starts_with(&format!("{na}/"))
+}
+
+// ─── 产物登记表（processed registry，T-25）───────────────────────────────────
+
+/// 登记表落盘文件名（与水位线 watchers.json 同目录惯例：`<root>/runtime/`）
+const PROCESSED_FILE_NAME: &str = "processed_registry.json";
+
+/// 条目上限：超出按 LRU 淘汰最旧（自防膨胀）
+pub const PROCESSED_MAX_ENTRIES: usize = 10_000;
+
+/// 单条产物登记
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProcessedEntry {
+    /// 产物绝对路径（按登记原样保存；比较时经 [`normalize_path_key`] 归一）
+    pub path: String,
+    /// 来源规则 id（自任务 `pipeline_id = "watcher/<rule_id>"` 解出）
+    pub rule_id: String,
+    /// 产生该产物的任务 id
+    pub task_id: String,
+    /// 登记时间（epoch 秒）
+    pub ts: i64,
+}
+
+/// 产物登记表：daemon 自己落盘的产物路径集合（扫描侧据此排除，系统产物
+/// 永不自我触发）。**只记路径**——不做内容级去重（sha256 与 exclude glob
+/// 留 follow-up）；用户手改/新增的文件不在表内，照常触发。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProcessedRegistry {
+    /// 新条目在前（LRU 语义：超限淘汰尾部最旧）
+    #[serde(default)]
+    pub entries: VecDeque<ProcessedEntry>,
+}
+
+impl ProcessedRegistry {
+    /// 登记一条产物（默认上限 [`PROCESSED_MAX_ENTRIES`]）
+    pub fn record(&mut self, path: &Path, rule_id: &str, task_id: &str, ts: i64) {
+        self.record_with_cap(path, rule_id, task_id, ts, PROCESSED_MAX_ENTRIES);
+    }
+
+    /// 登记核心（`max` 参数化供测试小容量验证 LRU）：同一路径（归一后）
+    /// 重复登记 → 刷新位置与元数据（LRU 触碰，覆盖写场景不累积）。
+    pub(crate) fn record_with_cap(
+        &mut self,
+        path: &Path,
+        rule_id: &str,
+        task_id: &str,
+        ts: i64,
+        max: usize,
+    ) {
+        let entry = ProcessedEntry {
+            path: path.to_string_lossy().into_owned(),
+            rule_id: rule_id.to_string(),
+            task_id: task_id.to_string(),
+            ts,
+        };
+        let key = normalize_path_key(&entry.path);
+        self.entries.retain(|e| normalize_path_key(&e.path) != key);
+        self.entries.push_front(entry);
+        self.entries.truncate(max.max(1));
+    }
+
+    /// 路径是否已登记（归一比较；仅测试断言用——扫描侧走 [`Self::path_keys`]
+    /// 集合比较，避免逐文件全表扫描）
+    #[cfg(test)]
+    pub(crate) fn contains_path(&self, path: &Path) -> bool {
+        let key = normalize_path_key(&path.to_string_lossy());
+        self.entries
+            .iter()
+            .any(|e| normalize_path_key(&e.path) == key)
+    }
+
+    /// 全部条目的归一键集合（扫描侧每轮构建一次）
+    pub(crate) fn path_keys(&self) -> HashSet<String> {
+        self.entries
+            .iter()
+            .map(|e| normalize_path_key(&e.path))
+            .collect()
+    }
+
+    /// 丢弃已不存在路径的条目（加载时调用，自防膨胀）
+    pub fn prune_missing(&mut self) {
+        self.entries.retain(|e| Path::new(&e.path).exists());
+    }
+
+    /// 加载；文件缺失按空表，损坏降级为空表并告警（复刻 WatchRegistry::load）
+    pub fn load(path: &Path) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
+                tracing::warn!(file = %path.display(), error = %e, "产物登记表解析失败，按空表启动");
+                Self::default()
+            }),
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// tmp + rename 原子落盘（复刻 WatchRegistry::save 模式）
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(self).unwrap_or_default())?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+}
+
+/// 进程内登记表状态：内存表 + 落盘路径（None = 无法定位 runtime 目录，
+/// 退化为仅内存生效——本次运行内仍防自我触发，重启即失，告警留痕）。
+struct ProcessedState {
+    disk: Option<PathBuf>,
+    registry: ProcessedRegistry,
+}
+
+static PROCESSED: OnceLock<Mutex<Option<ProcessedState>>> = OnceLock::new();
+
+fn processed_cell() -> &'static Mutex<Option<ProcessedState>> {
+    PROCESSED.get_or_init(|| Mutex::new(None))
+}
+
+/// 落盘路径定位（自包含，不经 AppState）：经任务注册表持久化目录反推
+/// `<root>/runtime/`——`bind_persistence` 在 `AppState::new` 启动即绑定，
+/// watcher 巡检 / 产物登记发生时必然已就绪。
+fn resolve_processed_disk_path() -> Option<PathBuf> {
+    let tasks_dir = crate::api::execute::execution::persistence_dir()?;
+    tasks_dir
+        .parent()
+        .map(|runtime| runtime.join(PROCESSED_FILE_NAME))
+}
+
+/// 从落盘路径构建登记表状态（加载 + 清理死路径；独立函数供「模拟重启」
+/// 测试与 [`init_processed_state`] 共用）
+fn load_processed_state(disk: Option<&Path>) -> ProcessedState {
+    match disk {
+        Some(p) => {
+            let mut reg = ProcessedRegistry::load(p);
+            let before = reg.entries.len();
+            reg.prune_missing();
+            let pruned = before - reg.entries.len();
+            if pruned > 0 {
+                tracing::info!(file = %p.display(), pruned, "产物登记表加载时清理已不存在路径的条目");
+                // 修剪结果即时回写，避免每次启动重复清扫同一批死路径
+                if let Err(e) = reg.save(p) {
+                    tracing::warn!(file = %p.display(), error = %e, "产物登记表修剪后回写失败");
+                }
+            }
+            ProcessedState {
+                disk: Some(p.to_path_buf()),
+                registry: reg,
+            }
+        }
+        None => {
+            tracing::warn!("无法定位 runtime 目录，产物登记表仅内存生效（重启即失）");
+            ProcessedState {
+                disk: None,
+                registry: ProcessedRegistry::default(),
+            }
+        }
+    }
+}
+
+fn init_processed_state() -> ProcessedState {
+    load_processed_state(resolve_processed_disk_path().as_deref())
+}
+
+fn with_processed<T>(f: impl FnOnce(&mut ProcessedState) -> T) -> T {
+    let mut cell = processed_cell().lock().unwrap_or_else(|e| e.into_inner());
+    let st = cell.get_or_insert_with(init_processed_state);
+    f(st)
+}
+
+/// 产物登记入口（execution.rs `record_artifact` 唯一挂钩调用）：watcher
+/// 直调任务的 archive 产物落盘即入表并落盘。落盘失败仅告警——登记缺失的
+/// 后果只是该产物路径可能自我触发一次，不阻断任务链路。
+pub(crate) fn record_processed_product(path: &Path, rule_id: &str, task_id: &str) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    with_processed(|st| {
+        st.registry.record(path, rule_id, task_id, ts);
+        if let Some(disk) = st.disk.clone() {
+            if let Err(e) = st.registry.save(&disk) {
+                tracing::warn!(file = %disk.display(), error = %e, "产物登记表落盘失败");
+            }
+        }
+    });
+}
+
+/// 扫描侧排除键集合（[`collect_watch_events`] 每轮构建一次；登记表尚未
+/// 初始化时此调用即完成惰性加载）。
+fn processed_path_keys() -> HashSet<String> {
+    with_processed(|st| st.registry.path_keys())
+}
+
+#[cfg(test)]
+pub(crate) fn processed_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 仅测试：整体重置登记表全局态（`disk` 显式指定落盘路径；`None` = 下次
+/// 使用时按生产逻辑重新惰性初始化）。
+#[cfg(test)]
+pub(crate) fn processed_reset_for_tests(disk: Option<PathBuf>) {
+    *processed_cell().lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(ProcessedState {
+            disk,
+            registry: ProcessedRegistry::default(),
+        });
+}
+
 /// 单次巡检产生的待触发项（`rule` 为收集完成后的规则快照，供调用方
 /// 提交与回写使用）
 #[derive(Debug, Clone)]
@@ -335,12 +631,19 @@ fn extensions_allow(extensions: &[String], path: &Path) -> bool {
 ///
 /// - 停用规则完全跳过（不扫描、不推进水位线）
 /// - 目录缺失/不可读 → `tracing::warn!` 跳过，不拖垮整个循环
+/// - T-25：产物登记表命中的路径在进入判定**之前**整条剔除——不触发、不入
+///   在途表、不阻塞水位线（系统产物永不自我触发；水位线/在途表语义不动，
+///   被剔除文件对 §5.2 机制完全不可见）。误入在途表的残留条目（登记前
+///   极窄竞态窗口）按"目录中已消失"语义自然剪除。
 pub fn collect_watch_events(
     registry: &WatchRegistry,
     now_epoch_secs: i64,
 ) -> (Vec<WatchHit>, WatchRegistry) {
     let mut next = registry.clone();
     let mut hits = Vec::new();
+    // T-25：产物登记表排除键（每轮构建一次，全规则共享；登记表不可用 →
+    // 空集，语义退化为无排除）
+    let processed_keys = processed_path_keys();
     for (rule_id, rule) in next.rules.iter_mut() {
         // §5.2-1：停用规则完全跳过；重新启用后首轮不触发存量
         if !rule.enabled {
@@ -358,6 +661,17 @@ pub fn collect_watch_events(
                 );
                 continue;
             }
+        };
+        let files: Vec<DirFile> = if processed_keys.is_empty() {
+            files
+        } else {
+            files
+                .into_iter()
+                .filter(|f| {
+                    !processed_keys
+                        .contains(&normalize_path_key(&f.path.to_string_lossy()))
+                })
+                .collect()
         };
         let (triggered, updated) = collect_rule_events(rule, &files, now_epoch_secs);
         *rule = updated;
@@ -947,5 +1261,295 @@ mod tests {
         // 黑名单大小写不敏感
         assert!(is_ignored_suffix(Path::new("/d/x.MKV.PART")));
         assert!(!is_ignored_suffix(Path::new("/d/x.mkv")));
+    }
+
+    // ── T-25：路径归一化 / 重叠判定 / 产物登记表 ──────────────────────────
+
+    static TEST_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let seq = TEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "ep-processed-{tag}-{}-{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 把文件 mtime 设为 now - age_secs（扫描按真实 FS mtime 判定）
+    fn set_file_mtime_age(path: &Path, age_secs: i64) {
+        let mtime = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(age_secs.max(0) as u64);
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+    }
+
+    fn now_epoch() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// 跨平台期望值助手：Windows 折叠小写，POSIX 保持原样
+    fn expect_key(s: &str) -> String {
+        if cfg!(windows) {
+            s.to_lowercase()
+        } else {
+            s.to_string()
+        }
+    }
+
+    // 16. 路径归一化：分隔符统一、\\?\ 前缀剥离、Windows 大小写折叠、
+    //     组件归一（空段/./..）、POSIX 根标记保留
+    #[test]
+    fn normalize_path_key_unifies_separators_prefix_case_and_components() {
+        // 分隔符统一 + 尾分隔符 + 空段
+        assert_eq!(
+            normalize_path_key("F:\\watch\\sub\\"),
+            expect_key("F:/watch/sub")
+        );
+        assert_eq!(
+            normalize_path_key("F://watch///sub"),
+            expect_key("F:/watch/sub")
+        );
+        // Windows 大小写折叠（POSIX 上保持原样）
+        if cfg!(windows) {
+            assert_eq!(normalize_path_key("F:\\Watch\\SUB"), "f:/watch/sub");
+            assert_eq!(normalize_path_key("f:/WATCH"), "f:/watch");
+        } else {
+            assert_eq!(normalize_path_key("/Data/Watch"), "/Data/Watch");
+        }
+        // \\?\ 前缀剥离（盘符）
+        assert_eq!(
+            normalize_path_key(r"\\?\F:\watch\sub"),
+            expect_key("F:/watch/sub")
+        );
+        // \\?\UNC\ 还原 UNC 形状后统一分隔符（归一键以根标记开头）
+        assert_eq!(
+            normalize_path_key(r"\\?\UNC\nas\share\x"),
+            expect_key("/nas/share/x")
+        );
+        // 组件归一：. 与 .. 与空段；.. 词法上浮
+        assert_eq!(
+            normalize_path_key("/data/./watch/../sub"),
+            expect_key("/data/sub")
+        );
+        // POSIX 根标记保留
+        assert_eq!(normalize_path_key("/"), "/");
+        // 空输入 → 空键
+        assert_eq!(normalize_path_key("   "), "");
+    }
+
+    // 17. 重叠判定：相等、dest 包含 watch、watch 包含 dest、无关放行、
+    //     Windows 大小写/分隔符变体
+    #[test]
+    fn paths_overlap_detection_matrix() {
+        // 相等
+        assert!(paths_overlap("/data/watch", "/data/watch"));
+        // dest 包含 watch（watch 是 dest 的子目录）
+        assert!(paths_overlap("/data/watch/src", "/data/watch"));
+        // watch 包含 dest
+        assert!(paths_overlap("/data/watch", "/data/watch/out"));
+        // 兄弟目录 / 无关路径放行
+        assert!(!paths_overlap("/data/watch", "/data/other"));
+        assert!(!paths_overlap("/data/watch", "/data/watch2"));
+        assert!(!paths_overlap("/a/b", "/c/d"));
+        // 空输入不判重叠
+        assert!(!paths_overlap("", "/data"));
+        // POSIX 根包含一切
+        assert!(paths_overlap("/", "/data/watch"));
+        // Windows：大小写不敏感 + 分隔符变体 + \\?\ 前缀等价
+        if cfg!(windows) {
+            assert!(paths_overlap("F:\\watch", "f:/WATCH"));
+            assert!(paths_overlap("F:\\watch\\src", "F:/watch"));
+            assert!(paths_overlap(r"\\?\F:\watch", "F:/watch/sub"));
+        }
+        // POSIX（非 Windows）大小写敏感：不同路径不重叠
+        if !cfg!(windows) {
+            assert!(!paths_overlap("/data/Watch", "/data/watch"));
+        }
+        // junction / 符号链接别名是词法判定的已知局限（见 paths_overlap 文档）
+    }
+
+    // 18. 登记表 record：归一去重（重复登记刷新位置与元数据）+ 超限 LRU
+    //     淘汰最旧（小容量参数化验证淘汰逻辑）
+    #[test]
+    fn processed_record_dedupes_and_evicts_oldest_beyond_cap() {
+        let mut reg = ProcessedRegistry::default();
+        for i in 0..6 {
+            reg.record_with_cap(
+                Path::new(&format!("/d/f{i}.mp4")),
+                "r1",
+                &format!("t{i}"),
+                1000 + i,
+                4,
+            );
+        }
+        assert_eq!(reg.entries.len(), 4, "超限截断到 max");
+        assert!(!reg.contains_path(Path::new("/d/f0.mp4")), "最旧被淘汰");
+        assert!(!reg.contains_path(Path::new("/d/f1.mp4")), "次旧被淘汰");
+        assert!(reg.contains_path(Path::new("/d/f5.mp4")));
+        assert_eq!(reg.entries[0].path, "/d/f5.mp4", "新条目在前");
+
+        // 重复登记同路径（Windows 下大小写/分隔符变体视为同一路径）→
+        // 去重并刷新到最前 + 元数据更新，不累积
+        if cfg!(windows) {
+            reg.record_with_cap(Path::new(r"\\?\D:\F3.MP4"), "r1", "t3-new", 2000, 4);
+            assert_eq!(reg.entries.len(), 4, "归一去重不累积");
+            assert_eq!(reg.entries[0].path, r"\\?\D:\F3.MP4");
+            assert_eq!(reg.entries[0].task_id, "t3-new");
+            assert_eq!(reg.entries[0].ts, 2000);
+        }
+        // 默认 record 上限接线：小量登记不触发淘汰
+        let mut small = ProcessedRegistry::default();
+        small.record(Path::new("/d/x.mp4"), "r", "t", 1);
+        assert_eq!(small.entries.len(), 1);
+        assert_eq!(PROCESSED_MAX_ENTRIES, 10_000, "上限契约冻结");
+    }
+
+    // 19. 登记表持久化：save/load 往返；加载时清理已不存在路径；损坏降级
+    //     为空表 + 告警
+    #[test]
+    fn processed_registry_roundtrip_prunes_missing_and_corrupt_degrades() {
+        let dir = temp_root("roundtrip");
+        let path = dir.join("processed_registry.json");
+        let existing = dir.join("kept.mp4");
+        std::fs::write(&existing, b"x").unwrap();
+
+        let mut reg = ProcessedRegistry::default();
+        reg.record(&existing, "r1", "t1", 100);
+        reg.record(Path::new("/definitely/ghost/gone.mp4"), "r1", "t2", 101);
+        reg.save(&path).unwrap();
+
+        // 直接 load：两条都在
+        let loaded = ProcessedRegistry::load(&path);
+        assert_eq!(loaded.entries.len(), 2);
+        // load + prune（load_processed_state 同款）：死路径被清理
+        let mut pruned = ProcessedRegistry::load(&path);
+        pruned.prune_missing();
+        assert_eq!(pruned.entries.len(), 1);
+        assert!(pruned.contains_path(&existing));
+        assert!(!pruned.contains_path(Path::new("/definitely/ghost/gone.mp4")));
+
+        // 损坏 → 空表 + 告警（不 panic）
+        std::fs::write(&path, "{not json").unwrap();
+        let broken = ProcessedRegistry::load(&path);
+        assert!(broken.entries.is_empty(), "损坏按空表启动");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 20. 零死循环 E2E（真实 FS）：watch == 产物目录场景，登记的产物永不
+    //     触发（不入在途表、不阻塞水位线）；用户手写新文件照常触发
+    #[test]
+    fn watch_dir_equals_dest_products_never_trigger_user_files_still_do() {
+        let _guard = processed_test_lock();
+        let watch = temp_root("e2e-watch");
+        // 登记表落盘路径放在 watch 目录之外（避免登记文件本身成为扫描候选）
+        let disk_dir = temp_root("e2e-disk");
+        let disk = disk_dir.join("processed_registry.json");
+        processed_reset_for_tests(Some(disk));
+
+        let src = watch.join("a.mkv");
+        std::fs::write(&src, b"video").unwrap();
+        set_file_mtime_age(&src, 60);
+
+        let mut reg = rule_with(|r| {
+            r.watch_dir = watch.to_string_lossy().into_owned();
+            r.stability_secs = 5;
+            r.checkpoint = 0;
+        });
+        reg.rules.get_mut("r1").unwrap().checkpoint = now_epoch() - 100;
+
+        // r1：a.mkv 入表（不触发）
+        let (hits, next) = collect_watch_events(&reg, now_epoch());
+        assert!(hits.is_empty(), "首轮仅入表");
+        assert!(
+            next.rules["r1"]
+                .in_flight
+                .contains_key(src.to_string_lossy().as_ref())
+        );
+        // r2：a.mkv 稳定触发，水位线推进到其 mtime
+        let (hits, next) = collect_watch_events(&next, now_epoch());
+        assert_eq!(hits.len(), 1, "触发文件：{:?}", hits);
+        assert_eq!(hits[0].path, src.to_string_lossy().as_ref());
+
+        // 模拟 daemon 产物落盘（watch == dest：产物落回监控目录）并登记
+        let product = watch.join("a.done.mp4");
+        std::fs::write(&product, b"result").unwrap();
+        set_file_mtime_age(&product, 2);
+        record_processed_product(&product, "r1", "task-e2e");
+        // 登记表已落盘且包含产物
+        let saved = ProcessedRegistry::load(&disk_dir.join("processed_registry.json"));
+        assert!(saved.contains_path(&product), "登记必须即时落盘");
+
+        // 用户手写新文件
+        let manual = watch.join("b.txt");
+        std::fs::write(&manual, b"note").unwrap();
+        set_file_mtime_age(&manual, 50);
+
+        // r3：产物被排除（不得入表）；b.txt 正常入表
+        let (hits, next) = collect_watch_events(&next, now_epoch());
+        assert!(hits.is_empty());
+        let in_flight = &next.rules["r1"].in_flight;
+        assert!(
+            !in_flight.contains_key(product.to_string_lossy().as_ref()),
+            "登记产物不得进入在途表"
+        );
+        assert!(
+            in_flight.contains_key(manual.to_string_lossy().as_ref()),
+            "用户手写文件照常入表"
+        );
+        // r4：b.txt 触发，产物仍未触发
+        let (hits, next) = collect_watch_events(&next, now_epoch());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, manual.to_string_lossy().as_ref());
+        // r5：多轮之后产物永不触发（不死循环）
+        let (hits, _) = collect_watch_events(&next, now_epoch());
+        assert!(
+            hits.is_empty(),
+            "产物路径永不触发（不死循环）：{:?}",
+            hits
+        );
+
+        // 收尾：重置全局态，避免泄漏到其它测试
+        processed_reset_for_tests(None);
+        let _ = std::fs::remove_dir_all(&watch);
+        let _ = std::fs::remove_dir_all(&disk_dir);
+    }
+
+    // 21. 全局态：经 load_processed_state 模拟重启 → 登记从落盘文件恢复；
+    //     恢复时同步清理已消失路径
+    #[test]
+    fn processed_state_survives_restart_and_prunes_on_reload() {
+        let _guard = processed_test_lock();
+        let dir = temp_root("restart");
+        let disk = dir.join("processed_registry.json");
+        processed_reset_for_tests(Some(disk.clone()));
+
+        let kept = dir.join("kept.mp4");
+        std::fs::write(&kept, b"x").unwrap();
+        record_processed_product(&kept, "r1", "t1");
+        record_processed_product(Path::new("/ghost/gone.mp4"), "r1", "t2");
+
+        // 模拟重启：从落盘文件重建状态（不经全局缓存）
+        let rebooted = load_processed_state(Some(&disk));
+        assert!(rebooted.registry.contains_path(&kept), "重启后登记仍在");
+        assert!(
+            !rebooted
+                .registry
+                .contains_path(Path::new("/ghost/gone.mp4")),
+            "重启加载时清理已消失路径"
+        );
+        // 修剪结果已回写落盘
+        let on_disk = ProcessedRegistry::load(&disk);
+        assert_eq!(on_disk.entries.len(), 1, "修剪后落盘不积累死路径");
+
+        processed_reset_for_tests(None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

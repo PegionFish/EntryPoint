@@ -2768,6 +2768,16 @@ fn record_artifact(task_id: &str, node_id: &str, path: &Path) {
         record
             .artifacts
             .insert(node_id.to_string(), path.to_path_buf());
+        // T-25 产物登记（execution.rs 唯一挂钩）：watcher 直调任务
+        // （pipeline_id = "watcher/<rule_id>"）的 archive 产物落盘即登记进
+        // watcher.rs 产物登记表，扫描侧据此排除——系统产物永不自我触发
+        // （watch 目录 = 产物目录场景不再死循环；skip 冲突透传的既有目标
+        // 路径同样登记，无害）。非 watcher 任务 / 非 archive 节点不登记。
+        if node_id == "archive" && record.pipeline_id.starts_with("watcher/") {
+            let rule_id = record.pipeline_id["watcher/".len()..].to_string();
+            drop(reg); // 先放注册表锁再做磁盘 IO
+            crate::watcher::record_processed_product(path, &rule_id, task_id);
+        }
     }
 }
 
@@ -5756,6 +5766,65 @@ mod watcher_direct_tests {
         // 三节点退化 DAG 形状（fake 模块无端口 → 任务失败，但结构已物化）
         assert_eq!(record.node_order, vec!["input", "run", "archive"]);
         assert_eq!(record.nodes.len(), 3);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── T-25：产物登记挂钩——watcher 直调任务 archive 产物落盘即登记 ─────────
+
+    /// 最小任务记录夹具（仅需 id + pipeline_id 供 record_artifact 判定）
+    fn seed_record(task_id: &str, pipeline_id: &str) {
+        insert_record_for_tests(TaskRecord {
+            id: task_id.to_string(),
+            pipeline_id: pipeline_id.to_string(),
+            status: TaskState::Running,
+            error: None,
+            queue_position: None,
+            priority: DEFAULT_TASK_PRIORITY,
+            started_at: chrono::Utc::now(),
+            started_running_at: Some(chrono::Utc::now()),
+            finished_at: None,
+            node_order: Vec::new(),
+            nodes: TestMap::new(),
+            artifacts: TestMap::new(),
+            served_artifacts: TestMap::new(),
+            work_dir: std::path::PathBuf::new(),
+            staging_dir: None,
+            module_ids: Vec::new(),
+            group: None,
+            cached_from: None,
+        });
+    }
+
+    #[test]
+    fn test_record_artifact_registers_watcher_archive_products() {
+        let _guard = lock_for_tests();
+        let _p_guard = crate::watcher::processed_test_lock();
+        clear_registry_for_tests();
+
+        let root = unique_root("processed");
+        let product = root.join("out.mp4");
+        std::fs::write(&product, b"result").unwrap();
+        // 登记表定向到本测试独立落盘文件（不依赖持久化绑定的全局状态）
+        let disk = root.join("runtime").join("processed_registry.json");
+        crate::watcher::processed_reset_for_tests(Some(disk.clone()));
+
+        // watcher 直调任务（pipeline_id = "watcher/<rule_id>"）与非 watcher 对照
+        seed_record("wt-1", "watcher/r1");
+        seed_record("mt-1", "my-pipeline");
+
+        // archive 节点产物 → 登记；非 archive 节点 / 非 watcher 任务 → 不登记
+        record_artifact("wt-1", "archive", &product);
+        record_artifact("wt-1", "input", &root.join("in.mp4"));
+        record_artifact("mt-1", "archive", &root.join("other.mp4"));
+
+        // disk=Some 时 record 即落盘：从落盘文件断言登记内容
+        let saved = crate::watcher::ProcessedRegistry::load(&disk);
+        assert_eq!(saved.entries.len(), 1, "仅 watcher archive 产物登记");
+        assert!(saved.contains_path(&product));
+        assert_eq!(saved.entries[0].rule_id, "r1");
+        assert_eq!(saved.entries[0].task_id, "wt-1");
+
+        crate::watcher::processed_reset_for_tests(None);
         let _ = std::fs::remove_dir_all(&root);
     }
 

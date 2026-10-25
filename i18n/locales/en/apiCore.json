@@ -22,6 +22,7 @@
   "watcher.outputRequired": "Direct mode requires an output config with an absolute destination directory",
   "watcher.notFound": "Watch rule not found: {{id}}",
   "watcher.saveFailed": "Failed to save watch rules: {{detail}}",
+  "watcher.pathOverlap": "Watch directory and destination directory must not be the same or nested inside each other",
   "accessProtection.unauthorized": "Missing or invalid access token: provide Authorization: Bearer <token> or X-API-Key: <token> (WebSocket and native previews may use ?token=)",
   "storage.scanFailed": "Failed to scan storage directories: {{detail}}"
 }

@@ -110,5 +110,6 @@
   "validation.capabilityRequired": "Select a module and capability",
   "validation.pipelineRequired": "Select a pipeline and input node",
   "validation.destDirRequired": "Destination directory is required",
-  "validation.destDirInvalid": "Enter an absolute path (Windows: F:\\output or \\\\nas\\share; Linux/macOS: /data/output)"
+  "validation.destDirInvalid": "Enter an absolute path (Windows: F:\\output or \\\\nas\\share; Linux/macOS: /data/output)",
+  "validation.pathOverlap": "Watch directory and destination directory are the same or nested; archived products would re-enter the watch directory and retrigger. Use two separate directories"
 }

@@ -22,6 +22,7 @@
   "watcher.outputRequired": "直接模式必须配置输出，且目标目录须为绝对路径",
   "watcher.notFound": "触发规则不存在：{{id}}",
   "watcher.saveFailed": "保存触发规则失败：{{detail}}",
+  "watcher.pathOverlap": "监控目录与输出目录不能相同或存在嵌套包含关系",
   "accessProtection.unauthorized": "访问令牌缺失或无效：请提供 Authorization: Bearer <令牌> 或 X-API-Key: <令牌>（WebSocket 与原生预览可用 ?token=）",
   "storage.scanFailed": "扫描存储目录失败：{{detail}}"
 }

@@ -137,6 +137,31 @@ function isAbsolutePath(path: string): boolean {
   )
 }
 
+/**
+ * 路径归一键（T-25）：与后端 `normalize_path_key` 同款语义——统一分隔符、
+ * 剥离 `\\?\` 前缀、去尾部分隔符；Windows 形状路径（盘符 / UNC，即
+ * isAbsolutePath 判真的形状）大小写不敏感。仅用于重叠快捷提示，
+ * 最终以服务端校验为准。
+ */
+function normalizePathKey(path: string): string {
+  const stripped = path.trim().replace(/^\\\\\?\\/, '')
+  const isWindowsShape = /^[A-Za-z]:[\\/]/.test(stripped) || stripped.startsWith('\\\\')
+  const unified = stripped.replace(/[\\/]+/g, '/')
+  const folded = isWindowsShape ? unified.toLowerCase() : unified
+  return folded !== '/' ? folded.replace(/\/+$/, '') : folded
+}
+
+/**
+ * 目录重叠判定（T-25）：相等或一方为另一方的路径前缀（组件级）。
+ * 与服务端第 8 步校验同语义；产物回流监控目录会自我触发，创建期即提示。
+ */
+function pathsOverlap(a: string, b: string): boolean {
+  const na = normalizePathKey(a)
+  const nb = normalizePathKey(b)
+  if (!na || !nb) return false
+  return na === nb || na.startsWith(`${nb}/`) || nb.startsWith(`${na}/`)
+}
+
 /** 从 apiFetch 抛出的 `API <status>: <body>` 错误中提取后端 error 字段 */
 function backendErrorMessage(err: unknown): string {
   if (!(err instanceof Error)) return String(err)
@@ -378,6 +403,11 @@ function RuleDialog({
       }
       if (!isAbsolutePath(form.dest_dir.trim())) {
         toast.error(t('validation.destDirInvalid'))
+        return
+      }
+      // T-25：监控目录与输出目录重叠 → 产物回流监控目录自我触发，创建期即拒
+      if (pathsOverlap(form.watch_dir, form.dest_dir)) {
+        toast.error(t('validation.pathOverlap'))
         return
       }
     }

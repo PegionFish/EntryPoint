@@ -110,5 +110,6 @@
   "validation.capabilityRequired": "请选择模块与能力",
   "validation.pipelineRequired": "请选择管线与输入节点",
   "validation.destDirRequired": "输出目录不能为空",
-  "validation.destDirInvalid": "请输入绝对路径（Windows：F:\\output 或 \\\\nas\\share；Linux/macOS：/data/output）"
+  "validation.destDirInvalid": "请输入绝对路径（Windows：F:\\output 或 \\\\nas\\share；Linux/macOS：/data/output）",
+  "validation.pathOverlap": "监控目录与输出目录相同或存在嵌套关系，产物会回流监控目录造成重复触发，请改用两个独立目录"
 }
