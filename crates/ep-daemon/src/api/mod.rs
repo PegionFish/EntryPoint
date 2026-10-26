@@ -10,6 +10,8 @@ pub mod health;
 pub mod hooks;
 pub mod inference;
 pub mod llm;
+// T-32：Prometheus 指标端点（GET /api/metrics，手写 0.0.4 文本格式）
+pub mod metrics;
 pub mod models;
 pub mod modules;
 pub mod module_import;
@@ -77,6 +79,9 @@ pub fn api_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .merge(inference::router(state))
         // T-24：命名 LLM 提供商档案（/api/llm/providers CRUD + 连接测试）
         .merge(llm::router())
+        // T-32：Prometheus 指标（池占用 / 任务吞吐 / 模块健康度；
+        // /api 前缀下自动落入 auth.rs 全局访问保护域）
+        .merge(metrics::router())
         // 未匹配的 /api/* → 404 + JSON，避免落入 SPA 的 HTML fallback
         .fallback(api_not_found)
 }

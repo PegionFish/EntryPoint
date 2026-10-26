@@ -59,6 +59,27 @@
 | GET | `/api/events`（支持 `?rule=&type=&limit=`） |
 | GET / PUT | `/api/config` |
 | GET | `/api/storage` |
+| GET | `/api/metrics`（T-32，Prometheus 文本格式） |
+
+`GET /api/metrics`（T-32）输出 Prometheus exposition format 0.0.4 文本
+（`Content-Type: text/plain; version=0.0.4; charset=utf-8`，零第三方依赖手写
+渲染）。与全部 `/api/*` 端点同受访问保护（token 模式下需凭据；Prometheus
+抓取端可走 `?token=` 或 header）。指标以 `entrypoint_` 为前缀：
+
+| 指标 | 类型 | 标签 | 口径 |
+|---|---|---|---|
+| `entrypoint_pool_total_mb` | gauge | `pool`, `device` | 池容量（MB）。`pool` ∈ `vram`（每块有容量指标的 GPU 设备一池）/ `ram`（单一池，`device="cpu"`，恒产出）/ `uma`（T-22 统一内存平台识别成功时产出，GPU 预算折叠进单一池、不产出逐设备 vram 池） |
+| `entrypoint_pool_committed_mb` | gauge | `pool`, `device` | 运行中模块实例的声明预算之和（模块粒度，与 `/api/pipelines/vram-budget` 同源取数：manifest `resolve_vram_estimate`/`resolve_ram_estimate` 变体级优先）。排队任务的已承诺额不计（调度账本未暴露）；CPU 落位不计 vram；无容量指标设备上的预算不产出（准入 fail-open 同边界） |
+| `entrypoint_tasks_total` | counter | `status` | 任务注册表终态计数（`completed`/`failed`/`cancelled` 三桶恒产出）。进程内随任务终态单调；重启时遗留 queued/running 改判 failed、retention 清理同步删除记录（F5）时计数可回落——按 Prometheus counter reset 语义聚合 |
+| `entrypoint_queue_running` / `entrypoint_queue_queued` | gauge | — | 调度器权威在途量（与 `GET /api/queue` 同源） |
+| `entrypoint_queue_paused` | gauge | — | 全局派发暂停标志（T-15），1 = 暂停 |
+| `entrypoint_modules` | gauge | `status` | 可解析 manifest 的模块按生命周期三分类计数：`running`（Running/Starting）、`error`（上次启动失败）、`stopped`（其余，含从未启动）。三桶恒产出 |
+
+不做时间序列，速率/窗口聚合交给 Prometheus（`rate()`/`increase()`）。自动
+重启次数 counter 与 external 池（openai-bridge，M2 后）暂未产出：前者待
+health_supervisor 暴露可读计数器，后者将以 `pool="external"` 标签接入。
+external 池指标为代码注释占位（`api/metrics.rs` 模块头「边界」段）。
+
 
 `GET /api/storage`（T-11）返回 `StorageReport`：`dirs[]` 为 `workspace` / `models` /
 `tasks` 三个逻辑目录（`path` 为解析后的绝对路径，`used_bytes` 递归求和；子目录符号链接
