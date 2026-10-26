@@ -43,7 +43,9 @@ function defaultParamsOf(
   const out: Record<string, unknown> = {}
   if (!params) return out
   for (const [name, schema] of Object.entries(params)) {
-    if (schema.default !== undefined && schema.default !== null) {
+    // 收官审查 P1-2：default="" 是「未设」哨兵（openai-bridge module.toml
+    // 口径），预填成显式值会让 float/boolean 参数在 daemon 类型核对处 400
+    if (schema.default !== undefined && schema.default !== null && schema.default !== '') {
       out[name] = schema.default
     }
   }

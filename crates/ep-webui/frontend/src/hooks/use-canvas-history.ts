@@ -107,9 +107,13 @@ export function useCanvasHistory<N, E>(): UseCanvasHistoryResult<N, E> {
         last &&
         opts?.coalesceKey &&
         last.coalesceKey === opts.coalesceKey &&
-        now - last.at <= COALESCE_WINDOW_MS
+        now - last.at <= COALESCE_WINDOW_MS &&
+        index === entries.length
       ) {
-        // 连续编辑合并：只更新上一步的 after（before 保持最初态；指针不动）
+        // 连续编辑合并：只更新上一步的 after（before 保持最初态；指针不动）。
+        // 收官审查 P1-1：必须指针在栈顶才允许合并——undo 后指针下方存在旧
+        // 条目，同窗重做同 key 操作若写入 last.after 会污染历史（redo 复活
+        // 过期分支并丢弃用户的新步进）。
         last.after = after
         last.at = now
         return

@@ -80,6 +80,10 @@ jobs:
       - name: Lint（oxlint）
         run: npm run lint
 
+      # T-28a：vitest 套件（纯函数/jshook，无浏览器依赖，<10s）
+      - name: 测试（vitest）
+        run: npm test
+
       # vite 产物输出到 crates/ep-webui/static（仓库跟踪目录），仅 CI 工作区重建，不回写仓库
       - name: 构建（tsc -b && vite build）
         run: npm run build

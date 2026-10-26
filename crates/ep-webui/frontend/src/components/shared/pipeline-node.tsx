@@ -262,10 +262,15 @@ export function capabilityParamSpec(
   }
 
   const def = s.default
+  // 收官审查 P1-2：module.toml 的可选参数以 default="" 表示「未设」（adapter
+  // 空串容忍、daemon 注入跳校验）——空串不得预填进 params，否则显式下发
+  // "" 会在 float/boolean 类型核对处 400（float 参数 TypeMismatch）
   let defaultValue: ParamValue | undefined =
-    typeof def === 'string' || typeof def === 'boolean' || isFiniteNumber(def)
-      ? def
-      : undefined
+    def === ''
+      ? undefined
+      : typeof def === 'string' || typeof def === 'boolean' || isFiniteNumber(def)
+        ? def
+        : undefined
   // select 默认值不在可选项内时丢弃（避免渲染出悬空选中项）
   if (type === 'select' && typeof defaultValue === 'string' && !options.includes(defaultValue)) {
     defaultValue = undefined
