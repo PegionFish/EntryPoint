@@ -24,6 +24,8 @@ pub mod stores;
 pub mod tasks;
 pub mod upload;
 pub mod watchers;
+// T-31：工作区整体导出/迁移（迁移包 = config+管线+cron+watcher+webhook+模块注册状态）
+pub mod workspace;
 
 use std::sync::Arc;
 
@@ -79,6 +81,8 @@ pub fn api_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .merge(inference::router(state))
         // T-24：命名 LLM 提供商档案（/api/llm/providers CRUD + 连接测试）
         .merge(llm::router())
+        // T-31：工作区整体导出/迁移（旧机→新机一键迁移；导出含密钥选项）
+        .merge(workspace::router())
         // T-32：Prometheus 指标（池占用 / 任务吞吐 / 模块健康度；
         // /api 前缀下自动落入 auth.rs 全局访问保护域）
         .merge(metrics::router())

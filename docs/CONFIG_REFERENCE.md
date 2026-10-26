@@ -860,3 +860,25 @@ EntryPoint/                        ← 应用根目录
    代码缺省 0.0.0.0；仓库自带配置缺省 127.0.0.1），本机浏览器访问 http://127.0.0.1:9800 即可使用；
    Windows server 包的 start-daemon.bat 会自动打开默认浏览器
 ```
+
+---
+
+## 8. 工作区迁移端点（T-31）
+
+整机迁移的导出/导入端点（操作指南见 [DEPLOYMENT.md §16](DEPLOYMENT.md)）：
+
+| 端点 | 说明 |
+|---|---|
+| `GET /api/workspace/export?include_secrets=` | 导出迁移包（单 JSON 文件）。默认掩码 `server.token` / `api.token` / `llm.providers[].api_key`（空串 + 包顶层 `server_token_set` / `api_token_set` 布尔，ConfigView 同款）；`include_secrets=true`（或 `1`）时明文入包并附 `secret_warning`；响应头恒 `Cache-Control: no-store` |
+| `POST /api/workspace/import?overwrite=` | 导入迁移包。`format_version`（当前 `workspace-migration/v1`）缺失/不符 → 400；config 段形状非法 → 400（不做半套迁移）。同名管线 id / cron 键 / watcher id / hook id 默认冲突跳过（`skipped_conflicts` 逐条列出），`overwrite=true` 覆盖；响应为逐段报告 |
+
+迁移包段：`config`（含 `[storage.stores]` 逻辑名，导入走 `PUT /api/config`
+同一合并实现）、`pipelines`（`entrypoint-pipeline/v1` 描述符数组，`store:`
+逻辑名改写同单管线导出）、`schedules` / `watchers`（注册表原样，水位线
+`last_checked` / `checkpoint` 与在途表逐字段保留）、`processed_registry`
+（T-25 产物登记表，合并导入，导入后建议重启 daemon 生效）、`webhooks`
+（hook_id 原样，对外触发 URL 不变）、`modules`（模块注册状态快照
+id/name/version；模块本体与 venv 不入包，导入响应 `modules_missing`
+提示需重装的模块）。
+
+不新增任何 `app.toml` 配置键；两端点均在 `/api` 前缀下，落入全局访问保护域。

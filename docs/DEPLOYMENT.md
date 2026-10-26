@@ -321,3 +321,65 @@ cargo build -p ep-tray --release   # 与 ep-daemon.exe 放同一目录后双击�
 - "停止 daemon"/退出为强制终止（daemon 无 HTTP 停机端点）；建议停机前
   先在 WebUI 停掉运行中的推理任务；
 - 采纳的外部 daemon（非托盘拉起）无子进程句柄，"停止"对其无效。
+
+---
+
+## 16. 整机迁移（工作区导出/导入，T-31）
+
+「旧机 → 新机整体迁移」：配置、管线、定时计划（含水位线）、触发规则
+（含水位线与产物登记表）、Webhook 触发器、存储池逻辑名与模块注册状态，
+一条命令导出为**单个 JSON 迁移包**，在新机一条命令导入。模型权重与模块
+venv 不入包（体积大且 venv 依赖新机 arch 重解析；模块经模块页重新导入，
+requirements 按新机架构自动安装）。
+
+### 16.1 导出（旧机）
+
+```bash
+# 默认导出（密钥掩码，传输面安全）
+curl -s http://127.0.0.1:9800/api/workspace/export -o migration.json
+
+# 含明文密钥导出（server.token / api.token / llm api_key 原样入包）
+curl -s "http://127.0.0.1:9800/api/workspace/export?include_secrets=true" -o migration.json
+```
+
+- 默认导出对 config 段密钥脱敏（与 WebUI 设置页同款纪律）：三处密钥置空串，
+  是否已配置经包顶层 `server_token_set` / `api_token_set` 布尔表达；
+- `include_secrets=true` 的包内含明文密钥，响应携带 `secret_warning`——
+  请妥善保管传输与存储介质，导入完成后建议删除该文件；
+- 管线段为 `entrypoint-pipeline/v1` 描述符（与管线页单管线导出同格式），
+  池内物理路径已改写为 `store:<逻辑名>` 引用（T-26 换机迁移契约）。
+
+### 16.2 导入（新机）
+
+```bash
+curl -s -X POST http://127.0.0.1:9800/api/workspace/import \
+  -H "content-type: application/json" \
+  --data-binary @migration.json
+
+# 覆盖新机同名资产（管线 id / cron 键 / watcher id / hook id）
+curl -s -X POST "http://127.0.0.1:9800/api/workspace/import?overwrite=true" \
+  -H "content-type: application/json" \
+  --data-binary @migration.json
+```
+
+响应为逐段报告（`imported` / `skipped_conflicts` / `invalid` 计数）：
+**默认不覆盖既有同名资产**——冲突逐条列入 `skipped_conflicts` 并跳过，
+带 `overwrite=true` 才覆盖。`modules_missing` 列出包内有、本机未装的模块
+（经模块页/`POST /api/modules/import` 重新导入即可）。
+
+### 16.3 密钥与冲突语义
+
+- **掩码包导入 = 保留新机既有密钥**（空串 = 不修改，与 `PUT /api/config`
+  的 T-16 语义一致）；**明文包导入 = 覆盖为旧机密钥**；
+- config 段整体生效（含 `[storage.stores]` 逻辑名）；`[server].host/port`
+  与 `[pipeline].workspace_dir` 属重启敏感项，导入报告的
+  `config.requires_restart = true` 时重启 daemon 生效；
+- 存储池换机重绑：逻辑名随配置迁移，新机物理路径不同只需改
+  `[storage.stores].path`（管线内 `store:` 引用不动，T-26 语义）；
+- cron 水位线（`last_checked`）与 watcher 水位线（`checkpoint`）逐字段
+  保留——迁移不重复触发、不丢失静默期状态；cron/watcher 注册表导入落盘后
+  由巡检循环下轮自动重载（30s / 10s）；
+- T-25 产物登记表为合并导入；该表内存缓存于 daemon，**导入后重启一次
+  daemon** 使其对触发扫描生效（旧机路径在新机不存在时启动期自动清扫）；
+- 包内 `format_version` 字段为向后兼容锚（当前
+  `workspace-migration/v1`），版本不符时导入返回 400。

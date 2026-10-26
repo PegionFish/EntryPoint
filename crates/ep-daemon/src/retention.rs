@@ -17,9 +17,10 @@
 //! - 淘汰顺序按完成时间（`finished_at`，缺失时回退 `started_at`）升序：
 //!   先删超龄任务（`max_age_days`），再按总容量（`max_total_gb`）从最旧开始删，
 //!   直至满足上限；两个维度互相独立，`0` = 该维度不限。
-//! - 删除即整个任务目录 `remove_dir_all`（**产物一并删除**）；成功写一条
-//!   `task_retention_cleanup` 事件到统一事件日志（复用
-//!   [`crate::eventlog::append_event`]，不另造日志文件/格式）。
+//! - 删除即整个任务目录 `remove_dir_all`（**产物一并删除**）；成功后同步删除
+//!   `runtime/tasks/{id}.json` 注册表记录（F5：防幽灵任务残留，删除失败仅
+//!   告警不回滚），并写一条 `task_retention_cleanup` 事件到统一事件日志
+//!   （复用 [`crate::eventlog::append_event`]，不另造日志文件/格式）。
 //! - 单个目录删除失败仅告警并继续本轮，不阻断其它任务清理。
 //!
 //! ## 调度
@@ -317,9 +318,23 @@ fn terminal_candidate(
 }
 
 /// 删除整个任务目录（含产物）并写清理事件；失败仅告警返回 false。
+///
+/// F5（审计遗留合并项）：目录删除成功后**同步删除** `runtime/tasks/{id}.json`
+/// 注册表记录——注册表是任务历史的唯一索引，目录已删而记录残留会让
+/// GET /api/tasks 列出指向不存在目录的幽灵任务；删除记录失败仅告警，
+/// **不回滚目录删除**（目录删除是磁盘回收的主语义，记录残留仅是可观测
+/// 面的陈旧项，下一轮巡检不再触碰该 id——目录不存在时 `load_record`
+/// 对应目录根本不会被扫描）。
 fn cleanup_task(root: &Path, candidate: &Candidate, reason: &str, now: DateTime<Utc>) -> bool {
     match std::fs::remove_dir_all(&candidate.path) {
         Ok(()) => {
+            if let Err(e) = delete_registry_record(root, &candidate.id) {
+                tracing::warn!(
+                    task_id = %candidate.id,
+                    error = %e,
+                    "任务注册表记录删除失败（目录已删除，不回滚）"
+                );
+            }
             eventlog::append_event(
                 root,
                 &json!({
@@ -349,6 +364,20 @@ fn cleanup_task(root: &Path, candidate: &Candidate, reason: &str, now: DateTime<
             );
             false
         }
+    }
+}
+
+/// 删除任务注册表记录（`runtime/tasks/{task_id}.json`）。
+/// 记录本就不存在视为成功（幂等）；其余 IO 错误上抛由调用方告警。
+fn delete_registry_record(root: &Path, task_id: &str) -> std::io::Result<()> {
+    let path = root
+        .join("runtime")
+        .join("tasks")
+        .join(format!("{task_id}.json"));
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
@@ -903,6 +932,110 @@ mod tests {
         assert!(dir.exists(), "注册表损坏的目录必须保守跳过");
         assert!(cleanup_events(&root).is_empty());
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── F5：目录删除成功后同步删除注册表记录 ──────────────────────────────
+
+    /// F5 验收 ①：超龄任务目录删除成功后，`runtime/tasks/{id}.json` 记录
+    /// 一并消失（防幽灵任务残留），其余任务的记录不受影响。
+    #[test]
+    fn cleanup_removes_registry_record_with_task_dir() {
+        let root = unique_root("f5-record");
+        let workspace = root.join("workspace");
+        let now = Utc::now();
+        let long_ago = now - chrono::Duration::days(30);
+
+        let old_dir = create_task_dir(&workspace, "old-task", 1024);
+        write_record(
+            &root,
+            "old-task",
+            "pipeline-f5",
+            TaskState::Completed,
+            long_ago,
+            Some(long_ago),
+            &old_dir,
+        );
+        let keep_dir = create_task_dir(&workspace, "keep-task", 1024);
+        write_record(
+            &root,
+            "keep-task",
+            "pipeline-f5",
+            TaskState::Completed,
+            now,
+            Some(now),
+            &keep_dir,
+        );
+
+        let policy = TasksRetentionConfig {
+            enabled: true,
+            max_age_days: 1,
+            max_total_gb: 0,
+        };
+        let report = run_retention_once(&root, &workspace, &policy, now);
+        assert_eq!(report.deleted, 1);
+
+        // 目录删除成功 → 注册表记录同步消失
+        assert!(!old_dir.exists());
+        assert!(
+            !root.join("runtime").join("tasks").join("old-task.json").exists(),
+            "F5：任务目录删除后注册表记录必须一并删除"
+        );
+        // 未被清理的任务记录原样保留
+        assert!(keep_dir.exists());
+        assert!(
+            root.join("runtime").join("tasks").join("keep-task.json").exists(),
+            "未清理任务的注册表记录不得误删"
+        );
+        // 清理事件照常
+        let events = cleanup_events(&root);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["task_id"], "old-task");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// F5 验收 ②：注册表记录删除失败仅告警，**不回滚目录删除**——
+    /// cleanup_task 仍返回成功语义（目录已删、事件照写）。
+    ///
+    /// 手法：把 `runtime/tasks/{id}.json` 造成**目录**——`remove_file` 对
+    /// 目录必然失败（Windows ACCESS_DENIED / POSIX EISDIR），而 cleanup_task
+    /// 只删记录不读内容，构造不影响候选判定。
+    #[test]
+    fn registry_record_delete_failure_does_not_block_dir_deletion() {
+        let root = unique_root("f5-stuck");
+        let workspace = root.join("workspace");
+        let now = Utc::now();
+        let long_ago = now - chrono::Duration::days(30);
+
+        let dir = create_task_dir(&workspace, "stuck-task", 1024);
+        // 注册表"记录"造成目录 → 删除必失败
+        let record_path = root.join("runtime").join("tasks").join("stuck-task.json");
+        std::fs::create_dir_all(&record_path).unwrap();
+
+        let candidate = Candidate {
+            id: "stuck-task".to_string(),
+            pipeline_id: "pipeline-f5".to_string(),
+            status: TaskState::Completed,
+            path: dir.clone(),
+            completed_at: long_ago,
+            size_bytes: 1024,
+        };
+
+        // cleanup_task 直接调用（私有函数，模块内测试可达）
+        let ok = cleanup_task(&root, &candidate, REASON_MAX_AGE, now);
+        assert!(ok, "记录删除失败不得改变目录删除的成功语义");
+        assert!(!dir.exists(), "任务目录必须已被删除");
+        assert!(
+            record_path.is_dir(),
+            "删不掉的记录仍留在原地（仅告警，不回滚）"
+        );
+        // 清理事件照常写入
+        let events = cleanup_events(&root);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["task_id"], "stuck-task");
+
+        std::fs::remove_dir_all(&record_path).unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 }
