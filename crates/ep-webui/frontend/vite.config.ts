@@ -1,3 +1,4 @@
+/// <reference types="vitest/config" />
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
@@ -29,5 +30,13 @@ export default defineConfig({
         ws: true,
       },
     },
+  },
+  // T-28a：vitest 单测（`npm test` = vitest run）。
+  // jsdom 环境：use-canvas-history 等 React hook 测试（@testing-library/react）
+  // 需要 DOM；纯函数测试（spec-io round-trip）在 jsdom 下同样工作。
+  // test 段仅被 vitest 消费，`npm run build` 产物不受影响（devDependency 不入 bundle）。
+  test: {
+    environment: 'jsdom',
+    include: ['src/**/*.{test,spec}.{ts,tsx}'],
   },
 })

@@ -972,3 +972,36 @@ export interface LlmConnectionTestResult {
   /** ok=false 时的失败原因 */
   error?: string
 }
+
+// ===== v1 批量接入（T-28c；POST /api/v1/batches —— crates/ep-daemon/src/api/batches.rs）=====
+
+/**
+ * POST /api/v1/batches 请求体：服务器侧文件夹逐文件直跑，同批成员任务
+ * 聚为一个任务组（group_id）。folder 缺省仅接受 workspace/uploads 内目录
+ * （越权 → 403 FOLDER_NOT_ALLOWED）；整批须能全部入队（超出 → 429）。
+ */
+export interface BatchSubmitRequest {
+  module_id: string
+  capability: string
+  /** 服务器侧文件夹（daemon 侧路径） */
+  folder: string
+  /** 应用于全部文件的能力参数（同一 schema 校验与默认值注入） */
+  params: Record<string, unknown>
+  /** 递归枚举子目录（缺省仅一层） */
+  recursive?: boolean
+  /** 扩展名过滤（如 [".png", ".jpg"]；大小写不敏感；缺省不过滤） */
+  extensions?: string[]
+  /** 每个成员任务完成后的回调（best-effort，透传既有 callback 机制） */
+  callback_url?: string
+}
+
+/** POST /api/v1/batches 响应（202）：一个 batch = 一个任务组；成员仍持独立 task_id */
+export interface BatchSubmitResponse {
+  group_id: string
+  submitted: number
+  /** 受理失败的文件数（failed_submissions 清单长度） */
+  skipped: number
+  task_ids: string[]
+  /** 提交失败的文件清单（可选；单个失败不影响其余成员） */
+  failed_submissions?: string[]
+}

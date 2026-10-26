@@ -30,10 +30,13 @@ import {
   Loader2,
   MemoryStick,
   Plus,
+  Redo2,
   RefreshCw,
+  Search,
   Sparkles,
   Trash2,
   TriangleAlert,
+  Undo2,
   Upload,
   Waypoints,
   X,
@@ -48,8 +51,6 @@ import type {
   ExecutePipelineRequest,
   ModelListResponse,
   ModuleResponse,
-  PipelineEdgeSpec,
-  PipelineNodeSpec,
   PipelineSpec,
   PipelineSummary,
   TaskArtifact,
@@ -82,6 +83,39 @@ import { Input } from '@/components/ui/input'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Switch } from '@/components/ui/switch'
 
+// T-28a：spec/TOML 互转纯函数抽出为独立模块（热点文件减负 + vitest 直测）
+import {
+  buildBudgetSpec,
+  canvasFingerprint,
+  collectDependencyLines,
+  edgeLabelFor,
+  fallbackPipelineId,
+  fromSpec,
+  parsePipelineToml,
+  PIPELINE_ID_RULE,
+  specToToml,
+  toSpec,
+} from '@/components/pipeline/spec-io'
+import type { CanvasMeta } from '@/components/pipeline/spec-io'
+// T-28b：多模块编辑（命令栈撤销/重做 + 多选批量操作 + 节点搜索）
+import { useCanvasHistory } from '@/hooks/use-canvas-history'
+import { BatchParamsPanel } from '@/components/pipeline/batch-params-panel'
+import { MultiSelectToolbar } from '@/components/pipeline/multi-select-toolbar'
+import { NodeSearchPanel } from '@/components/pipeline/node-search-panel'
+import {
+  RunSelectionDialog,
+  type RunGroupOptions,
+  type RunGroupTarget,
+} from '@/components/pipeline/run-selection-dialog'
+import {
+  alignSelected,
+  cloneSelection,
+  commonParamShape,
+  NUDGE_STEP,
+  nudgeSelected,
+} from '@/components/pipeline/selection-utils'
+import type { AlignMode } from '@/components/pipeline/selection-utils'
+
 import {
   BUILTIN_DEFS,
   DATA_TYPE_META,
@@ -97,19 +131,14 @@ import {
   defaultParams,
   getNodePorts,
   getParamSpecs,
-  moduleNodeFieldsFromSpec,
-  moduleNodeSpecFields,
   nodeKindLabel,
   normalizeNodeStatus,
   pipelineNodeTypes,
-  serializeArgsParam,
 } from '@/components/shared/pipeline-node'
 import type {
   BuiltinFlowNode,
-  BuiltinKind,
   CapabilityDef,
   DragPayload,
-  ModuleFlowNode,
   ModuleNodeData,
   NodeParams,
   ParamSpec,
@@ -384,18 +413,6 @@ function examplePipeline(
 // 辅助函数
 // ============================================================
 
-function edgeLabelFor(
-  sourceId: string | null | undefined,
-  sourceHandle: string | null | undefined,
-  nodeList: { id: string; data: PipelineNodeData }[],
-): string | undefined {
-  const source = nodeList.find((n) => n.id === sourceId)
-  if (!source) return undefined
-  const { outputs } = getNodePorts(source.data)
-  const port = outputs.find((p) => p.id === (sourceHandle ?? 'out')) ?? outputs[0]
-  return port ? DATA_TYPE_META[port.dataType].label : undefined
-}
-
 /** 后端错误对象 → 可展示文案 */
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
@@ -513,244 +530,6 @@ function formatMb(mb: number | null | undefined): string {
 }
 
 // ============================================================
-// spec ↔ React Flow 互转（纯函数）
-// ============================================================
-
-/** 管线 id 命名规则（与后端 PUT /api/pipelines/:id 校验一致） */
-const PIPELINE_ID_RULE = /^[a-z0-9][a-z0-9-]*$/
-
-interface CanvasMeta {
-  id: string
-  name: string
-  description: string
-}
-
-/**
- * P1-11 节点级超时/重试的前端挂载字段（后端 SpecNode 的 timeout_secs /
- * retry_count）。前端暂无编辑 UI，仅加载→保存往返保真（C2 节点数据类型
- * 不含这两个字段，页面层以交叉类型读写）。
- */
-interface NodeTimingExt {
-  timeoutSecs?: number
-  retryCount?: number
-}
-
-/** 深度排序对象键后序列化，保证相同内容产生相同指纹（与键插入顺序无关） */
-function canonicalJson(value: unknown): string {
-  const sort = (v: unknown): unknown => {
-    if (Array.isArray(v)) return v.map(sort)
-    if (v && typeof v === 'object') {
-      const out: Record<string, unknown> = {}
-      for (const key of Object.keys(v as Record<string, unknown>).sort()) {
-        out[key] = sort((v as Record<string, unknown>)[key])
-      }
-      return out
-    }
-    return v
-  }
-  return JSON.stringify(sort(value))
-}
-
-/**
- * React Flow 画布 → 服务端 PipelineSpec（toSpec）。
- *
- * - 节点保留 id/label/kind/builtin/module_id/capability/params/position；
- *   params 整体原样输出（含 UI 不展示的字段，往返不丢失）。
- * - 边以 `{from: [node, port], to: [node, port]}` 输出，sourceHandle/targetHandle
- *   即节点端口 id（缺省回退 out/in，与现有端口定义一致）。
- * - 外部 API 节点不在服务端 spec 契约内（后端仅接受 builtin/module），
- *   调用方需先拦截；此处作为最后防线抛错。
- */
-function toSpec(
-  nodes: PipelineFlowNode[],
-  edges: Edge[],
-  meta: CanvasMeta,
-): PipelineSpec {
-  const specNodes: PipelineNodeSpec[] = nodes.map((n): PipelineNodeSpec => {
-    // P1-11 节点级超时/重试：前端无编辑面，加载时挂在 data 上（NodeTimingExt），
-    // 保存时原样写回，保证 加载→保存 往返不丢失
-    const timing = n.data as PipelineNodeData & NodeTimingExt
-    const common = {
-      id: n.id,
-      label: n.data.label,
-      params: { ...n.data.params },
-      position: { x: n.position.x, y: n.position.y },
-      ...(typeof timing.timeoutSecs === 'number' ? { timeout_secs: timing.timeoutSecs } : {}),
-      ...(typeof timing.retryCount === 'number' ? { retry_count: timing.retryCount } : {}),
-    }
-    switch (n.data.kind) {
-      case 'builtin': {
-        const params = { ...n.data.params }
-        // P0-2：ffmpeg args 序列化恒数组（遗留字符串形状按空白拆词归一，
-        // 与后端 B7 防御性拆分的语义一致；C2 serializeArgsParam 统一出口）
-        if (n.data.builtin === 'ffmpeg' && params.args !== undefined) {
-          params.args = serializeArgsParam(params.args)
-        }
-        // §5.6：file_gate 的 media 条件在 UI 以平铺键（media_*）编辑，
-        // 序列化时收敛为后端契约的嵌套 media 对象；仅写出已配置（>0）的条件
-        if (n.data.builtin === 'file_gate') {
-          const media: Record<string, number> = {}
-          for (const [flat, nested] of FILE_GATE_MEDIA_KEYS) {
-            const v = params[flat]
-            if (typeof v === 'number' && Number.isFinite(v) && v > 0) media[nested] = v
-          }
-          for (const [flat] of FILE_GATE_MEDIA_KEYS) delete params[flat]
-          if (Object.keys(media).length > 0) params.media = media as unknown as ParamValue
-        }
-        // T-13：ffmpeg 模板节点（params.template）在服务端契约里是
-        // builtin = "ffmpeg_template"，模板 id 与参数原样下发（执行器零模型成本
-        // 按模板表渲染命令）；无模板的普通 ffmpeg 节点保持原样。
-        if (n.data.builtin === 'ffmpeg') {
-          const templateId = typeof params.template === 'string' ? params.template.trim() : ''
-          if (templateId) {
-            return { ...common, params, kind: 'builtin', builtin: 'ffmpeg_template' }
-          }
-        }
-        return { ...common, params, kind: 'builtin', builtin: n.data.builtin }
-      }
-      case 'module':
-        // §6.2 契约字段（capability 裸名 + model/device；C2 moduleNodeSpecFields
-        // 负责「空串/auto 等价缺省不输出」语义，仲裁 #2/#28）
-        return {
-          ...common,
-          kind: 'module',
-          module_id: n.data.moduleId,
-          ...moduleNodeSpecFields(n.data),
-        }
-      case 'external':
-        throw new Error(tp('save.externalNodeRejected', { label: n.data.label }))
-    }
-  })
-  const specEdges: PipelineEdgeSpec[] = edges.map((e) => ({
-    from: [e.source, e.sourceHandle ?? 'out'],
-    to: [e.target, e.targetHandle ?? 'in'],
-  }))
-  return {
-    pipeline: { id: meta.id, name: meta.name, description: meta.description },
-    nodes: specNodes,
-    edges: specEdges,
-  }
-}
-
-/**
- * VRAM 预算专用 spec 投影（§6.3）：只保留后端 vram-budget 消费的字段
- * （id/kind/module_id/capability/model/device + 边），跳过 external 节点。
- * 画布为空（无可用节点）返回 null（后端对空 spec 返回 400，前端先行拦截）。
- */
-function buildBudgetSpec(
-  nodes: PipelineFlowNode[],
-  edges: Edge[],
-): PipelineSpec | null {
-  const usable = nodes.filter(
-    (n): n is ModuleFlowNode | BuiltinFlowNode => n.data.kind !== 'external',
-  )
-  if (usable.length === 0) return null
-  const ids = new Set(usable.map((n) => n.id))
-  const specNodes: PipelineNodeSpec[] = usable.map((n) => {
-    if (n.data.kind === 'builtin') {
-      return {
-        id: n.id,
-        label: n.data.label,
-        kind: 'builtin' as const,
-        builtin: n.data.builtin,
-        params: {},
-      }
-    }
-    return {
-      id: n.id,
-      label: n.data.label,
-      kind: 'module' as const,
-      module_id: n.data.moduleId,
-      params: {},
-      ...moduleNodeSpecFields(n.data),
-    }
-  })
-  const specEdges: PipelineEdgeSpec[] = edges
-    .filter((e) => ids.has(e.source) && ids.has(e.target))
-    .map((e) => ({
-      from: [e.source, e.sourceHandle ?? 'out'] as [string, string],
-      to: [e.target, e.targetHandle ?? 'in'] as [string, string],
-    }))
-  return {
-    pipeline: { id: 'vram-budget', name: 'vram-budget', description: '' },
-    nodes: specNodes,
-    edges: specEdges,
-  }
-}
-
-/**
- * 简单级联布局：按拓扑深度分列（Kahn 求最长路径深度），每列纵向排开。
- * 仅用于 spec 中缺少 position 的节点；环上节点保持深度 0。
- */
-function cascadeLayout(spec: PipelineSpec): Map<string, { x: number; y: number }> {
-  const ids = spec.nodes.map((n) => n.id)
-  const depth = new Map<string, number>(ids.map((id) => [id, 0]))
-  const indegree = new Map<string, number>(ids.map((id) => [id, 0]))
-  const children = new Map<string, Set<string>>()
-  for (const e of spec.edges ?? []) {
-    if (!Array.isArray(e.from) || !Array.isArray(e.to)) continue
-    const u = e.from[0]
-    const v = e.to[0]
-    if (!depth.has(u) || !depth.has(v) || u === v) continue
-    const set = children.get(u) ?? new Set<string>()
-    if (!set.has(v)) {
-      set.add(v)
-      children.set(u, set)
-      indegree.set(v, (indegree.get(v) ?? 0) + 1)
-    }
-  }
-  const queue = ids.filter((id) => (indegree.get(id) ?? 0) === 0)
-  while (queue.length > 0) {
-    const u = queue.shift()!
-    for (const v of children.get(u) ?? []) {
-      depth.set(v, Math.max(depth.get(v) ?? 0, (depth.get(u) ?? 0) + 1))
-      indegree.set(v, (indegree.get(v) ?? 0) - 1)
-      if (indegree.get(v) === 0) queue.push(v)
-    }
-  }
-  const columns = new Map<number, string[]>()
-  for (const id of ids) {
-    const col = depth.get(id) ?? 0
-    const list = columns.get(col) ?? []
-    list.push(id)
-    columns.set(col, list)
-  }
-  const positions = new Map<string, { x: number; y: number }>()
-  for (const [col, list] of columns) {
-    list.forEach((id, row) => {
-      positions.set(id, { x: 40 + col * 320, y: 40 + row * 160 })
-    })
-  }
-  return positions
-}
-
-/**
- * file_gate media 条件的 UI 平铺键 ↔ 后端契约嵌套键（§5.6）。
- * UI 侧 `media_*` 平铺编辑，spec 侧收敛为嵌套 `media` 对象。
- */
-const FILE_GATE_MEDIA_KEYS: [flat: string, nested: string][] = [
-  ['media_min_duration_secs', 'min_duration_secs'],
-  ['media_max_duration_secs', 'max_duration_secs'],
-  ['media_min_width', 'min_width'],
-  ['media_min_height', 'min_height'],
-]
-
-/**
- * 端口名归一：服务端 spec 的端口名（input/output，ep-core 契约）
- * ↔ 前端节点 handle id（in/out，BUILTIN_DEFS 定义）。
- * fallback 为对应方向的默认 handle。
- */
-function normalizePortName(
-  port: string | undefined,
-  fallback: 'in' | 'out',
-): string {
-  if (!port) return fallback
-  if (port === 'input' || port === 'in') return 'in'
-  if (port === 'output' || port === 'out') return 'out'
-  return port
-}
-
-// ============================================================
 // T-13：内置 ffmpeg 模板库（GET /api/builtins）前端桥接
 //
 // 模板在服务端契约里是 builtin = "ffmpeg_template"（执行器按模板表渲染命令），
@@ -817,189 +596,6 @@ function createTemplateNode(
   }
 }
 
-/**
- * 服务端 PipelineSpec → React Flow 画布（fromSpec）。
- *
- * - builtin 节点：按 builtin 名恢复（未知 builtin 跳过并计数）；
- * - module 节点：能力/分类/版本按 moduleList（api.modules()）数据驱动恢复
- *   （P0-1 收口，capability 为裸名契约）；模块未安装时降级为无能力空态；
- * - §6.2 model/device 与 P1-11 timeout/retry 原样恢复（往返不丢失）；
- * - params 原样保留（含 UI 不展示字段，往返不丢失）；
- * - position 缺失的节点走级联布局；
- * - 引用未知节点的边被过滤。
- */
-function fromSpec(
-  spec: PipelineSpec,
-  moduleList: ModuleResponse[] | null,
-): {
-  nodes: PipelineFlowNode[]
-  edges: Edge[]
-  skippedNodes: number
-} {
-  const layout = cascadeLayout(spec)
-  const nodes: PipelineFlowNode[] = []
-  const known = new Set<string>()
-  let skippedNodes = 0
-
-  /** P1-11 超时/重试挂载（前端无编辑面，仅往返保真） */
-  const applyTiming = (data: PipelineNodeData, sn: PipelineNodeSpec) => {
-    const ext = data as PipelineNodeData & NodeTimingExt
-    if (typeof sn.timeout_secs === 'number') ext.timeoutSecs = sn.timeout_secs
-    if (typeof sn.retry_count === 'number') ext.retryCount = sn.retry_count
-  }
-
-  for (const sn of spec.nodes ?? []) {
-    const position = sn.position ?? layout.get(sn.id) ?? { x: 0, y: 0 }
-    // 保留非 UI 展示的参数值：运行时原样存取，toSpec 时整体写回
-    const params = (sn.params ?? {}) as NodeParams
-
-    if (sn.kind === 'builtin') {
-      // T-13：执行器模板节点在画布上以 ffmpeg builtin 呈现（端口/handle 沿用
-      // BUILTIN_DEFS.ffmpeg），模板 id 保留在 params.template，保存时由 toSpec
-      // 桥接回 ffmpeg_template，保证 加载→保存 往返不丢失。
-      if (sn.builtin === 'ffmpeg_template') {
-        const templateId = typeof params.template === 'string' ? params.template.trim() : ''
-        const data: PipelineNodeData = {
-          kind: 'builtin',
-          builtin: 'ffmpeg',
-          label:
-            sn.label ||
-            (templateId
-              ? tp(`builtinTemplate.${templateId}.name`, { defaultValue: templateId })
-              : BUILTIN_DEFS.ffmpeg.label),
-          status: 'waiting',
-          params,
-        }
-        applyTiming(data, sn)
-        nodes.push({ id: sn.id, type: 'builtin', position, data })
-        known.add(sn.id)
-        continue
-      }
-      const builtin = sn.builtin as BuiltinKind | undefined
-      if (builtin && builtin in BUILTIN_DEFS) {
-        // §5.6：file_gate 的嵌套 media 对象还原为 UI 平铺键（往返不丢失；
-        // toSpec 序列化时按原键收敛回嵌套对象）
-        if (builtin === 'file_gate' && params.media && typeof params.media === 'object' && !Array.isArray(params.media)) {
-          const media = params.media as Record<string, unknown>
-          for (const [flat, nested] of FILE_GATE_MEDIA_KEYS) {
-            const v = media[nested]
-            if (typeof v === 'number' && Number.isFinite(v)) params[flat] = v
-          }
-          delete params.media
-        }
-        const data: PipelineNodeData = {
-          kind: 'builtin',
-          builtin,
-          label: sn.label || BUILTIN_DEFS[builtin].label,
-          status: 'waiting',
-          params,
-        }
-        applyTiming(data, sn)
-        nodes.push({ id: sn.id, type: 'builtin', position, data })
-        known.add(sn.id)
-        continue
-      }
-      skippedNodes += 1
-      continue
-    }
-
-    if (sn.kind === 'module') {
-      // 能力数据驱动：按 module_id 查已安装模块的 manifest capabilities
-      const moduleInfo = moduleList?.find((m) => m.id === sn.module_id) ?? null
-      const caps = capabilitiesFromModule(moduleInfo?.capabilities)
-      const fields = moduleNodeFieldsFromSpec(sn)
-      const cap = caps.find((c) => c.id === fields.capabilityId) ?? null
-      const data: ModuleNodeData = {
-        kind: 'module',
-        label: sn.label || cap?.label || fields.capabilityId || sn.module_id || 'unknown',
-        moduleId: sn.module_id || 'unknown',
-        // spec 契约不含版本：取已安装模块版本，未知时占位展示
-        moduleVersion: moduleInfo?.version ?? '1.0.0',
-        category: moduleInfo?.category ?? 'other',
-        capabilities: caps,
-        capabilityId: fields.capabilityId || cap?.id || '',
-        capabilityLabel: cap?.label ?? fields.capabilityId,
-        status: 'waiting',
-        params,
-      }
-      // §6.2 变体 pin / 设备绑定（C2 ModuleNodeData 字段）
-      if (fields.model) data.model = fields.model
-      if (fields.device) data.device = fields.device
-      applyTiming(data, sn)
-      nodes.push({ id: sn.id, type: 'module', position, data })
-      known.add(sn.id)
-      continue
-    }
-
-    // 未知 kind：前端 spec 契约仅 builtin/module（external_api 已由后端 §6.7
-    // 归一为 builtin llm），不认识的种类跳过并计数，加载 toast 中提示
-    skippedNodes += 1
-  }
-
-  const edges: Edge[] = (spec.edges ?? [])
-    .filter(
-      (e) =>
-        Array.isArray(e.from) &&
-        Array.isArray(e.to) &&
-        known.has(e.from[0]) &&
-        known.has(e.to[0]),
-    )
-    .map((e, index) => ({
-      id: `e-${e.from[0]}:${e.from[1]}->${e.to[0]}:${e.to[1]}-${index}`,
-      source: e.from[0],
-      // 服务端 spec 端口名（input/output）归一到前端 handle id（in/out），
-      // 否则内置管线的边会因 handle 不存在被 React Flow 静默丢弃
-      sourceHandle: normalizePortName(e.from[1], 'out'),
-      target: e.to[0],
-      targetHandle: normalizePortName(e.to[1], 'in'),
-      label: edgeLabelFor(e.from[0], e.from[1], nodes),
-    }))
-
-  return { nodes, edges, skippedNodes }
-}
-
-/**
- * 画布指纹（仅覆盖 toSpec 实际输出的契约字段）：用于判断相对上次加载 / 保存
- * 是否存在未保存更改。capabilities/category/版本等水合元数据不进指纹，
- * 模块列表异步到达后的能力水合不会误报「未保存更改」。
- */
-function canvasFingerprint(
-  nodes: PipelineFlowNode[],
-  edges: Edge[],
-  meta: CanvasMeta,
-): string {
-  return canonicalJson({
-    meta,
-    nodes: nodes.map((n) => {
-      const base = {
-        id: n.id,
-        position: n.position,
-        label: n.data.label,
-        params: n.data.params,
-      }
-      switch (n.data.kind) {
-        case 'builtin':
-          return { ...base, kind: 'builtin', builtin: n.data.builtin }
-        case 'module':
-          return {
-            ...base,
-            kind: 'module',
-            module_id: n.data.moduleId,
-            ...moduleNodeSpecFields(n.data),
-          }
-        case 'external':
-          return { ...base, kind: 'external', endpoint: n.data.endpoint, method: n.data.method }
-      }
-    }),
-    edges: edges.map((e) => ({
-      source: e.source,
-      sourceHandle: e.sourceHandle ?? null,
-      target: e.target,
-      targetHandle: e.targetHandle ?? null,
-    })),
-  })
-}
-
 /** 新建空白管线最小模板：文件输入 → 文件输出 */
 function blankTemplate(): { nodes: PipelineFlowNode[]; edges: Edge[] } {
   const input = createPipelineNode(
@@ -1023,503 +619,9 @@ function blankTemplate(): { nodes: PipelineFlowNode[]; edges: Edge[] } {
   return { nodes: [input, output], edges }
 }
 
-/** 未保存画布按 spec 执行时的兜底 pipeline.id（后端要求非空） */
-function fallbackPipelineId(name: string): string {
-  const slug = name
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-  return slug || `pipeline-${Date.now().toString(36)}`
-}
-
 // ============================================================
-// 管线 TOML 导出 / 导入（§6.4）
+// 管线 TOML 导入依赖检查（§6.4 导出/导入纯函数本体在 components/pipeline/spec-io.ts）
 // ============================================================
-
-/**
- * TOML 基本字符串：JSON.stringify 的转义序列（\" \\ \n \t \uXXXX…）
- * 与 TOML 基本字符串兼容，直接复用。
- */
-function tomlString(s: string): string {
-  return JSON.stringify(s)
-}
-
-/** TOML 键：裸键仅 [A-Za-z0-9_-]，否则加引号（与后端 bridge toml_key 同款策略） */
-function tomlKey(k: string): string {
-  return /^[A-Za-z0-9_-]+$/.test(k) ? k : tomlString(k)
-}
-
-/**
- * JSON 值 → TOML 值文本；无法表达（null/undefined/非有限数）返回 null。
- * 对象 → 行内表（与后端 bridge 输出口径一致）。
- */
-function tomlValue(v: unknown): string | null {
-  if (typeof v === 'string') return tomlString(v)
-  if (typeof v === 'number') {
-    if (!Number.isFinite(v)) return null
-    return String(v)
-  }
-  if (typeof v === 'boolean') return v ? 'true' : 'false'
-  if (Array.isArray(v)) {
-    const parts: string[] = []
-    for (const item of v) {
-      const s = tomlValue(item)
-      if (s === null) return null
-      parts.push(s)
-    }
-    return `[${parts.join(', ')}]`
-  }
-  if (v && typeof v === 'object') {
-    const parts: string[] = []
-    for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
-      if (val === undefined || val === null) continue // TOML 无 null
-      const s = tomlValue(val)
-      if (s === null) return null
-      parts.push(`${tomlKey(k)} = ${s}`)
-    }
-    return `{ ${parts.join(', ')} }`
-  }
-  return null
-}
-
-/** 前端 handle id（in/out）→ ep-core 端口名（input/output）；其余原样 */
-function exportPortName(handle: string | null | undefined, fallback: 'input' | 'output'): string {
-  if (!handle) return fallback
-  if (handle === 'in') return 'input'
-  if (handle === 'out') return 'output'
-  return handle
-}
-
-/** 导出依赖清单行：显式 pin 的 `<qualified_id>@<variant>`（§6.4 头部注释） */
-function collectDependencyLines(nodes: PipelineFlowNode[]): string[] {
-  const lines: string[] = []
-  for (const n of nodes) {
-    if (n.data.kind !== 'module') continue
-    const pin = getModuleBinding(n.data).model?.trim()
-    if (pin) lines.push(`${pin}（节点 ${n.id} · 模块 ${n.data.moduleId}）`)
-  }
-  return lines
-}
-
-/**
- * 管线 spec → TOML 文本（§6.4 导出）：头部注释依赖清单 +
- * `[pipeline]` / `[[nodes]]` / `[[edges]]` 标准布局（与后端 bridge 输出口径一致，
- * 可被 ep_core::load_pipeline 直接读回）。
- */
-function specToToml(spec: PipelineSpec, dependencyLines: string[]): string {
-  const out: string[] = []
-  out.push('# ── EntryPoint 管线编辑器导出 ──')
-  out.push(`# 导出时间: ${new Date().toISOString()}`)
-  out.push('# 依赖清单（模型 / 变体 pin）:')
-  if (dependencyLines.length === 0) {
-    out.push('#   - （无显式 pin；模块节点均跟随激活变体）')
-  } else {
-    for (const d of dependencyLines) out.push(`#   - ${d}`)
-  }
-  out.push('')
-
-  out.push('[pipeline]')
-  out.push(`id = ${tomlString(spec.pipeline.id)}`)
-  out.push(`name = ${tomlString(spec.pipeline.name)}`)
-  out.push(`description = ${tomlString(spec.pipeline.description)}`)
-
-  for (const node of spec.nodes ?? []) {
-    out.push('')
-    out.push('[[nodes]]')
-    out.push(`id = ${tomlString(node.id)}`)
-    if (node.kind === 'builtin') {
-      out.push('kind = "builtin"')
-      out.push(`builtin = ${tomlString(node.builtin ?? '')}`)
-    } else {
-      out.push('kind = "module"')
-      out.push(`module_id = ${tomlString(node.module_id ?? '')}`)
-      out.push(`capability = ${tomlString(node.capability ?? '')}`)
-      if (node.model) out.push(`model = ${tomlString(node.model)}`)
-      if (node.device) out.push(`device = ${tomlString(node.device)}`)
-    }
-    if (node.label) out.push(`label = ${tomlString(node.label)}`)
-    if (node.position) {
-      out.push(`position = { x = ${node.position.x}, y = ${node.position.y} }`)
-    }
-    const params = tomlValue(node.params ?? {})
-    if (params && params !== '{  }') out.push(`params = ${params}`)
-  }
-
-  for (const edge of spec.edges ?? []) {
-    out.push('')
-    out.push('[[edges]]')
-    out.push(
-      `from = [${tomlString(edge.from[0])}, ${tomlString(exportPortName(edge.from[1], 'output'))}]`,
-    )
-    out.push(
-      `to = [${tomlString(edge.to[0])}, ${tomlString(exportPortName(edge.to[1], 'input'))}]`,
-    )
-  }
-  out.push('')
-  return out.join('\n')
-}
-
-// ---- 最小 TOML 解析器（管线文件子集，导入校验用） ----
-
-type TomlValue = string | number | boolean | TomlValue[] | { [key: string]: TomlValue }
-
-function tomlParseError(line: number, message: string): Error {
-  return new Error(`${message}（第 ${line} 行）`)
-}
-
-/** 去掉行尾注释（识别基本字符串/字面量字符串内的 # 不当作注释） */
-function stripTomlComment(line: string): string {
-  let out = ''
-  let inBasic = false
-  let inLiteral = false
-  for (let i = 0; i < line.length; i += 1) {
-    const c = line[i]
-    if (inBasic) {
-      out += c
-      if (c === '\\') {
-        out += line[i + 1] ?? ''
-        i += 1
-      } else if (c === '"') {
-        inBasic = false
-      }
-      continue
-    }
-    if (inLiteral) {
-      out += c
-      if (c === "'") inLiteral = false
-      continue
-    }
-    if (c === '"') {
-      inBasic = true
-      out += c
-      continue
-    }
-    if (c === "'") {
-      inLiteral = true
-      out += c
-      continue
-    }
-    if (c === '#') break
-    out += c
-  }
-  return out
-}
-
-/** 统计一行中字符串外的括号深度增量（[ { 加，] } 减） */
-function tomlBracketDelta(line: string): number {
-  let depth = 0
-  let inBasic = false
-  let inLiteral = false
-  for (let i = 0; i < line.length; i += 1) {
-    const c = line[i]
-    if (inBasic) {
-      if (c === '\\') i += 1
-      else if (c === '"') inBasic = false
-      continue
-    }
-    if (inLiteral) {
-      if (c === "'") inLiteral = false
-      continue
-    }
-    if (c === '"') inBasic = true
-    else if (c === "'") inLiteral = true
-    else if (c === '[' || c === '{') depth += 1
-    else if (c === ']' || c === '}') depth -= 1
-  }
-  return depth
-}
-
-function skipTomlWs(s: string, i: number): number {
-  while (i < s.length && (s[i] === ' ' || s[i] === '\t')) i += 1
-  return i
-}
-
-/** 解析 TOML 基本字符串（含转义），返回 [值, 结束下标] */
-function parseTomlBasicString(s: string, start: number, line: number): [string, number] {
-  let out = ''
-  let i = start + 1
-  while (i < s.length) {
-    const c = s[i]
-    if (c === '"') return [out, i + 1]
-    if (c === '\\') {
-      const next = s[i + 1]
-      let consumed = 2
-      if (next === '"' || next === '\\') out += next
-      else if (next === 'n') out += '\n'
-      else if (next === 't') out += '\t'
-      else if (next === 'r') out += '\r'
-      else if (next === 'b') out += '\b'
-      else if (next === 'f') out += '\f'
-      else if (next === 'u' || next === 'U') {
-        const len = next === 'u' ? 4 : 8
-        const hex = s.slice(i + 2, i + 2 + len)
-        if (!/^[0-9a-fA-F]+$/.test(hex)) throw tomlParseError(line, '非法的 \\u 转义')
-        out += String.fromCodePoint(Number.parseInt(hex, 16))
-        consumed = 2 + len
-      } else {
-        throw tomlParseError(line, `不支持的转义序列 \\${next ?? ''}`)
-      }
-      i += consumed
-      continue
-    }
-    out += c
-    i += 1
-  }
-  throw tomlParseError(line, '字符串未闭合')
-}
-
-/** 解析单个 TOML 值（字符串/数字/布尔/数组/行内表），返回 [值, 结束下标] */
-function parseTomlValue(s: string, start: number, line: number): [TomlValue, number] {
-  const i = skipTomlWs(s, start)
-  const c = s[i]
-  if (c === undefined) throw tomlParseError(line, '缺少值')
-  if (c === '"') {
-    if (s.startsWith('"""', i)) throw tomlParseError(line, '不支持多行字符串')
-    return parseTomlBasicString(s, i, line)
-  }
-  if (c === "'") {
-    if (s.startsWith("'''", i)) throw tomlParseError(line, '不支持多行字符串')
-    const end = s.indexOf("'", i + 1)
-    if (end < 0) throw tomlParseError(line, '字面量字符串未闭合')
-    return [s.slice(i + 1, end), end + 1]
-  }
-  if (c === '[') {
-    const arr: TomlValue[] = []
-    let j = i + 1
-    for (;;) {
-      j = skipTomlWs(s, j)
-      if (s[j] === ']') return [arr, j + 1]
-      const [item, next] = parseTomlValue(s, j, line)
-      arr.push(item)
-      j = skipTomlWs(s, next)
-      if (s[j] === ',') {
-        j += 1
-        continue
-      }
-      if (s[j] === ']') return [arr, j + 1]
-      throw tomlParseError(line, '数组元素间缺少逗号或 ]')
-    }
-  }
-  if (c === '{') {
-    const obj: { [key: string]: TomlValue } = {}
-    let j = i + 1
-    for (;;) {
-      j = skipTomlWs(s, j)
-      if (s[j] === '}') return [obj, j + 1]
-      let key: string
-      if (s[j] === '"') {
-        const [k, next] = parseTomlBasicString(s, j, line)
-        key = k
-        j = next
-      } else if (s[j] === "'") {
-        const end = s.indexOf("'", j + 1)
-        if (end < 0) throw tomlParseError(line, '键字符串未闭合')
-        key = s.slice(j + 1, end)
-        j = end + 1
-      } else {
-        const m = /^[A-Za-z0-9_-]+/.exec(s.slice(j))
-        if (!m) throw tomlParseError(line, '行内表缺少键')
-        key = m[0]
-        j += m[0].length
-      }
-      j = skipTomlWs(s, j)
-      if (s[j] !== '=') throw tomlParseError(line, '行内表键后缺少 =')
-      const [value, next] = parseTomlValue(s, j + 1, line)
-      obj[key] = value
-      j = skipTomlWs(s, next)
-      if (s[j] === ',') {
-        j += 1
-        continue
-      }
-      if (s[j] === '}') return [obj, j + 1]
-      throw tomlParseError(line, '行内表项间缺少逗号或 }')
-    }
-  }
-  if (s.startsWith('true', i)) return [true, i + 4]
-  if (s.startsWith('false', i)) return [false, i + 5]
-  const m = /^[+-]?(?:inf|nan|\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d+)?)/.exec(s.slice(i))
-  if (m) {
-    const raw = m[0].replace(/_/g, '')
-    const value =
-      raw === 'inf' || raw === '+inf'
-        ? Number.POSITIVE_INFINITY
-        : raw === '-inf'
-          ? Number.NEGATIVE_INFINITY
-          : raw === 'nan' || raw === '+nan' || raw === '-nan'
-            ? Number.NaN
-            : raw.includes('.') || raw.includes('e') || raw.includes('E')
-              ? Number.parseFloat(raw)
-              : Number.parseInt(raw, 10)
-    if (Number.isNaN(value) && !raw.includes('nan')) {
-      throw tomlParseError(line, `非法数字: ${m[0]}`)
-    }
-    return [value, i + m[0].length]
-  }
-  throw tomlParseError(line, `无法解析的值: ${s.slice(i, i + 20)}`)
-}
-
-/** 段头名归一（容忍引号与空格） */
-function tomlSectionName(raw: string): string {
-  return raw
-    .split('.')
-    .map((seg) => seg.trim().replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1'))
-    .join('.')
-}
-
-/**
- * 最小 TOML 解析器（管线文件子集，§6.4 导入校验）：
- * 支持 `[pipeline]` / `[[nodes]]` / `[nodes.params]` / `[[edges]]` 段与
- * 基本/字面量字符串、数字、布尔、数组、行内表值（后端 bridge 导出的全部形态）。
- * 不支持的语法（多行字符串、日期等）抛带行号的错误。
- */
-function parsePipelineToml(text: string): PipelineSpec {
-  const rawLines = text.split(/\r?\n/)
-
-  // 阶段 1：去注释 + 跨行括号合并为逻辑行
-  const logical: { text: string; line: number }[] = []
-  let buffer = ''
-  let bufferLine = 0
-  let depth = 0
-  for (let idx = 0; idx < rawLines.length; idx += 1) {
-    const stripped = stripTomlComment(rawLines[idx]).trim()
-    if (buffer) {
-      buffer += ` ${stripped}`
-      depth += tomlBracketDelta(stripped)
-      if (depth <= 0) {
-        logical.push({ text: buffer, line: bufferLine })
-        buffer = ''
-        depth = 0
-      }
-      continue
-    }
-    if (!stripped) continue
-    const delta = tomlBracketDelta(stripped)
-    if (delta > 0 && !stripped.startsWith('[[') && !stripped.startsWith('[')) {
-      // key = [ ... 未闭合（段头 [xxx] 自身平衡，不会进此分支）
-      buffer = stripped
-      bufferLine = idx + 1
-      depth = delta
-      continue
-    }
-    logical.push({ text: stripped, line: idx + 1 })
-  }
-  if (buffer) throw tomlParseError(bufferLine, '数组或行内表未闭合')
-
-  // 阶段 2：逐语句解析到原始结构
-  let pipelineMeta: { [key: string]: TomlValue } = {}
-  const rawNodes: { [key: string]: TomlValue }[] = []
-  const rawEdges: { [key: string]: TomlValue }[] = []
-  let section = 'other'
-
-  for (const { text, line } of logical) {
-    if (text.startsWith('[[')) {
-      const end = text.indexOf(']]')
-      if (end < 0) throw tomlParseError(line, '段头未闭合')
-      const name = tomlSectionName(text.slice(2, end))
-      if (name === 'nodes') {
-        rawNodes.push({})
-        section = 'nodes'
-      } else if (name === 'edges') {
-        rawEdges.push({})
-        section = 'edges'
-      } else {
-        section = 'other'
-      }
-      continue
-    }
-    if (text.startsWith('[')) {
-      const end = text.indexOf(']')
-      if (end < 0) throw tomlParseError(line, '段头未闭合')
-      const name = tomlSectionName(text.slice(1, end))
-      if (name === 'pipeline') section = 'pipeline'
-      else if (name === 'nodes.params') section = 'nodes.params'
-      else section = 'other'
-      continue
-    }
-
-    const keyMatch = /^("(?:[^"\\]|\\.)*"|'[^']*'|[A-Za-z0-9_-]+)\s*=/.exec(text)
-    if (!keyMatch) throw tomlParseError(line, `无法解析的语句: ${text.slice(0, 24)}`)
-    const key = keyMatch[1].replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1')
-    const [value] = parseTomlValue(text, keyMatch[0].length, line)
-
-    if (section === 'pipeline') {
-      pipelineMeta[key] = value
-    } else if (section === 'nodes') {
-      if (rawNodes.length === 0) throw tomlParseError(line, '[[nodes]] 段缺失')
-      rawNodes[rawNodes.length - 1][key] = value
-    } else if (section === 'nodes.params') {
-      if (rawNodes.length === 0) throw tomlParseError(line, '[[nodes]] 段缺失')
-      const node = rawNodes[rawNodes.length - 1]
-      const params = (node.params as { [key: string]: TomlValue } | undefined) ?? {}
-      params[key] = value
-      node.params = params
-    } else if (section === 'edges') {
-      if (rawEdges.length === 0) throw tomlParseError(line, '[[edges]] 段缺失')
-      rawEdges[rawEdges.length - 1][key] = value
-    }
-    // other 段：忽略（容忍未知扩展段）
-  }
-
-  // 阶段 3：组装 PipelineSpec
-  const id = typeof pipelineMeta.id === 'string' ? pipelineMeta.id : ''
-  if (!id) throw new Error('缺少 [pipeline] id')
-  const specNodes: PipelineNodeSpec[] = rawNodes.map((raw, index) => {
-    const nodeId = typeof raw.id === 'string' ? raw.id : ''
-    if (!nodeId) throw new Error(`第 ${index + 1} 个 [[nodes]] 缺少 id`)
-    const kind = typeof raw.kind === 'string' ? raw.kind : ''
-    if (kind !== 'builtin' && kind !== 'module') {
-      throw new Error(`节点 ${nodeId} 的 kind 非法或缺失: ${kind || '(无)'}`)
-    }
-    const str = (v: TomlValue | undefined): string | undefined =>
-      typeof v === 'string' && v ? v : undefined
-    const node: PipelineNodeSpec = {
-      id: nodeId,
-      label: str(raw.label) ?? '',
-      kind,
-      params: (raw.params as Record<string, unknown> | undefined) ?? {},
-    }
-    if (kind === 'builtin') {
-      node.builtin = str(raw.builtin) ?? ''
-    } else {
-      node.module_id = str(raw.module_id) ?? ''
-      node.capability = str(raw.capability) ?? ''
-    }
-    if (str(raw.model)) node.model = str(raw.model)
-    if (str(raw.device)) node.device = str(raw.device)
-    if (raw.position && typeof raw.position === 'object' && !Array.isArray(raw.position)) {
-      const p = raw.position as { [key: string]: TomlValue }
-      if (typeof p.x === 'number' && typeof p.y === 'number') {
-        node.position = { x: p.x, y: p.y }
-      }
-    }
-    return node
-  })
-
-  const specEdges: PipelineEdgeSpec[] = rawEdges.map((raw, index) => {
-    const side = (v: TomlValue | undefined, label: string): [string, string] => {
-      if (
-        !Array.isArray(v) ||
-        v.length !== 2 ||
-        typeof v[0] !== 'string' ||
-        typeof v[1] !== 'string'
-      ) {
-        throw new Error(`第 ${index + 1} 条 [[edges]] 的 ${label} 必须是 [节点, 端口]`)
-      }
-      return [v[0], v[1]]
-    }
-    return { from: side(raw.from, 'from'), to: side(raw.to, 'to') }
-  })
-
-  return {
-    pipeline: {
-      id,
-      name: typeof pipelineMeta.name === 'string' && pipelineMeta.name ? pipelineMeta.name : id,
-      description: typeof pipelineMeta.description === 'string' ? pipelineMeta.description : '',
-    },
-    nodes: specNodes,
-    edges: specEdges,
-  }
-}
 
 /** 导入依赖检查提示条目（缺模块 / 缺变体 / 无法渲染的 builtin） */
 interface ImportIssue {
@@ -1977,6 +1079,11 @@ interface PipelineLibraryBarProps {
   onExport: () => void
   /** §6.4 TOML 导入 */
   onImport: () => void
+  /** T-28b 撤销/重做（命令栈） */
+  canUndo: boolean
+  canRedo: boolean
+  onUndo: () => void
+  onRedo: () => void
 }
 
 function SourceBadge({ source }: { source: 'builtin' | 'custom' }) {
@@ -2008,6 +1115,10 @@ function PipelineLibraryBar({
   canExport,
   onExport,
   onImport,
+  canUndo,
+  canRedo,
+  onUndo,
+  onRedo,
 }: PipelineLibraryBarProps) {
   const { t } = useTranslation('pipeline')
   return (
@@ -2110,6 +1221,27 @@ function PipelineLibraryBar({
       </div>
 
       <div className="ml-auto flex shrink-0 items-center gap-1">
+        {/* T-28b：命令栈撤销/重做（Ctrl+Z / Ctrl+Shift+Z 的可见入口） */}
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          onClick={onUndo}
+          disabled={!canUndo}
+          title={t('history.undo', { defaultValue: '撤销（Ctrl+Z）' })}
+          aria-label={t('history.undo', { defaultValue: '撤销（Ctrl+Z）' })}
+        >
+          <Undo2 className="h-3.5 w-3.5" />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          onClick={onRedo}
+          disabled={!canRedo}
+          title={t('history.redo', { defaultValue: '重做（Ctrl+Shift+Z）' })}
+          aria-label={t('history.redo', { defaultValue: '重做（Ctrl+Shift+Z）' })}
+        >
+          <Redo2 className="h-3.5 w-3.5" />
+        </Button>
         <Button
           variant="ghost"
           size="xs"
@@ -3511,12 +2643,20 @@ function ImportTomlDialog({
 
 function PipelineEditor() {
   const { t } = useTranslation('pipeline')
-  const { screenToFlowPosition, fitView } = useReactFlow()
+  const { screenToFlowPosition, fitView, setCenter, getZoom } = useReactFlow()
   const [nodes, setNodes, onNodesChange] = useNodesState<PipelineFlowNode>([])
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([])
   const [name, setName] = useState(t('canvas.untitledName'))
   const [description, setDescription] = useState('')
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
+  /** T-28b 多选节点 id（xyflow 选中态的镜像；[first] = 单选） */
+  const [selectedIds, setSelectedIds] = useState<string[]>([])
+  /** T-28b 命令栈撤销/重做（快照对，spike 结论见 use-canvas-history） */
+  const history = useCanvasHistory<PipelineFlowNode, Edge>()
+  /** T-28b 节点搜索开关（画布左上浮层） */
+  const [searchOpen, setSearchOpen] = useState(false)
+  /** T-28c「作为组运行」对话框 */
+  const [runGroupOpen, setRunGroupOpen] = useState(false)
   /** 窄屏（<lg）节点库抽屉开关 */
   const [libraryOpen, setLibraryOpen] = useState(false)
   const isDesktop = useMediaQuery('(min-width: 64rem)')
@@ -3590,6 +2730,17 @@ function PipelineEditor() {
   useEffect(() => {
     nodesRef.current = nodes
   }, [nodes])
+  const edgesRef = useRef<Edge[]>([])
+  useEffect(() => {
+    edgesRef.current = edges
+  }, [edges])
+  /** 多选 id 的 ref（window 级键盘回调读取最新值，避免重订阅） */
+  const selectedIdsRef = useRef<string[]>([])
+  useEffect(() => {
+    selectedIdsRef.current = selectedIds
+  }, [selectedIds])
+  /** 拖动中的 before 快照（dragStart 捕获，dragStop 提交为一步移动命令） */
+  const dragBeforeRef = useRef<{ nodes: PipelineFlowNode[]; edges: Edge[] } | null>(null)
 
   const selectedNode = selectedNodeId
     ? (nodes.find((n) => n.id === selectedNodeId) ?? null)
@@ -3606,9 +2757,13 @@ function PipelineEditor() {
   const onConnect = useCallback(
     (connection: Connection) => {
       const label = edgeLabelFor(connection.source, connection.sourceHandle, nodes)
-      setEdges((eds) => addEdge({ ...connection, label }, eds))
+      // T-28b：连线变更入命令栈（一步 undo）
+      const before = history.beginChange(nodes, edges)
+      const nextEdges = addEdge({ ...connection, label }, edges)
+      setEdges(nextEdges)
+      history.commitChange(before, { nodes, edges: nextEdges }, 'connect')
     },
-    [nodes, setEdges],
+    [nodes, edges, setEdges, history],
   )
 
   const isValidConnection = useCallback(
@@ -3657,10 +2812,14 @@ function PipelineEditor() {
       const node = (payload as TemplateDragPayload).templateId
         ? createTemplateNode(payload, { x: target.x - 112, y: target.y - 40 }, templateList)
         : createPipelineNode(payload, { x: target.x - 112, y: target.y - 40 })
-      setNodes((nds) => [...nds, node])
+      // T-28b：节点新增入命令栈（一步 undo）
+      const before = history.beginChange(nodes, edges)
+      const nextNodes = [...nodes, node]
+      setNodes(nextNodes)
+      history.commitChange(before, { nodes: nextNodes, edges }, 'add')
       toast.success(t('node.addedToast', { label: node.data.label }))
     },
-    [screenToFlowPosition, setNodes, t, templateList],
+    [screenToFlowPosition, setNodes, t, templateList, nodes, edges, history],
   )
 
   const onDrop = useCallback(
@@ -3690,66 +2849,131 @@ function PipelineEditor() {
 
   // ---- 选择与参数编辑 ----
 
+  /** 选中态镜像（单选 → 参数面板；多选 → 批量工具条/批量参数面） */
   const onSelectionChange = useCallback(({ nodes: selected }: OnSelectionChangeParams) => {
     setSelectedNodeId(selected[0]?.id ?? null)
+    setSelectedIds(selected.map((n) => n.id))
   }, [])
+
+  /** T-28b：选中态清理（undo/redo 应用快照 / Esc / 工具条关闭时调用） */
+  const clearSelection = useCallback(() => {
+    setNodes((nds) => {
+      const next = nds.map((n) => (n.selected ? { ...n, selected: false } : n))
+      return nds.some((n) => n.selected) ? next : nds
+    })
+    setSelectedNodeId(null)
+    setSelectedIds([])
+  }, [setNodes])
+
+  /** T-28b：应用历史快照（undo/redo），并清理选中态 */
+  const applySnapshot = useCallback(
+    (snapshot: { nodes: PipelineFlowNode[]; edges: Edge[] } | null) => {
+      if (!snapshot) return
+      // 快照内节点保留 measured 等运行字段；仅剥离 selected（历史不含选择态）
+      setNodes(snapshot.nodes.map((n) => (n.selected ? { ...n, selected: false } : n)))
+      setEdges(snapshot.edges.map((e) => (e.selected ? { ...e, selected: false } : e)))
+      setSelectedNodeId(null)
+      setSelectedIds([])
+    },
+    [setNodes, setEdges],
+  )
+
+  const handleUndo = useCallback(() => {
+    applySnapshot(history.undo())
+  }, [applySnapshot, history])
+
+  const handleRedo = useCallback(() => {
+    applySnapshot(history.redo())
+  }, [applySnapshot, history])
 
   const updateNodeParams = useCallback(
     (nodeId: string, patch: NodeParams) => {
-      setNodes((nds) =>
-        nds.map((n) => {
-          if (n.id !== nodeId) return n
-          return {
-            ...n,
-            data: { ...n.data, params: { ...n.data.params, ...patch } },
-          } as PipelineFlowNode
-        }),
-      )
+      const before = history.beginChange(nodes, edges)
+      const nextNodes = nodes.map((n) => {
+        if (n.id !== nodeId) return n
+        return {
+          ...n,
+          data: { ...n.data, params: { ...n.data.params, ...patch } },
+        } as PipelineFlowNode
+      })
+      setNodes(nextNodes)
+      // 连续输入（同节点参数）在时间窗内合并为一步 undo
+      history.commitChange(before, { nodes: nextNodes, edges }, 'params', {
+        coalesceKey: `params:${nodeId}`,
+      })
     },
-    [setNodes],
+    [nodes, edges, setNodes, history],
+  )
+
+  /** T-28b 批量参数：一个值应用到全部选中节点（一步 undo，连续编辑合并） */
+  const applyBatchParam = useCallback(
+    (name: string, value: ParamValue) => {
+      if (selectedIds.length === 0) return
+      const before = history.beginChange(nodes, edges)
+      const idSet = new Set(selectedIds)
+      const nextNodes = nodes.map((n) => {
+        if (!idSet.has(n.id)) return n
+        return {
+          ...n,
+          data: { ...n.data, params: { ...n.data.params, [name]: value } },
+        } as PipelineFlowNode
+      })
+      setNodes(nextNodes)
+      history.commitChange(before, { nodes: nextNodes, edges }, 'batchParams', {
+        coalesceKey: `batch:${[...idSet].sort().join(',')}:${name}`,
+      })
+    },
+    [nodes, edges, selectedIds, setNodes, history],
   )
 
   /** §6.2 绑定字段更新（model/device；空串归一为 undefined = 跟随缺省语义） */
   const updateNodeBinding = useCallback(
     (nodeId: string, patch: ModuleBindingExt) => {
-      setNodes((nds) =>
-        nds.map((n) => {
-          if (n.id !== nodeId || n.data.kind !== 'module') return n
-          const data: ModuleNodeData = { ...n.data }
-          if (patch.model !== undefined) {
-            data.model = patch.model.trim() || undefined
-          }
-          if (patch.device !== undefined) {
-            data.device = patch.device.trim() || undefined
-          }
-          return { ...n, data } as PipelineFlowNode
-        }),
-      )
+      const before = history.beginChange(nodes, edges)
+      const nextNodes = nodes.map((n) => {
+        if (n.id !== nodeId || n.data.kind !== 'module') return n
+        const data: ModuleNodeData = { ...n.data }
+        if (patch.model !== undefined) {
+          data.model = patch.model.trim() || undefined
+        }
+        if (patch.device !== undefined) {
+          data.device = patch.device.trim() || undefined
+        }
+        return { ...n, data } as PipelineFlowNode
+      })
+      setNodes(nextNodes)
+      history.commitChange(before, { nodes: nextNodes, edges }, 'binding', {
+        coalesceKey: `binding:${nodeId}`,
+      })
     },
-    [setNodes],
+    [nodes, edges, setNodes, history],
   )
 
   /** 能力切换（C2 CapabilitySelect）：按新能力的 params 重建默认参数 */
   const changeNodeCapability = useCallback(
     (nodeId: string, capabilityId: string) => {
-      setNodes((nds) =>
-        nds.map((n) => {
-          if (n.id !== nodeId || n.data.kind !== 'module') return n
-          const cap = (n.data.capabilities ?? []).find((c) => c.id === capabilityId)
-          if (!cap) return n
-          return {
-            ...n,
-            data: {
-              ...n.data,
-              capabilityId: cap.id,
-              capabilityLabel: cap.label,
-              params: defaultParams(cap.params),
-            },
-          } as PipelineFlowNode
-        }),
-      )
+      const before = history.beginChange(nodes, edges)
+      let changed = false
+      const nextNodes = nodes.map((n) => {
+        if (n.id !== nodeId || n.data.kind !== 'module') return n
+        const cap = (n.data.capabilities ?? []).find((c) => c.id === capabilityId)
+        if (!cap) return n
+        changed = true
+        return {
+          ...n,
+          data: {
+            ...n.data,
+            capabilityId: cap.id,
+            capabilityLabel: cap.label,
+            params: defaultParams(cap.params),
+          },
+        } as PipelineFlowNode
+      })
+      if (!changed) return
+      setNodes(nextNodes)
+      history.commitChange(before, { nodes: nextNodes, edges }, 'capability')
     },
-    [setNodes],
+    [nodes, edges, setNodes, history],
   )
 
   /** 所选模块节点的变体列表与激活变体（NodeParamsPanel / ModuleBindingEditor 数据） */
@@ -3770,37 +2994,252 @@ function PipelineEditor() {
     return activeModels?.[selectedModuleId]
   }, [selectedModuleId, activeModels])
 
-  const deleteNode = useCallback(
-    (nodeId: string) => {
-      setNodes((nds) => nds.filter((n) => n.id !== nodeId))
-      setEdges((eds) => eds.filter((e) => e.source !== nodeId && e.target !== nodeId))
+  /**
+   * T-28b 统一删除入口（入命令栈，一步 undo）：
+   * - 参数面板「删除节点」按钮（单节点，带确认）；
+   * - 多选工具条批量删除（带确认）；
+   * - 键盘 Delete/Backspace 等 React Flow 内置删除路径 → onBeforeDelete
+   *   拦截后委托本函数执行（确认对话框在 onBeforeDelete 内）。
+   * 返回是否实际删除（供 onBeforeDelete 决定返回值）。
+   */
+  const deleteElements = useCallback(
+    async (
+      doomedNodes: PipelineFlowNode[],
+      doomedEdges: Edge[],
+      opts?: { skipConfirm?: boolean },
+    ): Promise<boolean> => {
+      if (doomedNodes.length === 0 && doomedEdges.length === 0) return false
+      if (doomedNodes.length > 0 && !opts?.skipConfirm) {
+        const subject =
+          doomedNodes.length === 1
+            ? t('node.deleteSubjectNode', { label: doomedNodes[0].data.label })
+            : t('node.deleteSubjectCount', { count: doomedNodes.length })
+        const ok = await confirmDialog({
+          title: t('node.deleteTitle'),
+          description: t('node.deleteDescription', { subject }),
+          confirmLabel: t('common:action.delete'),
+          cancelLabel: t('common:action.cancel'),
+          variant: 'destructive',
+        })
+        if (!ok) return false
+      }
+      const before = history.beginChange(nodes, edges)
+      const doomedNodeIds = new Set(doomedNodes.map((n) => n.id))
+      const doomedEdgeIds = new Set(doomedEdges.map((e) => e.id))
+      const nextNodes = nodes.filter((n) => !doomedNodeIds.has(n.id))
+      const nextEdges = edges.filter(
+        (e) =>
+          !doomedEdgeIds.has(e.id) &&
+          !doomedNodeIds.has(e.source) &&
+          !doomedNodeIds.has(e.target),
+      )
+      setNodes(nextNodes)
+      setEdges(nextEdges)
+      history.commitChange(before, { nodes: nextNodes, edges: nextEdges }, 'delete')
       setSelectedNodeId(null)
-      toast.success(t('node.deletedToast'))
+      setSelectedIds([])
+      toast.success(t('node.deletedToast', { count: doomedNodes.length }))
+      return true
     },
-    [setNodes, setEdges, t],
+    [nodes, edges, setNodes, setEdges, history, t],
   )
 
   /**
    * 删除节点确认（修复 P2-26）。两条路径：
-   * 1) 参数面板「删除节点」按钮 → 本函数确认后调用 deleteNode；
+   * 1) 参数面板「删除节点」按钮 → 本函数确认后走 deleteElements（入命令栈）；
    * 2) 键盘 Delete/Backspace 等 React Flow 内置删除路径 → 由下方 ReactFlow
-   *    的 onBeforeDelete 内联回调拦截确认。
+   *    的 onBeforeDelete 内联回调拦截确认后走 deleteElements。
    */
   const requestDeleteNode = useCallback(
     async (nodeId: string) => {
       const target = nodes.find((n) => n.id === nodeId)
-      const ok = await confirmDialog({
-        title: t('node.deleteTitle'),
-        description: t('node.deleteDescriptionSingle', {
-          label: target?.data.label ?? nodeId,
-        }),
-        confirmLabel: t('common:action.delete'),
-        cancelLabel: t('common:action.cancel'),
-        variant: 'destructive',
-      })
-      if (ok) deleteNode(nodeId)
+      if (!target) return
+      await deleteElements([target], [])
     },
-    [nodes, deleteNode, t],
+    [nodes, deleteElements],
+  )
+
+  // ---- T-28b 批量操作（多选工具条动作；全部入命令栈） ----
+
+  /** 批量删除当前多选（含选中边） */
+  const handleDeleteSelection = useCallback(() => {
+    const doomedNodes = nodes.filter((n) => selectedIds.includes(n.id))
+    const doomedEdges = edges.filter((e) => e.selected)
+    void deleteElements(doomedNodes, doomedEdges)
+  }, [nodes, edges, selectedIds, deleteElements])
+
+  /** 对齐 / 均布（单步 undo） */
+  const handleAlignSelection = useCallback(
+    (mode: AlignMode) => {
+      if (selectedIds.length < 2) return
+      const before = history.beginChange(nodes, edges)
+      const nextNodes = alignSelected(nodes, selectedIds, mode)
+      setNodes(nextNodes)
+      history.commitChange(before, { nodes: nextNodes, edges }, 'align')
+    },
+    [nodes, edges, selectedIds, setNodes, history],
+  )
+
+  /** 克隆选区（新 id + 内部边重映射 + 位置偏移；单步 undo） */
+  const handleCloneSelection = useCallback(() => {
+    if (selectedIds.length === 0) return
+    const { nodes: clonedNodes, edges: clonedEdges } = cloneSelection(
+      nodes,
+      edges,
+      selectedIds,
+    )
+    if (clonedNodes.length === 0) return
+    const before = history.beginChange(nodes, edges)
+    const nextNodes = [...nodes, ...clonedNodes]
+    const nextEdges = [...edges, ...clonedEdges]
+    setNodes(nextNodes)
+    setEdges(nextEdges)
+    history.commitChange(before, { nodes: nextNodes, edges: nextEdges }, 'clone')
+    toast.success(
+      t('multiSelect.clonedToast', { count: clonedNodes.length, defaultValue: '已复制 {{count}} 个节点' }),
+    )
+  }, [nodes, edges, selectedIds, setNodes, setEdges, history, t])
+
+  // ---- T-28b 键盘交互（Ctrl+Z / Ctrl+Shift+Z / Ctrl+A / 方向键步进 / Esc） ----
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      // 输入控件内不劫持快捷键
+      const target = event.target as HTMLElement | null
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return
+      }
+      const mod = event.ctrlKey || event.metaKey
+      if (mod && event.key.toLowerCase() === 'z') {
+        event.preventDefault()
+        if (event.shiftKey) handleRedo()
+        else handleUndo()
+        return
+      }
+      if (mod && event.key.toLowerCase() === 'y') {
+        event.preventDefault()
+        handleRedo()
+        return
+      }
+      if (mod && event.key.toLowerCase() === 'a') {
+        // 全选画布节点（覆盖浏览器默认全选）
+        event.preventDefault()
+        setNodes((nds) => {
+          const next = nds.map((n) => (n.selected ? n : { ...n, selected: true }))
+          return nds.every((n) => n.selected) ? nds : next
+        })
+        return
+      }
+      if (event.key === 'Escape') {
+        // 取消多选（xyflow 亦会取消单选；此处同步镜像态）
+        if (selectedIdsRef.current.length > 0) clearSelection()
+        return
+      }
+      if (event.key.startsWith('Arrow') && selectedIdsRef.current.length > 0) {
+        // 方向键步进选中节点（Shift = 细步进 1px；连续步进合并为一步 undo）
+        event.preventDefault()
+        const step = event.shiftKey ? 1 : NUDGE_STEP
+        const dx = event.key === 'ArrowLeft' ? -step : event.key === 'ArrowRight' ? step : 0
+        const dy = event.key === 'ArrowUp' ? -step : event.key === 'ArrowDown' ? step : 0
+        const before = history.beginChange(nodesRef.current, edgesRef.current)
+        const nextNodes = nudgeSelected(nodesRef.current, selectedIdsRef.current, dx, dy)
+        setNodes(nextNodes)
+        history.commitChange(before, { nodes: nextNodes, edges: edgesRef.current }, 'nudge', {
+          coalesceKey: `nudge:${selectedIdsRef.current.slice().sort().join(',')}`,
+        })
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [handleUndo, handleRedo, setNodes, clearSelection, history])
+
+  // ---- T-28b 拖动移动入栈（dragStart 捕获 before，dragStop 提交一步） ----
+
+  const onNodeDragStart = useCallback(() => {
+    dragBeforeRef.current = history.beginChange(nodesRef.current, edgesRef.current)
+  }, [history])
+
+  const onNodeDragStop = useCallback(() => {
+    const before = dragBeforeRef.current
+    dragBeforeRef.current = null
+    if (!before) return
+    history.commitChange(
+      before,
+      { nodes: nodesRef.current, edges: edgesRef.current },
+      'move',
+    )
+  }, [history])
+
+  /** 侧栏搜索结果点击：单选该节点并把画布聚焦（居中）到它 */
+  const focusNode = useCallback(
+    (id: string) => {
+      const node = nodesRef.current.find((n) => n.id === id)
+      if (!node) return
+      setNodes((nds) => {
+        const next = nds.map((n) => {
+          const should = n.id === id
+          return n.selected === should ? n : { ...n, selected: should }
+        })
+        return next
+      })
+      // 节点卡 w-56（224px）高约 96px：取中心点做画布居中，缩放不低于当前值
+      void setCenter(node.position.x + 112, node.position.y + 48, {
+        zoom: Math.max(getZoom(), 1),
+        duration: 300,
+      })
+    },
+    [setNodes, setCenter, getZoom],
+  )
+
+  // ---- T-28c 多选 → 组任务 ----
+
+  /**
+   * 多选中可直跑的目标（模块节点且已选能力，params 取当前值）。
+   * 一个节点 = 一次 POST /v1/batches = 一个任务组（batches.rs 契约：
+   * 单 batch 为单一 module+capability × 文件夹全部文件）。
+   */
+  const runGroupTargets = useMemo<RunGroupTarget[]>(
+    () =>
+      nodes
+        .filter((n) => selectedIds.includes(n.id))
+        .filter((n) => n.data.kind === 'module' && n.data.capabilityId)
+        .map((n) => {
+          const data = n.data as ModuleNodeData
+          return {
+            nodeId: n.id,
+            label: data.label,
+            moduleId: data.moduleId,
+            capability: data.capabilityId,
+            params: { ...data.params },
+          }
+        }),
+    [nodes, selectedIds],
+  )
+
+  /** 提交单目标：节点参数原样作为 batch params（后端按 capability schema 校验） */
+  const handleRunGroupConfirm = useCallback(
+    (target: RunGroupTarget, opts: RunGroupOptions) =>
+      api.submitBatch({
+        module_id: target.moduleId,
+        capability: target.capability,
+        folder: opts.folder,
+        params: target.params,
+        recursive: opts.recursive,
+        extensions: opts.extensions,
+      }),
+    [],
+  )
+
+  /** T-28b 批量参数面可用性（多选全部为同类型节点） */
+  const batchShape = useMemo(
+    () => commonParamShape(nodes, selectedIds),
+    [nodes, selectedIds],
   )
 
   // ---- WebSocket 管线进度（实时驱动节点状态） ----
@@ -4069,9 +3508,12 @@ function PipelineEditor() {
       setCurrentId(null)
       setCurrentSource(null)
       setSelectedNodeId(null)
+      setSelectedIds([])
       setBaseline(canvasFingerprint(nextNodes, nextEdges, nextMeta))
+      // 整画布替换为历史断层：清空命令栈
+      history.clear()
     },
-    [setNodes, setEdges],
+    [setNodes, setEdges, history],
   )
 
   /** 从服务端拉取 spec 并铺到画布（不含丢弃确认；调用方自行处理） */
@@ -4096,7 +3538,10 @@ function PipelineEditor() {
         setCurrentId(id)
         setCurrentSource(pipelines?.find((p) => p.id === id)?.source ?? null)
         setSelectedNodeId(null)
+        setSelectedIds([])
         setBaseline(canvasFingerprint(loadedNodes, loadedEdges, loadedMeta))
+        // 整画布替换为历史断层：清空命令栈
+        history.clear()
         fitSoon()
         const stats = t('canvas.stats', { nodes: loadedNodes.length, edges: loadedEdges.length })
         if (skippedNodes > 0) {
@@ -4108,7 +3553,7 @@ function PipelineEditor() {
         toast.error(t('load.failed'), { id: toastId, description: errMsg(err) })
       }
     },
-    [moduleList, pipelines, setNodes, setEdges, fitSoon, t],
+    [moduleList, pipelines, setNodes, setEdges, fitSoon, history, t],
   )
 
   /** 选择服务端管线 → 加载 spec 并铺到画布 */
@@ -4519,6 +3964,7 @@ function PipelineEditor() {
       setCurrentId(null)
       setCurrentSource(null)
       setSelectedNodeId(null)
+      setSelectedIds([])
       setBaseline(
         canvasFingerprint(loadedNodes, loadedEdges as Edge[], {
           id: '',
@@ -4526,6 +3972,8 @@ function PipelineEditor() {
           description: '',
         }),
       )
+      // 整画布替换为历史断层：清空命令栈
+      history.clear()
       requestAnimationFrame(() => {
         void fitView({ padding: 0.25, duration: 300 })
       })
@@ -4533,7 +3981,7 @@ function PipelineEditor() {
         description: t('load.nodeCount', { count: loadedNodes.length }),
       })
     },
-    [setNodes, setEdges, fitView, t],
+    [setNodes, setEdges, fitView, history, t],
   )
 
   // ---- 校验与执行 ----
@@ -4833,6 +4281,10 @@ function PipelineEditor() {
         canExport={nodes.length > 0}
         onExport={handleExportToml}
         onImport={() => importFileRef.current?.click()}
+        canUndo={history.canUndo}
+        canRedo={history.canRedo}
+        onUndo={handleUndo}
+        onRedo={handleRedo}
       />
 
       <div className="relative flex min-h-0 flex-1 overflow-hidden">
@@ -4873,25 +4325,26 @@ function PipelineEditor() {
             onDrop={onDrop}
             onDragOver={onDragOver}
             onSelectionChange={onSelectionChange}
+            /* T-28b 多选：Shift+拖拽框选（selectionKeyCode）+ Shift 点选追加
+               （multiSelectionKeyCode，均为 xyflow 内建语义） */
+            selectionKeyCode="Shift"
+            multiSelectionKeyCode="Shift"
+            onNodeDragStart={onNodeDragStart}
+            onNodeDragStop={onNodeDragStop}
             defaultEdgeOptions={DEFAULT_EDGE_OPTIONS}
             connectionLineType={ConnectionLineType.Bezier}
             connectionRadius={32}
             deleteKeyCode={['Backspace', 'Delete']}
-            onBeforeDelete={async ({ nodes: doomedNodes }) => {
-              // 键盘 Delete/Backspace 及 React Flow 其他内置删除路径统一在此拦截确认；
-              // 参数面板按钮删除走 requestDeleteNode，两者都接入 confirmDialog（P2-26）。
-              if (doomedNodes.length === 0) return true
-              const subject =
-                doomedNodes.length === 1
-                  ? t('node.deleteSubjectNode', { label: doomedNodes[0].data.label })
-                  : t('node.deleteSubjectCount', { count: doomedNodes.length })
-              return confirmDialog({
-                title: t('node.deleteTitle'),
-                description: t('node.deleteDescription', { subject }),
-                confirmLabel: t('common:action.delete'),
-                cancelLabel: t('common:action.cancel'),
-                variant: 'destructive',
+            onBeforeDelete={async ({ nodes: doomedNodes, edges: doomedEdges }) => {
+              // 键盘 Delete/Backspace 及 React Flow 其他内置删除路径统一在此拦截：
+              // 节点删除走确认对话框（P2-26），随后由页面层 deleteElements 执行
+              // 并入命令栈（T-28b 一步 undo）；恒返回 false——删除已由页面层应用，
+              // 避免 xyflow 重复应用。仅选中边（无节点）时保持原行为：直接删不确认。
+              if (doomedNodes.length === 0 && doomedEdges.length === 0) return true
+              await deleteElements(doomedNodes, doomedEdges, {
+                skipConfirm: doomedNodes.length === 0,
               })
+              return false
             }}
             fitView
             fitViewOptions={{ padding: 0.25 }}
@@ -4901,6 +4354,41 @@ function PipelineEditor() {
             <Background variant={BackgroundVariant.Dots} gap={22} size={1.5} />
             <Controls position="bottom-left" showInteractive={false} />
             <MiniMap pannable zoomable nodeStrokeWidth={2} />
+            {/* T-28b 节点搜索（名称/类型/id → 点击聚焦） */}
+            <Panel position="top-left">
+              {searchOpen ? (
+                <NodeSearchPanel
+                  nodes={nodes}
+                  onSelect={focusNode}
+                  onClose={() => setSearchOpen(false)}
+                />
+              ) : (
+                <Button
+                  variant="outline"
+                  size="icon-xs"
+                  onClick={() => setSearchOpen(true)}
+                  title={t('nodeSearch.openTitle', { defaultValue: '搜索节点' })}
+                  aria-label={t('nodeSearch.openTitle', { defaultValue: '搜索节点' })}
+                  className="glass shadow-sm"
+                >
+                  <Search className="h-3.5 w-3.5" />
+                </Button>
+              )}
+            </Panel>
+            {/* T-28b 批量操作工具条（多选 ≥2 浮出） */}
+            {selectedIds.length >= 2 && (
+              <Panel position="top-center">
+                <MultiSelectToolbar
+                  count={selectedIds.length}
+                  canRunGroup={runGroupTargets.length >= 2}
+                  onDelete={handleDeleteSelection}
+                  onClone={handleCloneSelection}
+                  onAlign={handleAlignSelection}
+                  onRunGroup={() => setRunGroupOpen(true)}
+                  onClear={clearSelection}
+                />
+              </Panel>
+            )}
             <Panel position="bottom-center" className="pointer-events-none">
               <div className="glass hidden max-w-[28rem] flex-wrap items-center justify-center gap-x-3 gap-y-1 rounded-lg border border-border-glow px-3.5 py-1.5 shadow-md md:flex">
                 {Object.entries(NODE_STATUS_META).map(([key, meta]) => (
@@ -4979,8 +4467,21 @@ function PipelineEditor() {
           />
         )}
 
-        {/* 桌面（≥lg）：参数面板常驻右栏；窄屏：右侧 overlay */}
-        {selectedNode && (
+        {/* T-28b 批量参数面（多选同类型节点；优先于单节点参数面板） */}
+        {selectedIds.length >= 2 && batchShape && (
+          <BatchParamsPanel
+            nodes={nodes}
+            selectedIds={selectedIds}
+            onApply={applyBatchParam}
+            onClose={clearSelection}
+            className={
+              isDesktop ? undefined : 'absolute inset-y-0 right-0 z-30 max-w-[85vw] shadow-lg'
+            }
+          />
+        )}
+
+        {/* 桌面（≥lg）：参数面板常驻右栏；窄屏：右侧 overlay（单选时） */}
+        {selectedIds.length < 2 && selectedNode && (
           <NodeParamsPanel
             node={selectedNode}
             onParamsChange={(patch) => updateNodeParams(selectedNode.id, patch)}
@@ -5063,6 +4564,14 @@ function PipelineEditor() {
         draft={importDraft}
         pipelines={pipelines}
         onConfirm={handleImportConfirm}
+      />
+
+      {/* T-28c：多选 → 组任务（每节点一个 batch = 一个任务组，任务中心按组折叠） */}
+      <RunSelectionDialog
+        open={runGroupOpen}
+        onOpenChange={setRunGroupOpen}
+        targets={runGroupTargets}
+        onConfirm={handleRunGroupConfirm}
       />
     </div>
   )

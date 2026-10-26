@@ -1,5 +1,7 @@
 import type {
   AppConfig,
+  BatchSubmitRequest,
+  BatchSubmitResponse,
   BuiltinTemplatesResponse,
   DepReport,
   DeviceResponse,
@@ -528,6 +530,17 @@ export const api = {
   // 直跑（§5.3 / §8.1）
   // 提交走 hooks/use-direct-exec.ts 的 postExecuteSingle（需 AbortController
   // 长超时语义，不复用 apiFetch）；此处仅保留输入文件上传。
+
+  // v1 批量接入（T-28c；POST /api/v1/batches —— 一个 batch = 一个任务组，
+  // 任务中心按组折叠展示）。提交内含模块自动拉起（首次可达 30s+），
+  // 给足超时余量（与直跑同量级）。
+  /** 文件夹批量直跑：同批成员聚为任务组，返回 group_id + 逐成员 task_ids */
+  submitBatch: (body: BatchSubmitRequest) =>
+    apiFetch<BatchSubmitResponse>('/v1/batches', {
+      method: 'POST',
+      body: JSON.stringify(body),
+      timeoutMs: 300_000,
+    }),
 
   /**
    * 上传输入文件到 workspace/uploads（浏览器端直跑输入；multipart 单文件）。
