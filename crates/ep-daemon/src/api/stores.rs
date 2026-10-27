@@ -815,14 +815,28 @@ mod tests {
             .unwrap()
             .resolve_path(&root);
 
+        // CI rust job 首轮修复：原实现硬编码 Windows 反斜杠分隔符，POSIX 上
+        // 反斜杠只是文件名字符、locate 判池外——按平台构造池内路径
+        let (inside, outside) = if cfg!(windows) {
+            (
+                format!(
+                    r#"{media}\\in\\a.wav"#,
+                    media = media_root.to_string_lossy().replace('\\', "\\\\")
+                ),
+                "D:/outside/x.wav".to_string(),
+            )
+        } else {
+            (
+                format!("{media}/in/a.wav", media = media_root.display()),
+                "/outside/x.wav".to_string(),
+            )
+        };
+
         let app = super::router().with_state(test_state(root.clone(), seeded_config(&root)));
         let resp = app
             .oneshot(post_json(
                 "/stores/locate",
-                &format!(
-                    r#"{{ "paths": ["{media}\\in\\a.wav", "D:/outside/x.wav", "store:media/keep"] }}"#,
-                    media = media_root.to_string_lossy().replace('\\', "\\\\")
-                ),
+                &format!(r#"{{ "paths": ["{inside}", "{outside}", "store:media/keep"] }}"#),
             ))
             .await
             .unwrap();
