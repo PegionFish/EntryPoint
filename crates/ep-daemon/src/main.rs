@@ -4,6 +4,7 @@ mod health_supervisor;
 mod logging;
 mod retention;
 mod schedule;
+mod service;
 mod state;
 mod updates;
 pub(crate) mod watcher;
@@ -68,6 +69,34 @@ async fn main() -> anyhow::Result<()> {
     // Parse CLI args
     let args: Vec<String> = std::env::args().collect();
     let module_pos = args.iter().position(|a| a == "--run-module");
+
+    // ── Windows 服务模式（计划2 M3）── 必须在任何长耗时工作之前进入 dispatcher
+    if service::requested() {
+        #[cfg(windows)]
+        {
+            let root = config::resolve_root();
+            let load_result = AppConfig::load_or_create(&root.join("config"));
+            let log_level = load_result
+                .as_ref()
+                .map(|c| c.general.log_level.clone())
+                .unwrap_or_else(|_| AppConfig::default().general.log_level);
+            logging::init_tracing(&log_level);
+            let mut cfg = load_result?;
+            cfg.resolve_paths(&root);
+            service::set_runner(Box::new(move || Box::pin(run_server(root, cfg))));
+            return service::dispatch();
+        }
+        #[cfg(not(windows))]
+        anyhow::bail!("--service 仅支持 Windows（服务化请用 systemd：scripts/install-service.sh）");
+    }
+
+    // --headless：显式声明无头运行的对称参数（daemon 本就无 GUI——UI 即
+    // WebUI、托盘壳为独立的 ep-tray；此参数为 CLI 脚本场景的语义自文档化，
+    // 接受即无行为差异）
+    if args.iter().any(|a| a == "--headless") {
+        // tracing 可能尚未初始化（参数在初始化前解析），eprintln 足够
+        eprintln!("[entrypoint] --headless accepted (no-op): daemon is always headless; UI is the WebUI");
+    }
 
     // ── P2-1/P1-10：配置加载先于 tracing 初始化 ─────────────────────────
     // `general.log_level` 决定日志过滤器（RUST_LOG 仍优先覆盖，见
@@ -1144,7 +1173,10 @@ async fn ip_filter(
 /// SIGTERM，此前仅监听 ctrl_c 时默认处置为立即终止，`stop_all_modules`
 /// （优雅回收模块子进程 + 释放端口）永不执行。SIGTERM handler 注册失败时
 /// eprintln 警告并回退到仅 Ctrl+C（不 panic）。
+/// Windows 服务模式（计划2 M3）额外 select SCM 的 STOP/SHUTDOWN——服务进程
+/// 无控制台信号可依赖，stop 通道由 service.rs 的控制处理器驱动。
 async fn shutdown_signal() {
+    let mut service_stop = service::stop_signal_rx();
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -1154,6 +1186,9 @@ async fn shutdown_signal() {
                     _ = tokio::signal::ctrl_c() => {},
                     _ = sigterm.recv() => {
                         tracing::info!("received SIGTERM, initiating graceful shutdown");
+                    },
+                    _ = service_stop.changed() => {
+                        tracing::info!("received service stop request, initiating graceful shutdown");
                     },
                 }
                 return;
@@ -1166,9 +1201,14 @@ async fn shutdown_signal() {
         }
     }
 
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to install CTRL+C signal handler");
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result.expect("failed to install CTRL+C signal handler");
+        },
+        _ = service_stop.changed() => {
+            tracing::info!("received service stop request, initiating graceful shutdown");
+        },
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

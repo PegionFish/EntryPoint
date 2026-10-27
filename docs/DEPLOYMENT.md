@@ -383,3 +383,50 @@ curl -s -X POST "http://127.0.0.1:9800/api/workspace/import?overwrite=true" \
   daemon** 使其对触发扫描生效（旧机路径在新机不存在时启动期自动清扫）；
 - 包内 `format_version` 字段为向后兼容锚（当前
   `workspace-migration/v1`），版本不符时导入返回 400。
+
+---
+
+## 17. Windows 服务化（sc create 路线，演进计划 计划2 M3）
+
+无人值守部署选择服务模式（开机自启、崩溃自动重启、无登录会话依赖）；
+交互会话桌面场景选 ep-tray 托盘壳（§15）——两者互斥使用，不要同时托管。
+
+### 17.1 安装 / 卸载
+
+```powershell
+# 安装（缺省 LocalSystem；无人值守建议低权限账户）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-service.ps1 `
+  -BinDir C:\EntryPoint\bin
+# 低权限账户（需先对 workspace 授权，脚本输出 icacls 命令）
+powershell ... -BinDir C:\EntryPoint\bin -Account NetworkService
+# 覆盖重装 / 卸载（卸载不动 workspace 与 config）
+powershell ... -Force
+powershell ... -Uninstall
+```
+
+服务名缺省 `EntryPoint`；`-DryRun` 只打印将执行的 sc 命令。服务以
+`ep-daemon --service` 运行，daemon 经 windows-service crate 与 SCM 对话
+（服务进程不通信 ~30s 即被系统终止，故完整 SCM 集成是本路线的前提），
+`sc failure` 已配崩溃自动重启链（10s/30s/60s 退避，每日重置计数）。
+
+### 17.2 防火墙与依赖
+
+```powershell
+# WebUI 端口入站规则（缺省仅 Private 配置文件；-Profile Any 放行全部）
+powershell -File scripts\configure-firewall.ps1 -Port 9800
+# uv 依赖兜底（winget astral-sh.uv，winget 缺失时输出直链指引）
+powershell -File scripts\deps-install.ps1
+```
+
+### 17.3 注意事项
+
+- **服务账户权限**：LocalSystem 拥有本机权限但无网络共享凭据；访问 NAS 的
+  store 建议改 NetworkService/专用账户 + `icacls` 授权工作目录（master
+  report 计划2 风险项：服务账户下 uv/venv 路径权限）。uv 的 Python 缓存
+  位于账户用户目录——切换服务账户后首跑会重新下载解释器。
+- **日志**：服务模式无控制台，tracing 输出不可见——排障请设置
+  `config/app.toml [general].log_level` 并依赖事件日志（WebUI 事件页），
+  或临时前台运行 `ep-daemon` 观察控制台。
+- **NSSM 替代路线**：`nssm install EntryPoint <path>\ep-daemon.exe --service`
+  等价可用（NSSM 代为对话 SCM）；官方脚本路线零第三方依赖为默认推荐。
+- 真装/真卸一轮需管理员 PowerShell；本仓 CI 不含服务安装冒烟。

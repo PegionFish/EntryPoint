@@ -31,6 +31,10 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 flate2 = "1"
 tar = "0.4"
 
+[target.'cfg(windows)'.dependencies]
+# 计划2 M3 服务化：--service 与 SCM 对话（服务进程不通信 ~30s 被杀，完整集成是 sc create 路线的前提）
+windows-service = "0.8"
+
 [dev-dependencies]
 # 测试设施：Router::oneshot 与响应体收集（版本与 Cargo.lock 中已有条目一致）
 tower = { version = "0.5", features = ["util"] }
