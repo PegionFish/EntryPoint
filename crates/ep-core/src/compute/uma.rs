@@ -38,6 +38,10 @@ pub const ENV_OVERRIDE: &str = "EP_UMA_TOTAL_MB";
 /// UMA 平台识别特征 token（归一化后子串匹配）：GB10 Superchip 及
 /// NVIDIA Grace CPU 系列。仅收录当前确知的统一内存平台代号，新平台走
 /// [`ENV_OVERRIDE`] 显式声明。
+// 唯一消费方是下方 #[cfg(windows)] 的注册表探测路径；非 Windows 目标编译
+// 为死代码（CI rust job 首轮在 ubuntu 上实际命中），显式豁免以保留纯逻辑
+// 的跨平台单测覆盖。
+#[cfg_attr(not(windows), allow(dead_code))]
 const PLATFORM_TOKENS: &[&str] = &["gb10", "grace"];
 
 /// 解析 env 覆盖值（纯函数，可单测）：非空十进制 MB，0 视为未声明。
@@ -47,6 +51,7 @@ pub(crate) fn parse_env_override_mb(raw: &str) -> Option<u32> {
 
 /// 平台名判定（纯函数，可单测）：CPU 型号或系统产品名（归一化：小写、
 /// 空白折叠）命中任一 UMA 平台 token。
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn looks_like_uma_platform(cpu_name: &str, system_product: &str) -> bool {
     let normalize =
         |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase();
