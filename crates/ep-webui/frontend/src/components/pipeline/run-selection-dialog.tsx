@@ -87,6 +87,21 @@ export function RunSelectionDialog({
     .filter((s) => s.length > 0)
     .map((s) => (s.startsWith('.') ? s : `.${s}`))
 
+  // 收官审查 P2-4：{input}/{output} 是执行器占位符（单文件管线语义），
+  // 批量场景无上游/产物路径——原样下发会产生 N 个必然失败的成员任务。
+  // 整值占位参数在提交时剔除并提示（部分值内嵌占位符的复杂形态不拦截）。
+  const placeholderTargets = targets.filter((t) =>
+    Object.values(t.params).some(
+      (v) => v === '{input}' || v === '{output}',
+    ),
+  )
+  const stripPlaceholders = (params: Record<string, unknown>): Record<string, unknown> =>
+    Object.fromEntries(
+      Object.entries(params).filter(
+        ([, v]) => v !== '{input}' && v !== '{output}',
+      ),
+    )
+
   const submitted = outcomes?.filter((o) => o.ok) ?? []
   const failed = outcomes?.filter((o) => !o.ok) ?? []
 
@@ -97,11 +112,14 @@ export function RunSelectionDialog({
     const collected: RunGroupOutcome[] = []
     for (const target of targets) {
       try {
-        const resp = await onConfirm(target, {
-          folder: folder.trim(),
-          recursive,
-          extensions,
-        })
+        const resp = await onConfirm(
+          { ...target, params: stripPlaceholders(target.params) },
+          {
+            folder: folder.trim(),
+            recursive,
+            extensions,
+          },
+        )
         collected.push({
           nodeId: target.nodeId,
           label: target.label,
@@ -151,6 +169,19 @@ export function RunSelectionDialog({
             })}
           </DialogDescription>
         </DialogHeader>
+
+        {placeholderTargets.length > 0 && (
+          <div
+            className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400"
+            role="alert"
+          >
+            {t('runGroup.placeholderWarn', {
+              count: placeholderTargets.length,
+              defaultValue:
+                '{{count}} 个节点的参数含 {input}/{output} 占位符——批量场景无单文件上游，提交时将剔除这些参数。',
+            })}
+          </div>
+        )}
 
         {outcomes === null ? (
           <div className="space-y-4 py-1">

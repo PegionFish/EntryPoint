@@ -337,6 +337,7 @@
   "runGroup.button": "作为组运行",
   "runGroup.dialogTitle": "作为组运行（{{count}} 个节点）",
   "runGroup.dialogDescription": "对服务器侧文件夹批量执行各选中节点的直跑能力：每个节点一个任务组，成员任务逐文件独立受理。",
+  "runGroup.placeholderWarn": "{{count}} 个节点的参数含 {input}/{output} 占位符——批量场景无单文件上游，提交时将剔除这些参数。",
   "runGroup.folder": "服务器侧文件夹",
   "runGroup.folderHint": "缺省仅接受 workspace/uploads 内的目录（越权返回 403 FOLDER_NOT_ALLOWED）。",
   "runGroup.recursive": "递归子目录",

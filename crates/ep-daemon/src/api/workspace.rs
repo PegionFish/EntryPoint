@@ -140,6 +140,36 @@ fn mask_config_secrets(config: &mut Value) {
     }
 }
 
+/// 收官审查 P2-3：递归掩码疑似密钥的 params 键值（键名含 api_key/token/
+/// secret/password，大小写不敏感）。默认导出生效；include_secrets=true 保留
+/// 明文（操作员显式选择）。启发式可能误伤同名合法参数——掩码值恒为空串，
+/// 导入端可选参数空串=未设（openai-bridge 口径），影响面可接受。
+fn mask_sensitive_params(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, val) in map.iter_mut() {
+                let lower = key.to_ascii_lowercase();
+                if ["api_key", "apikey", "token", "secret", "password"]
+                    .iter()
+                    .any(|s| lower.contains(s))
+                {
+                    if val.is_string() {
+                        *val = Value::String(String::new());
+                    }
+                } else {
+                    mask_sensitive_params(val);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                mask_sensitive_params(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// GET /api/workspace/export?include_secrets= — 工作区整体导出（T-31）。
 ///
 /// 响应为单个 JSON 迁移包（形状见模块文档）；`include_secrets=true` 时
@@ -173,10 +203,17 @@ async fn export_workspace(
                 &state.root,
                 &mut spec.nodes,
             );
+            let mut spec_value = serde_json::to_value(&spec).unwrap_or(Value::Null);
+            if !include_secrets {
+                // 收官审查 P2-3：节点 params 可能被用户手工填入密钥（如
+                // openai-bridge 的 api_key——module.toml 明言勿落盘但无强制），
+                // 默认导出对疑似密钥键做启发式掩码
+                mask_sensitive_params(&mut spec_value);
+            }
             json!({
                 "format": "entrypoint-pipeline/v1",
                 "exported_at": chrono::Utc::now().to_rfc3339(),
-                "spec": serde_json::to_value(&spec).unwrap_or(Value::Null),
+                "spec": spec_value,
             })
         })
         .collect();
@@ -291,6 +328,14 @@ impl SectionReport {
         }
     }
 
+    /// 收官审查 P2-2：段级失败（如落盘失败）标记——把已计入的 Imported 降级
+    /// 为 invalid（detail 携带原因），操作员不会误信该段已迁移成功
+    fn mark_failed(&mut self, detail: String) {
+        for key in std::mem::take(&mut self.imported) {
+            self.invalid.push(json!({ "id": key, "detail": detail }));
+        }
+    }
+
     fn to_json(&self) -> Value {
         json!({
             "imported": self.imported,
@@ -320,12 +365,16 @@ fn import_registry_section<R: RegistryImport>(
         report.record(key, outcome);
     }
     if changed {
+        // 收官审查 P2-2：落盘失败不得仍记 Imported（操作员会误信迁移成功）
         if let Err(e) = registry.save_to(path) {
             tracing::warn!(
                 file = %path.display(),
                 error = %e,
                 "workspace import: failed to persist registry"
             );
+            report.mark_failed(format!(
+                "registry persist failed: {e}（该段条目仅在内存，未落盘）"
+            ));
         }
     }
     report
@@ -883,6 +932,27 @@ type = "http"
             enabled: true,
         }];
         config
+    }
+
+    /// 收官审查 P2-3：params 疑似密钥键的启发式掩码（递归、大小写不敏感、
+    /// 非字符串值原样保留）
+    #[test]
+    fn mask_sensitive_params_heuristic() {
+        let mut v = json!({
+            "nodes": {
+                "n1": { "params": { "api_key": "sk-123", "Prompt": "keep", "voice": "af_heart" } },
+                "n2": { "params": { "X-Token": "t", "timeout": 30 } },
+                "nested": [ { "secret_value": "s", "n": 1 } ]
+            }
+        });
+        mask_sensitive_params(&mut v);
+        assert_eq!(v["nodes"]["n1"]["params"]["api_key"], "");
+        assert_eq!(v["nodes"]["n1"]["params"]["Prompt"], "keep");
+        assert_eq!(v["nodes"]["n1"]["params"]["voice"], "af_heart");
+        assert_eq!(v["nodes"]["n2"]["params"]["X-Token"], "");
+        assert_eq!(v["nodes"]["n2"]["params"]["timeout"], 30);
+        assert_eq!(v["nodes"]["nested"][0]["secret_value"], "");
+        assert_eq!(v["nodes"]["nested"][0]["n"], 1);
     }
 
     /// 默认导出：三处密钥明文零泄漏；*_set 布尔照 ConfigView 模式表达到位。

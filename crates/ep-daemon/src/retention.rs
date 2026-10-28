@@ -328,6 +328,9 @@ fn terminal_candidate(
 fn cleanup_task(root: &Path, candidate: &Candidate, reason: &str, now: DateTime<Utc>) -> bool {
     match std::fs::remove_dir_all(&candidate.path) {
         Ok(()) => {
+            // 演进 follow-up P2-1：内存注册表同步移除（此前只删盘上 JSON，
+            // GET /api/tasks 与 metrics 在重启前仍见幽灵条目）
+            crate::api::execute::execution::remove_task_record(&candidate.id);
             if let Err(e) = delete_registry_record(root, &candidate.id) {
                 tracing::warn!(
                     task_id = %candidate.id,

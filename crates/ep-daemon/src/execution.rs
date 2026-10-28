@@ -205,6 +205,18 @@ pub fn task_registry_all() -> Vec<ep_core::task_registry::TaskRecord> {
         .all()
 }
 
+/// 从内存注册表移除在案任务（retention 清盘 P2-1 消费；盘上 JSON 由调用方
+/// 单独删除）。任务不在案时无操作。
+// allow(dead_code)：e2e_daemon 经 #[path] 双编译本文件但不含 retention（调用
+// 方），与 task_registry_all 同款豁免
+#[allow(dead_code)]
+pub fn remove_task_record(task_id: &str) {
+    registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(task_id);
+}
+
 fn registry() -> &'static Mutex<TaskRegistry> {
     REGISTRY.get_or_init(|| Mutex::new(TaskRegistry::new()))
 }

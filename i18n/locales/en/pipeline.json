@@ -337,6 +337,7 @@
   "runGroup.button": "Run as group",
   "runGroup.dialogTitle": "Run as group ({{count}} nodes)",
   "runGroup.dialogDescription": "Batch-run each selected node's direct-run capability over a server-side folder: one task group per node, members submitted per file.",
+  "runGroup.placeholderWarn": "{{count}} node(s) have {input}/{output} placeholder params — batch runs have no per-file upstream, so these params are stripped on submit.",
   "runGroup.folder": "Server-side folder",
   "runGroup.folderHint": "By default only directories inside workspace/uploads are accepted (403 FOLDER_NOT_ALLOWED otherwise).",
   "runGroup.recursive": "Recurse subdirectories",

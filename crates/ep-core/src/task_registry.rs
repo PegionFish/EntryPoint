@@ -376,6 +376,18 @@ impl TaskRegistry {
         Some(self.persist_one(&clone))
     }
 
+    /// 移除在案记录：内存表删除 + 落盘 JSON 删除（记录不存在时两者皆无操作）。
+    ///
+    /// 消费方：retention 清盘（演进 follow-up P2——此前只删任务目录与盘上
+    /// JSON，内存表残留至重启，任务中心/metrics 仍见幽灵条目）。落盘删除
+    /// 失败不阻断内存删除（重启后以盘上残留为准，行为与旧版一致）。
+    pub fn remove(&mut self, task_id: &str) {
+        self.records.remove(task_id);
+        if let Some(dir) = &self.persist_dir {
+            let _ = std::fs::remove_file(dir.join(format!("{}.json", task_id)));
+        }
+    }
+
     fn persist_one(&self, record: &TaskRecord) -> std::io::Result<()> {
         let Some(dir) = &self.persist_dir else {
             return Ok(());
@@ -579,6 +591,24 @@ mod tests {
         let err = reg.insert(record("task-x", "p1", TaskState::Queued));
         assert!(err.is_err(), "落盘应失败");
         assert!(reg.get("task-x").is_some(), "落盘失败也须保留内存记录");
+    }
+
+    #[test]
+    fn remove_drops_memory_and_disk_record() {
+        let mut reg = TaskRegistry::new();
+        let dir = temp_dir("remove");
+        reg.enable_persistence(&dir).unwrap();
+        reg.insert(record("task-rm", "p1", TaskState::Completed)).unwrap();
+        assert!(reg.get("task-rm").is_some());
+        assert!(dir.join("task-rm.json").is_file());
+
+        reg.remove("task-rm");
+        assert!(reg.get("task-rm").is_none(), "内存记录应被移除");
+        assert!(!dir.join("task-rm.json").exists(), "盘上 JSON 应被删除");
+
+        // 幂等：移除不存在的记录无操作不报错
+        reg.remove("task-rm");
+        assert!(reg.is_empty());
     }
 
     #[test]
