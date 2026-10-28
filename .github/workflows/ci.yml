@@ -1,9 +1,13 @@
 # EntryPoint CI 门禁（T-01）
 #
-# 三个 job 对应 reports/handoff/AGENT_HANDOFF.md §5 T-01 的三条门禁线：
-#   1. rust     —— clippy（-D warnings，与 build.sh L296 同口径）+ workspace 全量测试
-#   2. frontend —— oxlint + 生产构建（tsc -b && vite build），不跑 e2e
-#   3. matrix   —— aarch64 交叉目标 cargo check（只做类型检查，不链接、不产包）
+# 四个 job 对应 reports/handoff/AGENT_HANDOFF.md §5 T-01 的三条门禁线 + T-44 的 Windows 部署冒烟：
+#   1. rust          —— clippy（-D warnings，与 build.sh L296 同口径）+ workspace 全量测试
+#   2. frontend      —— oxlint + vitest + 生产构建（tsc -b && vite build），不跑 e2e
+#   3. matrix        —— aarch64 交叉目标 cargo check（只做类型检查，不链接、不产包）
+#   4. windows-smoke —— T-44（计划2 M4 + 计划0.4）：debug 构建 ep-daemon + 部署脚本
+#      DryRun 拼装验证 + 前台拉起 daemon 的部署冒烟（探活 → /api/health 与
+#      /api/v1/capabilities 断言 200 → 优雅终止）；初期软失败（continue-on-error），
+#      稳定后由 Lead 收紧为必需门禁。
 #
 # 范围约束（handoff §5 T-01 禁区）：CI 不安装 Python / GPU / sherpa 等模块推理依赖，
 # modules/ 适配层不在本仓库 CI 范围；所有依赖走 action 缓存。
@@ -141,3 +145,171 @@ jobs:
         env:
           # 允许 pkg-config 在交叉目标下探测宿主 OpenSSL 头文件（见上一步注释）
           PKG_CONFIG_ALLOW_CROSS: "1"
+
+  # ── T-44（计划2 M4 + 计划0.4）：Windows 部署冒烟 ─────────────────────────────
+  # 范围策略（计划 T-44 建议已采纳）：全量 cargo test 的 Windows 时长风险高
+  # （40min+ 量级），全量门禁仍由 rust job（ubuntu）把守；本 job 只做——
+  #   debug 构建 ep-daemon（-p 单包，不构建 ep-tray/ep-pack-cli/ep-webui）
+  #   → 部署脚本 DryRun 拼装验证（零管理员、零系统副作用）
+  #   → 前台拉起 daemon：探活 → /api/health 与 /api/v1/capabilities 断言 200
+  #   → 优雅终止（CTRL_C 触发 graceful shutdown，超时兜底强杀进程树）
+  # 初期软失败：T-44 风险禁区①——Windows job 红不得阻断主门禁，Lead 看稳后收紧。
+  windows-smoke:
+    name: windows-smoke（构建 + daemon 冒烟）
+    runs-on: windows-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      # 显式 key 与其他 job 隔离（T-44 风险禁区③：缓存按 job/key 隔离防互踩，
+      # rustc host triple 已在 rust-cache 默认哈希内，天然不与 ubuntu 缓存互踩）；
+      # cache-on-failure：冒烟迭代期失败也落缓存，避免冷构建反复烧 15 分钟预算
+      - name: 缓存 Cargo 构建产物（windows-smoke 专用）
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-smoke
+          cache-on-failure: true
+
+      # 冒烟只需要 daemon 可执行体：-p ep-daemon 连带构建 ep-core/ep-pack 依赖链，
+      # 跳过 ep-tray/ep-pack-cli/ep-webui；debug profile 即可（不校验发布产物）
+      - name: 构建 ep-daemon（debug）
+        run: cargo build -p ep-daemon
+
+      # 计划2 M3 服务化三脚本之二的 DryRun 拼装验证（纯打印将执行的命令）：
+      # install-service.ps1 内部 Test-Path 校验 exe 存在（-BinDir 指向 debug 产物目录），
+      # 并真实执行 sc.exe query 探测服务占用（只读，无需管理员）；configure-firewall.ps1
+      # 的 -DryRun 在 netsh 之前打印即退（exit 0），零系统副作用
+      - name: 部署脚本 DryRun 拼装验证（install-service + configure-firewall）
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/install-service.ps1 -BinDir target/debug -DryRun
+          if ($LASTEXITCODE -ne 0) { throw "install-service.ps1 -DryRun 失败（exit $LASTEXITCODE）" }
+          pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/configure-firewall.ps1 -Port 9800 -DryRun
+          if ($LASTEXITCODE -ne 0) { throw "configure-firewall.ps1 -DryRun 失败（exit $LASTEXITCODE）" }
+
+      - name: daemon 冒烟（前台拉起 → 探活 → 端点断言 → 优雅终止）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $base = "http://127.0.0.1:9800"
+          # EP_ROOT 指向 runner 临时目录：工作区（config/workspace/runtime/logs）
+          # 全部落在临时目录，不污染检出树。预写最小 app.toml 把监听钉到回环地址
+          # （代码默认 0.0.0.0，见 ep-core config.rs default_host；回环探测对二者
+          # 都可用，但显式回环不在共享 runner 上多开一个外部监听面）。
+          # static 目录缺失不影响 /api 路由（ServeDir 仅请求期 404）
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "ep-smoke-root"
+          New-Item -ItemType Directory -Force -Path (Join-Path $smokeRoot "config") | Out-Null
+          # 多行单引号字符串（非 here-string，收尾引号无顶格约束）；
+          # 行内容在 YAML 基础缩进之上，剥离后 TOML 侧无前导空格
+          $appToml = '
+          [server]
+          host = "127.0.0.1"
+          port = 9800
+          '
+          Set-Content -Path (Join-Path $smokeRoot "config\app.toml") -Value $appToml -Encoding ascii
+          $env:EP_ROOT = $smokeRoot
+
+          $exe = Join-Path (Get-Location) "target\debug\ep-daemon.exe"
+          $outLog = Join-Path $smokeRoot "daemon-stdout.log"
+          $errLog = Join-Path $smokeRoot "daemon-stderr.log"
+          # 不带 -NoNewWindow：重定向使 daemon 独占新控制台——这是优雅终止
+          # （AttachConsole + CTRL_C）的前提
+          $proc = Start-Process -FilePath $exe -ArgumentList "--headless" -PassThru `
+            -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+          Write-Host "ep-daemon started (pid=$($proc.Id))"
+
+          try {
+            # 探活：≤60s 轮询 /api/health 直到 200；进程提前退出立即失败
+            $healthy = $false
+            for ($i = 1; $i -le 30; $i++) {
+              if ($proc.HasExited) { throw "ep-daemon 提前退出（exit code $($proc.ExitCode)）" }
+              Start-Sleep -Seconds 2
+              $code = curl.exe -s -o NUL -w "%{http_code}" "$base/api/health"
+              if ("$code" -eq "200") { $healthy = $true; break }
+            }
+            if (-not $healthy) { throw "/api/health 60s 内未就绪" }
+            Write-Host "/api/health -> 200（第 $i 次探测）"
+
+            # 关键端点：GET /api/v1/capabilities → 200 + 响应含 "capabilities" 键
+            #（注意真实路由前缀是 /api/health 而非 /health，与 verify-api.sh 同口径）
+            $capsFile = Join-Path $smokeRoot "caps.json"
+            $code = curl.exe -s -o $capsFile -w "%{http_code}" "$base/api/v1/capabilities"
+            if ("$code" -ne "200") { throw "/api/v1/capabilities HTTP $code（预期 200）" }
+            $caps = Get-Content $capsFile -Raw
+            if ($caps -notmatch '"capabilities"') {
+              $head = $caps.Substring(0, [Math]::Min(200, $caps.Length))
+              throw "/api/v1/capabilities 响应缺 capabilities 键: $head"
+            }
+            Write-Host "/api/v1/capabilities -> 200"
+            Write-Host "daemon 冒烟通过"
+          } catch {
+            Write-Host "── daemon stdout（尾部 40 行）──"
+            Get-Content $outLog -Tail 40 -ErrorAction SilentlyContinue
+            Write-Host "── daemon stderr（尾部 40 行）──"
+            Get-Content $errLog -Tail 40 -ErrorAction SilentlyContinue
+            throw
+          } finally {
+            # ── 优雅终止（无论成败都执行；清理路径自身绝不让步骤由绿转红）──
+            # Windows 控制台程序无 SIGTERM：唯一优雅出口是 daemon 的 tokio ctrl_c
+            # 处理器（graceful shutdown 会回收模块子进程再退出），经 FreeConsole/
+            # AttachConsole + GenerateConsoleCtrlEvent 投递 CTRL_C；15s 未退出或
+            # 投递路径异常则以 taskkill /T /F 强杀整棵进程树兜底——CI 场景无模块
+            # 子进程，强杀无残留副作用，保证 runner 不留悬挂 daemon
+            if (-not $proc.HasExited) {
+              try {
+                # pwsh here-string 的收尾 "@ 必须顶格：YAML 块标量剥离基础缩进
+                # （10 空格）后该行恰好落在脚本第 0 列——勿改动 "@ 行的缩进层级
+                Add-Type -TypeDefinition @"
+              using System;
+              using System.Runtime.InteropServices;
+              public static class ConsoleCtrl {
+                  [DllImport("kernel32.dll", SetLastError = true)]
+                  public static extern bool FreeConsole();
+                  [DllImport("kernel32.dll", SetLastError = true)]
+                  public static extern bool AttachConsole(uint pid);
+                  [DllImport("kernel32.dll", SetLastError = true)]
+                  public static extern bool SetConsoleCtrlHandler(IntPtr handler, bool add);
+                  [DllImport("kernel32.dll", SetLastError = true)]
+                  public static extern bool GenerateConsoleCtrlEvent(uint evt, uint pgid);
+              }
+          "@
+                [void][ConsoleCtrl]::FreeConsole()
+                if ([ConsoleCtrl]::AttachConsole([uint32]$proc.Id)) {
+                  # 自身忽略 CTRL_C，防止事件回流中断本脚本
+                  [void][ConsoleCtrl]::SetConsoleCtrlHandler([IntPtr]::Zero, $true)
+                  if ([ConsoleCtrl]::GenerateConsoleCtrlEvent(0, 0)) {
+                    for ($w = 0; $w -lt 15 -and -not $proc.HasExited; $w++) { Start-Sleep -Seconds 1 }
+                    if ($proc.HasExited) { Write-Host "ep-daemon 已优雅退出（CTRL_C 后 ${w}s 内）" }
+                  }
+                }
+              } catch {
+                Write-Host "CTRL_C 优雅终止路径异常（不影响步骤结果）：$_"
+              }
+              if (-not $proc.HasExited) {
+                Write-Host "优雅退出未达成（投递失败/超时/异常），taskkill 强杀进程树兜底"
+                taskkill /PID $proc.Id /T /F | Out-Null
+                $proc.WaitForExit()
+              }
+              Write-Host "ep-daemon 已终止"
+            } else {
+              Write-Host "ep-daemon 已自行退出（exit $($proc.ExitCode)）"
+            }
+          }
+
+      # 兜底清扫：无论前序成败，runner 上不留 ep-daemon 残留进程
+      - name: 清理残留进程（兜底）
+        if: always()
+        shell: pwsh
+        run: |
+          $left = Get-Process -Name "ep-daemon" -ErrorAction SilentlyContinue
+          if ($left) {
+            Write-Host "发现残留 ep-daemon（pid=$($left.Id -join ',')），强杀"
+            $left | Stop-Process -Force
+          } else {
+            Write-Host "无残留进程"
+          }
