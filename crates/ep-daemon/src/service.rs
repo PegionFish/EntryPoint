@@ -13,6 +13,9 @@ use std::sync::OnceLock;
 use tokio::sync::watch;
 
 /// sc create 使用的服务名（与 scripts/install-service.ps1 缺省一致）
+// 唯一消费方是 #[cfg(windows)] 的 SCM 注册路径；非 Windows 目标编译为死代码
+// （CI rust job 第四轮在 ubuntu 上命中——与 uma.rs 同类，教训同源）
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const SERVICE_NAME: &str = "EntryPoint";
 
 /// 从参数列表探测 `--service`（纯函数，可单测）
@@ -39,6 +42,8 @@ pub fn stop_signal_rx() -> watch::Receiver<bool> {
 }
 
 /// SCM 控制处理器调用：请求优雅停机（幂等）
+// 同上：唯一消费方在 cfg(windows) 控制处理器内
+#[cfg_attr(not(windows), allow(dead_code))]
 fn request_stop() {
     let _ = stop_channel().0.send(true);
 }
