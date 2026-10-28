@@ -33,7 +33,7 @@
 modules/<module-id>/
 ├── module.toml            ← 必须。模块清单，声明一切元信息
 ├── adapter.py             ← Python 模块必须。统一 REST 接口适配器
-├── requirements.txt       ← Python 模块必须。pip 依赖列表
+├── requirements.txt       ← Python 模块必须。pip 依赖列表（torch/ncnn 供给矩阵见 docs/MODULE_WHEEL_MATRIX.md）
 ├── README.md              ← 推荐。模块说明
 ├── bin/                   ← 原生模块。按平台存放二进制
 │   ├── windows-x86_64/
