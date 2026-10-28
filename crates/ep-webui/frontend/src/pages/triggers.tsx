@@ -70,15 +70,18 @@ const RECENT_PREVIEW_MAX = 5
 /** 动作模式（对话框表单视角：直接模式拆为 仅归档 / 模块 两档） */
 type RuleMode = 'direct-archive' | 'direct-module' | 'pipeline'
 
-/** 规则编辑表单状态（extensions 以原始文本持有，保存时归一） */
+/** 规则编辑表单状态（extensions/exclude 以原始文本持有，保存时归一） */
 interface RuleForm {
   name: string
   watch_dir: string
   extensionsText: string
+  excludeText: string
   recursive: boolean
   include_modified: boolean
   stability_secs: string
   backfill: boolean
+  dedup_enabled: boolean
+  dedup_max_mb: string
   enabled: boolean
   mode: RuleMode
   moduleId: string
@@ -94,10 +97,13 @@ const DEFAULT_FORM: RuleForm = {
   name: '',
   watch_dir: '',
   extensionsText: '',
+  excludeText: '',
   recursive: false,
   include_modified: false,
   stability_secs: '30',
   backfill: false,
+  dedup_enabled: true,
+  dedup_max_mb: '64',
   enabled: true,
   mode: 'direct-archive',
   moduleId: '',
@@ -125,6 +131,25 @@ function parseExtensions(text: string): string[] {
     .map((s) => s.replace(/^\./, '').trim().toLowerCase())
     .filter(Boolean)
   return Array.from(new Set(list))
+}
+
+/**
+ * 排除 glob 输入归一（T-51）：按逗号/分号/换行切分 → 去空白 → 去重去空，
+ * 保持书写顺序。glob 大小写保留（匹配期按平台折叠），此处不归一大小写。
+ */
+function parseExclude(text: string): string[] {
+  const list = text
+    .split(/[，,;\n]+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+  return Array.from(new Set(list))
+}
+
+/** 去重哈希阈值（MB）归一：钳制 1–4096（与服务端校验同口径），默认 64 */
+function parseDedupMaxMb(text: string): number {
+  const n = Number(text)
+  if (!Number.isFinite(n)) return 64
+  return Math.min(4096, Math.max(1, Math.floor(n)))
 }
 
 /**
@@ -214,6 +239,7 @@ function statusDotClass(status: string | null | undefined): string {
     case 'failed':
       return 'bg-status-error'
     case 'archive_skipped':
+    case 'dedup_skipped':
     case 'cancelled':
       return 'bg-status-preparing'
     default:
@@ -275,6 +301,11 @@ function formToInput(form: RuleForm): WatchRuleInput {
     watch_dir: form.watch_dir.trim(),
     recursive: form.recursive,
     extensions,
+    exclude: parseExclude(form.excludeText),
+    dedup: {
+      enabled: form.dedup_enabled,
+      max_hash_mb: parseDedupMaxMb(form.dedup_max_mb),
+    },
     include_modified: form.include_modified,
     stability_secs: stability,
     backfill: form.backfill,
@@ -319,10 +350,13 @@ function RuleDialog({
         name: rule.name,
         watch_dir: rule.watch_dir,
         extensionsText: (rule.extensions ?? []).join(', '),
+        excludeText: (rule.exclude ?? []).join(', '),
         recursive: rule.recursive ?? false,
         include_modified: rule.include_modified ?? false,
         stability_secs: String(rule.stability_secs ?? 30),
         backfill: rule.backfill ?? false,
+        dedup_enabled: rule.dedup?.enabled ?? true,
+        dedup_max_mb: String(rule.dedup?.max_hash_mb ?? 64),
         enabled: rule.enabled,
         mode: ruleMode(rule),
         moduleId: moduleDirect?.module_id ?? '',
@@ -510,6 +544,20 @@ function RuleDialog({
                 {t('dialog.extensionsHint')}
               </p>
             </div>
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium">
+                {t('dialog.exclude')}
+              </label>
+              <Input
+                value={form.excludeText}
+                onChange={(e) => set('excludeText', e.target.value)}
+                placeholder={t('dialog.excludePlaceholder')}
+                className="font-mono text-xs"
+              />
+              <p className="text-[11px] text-muted-foreground">
+                {t('dialog.excludeHint')}
+              </p>
+            </div>
             <div className="grid gap-2 sm:grid-cols-2">
               {(
                 [
@@ -520,6 +568,11 @@ function RuleDialog({
                     'dialog.includeModifiedHint',
                   ],
                   ['backfill', 'dialog.backfill', 'dialog.backfillHint'],
+                  [
+                    'dedup_enabled',
+                    'dialog.dedupEnabled',
+                    'dialog.dedupEnabledHint',
+                  ],
                   ['enabled', 'dialog.enabled', 'dialog.enabledHint'],
                 ] as const
               ).map(([key, labelKey, hintKey]) => (
@@ -540,6 +593,24 @@ function RuleDialog({
                   />
                 </div>
               ))}
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium">
+                  {t('dialog.dedupMaxMb')}
+                </label>
+                <Input
+                  type="number"
+                  min={1}
+                  max={4096}
+                  value={form.dedup_max_mb}
+                  onChange={(e) => set('dedup_max_mb', e.target.value)}
+                  disabled={!form.dedup_enabled}
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  {t('dialog.dedupMaxMbHint')}
+                </p>
+              </div>
             </div>
           </section>
 
@@ -1964,10 +2035,13 @@ export function TriggersPage() {
       name: rule.name,
       watch_dir: rule.watch_dir,
       extensionsText: (rule.extensions ?? []).join(', '),
+      excludeText: (rule.exclude ?? []).join(', '),
       recursive: rule.recursive ?? false,
       include_modified: rule.include_modified ?? false,
       stability_secs: String(rule.stability_secs ?? 30),
       backfill: rule.backfill ?? false,
+      dedup_enabled: rule.dedup?.enabled ?? true,
+      dedup_max_mb: String(rule.dedup?.max_hash_mb ?? 64),
       enabled,
       mode: ruleMode(rule),
       moduleId:

@@ -589,6 +589,10 @@ async fn run_server(root: PathBuf, cfg: AppConfig) -> anyhow::Result<()> {
     //      中推进）；QueueFull 等失败 → 写 rejected 事件 + **整轮放弃新注册表**
     //      （触发文件保持待触发，沿用旧表下轮重试——W0-C 模块文档既定的
     //      QueueFull 语义，不丢文件；collect 为纯函数，放弃新表即天然回滚）。
+    //      T-51：内容去重命中的文件不提交，collect 以 skips 单独返回 → 写
+    //      watcher_trigger(dedup_skipped) 事件 + 回写 recent；整轮 collect 在
+    //      spawn_blocking 内执行（sha256 不占 async 线程），登记表落盘走
+    //      flush_processed 防抖节拍（每轮检查，最小间隔合并写）。
     //      无状态变化不落盘。与 cron 巡检同为读-改-写窗口（§9 风险表既定，
     //      单进程 10s 周期，不引入新锁）。
     {
@@ -599,13 +603,57 @@ async fn run_server(root: PathBuf, cfg: AppConfig) -> anyhow::Result<()> {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
+                // T-51 清尾 3：登记表防抖落盘节拍（脏标记 + 最小间隔合并写）
+                watcher::flush_processed(false);
                 let path = watcher::default_registry_path(&state.root);
                 let registry = watcher::WatchRegistry::load(&path);
                 if registry.rules.is_empty() {
                     continue;
                 }
                 let now = chrono::Utc::now().timestamp();
-                let (hits, mut next) = watcher::collect_watch_events(&registry, now);
+                // T-51：扫描可能对候选文件计算 sha256（内容级去重，阈值内），
+                // 整轮 collect 进 spawn_blocking——哈希与目录扫描不占 async
+                // 线程（性能审计 P1 纪律）；JoinError 按本轮放弃处理（下轮
+                // 自磁盘重载，无状态丢失）。registry 闭包内用克隆——提交期
+                // 仍需旧表快照取在途签名。
+                let scan_registry = registry.clone();
+                let scan = tokio::task::spawn_blocking(move || {
+                    watcher::collect_watch_events(&scan_registry, now)
+                });
+                let (hits, skips, mut next) = match scan.await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        warn!(error = %e, "watcher 巡检任务 panic，本轮跳过");
+                        continue;
+                    }
+                };
+                // T-51 点3：内容去重跳过 → dedup_skipped 事件 + recent 速览
+                // （文件按「已解决」处理，仅不提交触发）。边界：若同轮后续
+                // 提交失败走 abandoned 合并，合并以旧表为基——该规则的跳过
+                // 解析（recent/水位线）回退，下一轮同文件再次命中去重并重复
+                // 写一次事件（QueueFull 故障路径才可达，事件为信息性记录，
+                // 干净轮次即自愈；如需精确去重需扩展 merge_abandoned_registry）。
+                for skip in &skips {
+                    warn!(rule_id = %skip.rule_id, file = %skip.path, "内容与已登记产物相同，跳过触发");
+                    eventlog::write_watcher_trigger(
+                        &state.root,
+                        &skip.rule_id,
+                        &skip.path,
+                        None,
+                        "dedup_skipped",
+                        Some(&skip.detail),
+                    );
+                    if let Some(r) = next.rules.get_mut(&skip.rule_id) {
+                        r.recent.push_front(watcher::EventRecord {
+                            ts: now,
+                            file: skip.path.clone(),
+                            task_id: None,
+                            status: "dedup_skipped".to_string(),
+                            detail: Some(skip.detail.clone()),
+                        });
+                        r.recent.truncate(5);
+                    }
+                }
                 if hits.is_empty() {
                     // 无状态变化不落盘（与 cron 巡检同款守卫）
                     if !watcher_registry_changed(&registry, &next) {
@@ -885,13 +933,19 @@ fn watcher_output(
     }
 }
 
-/// 巡检后注册表是否有持久化可见的状态变化（checkpoint / 在途表逐规则比较；
-/// `in_flight` 的 `PartialEq` 与键序无关）。命中为空时 recent / last_task_id
-/// 必然未被触碰，二者即完整判据——无变化不落盘（与 cron 巡检同款守卫）。
+/// 巡检后注册表是否有持久化可见的状态变化（checkpoint / 在途表 / recent /
+/// last_task_id 逐规则比较；`in_flight` 的 `PartialEq` 与键序无关）。
+/// T-51：recent 纳入比较——内容去重跳过（dedup_skipped）在 hits 为空时
+/// 也会回写 recent，须落盘保留。无变化不落盘（与 cron 巡检同款守卫）。
 fn watcher_registry_changed(a: &watcher::WatchRegistry, b: &watcher::WatchRegistry) -> bool {
     a.rules.len() != b.rules.len()
         || a.rules.iter().any(|(k, ra)| match b.rules.get(k) {
-            Some(rb) => ra.checkpoint != rb.checkpoint || ra.in_flight != rb.in_flight,
+            Some(rb) => {
+                ra.checkpoint != rb.checkpoint
+                    || ra.in_flight != rb.in_flight
+                    || ra.recent != rb.recent
+                    || ra.last_task_id != rb.last_task_id
+            }
             None => true,
         })
 }
@@ -1797,6 +1851,8 @@ mod tests {
             watch_dir: "/nowhere".into(),
             recursive: false,
             extensions: vec![],
+            exclude: vec![],
+            dedup: watcher::WatcherDedupConfig::default(),
             include_modified: false,
             stability_secs: 30,
             backfill: false,

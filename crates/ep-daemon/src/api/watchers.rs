@@ -6,6 +6,10 @@
 //! - `GET  /api/watchers/{id}`  — 单条规则（未配置 → 404 `apiCore.watcher.notFound`）
 //! - `PUT  /api/watchers/{id}`  — 全量更新（校验同 POST，保留运行态字段）
 //! - `DELETE /api/watchers/{id}`— 删除（幂等）
+//! - `GET  /api/watchers/processed` — 产物登记表只读列表（T-51 清尾 2：
+//!   TTL 内条目 + `ttl_secs` / `max_entries` 元信息；静态段优先于 `{id}`）
+//! - `DELETE /api/watchers/processed` — 手动清空登记表（T-51 清尾 2，
+//!   返回 `{ok, removed}` 并强制落盘；TTL 过期为自动清理，无需手动）
 //!
 //! POST/PUT 共用 §5.3 的 7 步校验链（顺序冻结，不得调整）：
 //! 1. `name` 非空 → `watcher.nameRequired`
@@ -23,6 +27,10 @@
 //!    另一方 → 400 `apiCore.watcher.pathOverlap`（产物回流监控目录会自我
 //!    触发；「风险自理」确认通道留后续票）。跨平台归一比较见
 //!    `crate::watcher::paths_overlap`。
+//! 9. （T-51）`exclude` glob 归一（去空白、去空条目、去重；单条 ≤ 256 字符
+//!    且总数 ≤ 64，超出 → 400 `apiCore.watcher.excludeInvalid`）；`dedup`
+//!    配置 `{enabled, max_hash_mb}` 缺省按默认（开启 / 64MB），
+//!    `max_hash_mb` 钳制 1..=4096。
 //!
 //! 错误响应统一走 `err_response` + i18n 键；注册表落盘失败 → 500
 //! `watcher.saveFailed`。
@@ -44,6 +52,7 @@ use crate::api::err_response;
 use crate::state::AppState;
 use crate::watcher::{
     DirectAction, DirectKind, OutputConfig, PipelineAction, WatchRule, WatchRegistry,
+    WatcherDedupConfig,
 };
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -52,6 +61,11 @@ pub fn router() -> Router<Arc<AppState>> {
         .route(
             "/watchers/{id}",
             get(get_watcher).put(update_watcher).delete(delete_watcher),
+        )
+        // T-51 清尾 2：登记表只读列表 + 手动清理（静态段优先于 {id} 匹配）
+        .route(
+            "/watchers/processed",
+            get(list_processed).delete(clear_processed),
         )
 }
 
@@ -241,6 +255,34 @@ async fn delete_watcher(
     (StatusCode::OK, Json(json!({ "ok": ok })))
 }
 
+// ─── 产物登记表（T-51 清尾 2）：只读列表 + 手动清理 ─────────────────────────
+
+/// GET /api/watchers/processed — 登记表只读列表（TTL 内条目，新条目在前）
+async fn list_processed(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
+    let _ = state; // 全局登记表自定位落盘路径，不经 AppState
+    let entries = crate::watcher::processed_snapshot();
+    let list: Vec<Value> = entries
+        .iter()
+        .map(|e| serde_json::to_value(e).unwrap_or_else(|_| json!({})))
+        .collect();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "entries": list,
+            "count": list.len(),
+            "ttl_secs": crate::watcher::PROCESSED_TTL_SECS,
+            "max_entries": crate::watcher::PROCESSED_MAX_ENTRIES,
+        })),
+    )
+}
+
+/// DELETE /api/watchers/processed — 手动清空登记表（强制落盘）
+async fn clear_processed(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
+    let _ = state;
+    let removed = crate::watcher::processed_clear();
+    (StatusCode::OK, Json(json!({ "ok": true, "removed": removed })))
+}
+
 // ─── §5.3 七步校验链（顺序冻结）+ T-25 重叠校验（第 8 步，追加不重排） ──────
 
 /// 校验后的规则草稿（未分配运行态字段）
@@ -250,6 +292,8 @@ struct RuleDraft {
     watch_dir: String,
     recursive: bool,
     extensions: Vec<String>,
+    exclude: Vec<String>,
+    dedup: WatcherDedupConfig,
     include_modified: bool,
     stability_secs: u64,
     backfill: bool,
@@ -270,6 +314,8 @@ impl RuleDraft {
             watch_dir: self.watch_dir.clone(),
             recursive: self.recursive,
             extensions: self.extensions,
+            exclude: self.exclude,
+            dedup: self.dedup,
             include_modified: self.include_modified,
             stability_secs: self.stability_secs,
             backfill: self.backfill,
@@ -410,12 +456,37 @@ async fn validate_rule_body(state: &Arc<AppState>, body: &Value) -> Result<RuleD
         }
     }
 
+    // 9. （T-51）exclude glob 归一 + dedup 配置钳制。exclude 逐条去空白、
+    //    丢弃空条目、保序去重；单条 > 256 字符或总数超 64 → 400
+    //    excludeInvalid（防畸形规则拖慢扫描）。dedup 缺省按默认配置
+    //    （开启 / 64MB），max_hash_mb 钳制 1..=4096（0 语义仅引擎测试用）。
+    let mut exclude: Vec<String> = Vec::new();
+    for raw in get_string_vec(body, "exclude") {
+        let pat = raw.trim().to_string();
+        if pat.is_empty() {
+            continue;
+        }
+        if pat.chars().count() > 256 || exclude.len() >= 64 {
+            return Err(
+                err_response(state, StatusCode::BAD_REQUEST, "apiCore.watcher.excludeInvalid", &[])
+                    .await,
+            );
+        }
+        if !exclude.contains(&pat) {
+            exclude.push(pat);
+        }
+    }
+    let mut dedup: WatcherDedupConfig = get_opt(body, "dedup").unwrap_or_default();
+    dedup.max_hash_mb = dedup.max_hash_mb.clamp(1, 4096);
+
     Ok(RuleDraft {
         name,
         enabled: get_bool(body, "enabled", true),
         watch_dir,
         recursive: get_bool(body, "recursive", false),
         extensions,
+        exclude,
+        dedup,
         include_modified: get_bool(body, "include_modified", false),
         stability_secs,
         backfill: get_bool(body, "backfill", false),
@@ -440,6 +511,11 @@ fn get_string_vec(body: &Value, key: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    // 测试夹具的 std 锁（processed_test_lock 等）在 async 测试中跨 await 持有
+    // 是测试隔离要求（全局登记表互斥），非生产代码——与 api::tasks /
+    // api::execute 测试模块同款豁免。
+    #![allow(clippy::await_holding_lock)]
+
     use super::*;
     use crate::state::AppState;
     use axum::body::Body;
@@ -988,6 +1064,135 @@ max_file_size_mb = 100
         let resp = app.oneshot(req("GET", "/watchers", None)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(collect(resp).await.as_array().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── T-51：exclude / dedup 校验 + processed 端点 ─────────────────────
+
+    // 9. exclude 归一（去空白/去空/去重）落盘；dedup 缺省按默认（开启/64MB）
+    #[tokio::test]
+    async fn create_normalizes_exclude_and_applies_dedup_defaults() {
+        let root = test_root("exclude-dedup");
+        let state = state_at(root.clone());
+        let mut body = valid_direct_body("exd");
+        body["exclude"] = json!(["*.tmp", "  temp/*  ", "", " *.tmp ", "subdir/*.part"]);
+        let app = super::router().with_state(state.clone());
+        let resp = app.oneshot(req("POST", "/watchers", Some(body))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "合法 exclude 必须放行");
+        let id = collect(resp).await["id"].as_str().unwrap().to_string();
+        let reg = WatchRegistry::load(&watchers_path(&state));
+        let rule = &reg.rules[&id];
+        assert_eq!(
+            rule.exclude,
+            vec!["*.tmp".to_string(), "temp/*".to_string(), "subdir/*.part".to_string()],
+            "去空白、去空条目、保序去重（大小写保留——匹配期按平台折叠）"
+        );
+        assert!(rule.dedup.enabled, "dedup 默认开启");
+        assert_eq!(rule.dedup.max_hash_mb, 64, "dedup 默认阈值 64MB");
+
+        // dedup 显式配置 + max_hash_mb 钳制（0 → 1，99999 → 4096）
+        let app = super::router().with_state(state.clone());
+        let mut low = valid_direct_body("low");
+        low["dedup"] = json!({"enabled": false, "max_hash_mb": 0});
+        let resp = app.oneshot(req("PUT", &format!("/watchers/{id}"), Some(low))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let reg = WatchRegistry::load(&watchers_path(&state));
+        assert!(!reg.rules[&id].dedup.enabled, "enabled=false 落盘");
+        assert_eq!(reg.rules[&id].dedup.max_hash_mb, 1, "max_hash_mb 下钳 1");
+
+        let app = super::router().with_state(state.clone());
+        let mut high = valid_direct_body("high");
+        high["dedup"] = json!({"max_hash_mb": 99999});
+        let resp = app.oneshot(req("PUT", &format!("/watchers/{id}"), Some(high))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let reg = WatchRegistry::load(&watchers_path(&state));
+        assert_eq!(reg.rules[&id].dedup.max_hash_mb, 4096, "max_hash_mb 上钳 4096");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 9b. exclude 超限拒绝：单条 > 256 字符或总数 > 64 → 400 excludeInvalid
+    #[tokio::test]
+    async fn create_rejects_invalid_exclude() {
+        let root = test_root("exclude-bad");
+        let state = state_at(root.clone());
+        let err = ep_core::i18n::t("zh-CN", "apiCore.watcher.excludeInvalid", &[]);
+
+        // 单条超长
+        let app = super::router().with_state(state.clone());
+        let mut long = valid_direct_body("long");
+        long["exclude"] = json!(["x".repeat(257)]);
+        let resp = app.oneshot(req("POST", "/watchers", Some(long))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "单条 > 256 字符必须拒绝");
+        assert_eq!(collect(resp).await["error"], err);
+
+        // 条数超限
+        let app = super::router().with_state(state.clone());
+        let mut many = valid_direct_body("many");
+        many["exclude"] = json!((0..65).map(|i| format!("p{i}")).collect::<Vec<_>>());
+        let resp = app.oneshot(req("POST", "/watchers", Some(many))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "总数 > 64 必须拒绝");
+        assert_eq!(collect(resp).await["error"], err);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // processed 端点：静态段 /watchers/processed 优先于 {id}（不得 404）；
+    // 列表返回 TTL 内条目与元信息；DELETE 清空并落盘
+    #[tokio::test]
+    async fn processed_list_and_clear_roundtrip() {
+        let _guard = crate::watcher::processed_test_lock();
+        let root = test_root("processed-api");
+        let state = state_at(root.clone());
+        let disk_dir = root.join("processed-disk");
+        std::fs::create_dir_all(&disk_dir).unwrap();
+        crate::watcher::processed_reset_for_tests(Some(disk_dir.join("processed_registry.json")));
+
+        // 预置两条登记（真实文件——清空断言不依赖 prune；列表断言 TTL 内可见）
+        let p1 = disk_dir.join("a.mp4");
+        std::fs::write(&p1, b"1").unwrap();
+        crate::watcher::record_processed_product(&p1, "r1", "t1", Some("c".repeat(64)));
+        crate::watcher::record_processed_product(Path::new("/ghost/gone.mp4"), "r1", "t2", None);
+        assert!(crate::watcher::flush_processed(true));
+
+        // GET：静态段优先，返回条目 + 元信息（sha256 随条目透出）
+        let app = super::router().with_state(state.clone());
+        let resp = app.oneshot(req("GET", "/watchers/processed", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "/watchers/processed 不得落入 id 处理器");
+        let body = collect(resp).await;
+        assert_eq!(body["count"], 2);
+        assert_eq!(body["ttl_secs"], crate::watcher::PROCESSED_TTL_SECS);
+        assert_eq!(body["max_entries"], crate::watcher::PROCESSED_MAX_ENTRIES);
+        let entries = body["entries"].as_array().unwrap();
+        assert_eq!(entries[0]["path"], "/ghost/gone.mp4", "新条目在前");
+        assert_eq!(entries[0]["rule_id"], "r1");
+        assert_eq!(
+            entries[1]["sha256"], json!("c".repeat(64)),
+            "内容指纹随列表透出"
+        );
+
+        // GET /watchers/{id} 仍按 id 语义工作（processed 之外的 id → 404 notFound）
+        let app = super::router().with_state(state.clone());
+        let resp = app.oneshot(req("GET", "/watchers/no-such", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "普通 id 语义不受静态段影响");
+
+        // DELETE：清空 + 强制落盘
+        let app = super::router().with_state(state.clone());
+        let resp = app.oneshot(req("DELETE", "/watchers/processed", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = collect(resp).await;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["removed"], 2);
+        let on_disk =
+            crate::watcher::ProcessedRegistry::load(&disk_dir.join("processed_registry.json"));
+        assert!(on_disk.entries.is_empty(), "清空必须落盘可见");
+
+        // 清空后再 GET → 空列表
+        let app = super::router().with_state(state.clone());
+        let resp = app.oneshot(req("GET", "/watchers/processed", None)).await.unwrap();
+        assert_eq!(collect(resp).await["count"], 0);
+
+        crate::watcher::processed_reset_for_tests(None);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

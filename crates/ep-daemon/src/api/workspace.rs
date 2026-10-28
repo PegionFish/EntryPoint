@@ -604,6 +604,7 @@ async fn import_workspace(
                     &entry.rule_id,
                     &entry.task_id,
                     entry.ts,
+                    entry.sha256.clone(),
                 );
                 merged += 1;
             }
@@ -788,6 +789,8 @@ builtin = "file_output"
                 watch_dir: std::env::temp_dir().to_string_lossy().to_string(),
                 recursive: false,
                 extensions: vec![],
+                exclude: vec![],
+                dedup: crate::watcher::WatcherDedupConfig::default(),
                 include_modified: false,
                 stability_secs: 30,
                 backfill: false,
@@ -829,7 +832,13 @@ builtin = "file_output"
     fn seed_processed(root: &Path, product_path: &str) {
         let path = root.join("runtime").join(PROCESSED_FILE_NAME);
         let mut reg = ProcessedRegistry::load(&path);
-        reg.record(Path::new(product_path), "waaa1111", "task-1", 1_700_000_000);
+        reg.record(
+            Path::new(product_path),
+            "waaa1111",
+            "task-1",
+            1_700_000_000,
+            None,
+        );
         reg.save(&path).unwrap();
     }
 

@@ -23,6 +23,7 @@
   "watcher.notFound": "Watch rule not found: {{id}}",
   "watcher.saveFailed": "Failed to save watch rules: {{detail}}",
   "watcher.pathOverlap": "Watch directory and destination directory must not be the same or nested inside each other",
+  "watcher.excludeInvalid": "Invalid exclude patterns: each at most 256 chars, at most 64 patterns",
   "accessProtection.unauthorized": "Missing or invalid access token: provide Authorization: Bearer <token> or X-API-Key: <token> (WebSocket and native previews may use ?token=)",
   "storage.scanFailed": "Failed to scan storage directories: {{detail}}",
   "store.notFound": "Storage store not configured: {{name}}",

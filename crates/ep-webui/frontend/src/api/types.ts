@@ -668,6 +668,13 @@ export interface WatcherEventRecord {
   detail?: string | null
 }
 
+/** 内容级去重配置（T-51，规则级）：同内容新文件默认跳过并记 dedup_skipped */
+export interface WatcherDedupConfig {
+  enabled: boolean
+  /** 参与内容指纹的文件大小上限（MB），服务端钳制 1–4096，默认 64 */
+  max_hash_mb: number
+}
+
 /** 触发规则（GET /api/watchers 列表项） */
 export interface WatchRule {
   id: string
@@ -678,6 +685,10 @@ export interface WatchRule {
   recursive?: boolean
   /** 扩展名白名单（小写无点；空 = 全部） */
   extensions?: string[]
+  /** 规则级排除 glob（T-51：命中即不触发；不含 / 匹配文件名，含 / 匹配全路径） */
+  exclude?: string[]
+  /** 内容级去重（T-51：默认开启 64MB，按规则可关） */
+  dedup?: WatcherDedupConfig
   include_modified?: boolean
   /** 静默秒数（后端钳制 ≥5，默认 30） */
   stability_secs?: number
@@ -699,6 +710,8 @@ export interface WatchRuleInput {
   watch_dir: string
   recursive?: boolean
   extensions?: string[]
+  exclude?: string[]
+  dedup?: WatcherDedupConfig
   include_modified?: boolean
   stability_secs?: number
   backfill?: boolean

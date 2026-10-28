@@ -24,10 +24,10 @@
 //! 或 `include_modified=false` 下签名变化。`in_flight` 中未决文件阻塞
 //! 其后的水位推进；目录中已消失的 `in_flight` 条目剪除。
 //!
-//! ## 产物登记表（T-25，自我触发防护）
+//! ## 产物登记表（T-25，自我触发防护；T-51 清尾）
 //!
 //! daemon watcher 触发任务的产物落盘时，execution.rs 在 `record_artifact`
-//! 挂钩登记「产物绝对路径 + 来源规则 id + task_id + 时间」到
+//! 挂钩登记「产物绝对路径 + 来源规则 id + task_id + 时间 + 内容指纹(可选)」到
 //! `runtime/processed_registry.json`（与水位线 `watchers.json` 同目录惯例）。
 //! 来源判定：直调任务取 `pipeline_id = "watcher/<rule_id>"` 前缀（仅 archive
 //! 节点）；管线模式规则的任务经 [`remember_watcher_pipeline_task`] 在提交时
@@ -37,11 +37,30 @@
 //! `file_archive` 指向 watch 目录时，本登记表是创建期校验覆盖不到时的
 //! 运行期安全网）。
 //!
-//! 语义边界（T-25 冻结）：登记表只记 daemon 自己落盘的产物**路径**——
+//! T-51 清尾（wave2 §6 follow-up 1/2/3 + 计划4 M1+ 点3/4）：
+//! - **按来源规则收窄**：登记表排除只对**同 rule_id** 的规则生效——规则链
+//!   场景（B 规则监听 A 规则产物）不再被跨规则误杀；
+//! - **条目 TTL**：登记超过 [`PROCESSED_TTL_SECS`]（默认 30 天）的条目在
+//!   扫描/快照侧视为不存在，flush 节拍物理清除——路径复用不会永久误杀；
+//! - **写盘防抖**：登记只置脏标记，flush 节拍（巡检循环每轮）按最小间隔
+//!   合并多次登记为一次 tmp+rename 全量重写（API 清理/测试走强制落盘）；
+//! - **内容级 sha256 去重**（计划4 M1+ 点3）：阈值内产物登记时计算 sha256
+//!   指纹（[`WatcherDedupConfig::max_hash_mb`]，默认 64MB；超阈值跳过哈希
+//!   不拖慢扫描）；扫描侧对**即将触发**的文件计算指纹，与**同规则**已登记
+//!   指纹命中 → 默认跳过并记 `dedup_skipped` 事件（`watcher_trigger` 事件
+//!   status 扩展值），按规则可关（`dedup.enabled`）。sha256 只在 blocking
+//!   上下文执行：登记侧 `run_task` 整体在 spawn_blocking 线程内
+//!   （execution.rs 提交链），扫描侧由 main.rs 经 `spawn_blocking` 调用；
+//! - **exclude glob**（计划4 M1+ 点4）：规则级排除模式列表
+//!   （[`glob_matches`]，简单 glob 零新依赖），命中即不触发（与黑名单同款
+//!   「已解决」语义）。
+//!
+//! 语义边界（T-25 冻结 + T-51 扩展）：登记表只记 daemon 自己落盘的产物——
 //! 用户手改/新增的文件仍照常触发；同一路径的原位手改不再触发（路径级登记
-//! 的已知边界）；**不做内容级去重**（sha256 内容指纹与 exclude glob 留
-//! follow-up）。自防膨胀：条目上限 10000（LRU 淘汰最旧）+ 加载时丢弃已
-//! 不存在路径的条目；登记文件损坏按空表启动并告警。
+//! 的已知边界）；内容去重被跳过的文件按「已解决」推进水位线，登记条目
+//! TTL 过期后不会复活（水位线已越过，手改 mtime 可重新触发）。自防膨胀：
+//! 条目上限 10000（LRU 淘汰最旧）+ TTL 30 天 + 加载时丢弃已不存在路径的
+//! 条目；登记文件损坏按空表启动并告警。
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -80,6 +99,37 @@ fn default_stability() -> u64 {
 
 fn default_max_batch() -> usize {
     16
+}
+
+/// 内容去重哈希阈值默认值（MB，计划4 M1+ 点3 建议默认 ≤64MB）
+fn default_dedup_max_hash_mb() -> u64 {
+    64
+}
+
+fn default_dedup() -> WatcherDedupConfig {
+    WatcherDedupConfig {
+        enabled: true,
+        max_hash_mb: default_dedup_max_hash_mb(),
+    }
+}
+
+/// 内容级去重配置（T-51 点3，规则级）：同内容新文件默认跳过并记
+/// `dedup_skipped` 事件；`enabled=false` 关闭该规则的扫描侧跳过与登记侧
+/// 哈希（路径级排除不受影响）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatcherDedupConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 参与内容指纹的文件大小上限（MB）：登记侧超过则不算哈希（省 IO），
+    /// 扫描侧超过则不比对（不拖慢扫描）。两侧同口径；0 = 引擎级关闭。
+    #[serde(default = "default_dedup_max_hash_mb")]
+    pub max_hash_mb: u64,
+}
+
+impl Default for WatcherDedupConfig {
+    fn default() -> Self {
+        default_dedup()
+    }
 }
 
 /// 文件签名（跨轮一致 → 稳定）
@@ -161,6 +211,14 @@ pub struct WatchRule {
     /// 空=全部；小写无点
     #[serde(default)]
     pub extensions: Vec<String>,
+    /// 规则级排除 glob（T-51 点4）：命中即不触发（视为已解决，推进水位线）。
+    /// 简单 glob：`*` 任意序列、`?` 单字符；不含 `/` 的模式匹配文件名，
+    /// 含 `/` 的匹配整条路径（分隔符统一 `/`）。
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// 内容级去重（T-51 点3）：默认开启（64MB 阈值），按规则可关
+    #[serde(default = "default_dedup")]
+    pub dedup: WatcherDedupConfig,
     /// 默认仅新文件
     #[serde(default)]
     pub include_modified: bool,
@@ -319,22 +377,38 @@ const PROCESSED_FILE_NAME: &str = "processed_registry.json";
 /// 条目上限：超出按 LRU 淘汰最旧（自防膨胀）
 pub const PROCESSED_MAX_ENTRIES: usize = 10_000;
 
+/// 条目 TTL（epoch 秒，T-51 清尾 2）：超过该时长的登记在扫描/快照侧视为
+/// 不存在（路径复用不永久误杀），flush 节拍物理清除。默认 30 天。
+pub const PROCESSED_TTL_SECS: i64 = 30 * 24 * 3600;
+
 /// 单条产物登记
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProcessedEntry {
     /// 产物绝对路径（按登记原样保存；比较时经 [`normalize_path_key`] 归一）
     pub path: String,
-    /// 来源规则 id（自任务 `pipeline_id = "watcher/<rule_id>"` 解出）
+    /// 来源规则 id（自任务 `pipeline_id = "watcher/<rule_id>"` 解出）。
+    /// T-51 清尾 1：排除只对同 rule_id 的规则生效（不再全局跨规则误杀）。
     pub rule_id: String,
     /// 产生该产物的任务 id
     pub task_id: String,
-    /// 登记时间（epoch 秒）
+    /// 登记时间（epoch 秒；TTL 判定基准）
     pub ts: i64,
+    /// 内容指纹（T-51 点3）：阈值内产物登记时的 sha256（小写 hex）；
+    /// 超阈值 / 规则关闭去重时为 None（旧版本登记文件无此字段 → 默认 None）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
+impl ProcessedEntry {
+    /// TTL 判定：登记时长仍在 [`PROCESSED_TTL_SECS`] 内
+    pub(crate) fn is_fresh(&self, now: i64) -> bool {
+        now.saturating_sub(self.ts) < PROCESSED_TTL_SECS
+    }
 }
 
 /// 产物登记表：daemon 自己落盘的产物路径集合（扫描侧据此排除，系统产物
-/// 永不自我触发）。**只记路径**——不做内容级去重（sha256 与 exclude glob
-/// 留 follow-up）；用户手改/新增的文件不在表内，照常触发。
+/// 永不自我触发）。排除按来源规则收窄（T-51 清尾 1）；阈值内产物带 sha256
+/// 内容指纹供内容级去重（T-51 点3）；用户手改/新增的文件不在表内，照常触发。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProcessedRegistry {
     /// 新条目在前（LRU 语义：超限淘汰尾部最旧）
@@ -344,8 +418,15 @@ pub struct ProcessedRegistry {
 
 impl ProcessedRegistry {
     /// 登记一条产物（默认上限 [`PROCESSED_MAX_ENTRIES`]）
-    pub fn record(&mut self, path: &Path, rule_id: &str, task_id: &str, ts: i64) {
-        self.record_with_cap(path, rule_id, task_id, ts, PROCESSED_MAX_ENTRIES);
+    pub fn record(
+        &mut self,
+        path: &Path,
+        rule_id: &str,
+        task_id: &str,
+        ts: i64,
+        sha256: Option<String>,
+    ) {
+        self.record_with_cap(path, rule_id, task_id, ts, sha256, PROCESSED_MAX_ENTRIES);
     }
 
     /// 登记核心（`max` 参数化供测试小容量验证 LRU）：同一路径（归一后）
@@ -356,6 +437,7 @@ impl ProcessedRegistry {
         rule_id: &str,
         task_id: &str,
         ts: i64,
+        sha256: Option<String>,
         max: usize,
     ) {
         let entry = ProcessedEntry {
@@ -363,6 +445,7 @@ impl ProcessedRegistry {
             rule_id: rule_id.to_string(),
             task_id: task_id.to_string(),
             ts,
+            sha256,
         };
         let key = normalize_path_key(&entry.path);
         self.entries.retain(|e| normalize_path_key(&e.path) != key);
@@ -370,8 +453,8 @@ impl ProcessedRegistry {
         self.entries.truncate(max.max(1));
     }
 
-    /// 路径是否已登记（归一比较；仅测试断言用——扫描侧走 [`Self::path_keys`]
-    /// 集合比较，避免逐文件全表扫描）
+    /// 路径是否已登记（归一比较；仅测试断言用——扫描侧走按规则键集
+    /// [`Self::path_keys_by_rule`]，避免逐文件全表扫描）
     #[cfg(test)]
     pub(crate) fn contains_path(&self, path: &Path) -> bool {
         let key = normalize_path_key(&path.to_string_lossy());
@@ -380,12 +463,41 @@ impl ProcessedRegistry {
             .any(|e| normalize_path_key(&e.path) == key)
     }
 
-    /// 全部条目的归一键集合（扫描侧每轮构建一次）
-    pub(crate) fn path_keys(&self) -> HashSet<String> {
-        self.entries
-            .iter()
-            .map(|e| normalize_path_key(&e.path))
-            .collect()
+    /// TTL 内条目的按来源规则路径键集（T-51 清尾 1/2：扫描侧每轮构建一次；
+    /// 排除只对同 rule_id 规则生效，过期条目不参与）
+    pub(crate) fn path_keys_by_rule(&self, now: i64) -> HashMap<String, HashSet<String>> {
+        let mut out: HashMap<String, HashSet<String>> = HashMap::new();
+        for e in &self.entries {
+            if !e.is_fresh(now) {
+                continue;
+            }
+            out.entry(e.rule_id.clone())
+                .or_default()
+                .insert(normalize_path_key(&e.path));
+        }
+        out
+    }
+
+    /// TTL 内条目的按规则内容指纹集（T-51 点3：内容去重同样按来源规则
+    /// 收窄——规则链场景 B 规则处理 A 规则同内容产物不被误杀）
+    pub(crate) fn content_hashes_by_rule(&self, now: i64) -> HashMap<String, HashSet<String>> {
+        let mut out: HashMap<String, HashSet<String>> = HashMap::new();
+        for e in &self.entries {
+            if !e.is_fresh(now) {
+                continue;
+            }
+            if let Some(h) = &e.sha256 {
+                out.entry(e.rule_id.clone()).or_default().insert(h.clone());
+            }
+        }
+        out
+    }
+
+    /// 物理清除过期条目（flush 节拍调用），返回清除数
+    pub(crate) fn retain_fresh(&mut self, now: i64) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|e| e.is_fresh(now));
+        before - self.entries.len()
     }
 
     /// 丢弃已不存在路径的条目（加载时调用，自防膨胀）
@@ -418,9 +530,14 @@ impl ProcessedRegistry {
 
 /// 进程内登记表状态：内存表 + 落盘路径（None = 无法定位 runtime 目录，
 /// 退化为仅内存生效——本次运行内仍防自我触发，重启即失，告警留痕）。
+/// T-51 清尾 3：登记只置脏标记，落盘由 flush 节拍防抖承担（写放大治理）。
 struct ProcessedState {
     disk: Option<PathBuf>,
     registry: ProcessedRegistry,
+    /// 有未落盘变更
+    dirty: bool,
+    /// 上次实际落盘时刻（防抖最小间隔基准）
+    last_flush: std::time::Instant,
 }
 
 static PROCESSED: OnceLock<Mutex<Option<ProcessedState>>> = OnceLock::new();
@@ -458,6 +575,8 @@ fn load_processed_state(disk: Option<&Path>) -> ProcessedState {
             ProcessedState {
                 disk: Some(p.to_path_buf()),
                 registry: reg,
+                dirty: false,
+                last_flush: std::time::Instant::now(),
             }
         }
         None => {
@@ -465,6 +584,8 @@ fn load_processed_state(disk: Option<&Path>) -> ProcessedState {
             ProcessedState {
                 disk: None,
                 registry: ProcessedRegistry::default(),
+                dirty: false,
+                last_flush: std::time::Instant::now(),
             }
         }
     }
@@ -480,31 +601,138 @@ fn with_processed<T>(f: impl FnOnce(&mut ProcessedState) -> T) -> T {
     f(st)
 }
 
+fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// 产物登记入口（execution.rs `record_artifact` 唯一挂钩调用）：watcher
-/// 直调任务的 archive 产物落盘即入表并落盘。落盘失败仅告警——登记缺失的
-/// 后果只是该产物路径可能自我触发一次，不阻断任务链路。
-pub(crate) fn record_processed_product(path: &Path, rule_id: &str, task_id: &str) {
+/// 直调任务的 archive 产物落盘即入表并**置脏标记**（落盘由
+/// [`flush_processed`] 节拍防抖承担，T-51 清尾 3）。`sha256` 由调用方在
+/// blocking 上下文预算（[`compute_content_hash`]，规则关闭去重 / 超阈值
+/// 时为 None）。落盘失败的后果只是该产物路径可能自我触发一次，不阻断
+/// 任务链路；进程崩溃丢失最近一个防抖窗口内的登记同理（best-effort）。
+pub(crate) fn record_processed_product(
+    path: &Path,
+    rule_id: &str,
+    task_id: &str,
+    sha256: Option<String>,
+) {
     if path.as_os_str().is_empty() {
         return;
     }
-    let ts = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let ts = now_epoch_secs();
     with_processed(|st| {
-        st.registry.record(path, rule_id, task_id, ts);
-        if let Some(disk) = st.disk.clone() {
-            if let Err(e) = st.registry.save(&disk) {
-                tracing::warn!(file = %disk.display(), error = %e, "产物登记表落盘失败");
-            }
-        }
+        st.registry.record(path, rule_id, task_id, ts, sha256);
+        st.dirty = true;
     });
 }
 
-/// 扫描侧排除键集合（[`collect_watch_events`] 每轮构建一次；登记表尚未
-/// 初始化时此调用即完成惰性加载）。
-fn processed_path_keys() -> HashSet<String> {
-    with_processed(|st| st.registry.path_keys())
+/// 登记侧内容指纹预算（T-51 点3）：规则开启去重且文件 ≤ 规则阈值时计算
+/// sha256；规则配置未知（尚未被巡检轮刷新）按默认配置。**blocking 上下文
+/// 限定**见 [`content_sha256`]。
+pub(crate) fn compute_content_hash(rule_id: &str, path: &Path) -> Option<String> {
+    let cfg = rule_dedup_config(rule_id);
+    if !cfg.enabled {
+        return None;
+    }
+    let max_bytes = cfg.max_hash_mb.saturating_mul(1024 * 1024);
+    content_sha256(path, max_bytes)
+}
+
+/// flush 防抖最小间隔：窗口内的多次登记合并为一次全量重写
+/// （T-51 清尾 3：写放大治理）
+const PROCESSED_FLUSH_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 登记表落盘节拍（watcher 巡检循环每轮调用）：脏标记 + 最小间隔防抖。
+/// 落盘前顺带物理清除 TTL 过期条目（清除即脏，下一写盘窗口带出）。
+/// `force=true` 跳过间隔（API 手动清理 / 测试显式落盘）。写盘在锁外——
+/// 锁内仅取快照（复刻 execution.rs「先放注册表锁再做磁盘 IO」纪律）。
+/// 返回是否实际落盘。
+pub(crate) fn flush_processed(force: bool) -> bool {
+    let snapshot = {
+        let mut cell = processed_cell().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(st) = cell.as_mut() else {
+            return false;
+        };
+        let removed = st.registry.retain_fresh(now_epoch_secs());
+        if removed > 0 {
+            st.dirty = true;
+        }
+        let due = force || (st.dirty && st.last_flush.elapsed() >= PROCESSED_FLUSH_MIN_INTERVAL);
+        if !due || !st.dirty {
+            return false;
+        }
+        st.last_flush = std::time::Instant::now();
+        st.dirty = false;
+        st.disk
+            .as_ref()
+            .map(|d| (d.clone(), st.registry.clone()))
+    };
+    let Some((disk, reg)) = snapshot else {
+        return false; // 仅内存模式：脏标记已清，无盘可写
+    };
+    match reg.save(&disk) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(file = %disk.display(), error = %e, "产物登记表防抖落盘失败");
+            false
+        }
+    }
+}
+
+/// 扫描侧排除快照（T-51 清尾 1/2）：按来源规则收窄的路径键集 + 内容指纹集
+/// （TTL 过期条目不参与）。[`collect_watch_events`] 每轮调用一次；登记表
+/// 尚未初始化时此调用即完成惰性加载。
+fn processed_exclusions(
+    now: i64,
+) -> (
+    HashMap<String, HashSet<String>>,
+    HashMap<String, HashSet<String>>,
+) {
+    with_processed(|st| {
+        (
+            st.registry.path_keys_by_rule(now),
+            st.registry.content_hashes_by_rule(now),
+        )
+    })
+}
+
+/// 只读快照（GET /api/watchers/processed）：TTL 内条目，新条目在前
+pub(crate) fn processed_snapshot() -> Vec<ProcessedEntry> {
+    let now = now_epoch_secs();
+    with_processed(|st| {
+        st.registry
+            .entries
+            .iter()
+            .filter(|e| e.is_fresh(now))
+            .cloned()
+            .collect()
+    })
+}
+
+/// 手动清空（DELETE /api/watchers/processed）：清内存表并强制落盘，
+/// 返回清除条数
+pub(crate) fn processed_clear() -> usize {
+    let (removed, snapshot) = with_processed(|st| {
+        let removed = st.registry.entries.len();
+        st.registry.entries.clear();
+        st.last_flush = std::time::Instant::now();
+        (
+            removed,
+            st.disk
+                .as_ref()
+                .map(|d| (d.clone(), st.registry.clone())),
+        )
+    });
+    if let Some((disk, reg)) = snapshot {
+        if let Err(e) = reg.save(&disk) {
+            tracing::warn!(file = %disk.display(), error = %e, "产物登记表清空后落盘失败");
+        }
+    }
+    removed
 }
 
 // ─── 管线模式规则的 task 归属映射（W2-1 审查 P1-1）──────────────────────────
@@ -543,6 +771,40 @@ pub(crate) fn watcher_pipeline_task_rule(task_id: &str) -> Option<String> {
         .cloned()
 }
 
+// ─── 规则级去重配置缓存（T-51 点3，登记侧消费）──────────────────────────────
+//
+// 登记挂钩（execution.rs record_artifact）需要来源规则的 dedup 配置决定
+// 是否计算 sha256；挂钩侧读 watchers.json 会造成逐产物读放大。巡检循环
+// 每轮已加载全量规则（collect_watch_events），此处仅缓存其配置投影，
+// ≤10s 陈旧度可接受；未刷新过的规则按默认配置（开启 / 64MB）兜底——
+// 多算一次哈希无害，漏算只导致该产物不参与内容去重。
+
+static RULE_DEDUP: OnceLock<Mutex<HashMap<String, WatcherDedupConfig>>> = OnceLock::new();
+
+fn rule_dedup_cell() -> &'static Mutex<HashMap<String, WatcherDedupConfig>> {
+    RULE_DEDUP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 巡检侧刷新（collect_watch_events 每轮调用，整体替换投影）
+fn refresh_rule_dedup(registry: &WatchRegistry) {
+    let map = registry
+        .rules
+        .iter()
+        .map(|(id, r)| (id.clone(), r.dedup.clone()))
+        .collect();
+    *rule_dedup_cell().lock().unwrap_or_else(|e| e.into_inner()) = map;
+}
+
+/// 登记侧查询（compute_content_hash 消费）
+pub(crate) fn rule_dedup_config(rule_id: &str) -> WatcherDedupConfig {
+    rule_dedup_cell()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(rule_id)
+        .cloned()
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 pub(crate) fn processed_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
@@ -557,6 +819,8 @@ pub(crate) fn processed_reset_for_tests(disk: Option<PathBuf>) {
         Some(ProcessedState {
             disk,
             registry: ProcessedRegistry::default(),
+            dirty: false,
+            last_flush: std::time::Instant::now(),
         });
 }
 
@@ -567,6 +831,17 @@ pub struct WatchHit {
     pub rule_id: String,
     pub path: String,
     pub rule: WatchRule,
+}
+
+/// 内容级去重跳过项（T-51 点3）：文件指纹与同规则已登记产物命中，默认
+/// 跳过不触发。调用方（main.rs 巡检循环）据此写 `dedup_skipped` 事件并
+/// 回写规则 recent 速览。
+#[derive(Debug, Clone)]
+pub struct DedupSkip {
+    pub rule_id: String,
+    pub path: String,
+    /// 事件 detail（含命中指纹前缀，便于人工核对）
+    pub detail: String,
 }
 
 // ─── 目录扫描 ────────────────────────────────────────────────────────────────
@@ -663,6 +938,139 @@ fn extensions_allow(extensions: &[String], path: &Path) -> bool {
         .any(|e| normalize_extension(e) == ext)
 }
 
+// ─── exclude glob（T-51 点4，零新依赖的手写匹配）────────────────────────────
+
+/// 单模式 glob 匹配核心：`*` 匹配任意字符序列（含分隔符）、`?` 匹配任意
+/// 单字符、其余逐字匹配。经典单星回溯算法，O(p·s) 最坏、零分配。
+fn glob_match_chars(pat: &[char], s: &[char]) -> bool {
+    let (mut pi, mut si) = (0usize, 0usize);
+    let (mut star, mut mark) = (usize::MAX, 0usize);
+    while si < s.len() {
+        if pi < pat.len() && (pat[pi] == '?' || pat[pi] == s[si]) {
+            pi += 1;
+            si += 1;
+        } else if pi < pat.len() && pat[pi] == '*' {
+            star = pi;
+            mark = si;
+            pi += 1;
+        } else if star != usize::MAX {
+            pi = star + 1;
+            mark += 1;
+            si = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < pat.len() && pat[pi] == '*' {
+        pi += 1;
+    }
+    pi == pat.len()
+}
+
+/// 全路径模式匹配：`/` 开头的模式从路径头部锚定；否则从任意组件边界起
+/// 匹配（gitignore 惯例——`temp/*` 命中任意层级下的 temp 目录内容）。
+fn glob_match_full(pat: &[char], s: &[char]) -> bool {
+    if !pat.is_empty() && pat[0] == '/' {
+        return glob_match_chars(pat, s);
+    }
+    if glob_match_chars(pat, s) {
+        return true;
+    }
+    for (i, c) in s.iter().enumerate() {
+        if *c == '/' && glob_match_chars(pat, &s[i + 1..]) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 规则级 exclude glob 匹配（T-51 点4）：
+///
+/// - 候选串：模式含 `/` 时匹配整条路径（分隔符统一为 `/`；`/` 开头头部
+///   锚定，否则任意组件边界生效）；否则匹配文件名
+///   （`sub\*` 与 `sub/*` 在 Windows 同义——模式分隔符随平台归一；POSIX 上
+///   反斜杠是合法文件名字符，保持字面量）；
+/// - 大小写：Windows（`cfg!(windows)`）不敏感（与 [`normalize_path_key`]
+///   同口径），POSIX 敏感。
+pub(crate) fn glob_matches(pattern: &str, path: &Path) -> bool {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let unified_path = path.to_string_lossy().replace('\\', "/");
+    let candidate = if cfg!(windows) {
+        trimmed.replace('\\', "/")
+    } else {
+        trimmed.to_string()
+    };
+    let full = candidate.contains('/');
+    let haystack = if full {
+        unified_path
+    } else {
+        path.file_name()
+            .map(|n| n.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| unified_path.clone())
+    };
+    if cfg!(windows) {
+        let pat: Vec<char> = candidate.to_lowercase().chars().collect();
+        let hay: Vec<char> = haystack.to_lowercase().chars().collect();
+        if full {
+            glob_match_full(&pat, &hay)
+        } else {
+            glob_match_chars(&pat, &hay)
+        }
+    } else {
+        let pat: Vec<char> = candidate.chars().collect();
+        let hay: Vec<char> = haystack.chars().collect();
+        if full {
+            glob_match_full(&pat, &hay)
+        } else {
+            glob_match_chars(&pat, &hay)
+        }
+    }
+}
+
+/// 规则级排除判定：任一模式命中即排除
+pub(crate) fn excluded_by_glob(patterns: &[String], path: &Path) -> bool {
+    patterns.iter().any(|p| glob_matches(p, path))
+}
+
+// ─── 内容指纹（T-51 点3，sha256）────────────────────────────────────────────
+
+/// 内容指纹：`size ≤ max_bytes` 的文件计算 sha256（小写 hex）；超阈值 /
+/// 非常规文件 / 不可读 → None（登记侧省 IO，扫描侧跳过比对）。
+///
+/// **仅可在 blocking 上下文调用**（sha256 不占 async 线程——性能审计 P1
+/// 纪律）：登记侧 `run_task` 整体在 `spawn_blocking` 线程内（execution.rs
+/// 提交链），扫描侧 [`collect_watch_events`] 由 main.rs 经 `spawn_blocking`
+/// 调用。
+pub(crate) fn content_sha256(path: &Path, max_bytes: u64) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    if max_bytes == 0 {
+        return None;
+    }
+    let Ok(md) = std::fs::metadata(path) else {
+        return None;
+    };
+    if !md.is_file() || md.len() > max_bytes {
+        return None;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return None;
+    };
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(_) => return None,
+        }
+    }
+    Some(hex::encode(hasher.finalize()))
+}
+
 // ─── 扫描引擎（纯函数）──────────────────────────────────────────────────────
 
 /// 巡检纯函数（§5.2-1..8 逐条实现）：对注册表求本窗口应触发的文件集合，
@@ -674,15 +1082,28 @@ fn extensions_allow(extensions: &[String], path: &Path) -> bool {
 ///   在途表、不阻塞水位线（系统产物永不自我触发；水位线/在途表语义不动，
 ///   被剔除文件对 §5.2 机制完全不可见）。误入在途表的残留条目（登记前
 ///   极窄竞态窗口）按"目录中已消失"语义自然剪除。
+/// - T-51 清尾 1：登记表排除**按来源规则收窄**——只剔除同 rule_id 登记
+///   的路径（规则链场景 B 规则监听 A 规则产物不再被跨规则误杀）。
+/// - T-51 点3：内容级去重在**触发判定之后**做后置过滤——只对即将触发的
+///   文件计算 sha256（前沿批次有界，不碰水位线下存量）；命中的文件同样
+///   按「已解决」处理（不入触发表、推进水位线），由调用方记
+///   `dedup_skipped` 事件。
+///
+/// **blocking 上下文限定**：内部可能对候选文件计算 sha256（阈值内），须
+/// 经 `spawn_blocking` 调用（main.rs 巡检循环）。返回
+/// `(待触发项, 内容去重跳过项, 推进后的注册表)`。
 pub fn collect_watch_events(
     registry: &WatchRegistry,
     now_epoch_secs: i64,
-) -> (Vec<WatchHit>, WatchRegistry) {
+) -> (Vec<WatchHit>, Vec<DedupSkip>, WatchRegistry) {
     let mut next = registry.clone();
     let mut hits = Vec::new();
-    // T-25：产物登记表排除键（每轮构建一次，全规则共享；登记表不可用 →
-    // 空集，语义退化为无排除）
-    let processed_keys = processed_path_keys();
+    let mut skips = Vec::new();
+    // T-51：登记规则 dedup 配置投影刷新（登记挂钩侧消费）
+    refresh_rule_dedup(registry);
+    // T-25/T-51：产物登记表按规则排除键 + 内容指纹（每轮构建一次；登记表
+    // 不可用 → 空表，语义退化为无排除）
+    let (keys_by_rule, hashes_by_rule) = processed_exclusions(now_epoch_secs);
     for (rule_id, rule) in next.rules.iter_mut() {
         // §5.2-1：停用规则完全跳过；重新启用后首轮不触发存量
         if !rule.enabled {
@@ -701,18 +1122,23 @@ pub fn collect_watch_events(
                 continue;
             }
         };
-        let files: Vec<DirFile> = if processed_keys.is_empty() {
-            files
-        } else {
-            files
+        let rule_keys = keys_by_rule.get(rule_id);
+        let files: Vec<DirFile> = match rule_keys {
+            Some(keys) if !keys.is_empty() => files
                 .into_iter()
-                .filter(|f| {
-                    !processed_keys
-                        .contains(&normalize_path_key(&f.path.to_string_lossy()))
-                })
-                .collect()
+                .filter(|f| !keys.contains(&normalize_path_key(&f.path.to_string_lossy())))
+                .collect(),
+            _ => files,
         };
         let (triggered, updated) = collect_rule_events(rule, &files, now_epoch_secs);
+        // T-51 点3：内容级去重后置过滤（仅即将触发的文件算指纹）
+        let (triggered, rule_skips) = filter_content_dups(
+            rule_id,
+            rule,
+            triggered,
+            &files,
+            hashes_by_rule.get(rule_id),
+        );
         *rule = updated;
         for path in triggered {
             hits.push(WatchHit {
@@ -721,8 +1147,56 @@ pub fn collect_watch_events(
                 rule: rule.clone(),
             });
         }
+        skips.extend(rule_skips);
     }
-    (hits, next)
+    (hits, skips, next)
+}
+
+/// 内容级去重后置过滤（T-51 点3）：对即将触发的文件计算 sha256（文件
+/// 尺寸 ≤ 规则阈值才计算，超阈值跳过不拖慢扫描），与**同规则**已登记
+/// 指纹命中 → 从触发列表剔除并产出 [`DedupSkip`]。被剔除文件在
+/// `collect_rule_events` 中已按触发解决（移出在途表 + 水位线推进）——
+/// 「跳过亦已解决」是既定语义（TTL 过期后水位线之下的历史文件不会复活，
+/// 手改 mtime 可重新触发）。
+fn filter_content_dups(
+    rule_id: &str,
+    rule: &WatchRule,
+    triggered: Vec<String>,
+    files: &[DirFile],
+    hashes: Option<&HashSet<String>>,
+) -> (Vec<String>, Vec<DedupSkip>) {
+    let empty: HashSet<String> = HashSet::new();
+    let hashes = hashes.unwrap_or(&empty);
+    if triggered.is_empty() || hashes.is_empty() || !rule.dedup.enabled || rule.dedup.max_hash_mb == 0
+    {
+        return (triggered, Vec::new());
+    }
+    let max_bytes = rule.dedup.max_hash_mb.saturating_mul(1024 * 1024);
+    let mut kept = Vec::with_capacity(triggered.len());
+    let mut skips = Vec::new();
+    for path in triggered {
+        let size = files
+            .iter()
+            .find(|f| f.path.to_string_lossy() == path)
+            .map(|f| f.size);
+        let within = size.is_some_and(|sz| sz <= max_bytes);
+        let hash = if within {
+            content_sha256(Path::new(&path), max_bytes)
+        } else {
+            None
+        };
+        match hash {
+            Some(h) if hashes.contains(&h) => {
+                skips.push(DedupSkip {
+                    rule_id: rule_id.to_string(),
+                    path: path.clone(),
+                    detail: format!("内容与已登记产物相同（sha256:{}…）", &h[..h.len().min(16)]),
+                });
+            }
+            _ => kept.push(path),
+        }
+    }
+    (kept, skips)
 }
 
 /// 单规则扫描判定核心（[`collect_watch_events`] 的分解，参数化文件列表
@@ -785,8 +1259,11 @@ pub(crate) fn collect_rule_events(
             }
             continue;
         }
-        // 过滤规则（§5.2-2）：黑名单 → 白名单；被排除即"已解决"
-        let filtered = is_ignored_suffix(&f.path) || !extensions_allow(&next.extensions, &f.path);
+        // 过滤规则（§5.2-2）：黑名单 → 白名单 → exclude glob（T-51 点4）；
+        // 被排除即"已解决"
+        let filtered = is_ignored_suffix(&f.path)
+            || !extensions_allow(&next.extensions, &f.path)
+            || excluded_by_glob(&next.exclude, &f.path);
         if filtered {
             removes.insert(path_str.clone());
             marks.push((f.mtime, path_str, true));
@@ -890,6 +1367,8 @@ mod tests {
             watch_dir: "/nowhere".into(),
             recursive: false,
             extensions: vec![],
+            exclude: vec![],
+            dedup: WatcherDedupConfig::default(),
             include_modified: false,
             stability_secs: 30,
             backfill: false,
@@ -1014,7 +1493,7 @@ mod tests {
             r.checkpoint = 1000;
             r.enabled = false;
         });
-        let (hits, next) = collect_watch_events(&r, 5000);
+        let (hits, _, next) = collect_watch_events(&r, 5000);
         assert!(hits.is_empty());
         assert_eq!(
             next.rules["r1"].checkpoint, 1000,
@@ -1024,7 +1503,7 @@ mod tests {
         // 重新启用后首轮不触发存量（先入表）
         let mut re = next;
         re.rules.get_mut("r1").unwrap().enabled = true;
-        let (hits, next) = collect_watch_events(&re, 5000);
+        let (hits, _, next) = collect_watch_events(&re, 5000);
         assert!(hits.is_empty(), "重新启用首轮不触发");
         let rule = &next.rules["r1"];
         let files = vec![df("/nowhere/x.mp4", 4000, 1)];
@@ -1046,7 +1525,7 @@ mod tests {
         r2.id = "r2".into();
         r2.watch_dir = "/also/missing".into();
         reg.rules.insert("r2".into(), r2);
-        let (hits, next) = collect_watch_events(&reg, 5000);
+        let (hits, _, next) = collect_watch_events(&reg, 5000);
         assert!(hits.is_empty());
         assert_eq!(next.rules["r1"].checkpoint, 1000, "缺失目录规则原样保留");
     }
@@ -1190,7 +1669,7 @@ mod tests {
         assert!(hits.is_empty(), "重启后更晚窗口也不得重放已解决文件");
 
         // 注册表层入口：目录缺失路径走容错分支也不产生命中
-        let (hits, _) = collect_watch_events(&reloaded, 9000);
+        let (hits, _, _) = collect_watch_events(&reloaded, 9000);
         assert!(hits.is_empty());
     }
 
@@ -1415,7 +1894,7 @@ mod tests {
     }
 
     // 18. 登记表 record：归一去重（重复登记刷新位置与元数据）+ 超限 LRU
-    //     淘汰最旧（小容量参数化验证淘汰逻辑）
+    //     淘汰最旧（小容量参数化验证淘汰逻辑）+ sha256 指纹随条目保存
     #[test]
     fn processed_record_dedupes_and_evicts_oldest_beyond_cap() {
         let mut reg = ProcessedRegistry::default();
@@ -1425,6 +1904,7 @@ mod tests {
                 "r1",
                 &format!("t{i}"),
                 1000 + i,
+                Some(format!("{i:064x}")),
                 4,
             );
         }
@@ -1433,21 +1913,32 @@ mod tests {
         assert!(!reg.contains_path(Path::new("/d/f1.mp4")), "次旧被淘汰");
         assert!(reg.contains_path(Path::new("/d/f5.mp4")));
         assert_eq!(reg.entries[0].path, "/d/f5.mp4", "新条目在前");
+        assert_eq!(
+            reg.entries[0].sha256.as_deref(),
+            Some("0000000000000000000000000000000000000000000000000000000000000005"),
+            "内容指纹随条目保存"
+        );
 
         // 重复登记同路径（Windows 下大小写/分隔符变体视为同一路径）→
         // 去重并刷新到最前 + 元数据更新，不累积
         if cfg!(windows) {
-            reg.record_with_cap(Path::new(r"\\?\D:\F3.MP4"), "r1", "t3-new", 2000, 4);
+            reg.record_with_cap(Path::new(r"\\?\D:\F3.MP4"), "r1", "t3-new", 2000, None, 4);
             assert_eq!(reg.entries.len(), 4, "归一去重不累积");
             assert_eq!(reg.entries[0].path, r"\\?\D:\F3.MP4");
             assert_eq!(reg.entries[0].task_id, "t3-new");
             assert_eq!(reg.entries[0].ts, 2000);
+            assert_eq!(reg.entries[0].sha256, None, "重复登记覆盖元数据与指纹");
         }
         // 默认 record 上限接线：小量登记不触发淘汰
         let mut small = ProcessedRegistry::default();
-        small.record(Path::new("/d/x.mp4"), "r", "t", 1);
+        small.record(Path::new("/d/x.mp4"), "r", "t", 1, None);
         assert_eq!(small.entries.len(), 1);
         assert_eq!(PROCESSED_MAX_ENTRIES, 10_000, "上限契约冻结");
+        assert_eq!(
+            PROCESSED_TTL_SECS,
+            30 * 24 * 3600,
+            "TTL 契约冻结（30 天）"
+        );
     }
 
     // 19. 登记表持久化：save/load 往返；加载时清理已不存在路径；损坏降级
@@ -1460,8 +1951,8 @@ mod tests {
         std::fs::write(&existing, b"x").unwrap();
 
         let mut reg = ProcessedRegistry::default();
-        reg.record(&existing, "r1", "t1", 100);
-        reg.record(Path::new("/definitely/ghost/gone.mp4"), "r1", "t2", 101);
+        reg.record(&existing, "r1", "t1", 100, None);
+        reg.record(Path::new("/definitely/ghost/gone.mp4"), "r1", "t2", 101, None);
         reg.save(&path).unwrap();
 
         // 直接 load：两条都在
@@ -1505,7 +1996,7 @@ mod tests {
         reg.rules.get_mut("r1").unwrap().checkpoint = now_epoch() - 100;
 
         // r1：a.mkv 入表（不触发）
-        let (hits, next) = collect_watch_events(&reg, now_epoch());
+        let (hits, _, next) = collect_watch_events(&reg, now_epoch());
         assert!(hits.is_empty(), "首轮仅入表");
         assert!(
             next.rules["r1"]
@@ -1513,18 +2004,20 @@ mod tests {
                 .contains_key(src.to_string_lossy().as_ref())
         );
         // r2：a.mkv 稳定触发，水位线推进到其 mtime
-        let (hits, next) = collect_watch_events(&next, now_epoch());
+        let (hits, _, next) = collect_watch_events(&next, now_epoch());
         assert_eq!(hits.len(), 1, "触发文件：{:?}", hits);
         assert_eq!(hits[0].path, src.to_string_lossy().as_ref());
 
         // 模拟 daemon 产物落盘（watch == dest：产物落回监控目录）并登记
+        //（T-51 清尾 3：登记置脏，测试显式强制落盘后断言）
         let product = watch.join("a.done.mp4");
         std::fs::write(&product, b"result").unwrap();
         set_file_mtime_age(&product, 2);
-        record_processed_product(&product, "r1", "task-e2e");
+        record_processed_product(&product, "r1", "task-e2e", None);
+        assert!(flush_processed(true), "强制落盘应成功");
         // 登记表已落盘且包含产物
         let saved = ProcessedRegistry::load(&disk_dir.join("processed_registry.json"));
-        assert!(saved.contains_path(&product), "登记必须即时落盘");
+        assert!(saved.contains_path(&product), "登记必须落盘可见");
 
         // 用户手写新文件
         let manual = watch.join("b.txt");
@@ -1532,7 +2025,7 @@ mod tests {
         set_file_mtime_age(&manual, 50);
 
         // r3：产物被排除（不得入表）；b.txt 正常入表
-        let (hits, next) = collect_watch_events(&next, now_epoch());
+        let (hits, _, next) = collect_watch_events(&next, now_epoch());
         assert!(hits.is_empty());
         let in_flight = &next.rules["r1"].in_flight;
         assert!(
@@ -1544,11 +2037,11 @@ mod tests {
             "用户手写文件照常入表"
         );
         // r4：b.txt 触发，产物仍未触发
-        let (hits, next) = collect_watch_events(&next, now_epoch());
+        let (hits, _, next) = collect_watch_events(&next, now_epoch());
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, manual.to_string_lossy().as_ref());
         // r5：多轮之后产物永不触发（不死循环）
-        let (hits, _) = collect_watch_events(&next, now_epoch());
+        let (hits, _, _) = collect_watch_events(&next, now_epoch());
         assert!(
             hits.is_empty(),
             "产物路径永不触发（不死循环）：{:?}",
@@ -1572,8 +2065,9 @@ mod tests {
 
         let kept = dir.join("kept.mp4");
         std::fs::write(&kept, b"x").unwrap();
-        record_processed_product(&kept, "r1", "t1");
-        record_processed_product(Path::new("/ghost/gone.mp4"), "r1", "t2");
+        record_processed_product(&kept, "r1", "t1", None);
+        record_processed_product(Path::new("/ghost/gone.mp4"), "r1", "t2", None);
+        flush_processed(true);
 
         // 模拟重启：从落盘文件重建状态（不经全局缓存）
         let rebooted = load_processed_state(Some(&disk));
@@ -1589,6 +2083,394 @@ mod tests {
         assert_eq!(on_disk.entries.len(), 1, "修剪后落盘不积累死路径");
 
         processed_reset_for_tests(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── T-51：内容级 sha256 去重 / exclude glob / registry 清尾 ─────────────
+
+    // 22. content_sha256 已知向量 + 阈值语义：≤max_bytes 才计算，
+    //     max_bytes=0 / 超阈值 / 缺文件 → None
+    #[test]
+    fn content_sha256_known_vectors_and_threshold() {
+        let dir = temp_root("sha");
+        let f_empty = dir.join("empty.bin");
+        let f_abc = dir.join("abc.bin");
+        std::fs::write(&f_empty, b"").unwrap();
+        std::fs::write(&f_abc, b"abc").unwrap();
+
+        // FIPS 180-4 已知向量
+        assert_eq!(
+            content_sha256(&f_abc, 1024).as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        assert_eq!(
+            content_sha256(&f_empty, 1024).as_deref(),
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        );
+
+        // 阈值语义：恰好等于上限放行，超出跳过（大文件不拖慢扫描）
+        let full = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert_eq!(content_sha256(&f_abc, 3).as_deref(), Some(full));
+        assert_eq!(content_sha256(&f_abc, 2), None, "超阈值跳过哈希");
+        // max_bytes=0 = 引擎级关闭
+        assert_eq!(content_sha256(&f_abc, 0), None);
+        // 缺文件 → None
+        assert_eq!(content_sha256(&dir.join("ghost.bin"), 1024), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 23. exclude glob 匹配矩阵：字面量 / `*` / `?` / 文件名 vs 全路径 /
+    //     Windows 大小写折叠 / 无命中 / 空模式
+    #[test]
+    fn glob_matching_matrix() {
+        // 字面量文件名
+        assert!(glob_matches("desktop.ini", Path::new("/d/desktop.ini")));
+        assert!(!glob_matches("desktop.ini", Path::new("/d/desktop.ini.bak")));
+        // `*` 任意序列（含无字符）
+        assert!(glob_matches("*.tmp", Path::new("/d/a.tmp")));
+        assert!(glob_matches("*.tmp", Path::new("/d/.tmp")));
+        assert!(glob_matches("*.tmp", Path::new("/d/deep/name.tmp")));
+        assert!(!glob_matches("*.tmp", Path::new("/d/a.tmpx")));
+        // `*` 前缀 / 中段
+        assert!(glob_matches("backup*", Path::new("/d/backup-2026.zip")));
+        assert!(glob_matches("a*b", Path::new("/d/aXXXb")));
+        assert!(!glob_matches("a*b", Path::new("/d/aXXX")));
+        // `?` 单字符
+        assert!(glob_matches("keep?.mkv", Path::new("/d/keep1.mkv")));
+        assert!(!glob_matches("keep?.mkv", Path::new("/d/keep12.mkv")));
+        // 含 `/` 的模式匹配整条路径（分隔符统一）
+        assert!(glob_matches("temp/*", Path::new("/d/temp/x.mkv")));
+        assert!(!glob_matches("temp/*", Path::new("/d/other/x.mkv")));
+        assert!(glob_matches("/d/temp/*.mkv", Path::new("/d/temp/a.mkv")));
+        assert!(!glob_matches("/d/temp/*.mkv", Path::new("/e/temp/a.mkv")));
+        // Windows：大小写不敏感 + 反斜杠模式分隔符同义；POSIX 敏感
+        if cfg!(windows) {
+            assert!(glob_matches("*.TMP", Path::new("/d/a.tmp")));
+            assert!(glob_matches(r"temp\*", Path::new("/d/temp/x.mkv")));
+            assert!(glob_matches("Desktop.INI", Path::new("/d/DESKTOP.ini")));
+        } else {
+            assert!(!glob_matches("*.TMP", Path::new("/d/a.tmp")));
+            assert!(!glob_matches("Desktop.INI", Path::new("/d/desktop.ini")));
+        }
+        // 空模式 / 空白模式不命中任何文件
+        assert!(!glob_matches("", Path::new("/d/a.tmp")));
+        assert!(!glob_matches("   ", Path::new("/d/a.tmp")));
+    }
+
+    // 24. exclude glob 集成（合成断言）：命中模式即不触发、不入在途表、
+    //     视为已解决推进水位线；未命中文件照常触发
+    #[test]
+    fn exclude_glob_resolves_and_watermark_advances() {
+        let r = rule_with(|r| {
+            r.checkpoint = 1000;
+            r.exclude = vec!["*.tmp".into(), "temp/*".into(), "keep?.mkv".into()];
+        });
+        let rule = &r.rules["r1"];
+        let files = vec![
+            df("/d/skip.tmp", 1100, 1),
+            df("/d/temp/x.mkv", 1200, 2),
+            df("/d/keep1.mkv", 1300, 3),
+            df("/d/other.mkv", 1400, 4),
+        ];
+        // 首轮：排除文件不入表，other.mkv 入表
+        let (hits, next) = run(rule, files.clone(), 2000);
+        assert!(hits.is_empty(), "首轮仅入表");
+        assert_eq!(next.in_flight.len(), 1, "仅未命中模式的文件入表");
+        assert!(next.in_flight.contains_key("/d/other.mkv"));
+        // 次轮：other.mkv 触发；水位线越过全部被排除文件
+        let (hits, next) = run(&next, files, 2000);
+        assert_eq!(hits, vec!["/d/other.mkv".to_string()]);
+        assert_eq!(
+            next.checkpoint, 1400,
+            "被排除文件视为已解决，水位线推进到最后一个"
+        );
+        // 跨轮：排除文件永不触发
+        let files2 = vec![df("/d/skip.tmp", 1500, 9)];
+        let (hits, _) = run(&next, files2, 3000);
+        assert!(hits.is_empty());
+    }
+
+    // 25. 内容级去重 E2E（真实 FS）：同规则下同内容新文件默认跳过并产出
+    //     DedupSkip；不同内容照常触发；dedup 关闭的规则不受影响；
+    //     登记产物路径本身仍被路径排除
+    #[test]
+    fn content_dedup_skips_same_content_per_rule() {
+        let _guard = processed_test_lock();
+        let watch = temp_root("dedup-watch");
+        let disk_dir = temp_root("dedup-disk");
+        processed_reset_for_tests(Some(disk_dir.join("processed_registry.json")));
+
+        let product = watch.join("prod.mp4");
+        std::fs::write(&product, b"same-content").unwrap();
+        let hash = content_sha256(&product, u64::MAX).unwrap();
+        record_processed_product(&product, "r1", "t0", Some(hash));
+        flush_processed(true);
+
+        let dup = watch.join("dup.bin");
+        std::fs::write(&dup, b"same-content").unwrap();
+        let other = watch.join("other.bin");
+        std::fs::write(&other, b"different").unwrap();
+        for f in [&dup, &other] {
+            set_file_mtime_age(f, 60);
+        }
+
+        // 预置在途表（已稳定）+ 水位线，单轮判定
+        let mut reg = rule_with(|r| {
+            r.watch_dir = watch.to_string_lossy().into_owned();
+            r.stability_secs = 5;
+            r.checkpoint = now_epoch() - 100;
+            r.dedup = WatcherDedupConfig { enabled: true, max_hash_mb: 64 };
+        });
+        {
+            let rule = reg.rules.get_mut("r1").unwrap();
+            for f in [&dup, &other] {
+                let md = std::fs::metadata(f).unwrap();
+                rule.in_flight.insert(
+                    f.to_string_lossy().into_owned(),
+                    FileSig {
+                        mtime: md.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
+                        size: md.len(),
+                    },
+                );
+            }
+        }
+        let (hits, skips, _) = collect_watch_events(&reg, now_epoch());
+        assert_eq!(
+            hits.iter().map(|h| h.path.clone()).collect::<Vec<_>>(),
+            vec![other.to_string_lossy().into_owned()],
+            "不同内容文件照常触发"
+        );
+        assert_eq!(skips.len(), 1, "同内容新文件被去重跳过");
+        assert_eq!(skips[0].rule_id, "r1");
+        assert_eq!(skips[0].path, dup.to_string_lossy().into_owned());
+        assert!(
+            skips[0].detail.contains("sha256:"),
+            "detail 必须带指纹前缀：{}",
+            skips[0].detail
+        );
+        // 登记产物本身被路径排除（不在 skips——那是路径排除，不是内容去重）
+
+        // dedup 关闭的同目录规则：同内容文件照常触发（按规则可关）
+        let mut r2 = reg.rules["r1"].clone();
+        r2.id = "r2".into();
+        r2.dedup.enabled = false;
+        // r2 无登记条目（登记按来源规则收窄），路径排除也不覆盖
+        reg.rules.insert("r2".into(), r2);
+        let (hits, skips, _) = collect_watch_events(&reg, now_epoch());
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert!(
+            paths.contains(&dup.to_string_lossy().as_ref()),
+            "dedup 关闭的规则不受影响：{:?}",
+            paths
+        );
+        assert!(
+            !paths.contains(&product.to_string_lossy().as_ref()),
+            "r2 无登记条目，产物路径对 r2 可见但本轮未稳定——不得误触发"
+        );
+        assert!(skips.iter().all(|s| s.rule_id != "r2"), "关闭去重的规则不产出 skips");
+
+        // 超阈值（max_hash_mb=0 引擎级关闭）：同内容文件不再被跳过
+        let mut reg3 = rule_with(|r| {
+            r.watch_dir = watch.to_string_lossy().into_owned();
+            r.stability_secs = 5;
+            r.checkpoint = now_epoch() - 100;
+            r.dedup.max_hash_mb = 0;
+        });
+        {
+            let rule = reg3.rules.get_mut("r1").unwrap();
+            let md = std::fs::metadata(&dup).unwrap();
+            rule.in_flight.insert(
+                dup.to_string_lossy().into_owned(),
+                FileSig {
+                    mtime: md.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
+                    size: md.len(),
+                },
+            );
+        }
+        let (hits, skips, _) = collect_watch_events(&reg3, now_epoch());
+        assert!(
+            hits.iter().any(|h| h.path == dup.to_string_lossy()),
+            "阈值 0 = 引擎级关闭，同内容文件照常触发"
+        );
+        assert!(skips.is_empty());
+
+        processed_reset_for_tests(None);
+        let _ = std::fs::remove_dir_all(&watch);
+        let _ = std::fs::remove_dir_all(&disk_dir);
+    }
+
+    // 26. 跨规则放行（T-51 清尾 1，真实 FS）：登记条目只对同 rule_id 规则
+    //     生效——规则链场景 B 规则监听 A 规则产物不再被误杀
+    #[test]
+    fn processed_exclusions_scoped_to_source_rule() {
+        let _guard = processed_test_lock();
+        let watch = temp_root("chain-watch");
+        let disk_dir = temp_root("chain-disk");
+        processed_reset_for_tests(Some(disk_dir.join("processed_registry.json")));
+
+        let product = watch.join("chain.out");
+        std::fs::write(&product, b"chained").unwrap();
+        set_file_mtime_age(&product, 60);
+        // 规则 A 的登记条目
+        record_processed_product(&product, "rA", "tA", None);
+        flush_processed(true);
+
+        let md = std::fs::metadata(&product).unwrap();
+        let sig = FileSig {
+            mtime: md.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
+            size: md.len(),
+        };
+        let mut reg = rule_with(|r| {
+            r.id = "rA".into();
+            r.watch_dir = watch.to_string_lossy().into_owned();
+            r.stability_secs = 5;
+            r.checkpoint = now_epoch() - 100;
+        });
+        {
+            let rule = reg.rules.get_mut("rA").unwrap();
+            rule.in_flight.insert(product.to_string_lossy().into_owned(), sig);
+        }
+        let mut rb = reg.rules["rA"].clone();
+        rb.id = "rB".into();
+        rb.in_flight = HashMap::new();
+        rb.in_flight.insert(product.to_string_lossy().into_owned(), sig);
+        reg.rules.insert("rB".into(), rb);
+
+        let (hits, _, next) = collect_watch_events(&reg, now_epoch());
+        let fired: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert!(
+            fired.contains(&product.to_string_lossy().as_ref()),
+            "B 规则必须放行 A 规则的登记产物（跨规则放行）：{:?}",
+            hits.iter().map(|h| h.rule_id.as_str()).collect::<Vec<_>>()
+        );
+        assert!(
+            hits.iter().all(|h| h.rule_id != "rA"),
+            "A 规则自身仍被路径排除（防自我触发）"
+        );
+        let _ = next;
+
+        processed_reset_for_tests(None);
+        let _ = std::fs::remove_dir_all(&watch);
+        let _ = std::fs::remove_dir_all(&disk_dir);
+    }
+
+    // 27. 条目 TTL（T-51 清尾 2）：过期条目不参与路径排除与内容指纹集，
+    //     retain_fresh 物理清除；新鲜条目不受影响
+    #[test]
+    fn processed_ttl_expires_entries() {
+        let now = 10_000_000i64;
+        let mut reg = ProcessedRegistry::default();
+        reg.record(
+            Path::new("/d/old.mp4"),
+            "r1",
+            "t-old",
+            now - PROCESSED_TTL_SECS - 10,
+            Some("a".repeat(64)),
+        );
+        reg.record(Path::new("/d/fresh.mp4"), "r1", "t-new", now - 5, Some("b".repeat(64)));
+
+        let keys = reg.path_keys_by_rule(now);
+        let r1_keys = keys.get("r1").unwrap();
+        assert!(
+            r1_keys.contains(&normalize_path_key("/d/fresh.mp4")),
+            "新鲜条目参与排除"
+        );
+        assert!(
+            !r1_keys.contains(&normalize_path_key("/d/old.mp4")),
+            "过期条目不参与路径排除（路径复用不永久误杀）"
+        );
+        let hashes = reg.content_hashes_by_rule(now);
+        let r1_hashes = hashes.get("r1").unwrap();
+        assert!(r1_hashes.contains(&"b".repeat(64)));
+        assert!(!r1_hashes.contains(&"a".repeat(64)), "过期指纹不参与内容去重");
+
+        // TTL 边界：恰好 TTL 秒整仍视为过期（< 判定）
+        reg.record(Path::new("/d/edge.mp4"), "r1", "t-edge", now - PROCESSED_TTL_SECS, None);
+        assert!(!reg.path_keys_by_rule(now).get("r1").unwrap().contains(&normalize_path_key("/d/edge.mp4")));
+
+        // 物理清除：只删过期，条目数随之收缩
+        let removed = reg.retain_fresh(now);
+        assert_eq!(removed, 2, "清除 old 与 edge 两条过期条目");
+        assert_eq!(reg.entries.len(), 1);
+        assert!(reg.contains_path(Path::new("/d/fresh.mp4")));
+    }
+
+    // 28. 写盘防抖（T-51 清尾 3）：登记只置脏，节拍窗口内不落盘；force
+    //     立即落盘；窗口内多次登记合并为一次写
+    #[test]
+    fn processed_flush_debounce_coalesces_writes() {
+        let _guard = processed_test_lock();
+        let dir = temp_root("debounce");
+        let disk = dir.join("processed_registry.json");
+        processed_reset_for_tests(Some(disk.clone()));
+
+        let f1 = dir.join("a.mp4");
+        std::fs::write(&f1, b"1").unwrap();
+        record_processed_product(&f1, "r1", "t1", None);
+        // 节拍窗口内（last_flush 刚重置）：非强制 flush 不落盘
+        assert!(!flush_processed(false), "窗口内非强制 flush 不得写盘");
+        assert!(!disk.exists(), "防抖窗口内登记不产生磁盘写");
+
+        // 强制 flush：立即可见
+        assert!(flush_processed(true), "强制 flush 应落盘");
+        assert!(ProcessedRegistry::load(&disk).contains_path(&f1));
+
+        // 窗口内的第二次登记同样被合并（非强制 flush 不写）
+        let f2 = dir.join("b.mp4");
+        std::fs::write(&f2, b"2").unwrap();
+        record_processed_product(&f2, "r1", "t2", None);
+        assert!(!flush_processed(false), "强制落盘后窗口重新计时");
+        let on_disk = ProcessedRegistry::load(&disk);
+        assert!(
+            !on_disk.contains_path(&f2),
+            "窗口内登记未落盘（内存态生效）"
+        );
+        assert!(flush_processed(true));
+        assert!(ProcessedRegistry::load(&disk).contains_path(&f2));
+
+        // processed_clear：清空 + 强制落盘
+        let removed = processed_clear();
+        assert_eq!(removed, 2);
+        assert!(ProcessedRegistry::load(&disk).entries.is_empty(), "清空必须落盘可见");
+
+        processed_reset_for_tests(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 29. 登记侧指纹预算：规则 dedup 配置缓存驱动 compute_content_hash——
+    //     开启且 ≤ 阈值才计算；关闭返回 None；默认配置兜底
+    #[test]
+    fn compute_content_hash_follows_rule_config() {
+        let dir = temp_root("hashcfg");
+        let f = dir.join("x.bin");
+        std::fs::write(&f, b"payload").unwrap();
+        let expected = content_sha256(&f, u64::MAX).unwrap();
+
+        // 默认配置兜底（缓存为空）：开启 / 64MB
+        *rule_dedup_cell().lock().unwrap_or_else(|e| e.into_inner()) = HashMap::new();
+        assert_eq!(compute_content_hash("rX", &f).as_deref(), Some(expected.as_str()));
+
+        // 规则关闭 → None
+        let mut reg = rule_with(|r| {
+            r.id = "rX".into();
+            r.dedup.enabled = false;
+        });
+        refresh_rule_dedup(&reg);
+        assert_eq!(compute_content_hash("rX", &f), None, "关闭去重的规则不算指纹");
+
+        // 阈值收紧到 0 → None
+        reg.rules.get_mut("rX").unwrap().dedup.max_hash_mb = 0;
+        refresh_rule_dedup(&reg);
+        assert_eq!(compute_content_hash("rX", &f), None);
+
+        // 阈值内 → Some
+        reg.rules.get_mut("rX").unwrap().dedup = WatcherDedupConfig { enabled: true, max_hash_mb: 1 };
+        refresh_rule_dedup(&reg);
+        assert_eq!(compute_content_hash("rX", &f).as_deref(), Some(expected.as_str()));
+
+        // 清理缓存，避免泄漏到其它测试
+        *rule_dedup_cell().lock().unwrap_or_else(|e| e.into_inner()) = HashMap::new();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

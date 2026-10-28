@@ -3021,6 +3021,9 @@ fn record_artifact(task_id: &str, node_id: &str, path: &Path) {
         //   记下 task_id → rule_id（审查 P1-1；管线产物节点 id 任意，全部
         //   登记；映射仅进程内存存活，任务不跨重启运行故无需持久化）。
         // 非 watcher 任务不登记。skip 冲突透传的既有目标路径同样登记（无害）。
+        // T-51：登记同时预算 sha256 内容指纹（规则开启去重且 ≤ 阈值），
+        // 扫描侧据此做内容级去重；run_task 整体在本 spawn_blocking 线程内，
+        // 哈希不占 async 线程（性能审计 P1 纪律）。
         let processed_rule_id = if node_id == "archive" && record.pipeline_id.starts_with("watcher/")
         {
             Some(record.pipeline_id["watcher/".len()..].to_string())
@@ -3029,7 +3032,8 @@ fn record_artifact(task_id: &str, node_id: &str, path: &Path) {
         };
         if let Some(rule_id) = processed_rule_id {
             drop(reg); // 先放注册表锁再做磁盘 IO
-            crate::watcher::record_processed_product(path, &rule_id, task_id);
+            let hash = crate::watcher::compute_content_hash(&rule_id, path);
+            crate::watcher::record_processed_product(path, &rule_id, task_id, hash);
         }
     }
 }
@@ -6082,12 +6086,18 @@ mod watcher_direct_tests {
         record_artifact("wt-1", "input", &root.join("in.mp4"));
         record_artifact("mt-1", "archive", &root.join("other.mp4"));
 
-        // disk=Some 时 record 即落盘：从落盘文件断言登记内容
+        // T-51 清尾 3：登记置脏，防抖节拍落盘——测试显式强制落盘后断言
+        assert!(crate::watcher::flush_processed(true));
         let saved = crate::watcher::ProcessedRegistry::load(&disk);
         assert_eq!(saved.entries.len(), 1, "仅 watcher archive 产物登记");
         assert!(saved.contains_path(&product));
         assert_eq!(saved.entries[0].rule_id, "r1");
         assert_eq!(saved.entries[0].task_id, "wt-1");
+        // T-51：阈值内产物登记 sha256 指纹（规则缓存未刷新 → 默认配置开启）
+        assert!(
+            saved.entries[0].sha256.is_some(),
+            "watcher 产物登记必须带内容指纹"
+        );
 
         crate::watcher::processed_reset_for_tests(None);
         let _ = std::fs::remove_dir_all(&root);
@@ -6116,6 +6126,8 @@ mod watcher_direct_tests {
         record_artifact("wp-1", "save_output", &product);
         record_artifact("mp-1", "save_output", &root.join("other.mkv"));
 
+        // T-51 清尾 3：登记置脏，测试显式强制落盘后断言
+        assert!(crate::watcher::flush_processed(true));
         let saved = crate::watcher::ProcessedRegistry::load(&disk);
         assert_eq!(saved.entries.len(), 1, "仅映射在册的管线任务产物登记");
         assert!(saved.contains_path(&product));
