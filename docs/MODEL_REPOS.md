@@ -14,7 +14,7 @@ EntryPoint 的每个推理模块（`modules/<module_id>/`）本质上是**对某
 | `deep-filter` | [Rikorose/DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) | [EntryPoint_DeepFilterNet](https://github.com/PegionFish/EntryPoint_DeepFilterNet) | df3 |
 | `faster-whisper` | [SYSTRAN/faster-whisper](https://github.com/SYSTRAN/faster-whisper) | [EntryPoint_faster-whisper](https://github.com/PegionFish/EntryPoint_faster-whisper) | large-v1/v2/v3, medium(.en), small(.en), base(.en), tiny(.en) |
 | `firered-ocr` | [FireRedTeam/FireRed-OCR](https://github.com/FireRedTeam/FireRed-OCR) | [EntryPoint_FireRed-OCR](https://github.com/PegionFish/EntryPoint_FireRed-OCR) | firered-ocr-2b |
-| `paddleocr` | [PaddlePaddle/PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) | [EntryPoint_PaddleOCR](https://github.com/PegionFish/EntryPoint_PaddleOCR) | v4-chinese, pp-structure-v3 |
+| `paddleocr` | [PaddlePaddle/PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) | [EntryPoint_PaddleOCR](https://github.com/PegionFish/EntryPoint_PaddleOCR) | v4-chinese, v5-chinese, pp-structure-v3, paddleocr-vl（T-45；VL 走 local_import 手动落位） |
 | `qwen3-asr` | [QwenLM/Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) | [EntryPoint_Qwen3-ASR](https://github.com/PegionFish/EntryPoint_Qwen3-ASR) | qwen3-asr-0.6b, qwen3-asr-1.7b, qwen3-forced-aligner-0.6b |
 | `qwen3-tts` | [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) | [EntryPoint_Qwen3-TTS](https://github.com/PegionFish/EntryPoint_Qwen3-TTS) | qwen3-tts-0.6b, qwen3-tts-12hz-1.7b-* |
 | `animevideo` | [xinntao/Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) | [EntryPoint_Real-ESRGAN/adapters/animevideo](https://github.com/PegionFish/EntryPoint_Real-ESRGAN) | animevideo-xsx2-pth |
