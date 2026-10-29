@@ -75,7 +75,10 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(windows)]
         {
             let root = config::resolve_root();
-            let load_result = AppConfig::load_or_create(&root.join("config"));
+            // T-40：加载不再物化缺省文件——「app.toml 存在 = 已初始化」是
+            // 首次运行向导（GET /api/setup/status）的门控判据；缺失时用
+            // 内存缺省值，首次 PUT /api/config（向导完成/跳过/设置保存）才落盘
+            let load_result = AppConfig::load(&root.join("config"));
             let log_level = load_result
                 .as_ref()
                 .map(|c| c.general.log_level.clone())
@@ -103,7 +106,9 @@ async fn main() -> anyhow::Result<()> {
     // logging::build_env_filter）；加载失败时按默认级别初始化，
     // 各模式沿用迁移前的错误容忍度（server 模式 fail-fast / standalone 容忍）。
     let root = config::resolve_root();
-    let load_result = AppConfig::load_or_create(&root.join("config"));
+    // T-40：同上——load 不物化（语义与 load_or_create 的差异仅在「缺失时不写盘」，
+    // 内存态同为缺省值；向导门控依赖该差异，见 api/setup.rs 模块注释）
+    let load_result = AppConfig::load(&root.join("config"));
     let log_level = load_result
         .as_ref()
         .map(|c| c.general.log_level.clone())

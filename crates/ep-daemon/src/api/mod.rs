@@ -19,6 +19,8 @@ pub mod module_proxy;
 pub mod packs;
 pub mod pipelines;
 pub mod scheduler;
+// T-40：首次运行初始化状态探测（GET /api/setup/status，WebUI 向导门控）
+pub mod setup;
 pub mod storage;
 pub mod stores;
 pub mod tasks;
@@ -61,6 +63,8 @@ pub fn api_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // T-15：全局队列控制（暂停/恢复派发 + 队列运行态）
         .merge(scheduler::router())
         .merge(deps::router())
+        // T-40：首次运行向导门控探测（只读；/api 前缀下落入 auth.rs 访问保护域）
+        .merge(setup::router())
         .merge(packs::router())
         .merge(module_proxy::router())
         // 触发规则（PLAN_TRIGGER_UNIFIED_LOG §5.3；巡检循环由 main.rs 驱动）
