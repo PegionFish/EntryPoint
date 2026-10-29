@@ -14,6 +14,8 @@ import zhTasks from '@i18n/locales/zh-CN/tasks.json'
 import zhSettings from '@i18n/locales/zh-CN/settings.json'
 import zhComponents from '@i18n/locales/zh-CN/components.json'
 import zhTriggers from '@i18n/locales/zh-CN/triggers.json'
+// T-40：首次运行向导命名空间（仅前端消费）
+import zhOnboarding from '@i18n/locales/zh-CN/onboarding.json'
 import enCommon from '@i18n/locales/en/common.json'
 import enDashboard from '@i18n/locales/en/dashboard.json'
 import enModules from '@i18n/locales/en/modules.json'
@@ -25,6 +27,7 @@ import enTasks from '@i18n/locales/en/tasks.json'
 import enSettings from '@i18n/locales/en/settings.json'
 import enComponents from '@i18n/locales/en/components.json'
 import enTriggers from '@i18n/locales/en/triggers.json'
+import enOnboarding from '@i18n/locales/en/onboarding.json'
 
 /** 前端支持的语言码 */
 export type AppLanguage = 'zh-CN' | 'en'
@@ -50,6 +53,7 @@ const resources = {
     settings: zhSettings,
     components: zhComponents,
     triggers: zhTriggers,
+    onboarding: zhOnboarding,
   },
   en: {
     common: enCommon,
@@ -63,6 +67,7 @@ const resources = {
     settings: enSettings,
     components: enComponents,
     triggers: enTriggers,
+    onboarding: enOnboarding,
   },
 } as const
 

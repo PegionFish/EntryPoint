@@ -46,6 +46,7 @@ import type {
   StoreLocateResponse,
   StoreResolveResponse,
   ScheduleListEntry,
+  SetupStatus,
   UnifiedEvent,
   WatchRule,
   WatchRuleInput,
@@ -275,6 +276,10 @@ export const api = {
 
   // Config
   getConfig: () => apiFetch<AppConfig>('/config'),
+
+  // Setup（T-40 首次运行向导）
+  /** 初始化状态探测（只读）：initialized=false 时 App 级门控弹出向导 */
+  setupStatus: () => apiFetch<SetupStatus>('/setup/status'),
 
   // Models
   models: () => apiFetch<ModelListResponse>('/models'),

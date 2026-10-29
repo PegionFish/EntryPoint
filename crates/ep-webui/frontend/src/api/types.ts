@@ -150,6 +150,25 @@ export interface AppConfig {
   active_models?: Record<string, string>
 }
 
+// ===== Setup（T-40 首次运行向导）=====
+/** GET /api/setup/status 响应：初始化状态探测 + 向导各步预填数据 */
+export interface SetupStatus {
+  /** config/app.toml 是否已存在（true = 已初始化，WebUI 不弹首次运行向导） */
+  initialized: boolean
+  /** 应用根目录（daemon 启动期 resolve_root 解析结果，绝对路径） */
+  root: string
+  /** 主配置文件预期路径（<root>/config/app.toml） */
+  config_file: string
+  /** pipeline.workspace_dir 解析后的绝对路径（resolve(root) 只读视图） */
+  workspace_dir: string
+  /** pipeline.workspace_dir 配置原始串（相对保持相对；向导输入框预填/回写） */
+  workspace_dir_raw: string
+  /** 当前 [server].port（向导端口步预填） */
+  port: number
+  /** 当前 [general].language（向导语言步预填） */
+  language: string
+}
+
 /** 管线定时计划（cron；GET /pipelines/{id}/schedule） */
 export interface ScheduleInfo {
   id: string

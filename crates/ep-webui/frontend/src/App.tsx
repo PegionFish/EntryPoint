@@ -9,10 +9,12 @@ import { ErrorBoundary } from '@/components/shared/error-boundary'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { Toaster } from '@/components/ui/sonner'
 import { api } from '@/api/client'
+import type { SetupStatus } from '@/api/types'
 import { wsManager } from '@/api/ws'
 import { useModelUpdateToast } from '@/hooks/use-model-update-toast'
 import { DashboardPage } from '@/pages/dashboard'
 import { ModulesPage } from '@/pages/modules'
+import { OnboardingPage } from '@/pages/onboarding'
 import { PipelinePage } from '@/pages/pipeline'
 import { RunPage } from '@/pages/run'
 import { TasksPage } from '@/pages/tasks'
@@ -20,16 +22,45 @@ import { TriggersPage } from '@/pages/triggers'
 import { SettingsPage } from '@/pages/settings'
 import { NotFoundPage } from '@/pages/not-found'
 
+/**
+ * 首次运行门控（T-40）：checking = 探测中；onboarding = 未初始化
+ * （config/app.toml 不存在），全屏渲染向导；ready = 进入主界面。
+ */
+type SetupGate = 'checking' | 'ready' | 'onboarding'
+
 export default function App() {
   // 移动端（<lg）导航抽屉开关状态
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   // 当前路径用于重建错误边界：换页后自动清除上一页的崩溃态
   const location = useLocation()
+  // T-40 首访探测状态 + 向导预填数据
+  const [gate, setGate] = useState<SetupGate>('checking')
+  const [setupStatus, setSetupStatus] = useState<SetupStatus | null>(null)
 
   // 应用启动时建立全局 WebSocket 连接
   useEffect(() => {
     wsManager.connect()
     return () => wsManager.disconnect()
+  }, [])
+
+  // T-40 首次运行向导门控：GET /api/setup/status 只读探测。
+  // 仅 initialized=false（无 config/app.toml）时弹向导；探测失败（服务
+  // 暂不可达）按已初始化处理直进主界面——向导零强制、不承载业务逻辑。
+  useEffect(() => {
+    let cancelled = false
+    api
+      .setupStatus()
+      .then((status) => {
+        if (cancelled) return
+        setSetupStatus(status)
+        setGate(status.initialized ? 'ready' : 'onboarding')
+      })
+      .catch(() => {
+        if (!cancelled) setGate('ready')
+      })
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   // 全局常驻订阅 WS model_update（后台自动更新检查发现可用更新 → toast 提示）
@@ -45,6 +76,36 @@ export default function App() {
         // 服务器暂不可达时保留本地缓存语言，下次挂载再校准
       })
   }, [])
+
+  // T-40：探测中显示极简启动画面（本地请求，耗时亚秒级）
+  if (gate === 'checking') {
+    return (
+      <>
+        <div className="flex h-screen items-center justify-center bg-background">
+          <p className="text-2xl font-bold tracking-tight text-muted-foreground">
+            EntryPoint
+          </p>
+        </div>
+        <Toaster richColors closeButton position="top-right" />
+      </>
+    )
+  }
+
+  // T-40：未初始化 → 全屏向导接管（无 Header/Sidebar；完成后切回主界面）。
+  // setupStatus 理论上必非空（gate=onboarding 只在探测成功后设置），兜底直进主界面。
+  if (gate === 'onboarding' && setupStatus) {
+    return (
+      <>
+        <ErrorBoundary key="onboarding">
+          <OnboardingPage
+            status={setupStatus}
+            onDone={() => setGate('ready')}
+          />
+        </ErrorBoundary>
+        <Toaster richColors closeButton position="top-right" />
+      </>
+    )
+  }
 
   return (
     <TooltipProvider>
