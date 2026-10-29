@@ -43,6 +43,8 @@ declare -A MOD_TO_REPO=(
   [rife]="EntryPoint_rife-ncnn-vulkan|https://github.com/nihui/rife-ncnn-vulkan|RIFE 视频插帧"
   [waifu2x]="EntryPoint_waifu2x|https://github.com/nagadomi/nunif|waifu2x 图像/视频超分降噪"
   [waifu2x-unlimited]="EntryPoint_waifu2x-unlimited|https://github.com/nagadomi/nunif|waifu2x-unlimited ONNX 本地推理"
+  [kokoro-tts]="EntryPoint_Kokoro-TTS|https://github.com/hexgrad/Kokoro-82M|Kokoro TTS 语音合成"
+  [openai-bridge]="EntryPoint_OpenAI-Bridge|https://platform.openai.com/docs/api-reference|OpenAI 兼容 API 桥接（chat/asr/tts/文档）"
 )
 
 log() { printf '[sync] %s\n' "$*"; }
@@ -157,7 +159,7 @@ sync_module() { # $1=module_id
   if [[ -d "$target/adapters" ]]; then multi=1; dest="$target/adapters/$mid"; fi
 
   log "$(printf '%-18s -> %s%s' "$mid" "$target" "$([[ $multi -eq 1 ]] && echo "/adapters/$mid")")"
-  rsync -a --delete --exclude='.git' --exclude='__pycache__' --exclude='README.md' \
+  rsync -a --delete --exclude='.git' --exclude='__pycache__' --exclude='.venv' --exclude='.pytest-tmp' --exclude='README.md' \
         --exclude='ADAPTER.md' --exclude='upstream.json' \
         --exclude='nunif' \
         "$EP_ROOT/modules/$mid/" "$dest/"
