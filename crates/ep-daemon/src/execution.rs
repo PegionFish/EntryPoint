@@ -324,6 +324,46 @@ pub fn task_forced_overcommit(task_id: &str) -> bool {
         .contains(task_id)
 }
 
+// ─── T-54：提交幂等键侧表（Agent 重试安全；进程内，FORCED_TASKS 同款）───────
+
+/// T-54：`idempotency_key` → 首次提交的 task_id（提交幂等去重）。
+///
+/// **进程内侧表，与 [`FORCED_TASKS`] 同款先例：不落盘、不跨重启**（重启后
+/// 键失传，同键重试按新任务处理——调用方语义从"重放"退化为"重交"，可接受）。
+/// 条目在任务终态后保留（在案期内同键重试稳定返回首个 task_id），仅
+/// `clear_registry_for_tests` 清空。键无 TTL：条目 = 两条 String，数量以
+/// 调用方 distinct key 数为界，无回收压力。
+static IDEMPOTENCY_KEYS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn idempotency_keys() -> &'static Mutex<HashMap<String, String>> {
+    IDEMPOTENCY_KEYS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 幂等键查询（T-54）：键已登记 → `Some(首个 task_id)`，handler 直接重放
+/// 该任务 id 且不再触碰任何提交副作用；未登记 → `None`（照常首次提交）。
+pub fn idempotency_lookup(key: &str) -> Option<String> {
+    idempotency_keys()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+        .cloned()
+}
+
+/// 幂等键登记（T-54）：提交成功（任务已创建）后调用。先到先得：并发同键
+/// 的第二个提交在 register 时读到已有条目 → 返回 `Err(首个 task_id)`
+/// （首个任务照常执行；第二个任务亦已创建，调用方按首个 id 轮询即可——
+/// lookup 与 register 之间的进程内极小窗口属 best-effort 语义，注释声明）。
+pub fn idempotency_register(key: &str, task_id: &str) -> Result<(), String> {
+    let mut map = idempotency_keys().lock().unwrap_or_else(|e| e.into_inner());
+    match map.get(key) {
+        Some(existing) => Err(existing.clone()),
+        None => {
+            map.insert(key.to_string(), task_id.to_string());
+            Ok(())
+        }
+    }
+}
+
 static SCHEDULER: OnceLock<Mutex<Scheduler>> = OnceLock::new();
 
 fn scheduler() -> &'static Mutex<Scheduler> {
@@ -3123,6 +3163,7 @@ pub fn clear_registry_for_tests() {
     extras().lock().unwrap_or_else(|e| e.into_inner()).clear();
     finalized().lock().unwrap_or_else(|e| e.into_inner()).clear();
     forced_tasks().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    idempotency_keys().lock().unwrap_or_else(|e| e.into_inner()).clear();
     set_test_run_hook(None);
 }
 

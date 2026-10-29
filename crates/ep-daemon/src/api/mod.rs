@@ -16,6 +16,8 @@ pub mod models;
 pub mod modules;
 pub mod module_import;
 pub mod module_proxy;
+// T-54：GET /api/openapi.json（手写 OpenAPI 3.1 机读规范导出，零新依赖）
+pub mod openapi;
 pub mod packs;
 pub mod pipelines;
 pub mod scheduler;
@@ -90,6 +92,9 @@ pub fn api_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // T-32：Prometheus 指标（池占用 / 任务吞吐 / 模块健康度；
         // /api 前缀下自动落入 auth.rs 全局访问保护域）
         .merge(metrics::router())
+        // T-54：机读 OpenAPI 规范（Agent/工具生成器路由发现入口；
+        // /api 前缀下落入 auth.rs 全局访问保护域）
+        .merge(openapi::router())
         // 未匹配的 /api/* → 404 + JSON，避免落入 SPA 的 HTML fallback
         .fallback(api_not_found)
 }

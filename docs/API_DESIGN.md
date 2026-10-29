@@ -166,6 +166,39 @@ JSON 与 multipart）请求体增可选 `force: true`（缺省 false；multipart
 任务详情同步透出这两字段。**不传 force 时请求与响应行为逐字节不变**。
 `POST /v1/batches` 不开放 force（批量本为无人值守整目录吞吐设计）。
 
+**dry-run 预演与提交幂等键（T-54，计划6 6.1）**：Agent/自动化调用的两个
+提交安全面，覆盖 `POST /api/execute/single`（canonical
+`POST /api/modules/{module_id}/runs`）与 `POST /v1/inference/{module}/{capability}`
+（JSON 与 multipart 双形态）：
+
+- **dry-run 预演**：请求体可选 `dry_run: true`（multipart 为文本字段 `"true"`）——
+  校验全部通过（模块/capability/参数 schema/输入存在性）后**不入队**，返回
+  `200 {"would_submit": true, "dry_run": true, "plan": {…}}`。`plan` 摘要含
+  `module_id` / `capability` / 校验+默认值注入后的 `params` / 目标 `device`
+  （显式 hint 或调度器选择，`device_source: auto|explicit`）/ 解析后的
+  `model_variant` / 预估显存内存（`vram_estimate_mb` / `ram_estimate_mb`，
+  复用 vram-budget 同一取数路径：变体级优先、模块级兜底）/ 输入描述
+  （`input.kind: path|text|file`）。**零副作用**：不建任务、不占端口、
+  不拉模块、文本输入不物化；校验失败照常 400/404/409。
+- **提交幂等键**：请求体可选 `idempotency_key`（string，≤128 字符，超长
+  400）——同键重复提交在任务在案期返回**首个 task_id**，响应带
+  `idempotent_replay: true` 标记（202，与首次提交同形状）。侧表为进程内
+  实现（与 FORCE 任务登记同款）：任务终态后条目保留、**不跨重启**；查重
+  前置于输入物化/模块拉起/入队，重放零副作用。不同键互相独立（各自新任务）。
+
+### 机器可读规范（T-54）
+
+| 方法 | 路径 |
+|---|---|
+| GET | `/api/openapi.json`（OpenAPI 3.1 机读规范导出） |
+
+手写 serde 结构生成（零新依赖），覆盖 v1 门面主要端点（capabilities /
+inference 提交 / tasks 查询取消 / batches·groups / 旧 result 别名）：每端点
+提供 summary / 请求体形状摘要（含 dry_run / idempotency_key）/ 错误码表
+（`x-error-codes` 扩展字段）。精度定位**机器可读路由发现**而非完整 schema
+校验；字段级契约以 INFERENCE_API.md 为准。位于 `/api` 前缀下，token 模式
+随全局访问保护一起校验。
+
 ### 其他
 
 | 方法 | 路径 |

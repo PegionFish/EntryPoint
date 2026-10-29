@@ -12,6 +12,10 @@ WebUI 内部端点分离：本文件描述的请求/响应形状与错误码属�
 
 ## 1. 端点清单
 
+> 机读规范：`GET /api/openapi.json`（OpenAPI 3.1，T-54）——本节端点的
+> 机器可读路由发现入口（summary / 请求形状摘要 / 错误码表），字段级契约
+> 仍以本文件为准。
+
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/api/v1/capabilities` | 能力目录：聚合所有已安装模块 manifest 的 capability 声明（纯只读，永不调用模块进程） |
@@ -61,6 +65,8 @@ WebUI 内部端点分离：本文件描述的请求/响应形状与错误码属�
 | `priority` | 否 | 任务优先级 `0`–`255`（十进制字符串）：`0`–`49` 高于缺省、`50` 缺省、同优先级先入先出；字段上限 1MB |
 | `bypass_cache` | 否 | `"true"` 时本次直跑既**不读也不写**结果缓存（缺省参与缓存）；字段上限 1MB |
 | `force` | 否 | `"true"` 时跳过 §6.8b 动态 VRAM 准入的排队等待直接执行（T-22，见下方 JSON 形态说明）；缺省 `"false"`；字段上限 1MB |
+| `dry_run` | 否 | `"true"` 时校验通过后不入队，返回执行计划摘要（T-54，见下方 dry-run 说明）；缺省 `"false"`；字段上限 1MB |
+| `idempotency_key` | 否 | 提交幂等键，≤128 字符（超长 `400 INPUT_INVALID`，T-54，见下方幂等说明）；字段上限 1MB |
 
 重复 `file` 字段以最后一个为准（先前已接收的文件会被清理）。
 
@@ -75,6 +81,8 @@ WebUI 内部端点分离：本文件描述的请求/响应形状与错误码属�
   "priority": 10,
   "bypass_cache": false,
   "force": false,
+  "dry_run": false,
+  "idempotency_key": "agent-msg-42",
   "callback_url": "http://your-host/done"
 }
 ```
@@ -101,6 +109,49 @@ vram-budget `pools` 形状的明细）；`GET /v1/tasks/{task_id}` 同步透出
 （对齐内部 `POST /api/modules/{module_id}/runs`（旧别名
 `POST /api/execute/single`）的双字段 400 口径）。JSON 请求体上限
 8MB（推理提交的文本/params 为 KB 量级，超限即错，防无上限缓冲）。
+
+**dry-run 预演（T-54）**：请求体可选 `dry_run: true`（multipart 为文本字段
+`"true"`）——manifest/capability/参数 schema/输入校验**全部通过后不入队**，
+返回 `200`：
+
+```json
+{
+  "would_submit": true,
+  "dry_run": true,
+  "plan": {
+    "module_id": "faster-whisper",
+    "capability": "transcribe",
+    "params": { "language": "zh", "beam_size": 5 },
+    "device": "cuda:0",
+    "device_source": "auto",
+    "model_variant": "large-v3",
+    "vram_estimate_mb": 4096,
+    "ram_estimate_mb": 512,
+    "input": { "kind": "path", "path": "…" }
+  }
+}
+```
+
+- `params` 为校验 + 默认值注入后的最终形态；`device` 为显式指定或调度器
+  选择（`device_source: auto | explicit`）；`model_variant` / `vram_estimate_mb` /
+  `ram_estimate_mb` 取自模块 manifest（变体级优先、模块级兜底，与 vram-budget
+  同一取数路径；未声明时字段缺省不出）；
+- **零副作用**：不建任务、不占端口、不拉模块、`input_text` 不物化
+  （`input.kind` 为 `path | text | file` 三种介质描述）；校验失败照常
+  400/404/409——预演适合 Agent 在真实提交前做"这一发会打到哪"的确认。
+
+**提交幂等键（T-54）**：请求体可选 `idempotency_key`（string，≤128 字符，
+超长 `400 INPUT_INVALID`；multipart 为同名文本字段）——同键重复提交返回
+**首个 task_id**，响应带 `idempotent_replay: true` 标记：
+
+```json
+{ "task_id": "task-...", "idempotent_replay": true }
+```
+
+- 查重前置于输入物化/模块拉起/入队：重放**零副作用**，且 `wait=true`
+  不适用于重放（立即返回首个 task_id）；
+- 键在任务**终态后仍可查**（同键重试稳定返回首个任务 id），但侧表为进程
+  内实现，**不跨重启**（重启后同键按新任务处理）；不同键互相独立。
 
 安全约束：`input_path` 经服务端 canonicalize 后必须位于 workspace/uploads
 之内（防符号链接 / `..` 穿越），**绝不透传任意服务器绝对路径**；越权返回
@@ -265,7 +316,7 @@ folder 准入与错误语义：
 | `TASK_NOT_FOUND` | 404 | 任务不存在（详情查询/取消） |
 | `TASK_ALREADY_TERMINAL` | 409 | 任务已处于终态（completed/failed/cancelled），不可取消 |
 | `PARAM_INVALID` | 400 | 参数缺失/类型不符/枚举越界 |
-| `INPUT_INVALID` | 400 | 输入缺失、`input_path` 越权、multipart/JSON 形态非法；亦含 `input_text`/`input_path` 同传（互斥）、输入文件超出 `max_file_size_mb` 声明上限、multipart 文本字段超 1MB、JSON 请求体超 8MB |
+| `INPUT_INVALID` | 400 | 输入缺失、`input_path` 越权、multipart/JSON 形态非法；亦含 `input_text`/`input_path` 同传（互斥）、输入文件超出 `max_file_size_mb` 声明上限、multipart 文本字段超 1MB、JSON 请求体超 8MB、`idempotency_key` 超 128 字符 |
 | `MODEL_NOT_READY` | 409 | 激活变体模型未下载就绪 |
 | `MODULE_START_FAILED` | 502 | 模块自动拉起失败（启动错误/健康超时等） |
 | `QUEUE_FULL` | 429 | 任务队列已满 |

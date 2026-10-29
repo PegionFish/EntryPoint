@@ -42,7 +42,7 @@ use ep_core::module::manifest::CapabilityDecl;
 use crate::api::autostart::{self, AutoStartError};
 use crate::api::execute::execution::{self, SubmitError, SubmitOptions};
 use crate::api::execute::{
-    find_module_manifest, validate_and_fill_params, ParamError,
+    find_module_manifest, validate_and_fill_params, validate_idempotency_key, ParamError,
 };
 use crate::api::upload::{input_uploads_dir, staging_id, store_input_file};
 use crate::state::AppState;
@@ -390,6 +390,15 @@ struct InferenceJsonRequest {
     /// 提交响应附带 force 附加字段（缺省/不传时响应形状零变化）
     #[serde(default)]
     force: bool,
+    /// T-54 dry-run：true = 全部校验通过后不入队，返回「将执行的计划」摘要
+    ///（`would_submit: true` + `plan`；零副作用：不物化输入、不拉起模块、
+    /// 不建任务）
+    #[serde(default)]
+    dry_run: bool,
+    /// T-54 提交幂等键（≤128 字符）：同键重复提交在任务在案期返回首个
+    /// task_id（响应带 `idempotent_replay: true`）；进程内侧表、不跨重启
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 
 /// 提交推理（双形态）：按 Content-Type 分流。
@@ -496,6 +505,9 @@ async fn submit_multipart(
     let mut bypass_cache = false;
     // T-22：§6.8b force（跳过动态准入排队等待）；缺省 false
     let mut force = false;
+    // T-54：dry-run 预演开关（缺省 false）与提交幂等键（缺省未指定）
+    let mut dry_run = false;
+    let mut idempotency_raw: Option<String> = None;
 
     loop {
         let field = match multipart.next_field().await {
@@ -641,6 +653,30 @@ async fn submit_multipart(
                     }
                 };
             }
+            "dry_run" => {
+                // T-54：口径与 wait/force 一致（严格 "true"/"false"）
+                dry_run = match field.text().await {
+                    Ok(text) => text.trim() == "true",
+                    Err(e) => {
+                        cleanup_staged(&file_staged).await;
+                        return multipart_field_error("dry_run", &e, Some(TEXT_FIELD_LIMIT));
+                    }
+                };
+            }
+            "idempotency_key" => {
+                // T-54：提交幂等键（文本字段；长度校验在字段循环后统一进行）
+                idempotency_raw = match field.text().await {
+                    Ok(text) => Some(text),
+                    Err(e) => {
+                        cleanup_staged(&file_staged).await;
+                        return multipart_field_error(
+                            "idempotency_key",
+                            &e,
+                            Some(TEXT_FIELD_LIMIT),
+                        );
+                    }
+                };
+            }
             _ => {} // 未知字段忽略（multer 自动丢弃未读内容）
         }
     }
@@ -649,6 +685,49 @@ async fn submit_multipart(
         Some(staged) => staged,
         None => return input_error("multipart field `file` is required"),
     };
+
+    // T-54：幂等键校验（超长 → 400）+ 查重 + dry-run 分支，均位于
+    // store_input_file（uploads 落盘）之前——重放/预演零持久副作用，
+    // 已暂存的临时文件即查即清。
+    let idem_key = match validate_idempotency_key(idempotency_raw.as_deref()) {
+        Ok(k) => k,
+        Err(detail) => {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return input_error(detail);
+        }
+    };
+    if let Some(key) = &idem_key {
+        if let Some(first) = execution::idempotency_lookup(key) {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return (
+                StatusCode::ACCEPTED,
+                Json(json!({ "task_id": first, "idempotent_replay": true })),
+            );
+        }
+    }
+    if dry_run {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        // multipart 的 params 字段在解析期只做校验（默认值注入延后至
+        // run_inference）——计划摘要承诺「最终参数形态」，此处补一次注入
+        //（字段期已校验通过，此处必成功；unwrap_or 兜底原值）
+        let resolved_params = match validate_and_fill_params(&cap, params.clone()) {
+            Ok(p) => p,
+            Err(_) => params,
+        };
+        let plan = crate::api::execute::build_dry_run_plan(
+            state,
+            module_id,
+            capability,
+            resolved_params,
+            None,
+            json!({ "kind": "file", "name": raw_name }),
+        )
+        .await;
+        return (
+            StatusCode::OK,
+            Json(json!({ "would_submit": true, "dry_run": true, "plan": plan })),
+        );
+    }
 
     let stored = match store_input_file(state, &temp_path, &raw_name).await {
         Ok(path) => path,
@@ -672,6 +751,7 @@ async fn submit_multipart(
             priority,
             bypass_cache,
             force,
+            idempotency_key: idem_key,
         },
     )
     .await
@@ -710,11 +790,43 @@ fn multipart_field_error(
     }
 }
 
+/// uploads 前缀校验（T-54 从 submit_json 提取共享；dry-run 预演路径与真实
+/// 提交路径共用同一只读校验）：文件必须存在，且 canonicalize 后位于
+/// uploads 内（解析符号链接与 `..`，杜绝越权引用任意服务器路径）。
+/// 合法返回规范化后的物理路径；非法 → `Err(400 INPUT_INVALID)`。
+async fn validate_uploads_input(
+    state: &Arc<AppState>,
+    p: &str,
+) -> Result<PathBuf, (StatusCode, Json<Value>)> {
+    let candidate = PathBuf::from(p);
+    if !candidate.is_file() {
+        return Err(input_error(format!(
+            "input_path does not exist or is not a file: {p}"
+        )));
+    }
+    let uploads = input_uploads_dir(state).await;
+    let (canon_file, canon_uploads) = match (candidate.canonicalize(), uploads.canonicalize()) {
+        (Ok(f), Ok(u)) => (f, u),
+        _ => {
+            return Err(input_error(format!(
+                "input_path must be inside workspace/uploads: {p}"
+            )))
+        }
+    };
+    if !canon_file.starts_with(&canon_uploads) {
+        return Err(input_error(format!(
+            "input_path must be inside workspace/uploads (rejected: {p})"
+        )));
+    }
+    Ok(canon_file)
+}
+
 /// JSON 形态：`input_text` 与 `input_path` 互斥（m3：同传/双缺 → 400
 /// INPUT_INVALID，对齐 execute.rs 双字段 400 口径）；`input_text` 物化为
 /// uploads 下 .txt；`input_path` 仅限 uploads 前缀（canonicalize 后校验，
 /// 绝不透传任意绝对路径）。m5：manifest/capability/参数校验前移至输入
-/// 物化之前（纯读，无副作用）。
+/// 物化之前（纯读，无副作用）。T-54：幂等查重与 dry-run 分支位于输入
+/// 物化之前（重放/预演零持久副作用）。
 async fn submit_json(
     state: &Arc<AppState>,
     module_id: &str,
@@ -742,6 +854,13 @@ async fn submit_json(
         _ => {}
     }
 
+    // T-54：幂等键形状校验（超长 → 400）——属请求形状检查，先于模块解析
+    //（与 m3 互斥校验同级；否则未知模块会以 404 抢先，键错误被掩盖）
+    let idem_key = match validate_idempotency_key(req.idempotency_key.as_deref()) {
+        Ok(k) => k,
+        Err(detail) => return input_error(detail),
+    };
+
     // m5：manifest/capability/参数校验前移至输入物化之前（纯读无副作用），
     // 避免非法请求向 uploads 留垃圾文件
     let cap = match resolve_capability(state, module_id, capability).await {
@@ -752,6 +871,47 @@ async fn submit_json(
         Ok(p) => p,
         Err(e) => return map_param_error(e),
     };
+
+    // T-54：幂等查重（命中 → 重放首个 task_id，
+    // 绝不物化输入/拉起模块/建任务；wait 同步语义不适用于重放）
+    if let Some(key) = &idem_key {
+        if let Some(first) = execution::idempotency_lookup(key) {
+            return (
+                StatusCode::ACCEPTED,
+                Json(json!({ "task_id": first, "idempotent_replay": true })),
+            );
+        }
+    }
+
+    // T-54 dry-run：校验全部通过 → 返回「将执行的计划」摘要（would_submit）
+    // 并就此打住。input_path 只读校验照常执行（预演同样要求输入真实可用）；
+    // input_text 不物化。
+    if req.dry_run {
+        let input_desc = match (&req.input_text, &req.input_path) {
+            (Some(text), _) => json!({ "kind": "text", "chars": text.chars().count() }),
+            (None, Some(p)) => {
+                let resolved = match validate_uploads_input(state, p).await {
+                    Ok(path) => path,
+                    Err(resp) => return resp,
+                };
+                json!({ "kind": "path", "path": resolved.display().to_string() })
+            }
+            (None, None) => unreachable!("互斥校验已保证二选一"),
+        };
+        let plan = crate::api::execute::build_dry_run_plan(
+            state,
+            module_id,
+            capability,
+            params,
+            None,
+            input_desc,
+        )
+        .await;
+        return (
+            StatusCode::OK,
+            Json(json!({ "would_submit": true, "dry_run": true, "plan": plan })),
+        );
+    }
 
     let input_path = match (&req.input_text, &req.input_path) {
         (Some(text), _) => {
@@ -787,30 +947,10 @@ async fn submit_json(
             let _ = tokio::fs::remove_file(&temp_path).await;
             stored
         }
-        (None, Some(p)) => {
-            // 前缀规范化校验：文件必须存在，且 canonicalize 后位于 uploads 内
-            // （解析符号链接与 `..`，杜绝越权引用任意服务器路径）
-            let candidate = PathBuf::from(p);
-            if !candidate.is_file() {
-                return input_error(format!("input_path does not exist or is not a file: {p}"));
-            }
-            let uploads = input_uploads_dir(state).await;
-            let (canon_file, canon_uploads) =
-                match (candidate.canonicalize(), uploads.canonicalize()) {
-                    (Ok(f), Ok(u)) => (f, u),
-                    _ => {
-                        return input_error(format!(
-                            "input_path must be inside workspace/uploads: {p}"
-                        ))
-                    }
-                };
-            if !canon_file.starts_with(&canon_uploads) {
-                return input_error(format!(
-                    "input_path must be inside workspace/uploads (rejected: {p})"
-                ));
-            }
-            canon_file
-        }
+        (None, Some(p)) => match validate_uploads_input(state, p).await {
+            Ok(path) => path,
+            Err(resp) => return resp,
+        },
         (None, None) => {
             return input_error("either `input_text` or `input_path` is required");
         }
@@ -828,19 +968,22 @@ async fn submit_json(
             priority: req.priority,
             bypass_cache: req.bypass_cache,
             force: req.force,
+            idempotency_key: idem_key,
         },
     )
     .await
 }
 
-/// 推理提交选项（T-15/T-16/T-22）：wait / callback / priority / 缓存旁路 /
-/// force 一并透传给直跑执行器
+/// 推理提交选项（T-15/T-16/T-22/T-54）：wait / callback / priority / 缓存旁路 /
+/// force / 提交幂等键一并透传给直跑执行器
 struct InferenceRunOptions {
     wait: bool,
     callback_url: Option<String>,
     priority: Option<u8>,
     bypass_cache: bool,
     force: bool,
+    /// T-54：提交幂等键（提交成功后登记进程内侧表；None = 未指定）
+    idempotency_key: Option<String>,
 }
 
 /// 公共执行序列（对齐 execute_single 校验顺序）：参数 schema 校验与默认值
@@ -870,9 +1013,10 @@ async fn run_inference(
     }
 
     // 3. 提交（wait/callback 语义镜像 submit_pipeline_full；T-15 priority、
-    //    T-22 force 透传）
+    //    T-22 force、T-54 幂等键透传）
     let wait = options.wait;
     let force = options.force;
+    let options_idem = options.idempotency_key.clone();
     let module_ids = vec![module_id.to_string()];
     let options = SubmitOptions {
         wait,
@@ -894,6 +1038,12 @@ async fn run_inference(
     .await
     {
         Ok(outcome) => {
+            // T-54：提交成功（任务已创建）即登记幂等键（先到先得；wait 模式
+            // 亦在此登记——重放只要求返回首个 task_id，不重放等待）。
+            // Err = 并发同键竞态下首个任务已在案，本任务照常执行。
+            if let Some(key) = &options_idem {
+                let _ = execution::idempotency_register(key, &outcome.task_id);
+            }
             if wait {
                 let record = outcome
                     .record
@@ -1070,6 +1220,12 @@ async fn v1_cancel_task(
 
 #[cfg(test)]
 mod tests {
+    // 测试锁的唯一目的就是跨 await 串行化触碰进程级静态注册表/幂等侧表的
+    // 测试（T-54 起本文件测试也消费 execution::lock_for_tests）；锁内临界区
+    // 全部是极短同步操作 + HTTP oneshot，不存在持锁阻塞运行时的风险
+    //（与 api/execute.rs tests 同款豁免）。
+    #![allow(clippy::await_holding_lock)]
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1522,5 +1678,213 @@ output_type = "text"
                 "文本 '{text}' 的统一解析须与旧 parse::<u8> 等价"
             );
         }
+    }
+
+    // ── T-54：dry-run 预演 + 提交幂等键（v1 JSON / multipart 双形态） ───────
+
+    /// 单能力模块 fixture（run 无 params schema：校验序列穿过
+    /// manifest/capability 即到输入层）
+    fn single_cap_module(root: &std::path::Path) -> ep_core::module::discovery::DiscoveredModule {
+        let manifest: ep_core::module::manifest::ModuleManifest = toml::from_str(
+            r#"
+[module]
+id = "mock-mod"
+name = "Mock"
+version = "0.1.0"
+description = "test"
+category = "asr"
+genre = "test"
+license = "MIT"
+
+[runtime]
+type = "python"
+
+[compute]
+backends = ["cpu"]
+
+[interface]
+type = "http"
+
+[[interface.capabilities]]
+name = "run"
+description = "test"
+input_type = "text"
+output_type = "text"
+"#,
+        )
+        .unwrap();
+        ep_core::module::discovery::DiscoveredModule {
+            manifest: Some(manifest),
+            path: root.join("modules/mock-mod"),
+            status: ep_core::module::discovery::DiscoveryStatus::Valid,
+        }
+    }
+
+    /// POST JSON 请求构造
+    fn post_json(uri: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    /// T-54 字段反序列化：缺省 dry_run=false / idempotency_key=None；
+    /// 显式值正常解析
+    #[test]
+    fn inference_json_request_parses_dry_run_and_idempotency() {
+        let parsed: InferenceJsonRequest =
+            serde_json::from_value(json!({ "input_text": "hi" })).unwrap();
+        assert!(!parsed.dry_run, "缺省 dry_run 必须 false");
+        assert!(parsed.idempotency_key.is_none());
+
+        let parsed: InferenceJsonRequest = serde_json::from_value(json!({
+            "input_text": "hi",
+            "dry_run": true,
+            "idempotency_key": "agent-key-1"
+        }))
+        .unwrap();
+        assert!(parsed.dry_run);
+        assert_eq!(parsed.idempotency_key.as_deref(), Some("agent-key-1"));
+    }
+
+    /// dry_run=true：校验通过 → 200 计划摘要（would_submit + plan），
+    /// 零副作用——不物化 input_text、不建任务、不拉起模块（模块未运行的
+    /// 证据：process_manager 无实例）。注册表为进程级全局，取执行测试锁
+    /// 保证 is_empty 断言不受并行测试在途任务串染。
+    #[tokio::test]
+    async fn dry_run_returns_plan_without_side_effects() {
+        let _guard = execution::lock_for_tests();
+        execution::clear_registry_for_tests();
+
+        let root = unique_root("v1-dryrun");
+        let state = test_state(
+            root.clone(),
+            AppConfig::default(),
+            vec![single_cap_module(&root)],
+        );
+        let resp = app(state.clone())
+            .oneshot(post_json(
+                "/v1/inference/mock-mod/run",
+                json!({ "input_text": "预演文本", "dry_run": true }),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = json_of(resp).await;
+        assert_eq!(status, StatusCode::OK, "响应: {body}");
+        assert_eq!(body["would_submit"], json!(true));
+        assert_eq!(body["dry_run"], json!(true));
+
+        let plan = &body["plan"];
+        assert_eq!(plan["module_id"], "mock-mod");
+        assert_eq!(plan["capability"], "run");
+        assert_eq!(plan["params"], json!({}));
+        assert_eq!(plan["device"], "cpu", "空设备快照 → select_module_device CPU 兜底");
+        assert_eq!(plan["device_source"], "auto");
+        assert_eq!(plan["input"]["kind"], "text");
+
+        // 零副作用：uploads 无物化文件、注册表无新任务、无模块进程
+        let uploads = input_uploads_dir(&state).await;
+        assert!(
+            !uploads.exists()
+                || std::fs::read_dir(&uploads)
+                    .map(|it| it.count())
+                    .unwrap_or(0)
+                    == 0,
+            "dry-run 不得物化 input_text"
+        );
+        assert!(execution::snapshot_all().is_empty(), "dry-run 不得建任务");
+        assert!(state
+            .process_manager
+            .read()
+            .await
+            .get_instance("mock-mod")
+            .is_none());
+    }
+
+    /// dry_run=true 校验失败照常 400：input_text 与 input_path 同传在
+    /// dry-run 分支之前即拒（校验先行，预演不豁免校验）
+    #[tokio::test]
+    async fn dry_run_validation_failure_still_400() {
+        let root = unique_root("v1-dryrun-bad");
+        let state = test_state(root, AppConfig::default(), vec![]);
+        let resp = app(state)
+            .oneshot(post_json(
+                "/v1/inference/any-mod/any-cap",
+                json!({
+                    "input_text": "a",
+                    "input_path": "b",
+                    "dry_run": true
+                }),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = json_of(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_error_code(&body, "INPUT_INVALID");
+    }
+
+    /// 幂等重放：预登记键 → 提交返回首个 task_id + idempotent_replay 标记，
+    /// 且重放发生在自动拉起之前（mock 模块本会 venv/启动失败——能拿到
+    /// 202 重放即证明查重前置于任何副作用）
+    #[tokio::test]
+    async fn idempotency_replay_returns_first_task_before_autostart() {
+        let _guard = execution::lock_for_tests();
+        execution::clear_registry_for_tests();
+        execution::idempotency_register("v1-replay-key", "task-first").unwrap();
+
+        let root = unique_root("v1-replay");
+        let state = test_state(
+            root.clone(),
+            AppConfig::default(),
+            vec![single_cap_module(&root)],
+        );
+        let resp = app(state.clone())
+            .oneshot(post_json(
+                "/v1/inference/mock-mod/run",
+                json!({ "input_text": "hi", "idempotency_key": "v1-replay-key" }),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = json_of(resp).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "响应: {body}");
+        assert_eq!(body["task_id"], "task-first");
+        assert_eq!(body["idempotent_replay"], json!(true));
+        // 重放零副作用：无模块进程（未走到 autostart）、注册表无新建任务
+        assert!(state
+            .process_manager
+            .read()
+            .await
+            .get_instance("mock-mod")
+            .is_none());
+        assert!(execution::snapshot("task-first").is_none(), "重放不创建/触碰任务记录");
+    }
+
+    /// v1 幂等键超 128 字符 → 400 INPUT_INVALID
+    #[tokio::test]
+    async fn idempotency_key_too_long_is_400() {
+        let root = unique_root("v1-idem-long");
+        let state = test_state(root, AppConfig::default(), vec![]);
+        let resp = app(state)
+            .oneshot(post_json(
+                "/v1/inference/any-mod/any-cap",
+                json!({
+                    "input_text": "hi",
+                    "idempotency_key": "k".repeat(129)
+                }),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = json_of(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_error_code(&body, "INPUT_INVALID");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("128"),
+            "错误信息须指明上限: {body}"
+        );
     }
 }

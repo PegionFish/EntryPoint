@@ -478,6 +478,97 @@ pub(crate) fn parse_priority_u64(raw: Option<u64>) -> Option<u8> {
     raw.and_then(|v| u8::try_from(v).ok())
 }
 
+// ─── T-54：dry-run 预演 + 提交幂等键（Agent 平台链第一环） ──────────────────
+
+/// `idempotency_key` 最大长度（字符数，T-54）：超长 → 400，防无界键撑爆
+/// 进程内侧表。
+pub(crate) const IDEMPOTENCY_KEY_MAX_LEN: usize = 128;
+
+/// `idempotency_key` 字段统一解析（T-54，提交系三个入口共用——
+/// execute/single 请求体、v1 JSON 请求体、v1 multipart 文本字段）：
+/// 缺失/空白串 = 未指定（`Ok(None)`，宽容口径与其余可选字段一致）；
+/// 超 [`IDEMPOTENCY_KEY_MAX_LEN`] 字符 → `Err(技术细节)`（handler 映射 400；
+/// v1 门面映射 INPUT_INVALID）。字符数按 `chars().count()` 计（CJK 友好）。
+pub(crate) fn validate_idempotency_key(raw: Option<&str>) -> Result<Option<String>, String> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(key) if key.chars().count() > IDEMPOTENCY_KEY_MAX_LEN => Err(format!(
+            "`idempotency_key` exceeds the maximum length of {IDEMPOTENCY_KEY_MAX_LEN} characters"
+        )),
+        Some(key) => Ok(Some(key.to_string())),
+    }
+}
+
+/// dry-run 计划摘要组装（T-54；`pub(crate)`：inference.rs v1 门面复用同一形状）。
+///
+/// **纯读零副作用**——取数路径复用 vram-budget（§6.3）同一数据源：
+/// - 变体解析 = `config.active_models` → manifest `default=true` → 首个
+///   （§5.2 单槽位三级回退的预算口径，与 pipelines.rs vram_budget 一致）；
+/// - 显存/内存 = [`ep_core::module::manifest::ModuleManifest::resolve_vram_estimate`]
+///   / `resolve_ram_estimate`（变体级优先、模块级兜底；未声明则字段缺省不出）；
+/// - 设备 = 显式 hint（调用方已硬校验，原样透出）或 [`select_module_device`]
+///   （D-4 调度器统一选择，与真实启动路径同一入口）；
+/// - `input` 描述符由调用方按输入介质给：`{"kind":"path","path":…}` /
+///   `{"kind":"text","chars":…}` / `{"kind":"file","name":…}`。
+pub(crate) async fn build_dry_run_plan(
+    state: &Arc<AppState>,
+    module_id: &str,
+    capability: &str,
+    resolved_params: Value,
+    device_hint: Option<&str>,
+    input: Value,
+) -> Value {
+    let manifest = find_module_manifest(state, module_id)
+        .await
+        .expect("dry-run 前置校验已确认 manifest 存在");
+    let variant = {
+        let cfg = state.config.read().await;
+        cfg.active_models
+            .get(module_id)
+            .cloned()
+            .or_else(|| {
+                manifest
+                    .models
+                    .iter()
+                    .find(|m| m.default)
+                    .or(manifest.models.first())
+                    .map(|m| m.id.clone())
+            })
+    };
+    let (vram_mb, ram_mb) = match &variant {
+        Some(v) => (
+            manifest.resolve_vram_estimate(v),
+            manifest.resolve_ram_estimate(v),
+        ),
+        None => (None, None),
+    };
+    let (device, device_source) = match device_hint {
+        Some(hint) => (hint.to_string(), "explicit"),
+        None => (
+            super::select_module_device(state, &manifest).await.to_string(),
+            "auto",
+        ),
+    };
+    let mut plan = json!({
+        "module_id": module_id,
+        "capability": capability,
+        "params": resolved_params,
+        "device": device,
+        "device_source": device_source,
+        "input": input,
+    });
+    if let Some(v) = variant {
+        plan["model_variant"] = json!(v);
+    }
+    if let Some(mb) = vram_mb {
+        plan["vram_estimate_mb"] = json!(mb);
+    }
+    if let Some(mb) = ram_mb {
+        plan["ram_estimate_mb"] = json!(mb);
+    }
+    plan
+}
+
 /// `input_path` / `input_text` 二选一判定（D2，纯函数单测直接断言）：
 /// 均缺失或同时给出 → [`SingleInputError`]；文本原样保留（不做 trim）。
 pub(crate) fn choose_single_input(
@@ -670,6 +761,28 @@ async fn execute_single(
     // §6.8b force（T-22）：true 时跳过动态 VRAM 准入排队等待；缺省 false。
     // 非 bool 值宽容按缺省处理（与本 handler 其余可选 bool 字段口径一致）
     let force = body.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+    // T-54 dry-run：true = 全部校验通过后不入队，返回「将执行的计划」摘要
+    //（零副作用：不建任务、不占端口、不拉模块、文本输入不物化）。
+    let dry_run = body
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // T-54 提交幂等键（≤128 字符）：超长必须快失败 400（此字段不宽容——
+    // 静默截断/忽略会破坏 Agent 重试安全语义）
+    let idempotency_key = match validate_idempotency_key(
+        body.get("idempotency_key").and_then(|v| v.as_str()),
+    ) {
+        Ok(key) => key,
+        Err(_) => {
+            return err_response(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "apiPipelines.single.idempotencyKeyTooLong",
+                &[("max", IDEMPOTENCY_KEY_MAX_LEN.to_string())],
+            )
+            .await
+        }
+    };
     let request_params = match body.get("params") {
         None | Some(Value::Null) => json!({}),
         Some(p) if p.is_object() => p.clone(),
@@ -762,6 +875,64 @@ async fn execute_single(
         }
     }
 
+    // ── 4.5 幂等键查重（T-54）：字段/模块/capability/参数/设备校验全部通过
+    //    后查进程内侧表，命中 → 直接重放首个 task_id（零副作用：不物化输入、
+    //    不拉起模块、不入队；wait 同步语义亦不适用于重放——立即返回）。 ──
+    if let Some(key) = &idempotency_key {
+        if let Some(first) = execution::idempotency_lookup(key) {
+            return (
+                StatusCode::ACCEPTED,
+                Json(json!({ "task_id": first, "idempotent_replay": true })),
+            );
+        }
+    }
+
+    // ── 4.6 dry-run 预演（T-54）：校验全部通过 → 返回「将执行的计划」摘要
+    //    并就此打住（不入队零副作用）。Path 输入的存在性校验属纯读，照常
+    //    执行（预演同样要求输入真实可用）；Text 输入不物化。 ──
+    if dry_run {
+        let input_desc = match &input_choice {
+            SingleInput::Path(p) => {
+                // T-26：store: 逻辑名解析 + 存在性（与步骤 5 同一校验，纯读）
+                let resolved = match super::stores::resolve_entry_path(
+                    &state,
+                    &p.to_string_lossy(),
+                )
+                .await
+                {
+                    Ok(path) => path,
+                    Err(resp) => return resp,
+                };
+                if !resolved.is_file() {
+                    return err_response(
+                        &state,
+                        StatusCode::BAD_REQUEST,
+                        "apiPipelines.single.inputNotFound",
+                        &[("path", resolved.display().to_string())],
+                    )
+                    .await;
+                }
+                json!({ "kind": "path", "path": resolved.display().to_string() })
+            }
+            SingleInput::Text(text) => {
+                json!({ "kind": "text", "chars": text.chars().count() })
+            }
+        };
+        let plan = build_dry_run_plan(
+            &state,
+            &module_id,
+            &capability,
+            params,
+            device_hint.as_deref(),
+            input_desc,
+        )
+        .await;
+        return (
+            StatusCode::OK,
+            Json(json!({ "would_submit": true, "dry_run": true, "plan": plan })),
+        );
+    }
+
     // ── 5. 输入落位：Path 校验既有存在性；Text 物化为 uploads 下 .txt（D2）──
     let input_path = match &input_choice {
         SingleInput::Path(p) => {
@@ -823,6 +994,12 @@ async fn execute_single(
     .await
     {
         Ok(outcome) => {
+            // T-54：提交成功（任务已创建）即登记幂等键（先到先得；wait 模式
+            // 亦在此登记——重放只要求返回首个 task_id，不重放等待）。
+            // Err = 并发同键竞态下首个任务已在案，本任务照常执行。
+            if let Some(key) = &idempotency_key {
+                let _ = execution::idempotency_register(key, &outcome.task_id);
+            }
             let mut body = json!({ "task_id": outcome.task_id });
             apply_force_response_fields(&state, &mut body, force, &[module_id]).await;
             (StatusCode::ACCEPTED, Json(body))
@@ -2338,5 +2515,424 @@ to = ["output", "input"]
         assert_eq!(parse_priority_u64(Some(50)), Some(50));
         assert_eq!(parse_priority_u64(Some(300)), None);
         assert_eq!(parse_priority_u64(None), None);
+    }
+
+    // ── T-54：dry-run 预演（/execute/single 与 /modules/{id}/runs 共用） ────
+
+    /// dry-run 专用模块清单：带默认模型变体（变体级 vram/ram 声明）+
+    /// 模块级 vram 兜底，供计划摘要的取数路径断言；ready_timeout_secs=1
+    /// 让真实提交路径的失败快速终结（幂等测试复用）。
+    fn dryrun_manifest_toml() -> String {
+        r#"
+[module]
+id = "dryrun-mod"
+name = "dry-run 测试模块"
+version = "0.1.0"
+description = "dry run test module"
+category = "asr"
+genre = "test"
+
+[runtime]
+type = "native"
+binaries = { "test" = "test" }
+start_command = "definitely-not-a-real-command"
+
+[compute]
+backends = ["cpu"]
+vram_estimate_mb = 2048
+
+[[models]]
+id = "base"
+name = "Base"
+source = "url"
+url = "auto"
+target_dir = "never-downloaded-dryrun"
+default = true
+vram_estimate_mb = 1024
+ram_estimate_mb = 256
+
+[interface]
+type = "http"
+health_endpoint = "/health"
+ready_timeout_secs = 1
+
+[[interface.capabilities]]
+name = "run"
+description = "run it"
+input_type = "file"
+output_type = "file"
+
+[interface.capabilities.params]
+beam_size = { type = "integer", min = 1, max = 20 }
+language = { type = "string", default = "auto" }
+"#
+        .to_string()
+    }
+
+    fn dryrun_test_state(root: std::path::PathBuf) -> Arc<AppState> {
+        let manifest: ModuleManifest = toml::from_str(&dryrun_manifest_toml()).unwrap();
+        let module = ep_core::module::discovery::DiscoveredModule {
+            path: root.join("modules").join("dryrun-mod"),
+            manifest: Some(manifest),
+            status: ep_core::module::discovery::DiscoveryStatus::Valid,
+        };
+        Arc::new(AppState::new(
+            root,
+            AppConfig::default(),
+            vec![],
+            vec![module],
+            // 独立区间（避开 direct 48330-48340 / lazy 48350-48360 / device 48360-48370）
+            PortManager::new(48400, 48410),
+        ))
+    }
+
+    /// dry_run=true：校验通过 → 200 计划摘要（would_submit + plan 字段完整，
+    /// 显存取数复用 vram-budget 数据路径），且零副作用（无新任务记录、无进程
+    /// 实例、无端口占用）
+    #[tokio::test]
+    async fn test_single_dry_run_returns_plan_without_side_effects() {
+        let _guard = execution::lock_for_tests();
+        execution::clear_registry_for_tests();
+
+        let root = unique_root("dryrun-plan");
+        let input = root.join("in.txt");
+        std::fs::write(&input, "data").unwrap();
+        let state = dryrun_test_state(root.clone());
+        let tasks_before = execution::snapshot_all().len();
+
+        let resp = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(state.clone())
+            .oneshot(single_request(json!({
+                "module_id": "dryrun-mod",
+                "capability": "run",
+                "params": { "beam_size": 5 },
+                "input_path": input.display().to_string(),
+                "dry_run": true
+            })))
+            .await
+            .unwrap();
+        let (status, body) = single_response(resp).await;
+        assert_eq!(status, StatusCode::OK, "响应: {body}");
+        assert_eq!(body["would_submit"], json!(true));
+        assert_eq!(body["dry_run"], json!(true));
+
+        let plan = &body["plan"];
+        assert_eq!(plan["module_id"], "dryrun-mod");
+        assert_eq!(plan["capability"], "run");
+        // params 为校验 + 默认值注入后的最终形态
+        assert_eq!(plan["params"]["beam_size"], 5);
+        assert_eq!(plan["params"]["language"], "auto");
+        // 设备：devices 快照为空 → select_module_device CPU 兜底；auto 来源
+        assert_eq!(plan["device"], "cpu");
+        assert_eq!(plan["device_source"], "auto");
+        // 变体解析（active_models 缺省 → default 变体）+ 显存/内存预估
+        assert_eq!(plan["model_variant"], "base");
+        assert_eq!(plan["vram_estimate_mb"], 1024, "变体级声明优先于模块级 2048");
+        assert_eq!(plan["ram_estimate_mb"], 256);
+        // 输入描述符（path 介质带解析后路径）
+        assert_eq!(plan["input"]["kind"], "path");
+        assert_eq!(
+            plan["input"]["path"],
+            json!(input.display().to_string())
+        );
+
+        // 零副作用：无新任务记录、无进程实例、无端口占用
+        assert_eq!(
+            execution::snapshot_all().len(),
+            tasks_before,
+            "dry-run 不得创建任务记录"
+        );
+        assert!(state
+            .process_manager
+            .read()
+            .await
+            .get_instance("dryrun-mod")
+            .is_none());
+        assert!(state
+            .port_manager
+            .read()
+            .await
+            .get_port("dryrun-mod")
+            .is_none());
+    }
+
+    /// dry_run=true 跳过模块自动拉起：模型未就绪的模块（真实提交会 409
+    /// ModelNotReady）预演仍 200——行为学证明预演不含拉起步骤
+    #[tokio::test]
+    async fn test_single_dry_run_skips_autostart() {
+        let _guard = execution::lock_for_tests();
+        execution::clear_registry_for_tests();
+
+        let root = unique_root("dryrun-noautostart");
+        let input = root.join("in.txt");
+        std::fs::write(&input, "data").unwrap();
+        let state = dryrun_test_state(root.clone());
+
+        let resp = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(state.clone())
+            .oneshot(single_request(json!({
+                "module_id": "dryrun-mod",
+                "capability": "run",
+                "params": { "beam_size": 5 },
+                "input_path": input.display().to_string(),
+                "dry_run": true
+            })))
+            .await
+            .unwrap();
+        let (status, body) = single_response(resp).await;
+        assert_eq!(status, StatusCode::OK, "预演不得触发拉起: {body}");
+        assert!(state
+            .process_manager
+            .read()
+            .await
+            .get_instance("dryrun-mod")
+            .is_none());
+    }
+
+    /// dry_run=true 时校验失败照常 400：缺必填参数 / 输入文件不存在
+    #[tokio::test]
+    async fn test_single_dry_run_validation_failure_still_400() {
+        let _guard = execution::lock_for_tests();
+        execution::clear_registry_for_tests();
+
+        let root = unique_root("dryrun-badval");
+        let state = dryrun_test_state(root.clone());
+        let app = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(state);
+
+        // 缺必填参数（beam_size 无默认）→ 400（先于 dry-run 分支）
+        let resp = app
+            .oneshot(single_request(json!({
+                "module_id": "dryrun-mod",
+                "capability": "run",
+                "input_path": "/tmp/x.txt",
+                "dry_run": true
+            })))
+            .await
+            .unwrap();
+        let (status, body) = single_response(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "缺少必填参数 'beam_size'");
+
+        // 输入文件不存在 → 400（dry-run 分支内的纯读存在性校验）
+        let app = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(dryrun_test_state(unique_root("dryrun-badinput")));
+        let resp = app
+            .oneshot(single_request(json!({
+                "module_id": "dryrun-mod",
+                "capability": "run",
+                "params": { "beam_size": 5 },
+                "input_path": "/definitely/not/here.txt",
+                "dry_run": true
+            })))
+            .await
+            .unwrap();
+        let (status, body) = single_response(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("/definitely/not/here.txt")
+        );
+    }
+
+    /// dry_run=true + input_text：文本不物化（uploads 目录零新增文件——
+    /// 真实提交路径会在 uploads 物化 .txt，预演必须跳过）
+    #[tokio::test]
+    async fn test_single_dry_run_text_input_not_materialized() {
+        let _guard = execution::lock_for_tests();
+        execution::clear_registry_for_tests();
+
+        let root = unique_root("dryrun-text");
+        let state = dryrun_test_state(root.clone());
+        let resp = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(state)
+            .oneshot(single_request(json!({
+                "module_id": "dryrun-mod",
+                "capability": "run",
+                "params": { "beam_size": 5 },
+                "input_text": "预演文本，不应落盘",
+                "dry_run": true
+            })))
+            .await
+            .unwrap();
+        let (status, body) = single_response(resp).await;
+        assert_eq!(status, StatusCode::OK, "响应: {body}");
+        assert_eq!(body["plan"]["input"]["kind"], "text");
+        assert_eq!(
+            body["plan"]["input"]["chars"],
+            json!("预演文本，不应落盘".chars().count())
+        );
+        let uploads = root.join("workspace").join("uploads");
+        assert!(
+            !uploads.exists()
+                || std::fs::read_dir(&uploads)
+                    .map(|it| it.count())
+                    .unwrap_or(0)
+                    == 0,
+            "dry-run 不得在 uploads 物化文本文件"
+        );
+    }
+
+    // ── T-54：提交幂等键（同键重放 / 异键新任务 / 终态后仍可查 / 超长 400） ──
+
+    /// 同键两次提交 → 同一 task_id + idempotent_replay 标记；不同键 → 新任务；
+    /// 任务终态后同键仍返回首个 task_id
+    #[tokio::test]
+    async fn test_single_idempotency_key_replays_first_task() {
+        let _guard = execution::lock_for_tests();
+        execution::clear_registry_for_tests();
+
+        let root = unique_root("idem-cycle");
+        let state = dryrun_test_state(root.clone());
+        let app = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(state);
+
+        // 首次提交（lazy_start=true：跳过预启动，任务入队后由安全网拉起失败）
+        let first = json!({
+            "module_id": "dryrun-mod",
+            "capability": "run",
+            "params": { "beam_size": 5 },
+            "input_text": "幂等重试语义验证",
+            "lazy_start": true,
+            "idempotency_key": "agent-retry-key-1"
+        });
+        let resp = app.clone().oneshot(single_request(first.clone())).await.unwrap();
+        let (status, body) = single_response(resp).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "响应: {body}");
+        let task_id_1 = body["task_id"].as_str().unwrap().to_string();
+        assert!(body.get("idempotent_replay").is_none(), "首次提交无重放标记");
+
+        // 同键第二次提交 → 同 task_id + idempotent_replay: true（零新任务）
+        let resp = app.clone().oneshot(single_request(first)).await.unwrap();
+        let (status, body) = single_response(resp).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["task_id"], json!(task_id_1), "同键必须重放首个任务");
+        assert_eq!(body["idempotent_replay"], json!(true));
+
+        // 不同键 → 全新任务（不同 task_id）
+        let resp = app
+            .clone()
+            .oneshot(single_request(json!({
+                "module_id": "dryrun-mod",
+                "capability": "run",
+                "params": { "beam_size": 5 },
+                "input_text": "幂等重试语义验证",
+                "lazy_start": true,
+                "idempotency_key": "agent-retry-key-2"
+            })))
+            .await
+            .unwrap();
+        let (status, body) = single_response(resp).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let task_id_2 = body["task_id"].as_str().unwrap().to_string();
+        assert_ne!(task_id_2, task_id_1, "不同键必须产生新任务");
+        assert!(body.get("idempotent_replay").is_none());
+
+        // 等首个任务终态（模块拉起失败 → Failed），同键重放仍返回首个 task_id
+        let record = wait_terminal(&task_id_1).await.expect("任务应终结");
+        assert_eq!(record.status, execution::TaskState::Failed);
+        let resp = app
+            .oneshot(single_request(json!({
+                "module_id": "dryrun-mod",
+                "capability": "run",
+                "params": { "beam_size": 5 },
+                "input_text": "幂等重试语义验证",
+                "lazy_start": true,
+                "idempotency_key": "agent-retry-key-1"
+            })))
+            .await
+            .unwrap();
+        let (status, body) = single_response(resp).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["task_id"], json!(task_id_1), "终态后条目保留（在案期内）");
+        assert_eq!(body["idempotent_replay"], json!(true));
+
+        // 收尾前等 task_2 也终结：测试锁释放时不留任何在途后台任务
+        //（否则其准入/入册写入会串染下一个拿锁测试的注册表断言）
+        let record = wait_terminal(&task_id_2).await.expect("第二个任务应终结");
+        assert_eq!(record.status, execution::TaskState::Failed);
+    }
+
+    /// 幂等键超 128 字符 → 400（快失败，不宽容截断）
+    #[tokio::test]
+    async fn test_single_idempotency_key_too_long_400() {
+        let _guard = execution::lock_for_tests();
+        execution::clear_registry_for_tests();
+
+        let state = dryrun_test_state(unique_root("idem-toolong"));
+        let app = Router::new()
+            .route("/execute/single", post(execute_single))
+            .with_state(state);
+        let long_key = "k".repeat(IDEMPOTENCY_KEY_MAX_LEN + 1);
+        let resp = app
+            .oneshot(single_request(json!({
+                "module_id": "dryrun-mod",
+                "capability": "run",
+                "input_text": "x",
+                "idempotency_key": long_key
+            })))
+            .await
+            .unwrap();
+        let (status, body) = single_response(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains(&IDEMPOTENCY_KEY_MAX_LEN.to_string())
+        );
+    }
+
+    /// validate_idempotency_key 纯函数口径（缺失/空白 = 未指定；字符数计数）
+    #[test]
+    fn validate_idempotency_key_boundaries() {
+        assert_eq!(validate_idempotency_key(None).unwrap(), None);
+        assert_eq!(validate_idempotency_key(Some("  ")).unwrap(), None);
+        assert_eq!(
+            validate_idempotency_key(Some(" agent-1 ")).unwrap(),
+            Some("agent-1".to_string())
+        );
+        let maxed = "k".repeat(IDEMPOTENCY_KEY_MAX_LEN);
+        assert_eq!(
+            validate_idempotency_key(Some(&maxed)).unwrap(),
+            Some(maxed.clone())
+        );
+        assert!(validate_idempotency_key(Some(&(maxed + "k"))).is_err());
+        // CJK 字符按字符数计（128 个汉字合法，129 个拒绝）
+        let cjk = "键".repeat(IDEMPOTENCY_KEY_MAX_LEN);
+        assert!(validate_idempotency_key(Some(&cjk)).is_ok());
+        assert!(validate_idempotency_key(Some(&(cjk + "键"))).is_err());
+    }
+
+    /// 幂等侧表先到先得：register 已有键 → Err(首个 task_id)，查询稳定
+    #[test]
+    fn idempotency_table_first_wins() {
+        let _guard = execution::lock_for_tests();
+        execution::clear_registry_for_tests();
+        assert_eq!(execution::idempotency_lookup("tbl-k"), None);
+        execution::idempotency_register("tbl-k", "task-a").unwrap();
+        assert_eq!(
+            execution::idempotency_lookup("tbl-k"),
+            Some("task-a".to_string())
+        );
+        assert_eq!(
+            execution::idempotency_register("tbl-k", "task-b"),
+            Err("task-a".to_string()),
+            "并发同键先到先得，首个条目不被覆盖"
+        );
+        assert_eq!(
+            execution::idempotency_lookup("tbl-k"),
+            Some("task-a".to_string())
+        );
+        execution::clear_registry_for_tests();
+        assert_eq!(execution::idempotency_lookup("tbl-k"), None, "测试清空钩子生效");
     }
 }

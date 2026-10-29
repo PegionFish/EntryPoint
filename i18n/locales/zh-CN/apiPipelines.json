@@ -32,6 +32,7 @@
   "single.paramMissing": "缺少必填参数 '{{param}}'",
   "single.paramTypeInvalid": "参数 '{{param}}' 类型无效（期望 {{expected}}）",
   "single.paramEnumInvalid": "参数 '{{param}}' 取值不在可选列表内",
+  "single.idempotencyKeyTooLong": "idempotency_key 超过最大长度 {{max}} 字符",
   "single.inputNotFound": "输入文件不存在: {{path}}",
   "single.autostartTimeout": "模块 '{{module_id}}' 自动拉起后 {{secs}}s 内未就绪",
   "single.submitFailed": "直跑任务提交失败: {{detail}}",
