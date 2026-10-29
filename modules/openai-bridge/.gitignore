@@ -1,0 +1,13 @@
+# Python 运行产物
+__pycache__/
+*.pyc
+.pytest_cache/
+.pytest_tmp/
+
+# 本地虚拟环境（依赖安装目录，不入模块仓）
+.venv/
+venv/
+
+# 运行产物（缺省 output 目录）
+output/
+usage.json

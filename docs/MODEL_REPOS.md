@@ -15,7 +15,6 @@ EntryPoint 的每个推理模块（`modules/<module_id>/`）本质上是**对某
 | `faster-whisper` | [SYSTRAN/faster-whisper](https://github.com/SYSTRAN/faster-whisper) | [EntryPoint_faster-whisper](https://github.com/PegionFish/EntryPoint_faster-whisper) | large-v1/v2/v3, medium(.en), small(.en), base(.en), tiny(.en) |
 | `firered-ocr` | [FireRedTeam/FireRed-OCR](https://github.com/FireRedTeam/FireRed-OCR) | [EntryPoint_FireRed-OCR](https://github.com/PegionFish/EntryPoint_FireRed-OCR) | firered-ocr-2b |
 | `kokoro-tts` | [hexgrad/Kokoro-82M](https://github.com/hexgrad/Kokoro-82M) | [EntryPoint_Kokoro-TTS](https://github.com/PegionFish/EntryPoint_Kokoro-TTS) | kokoro-v1.0, kokoro-v1.1-zh |
-| `openai-bridge` | [OpenAI API](https://platform.openai.com/docs/api-reference) | [EntryPoint_OpenAI-Bridge](https://github.com/PegionFish/EntryPoint_OpenAI-Bridge) | （桥模块：无本地模型） |
 | `paddleocr` | [PaddlePaddle/PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) | [EntryPoint_PaddleOCR](https://github.com/PegionFish/EntryPoint_PaddleOCR) | v4-chinese, v5-chinese, pp-structure-v3, paddleocr-vl（T-45；VL 走 local_import 手动落位） |
 | `qwen3-asr` | [QwenLM/Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) | [EntryPoint_Qwen3-ASR](https://github.com/PegionFish/EntryPoint_Qwen3-ASR) | qwen3-asr-0.6b, qwen3-asr-1.7b, qwen3-forced-aligner-0.6b |
 | `qwen3-tts` | [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) | [EntryPoint_Qwen3-TTS](https://github.com/PegionFish/EntryPoint_Qwen3-TTS) | qwen3-tts-0.6b, qwen3-tts-12hz-1.7b-* |
@@ -112,3 +111,6 @@ gh repo create PegionFish/EntryPoint_<模型> --public --description "EntryPoint
 - **主仓库模块更新了但反向 repo 没变？** 重跑 `sync-model-repos.sh` 即可，脚本只改动文件并新增提交，不会改写历史。
 - **Q: 为什么 Real-ESRGAN 一个 repo 两个适配器？** 上游把 AnimeVideo 与 RealESR 两个模型族放在同一项目（共享 `realesrgan` 代码），单独拆分会失去上游对照价值，故同一个 repo 内分 `adapters/` 子目录。
 - **Q: GitHub 许可证徽标没显示？** `gh repo view --json licenseInfo` 若为 null，是 GitHub 索引延迟，检查 repo 根目录是否存在 `LICENSE` 文件即可。
+
+> 注：`modules/openai-bridge`（OpenAI 兼容 API 桥接）为**主线内置**桥接层（非模型适配），
+> 随主仓分发并由 build.ps1 打包进发行 modules/，不在上表模型仓家族内。

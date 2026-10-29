@@ -44,7 +44,7 @@ declare -A MOD_TO_REPO=(
   [waifu2x]="EntryPoint_waifu2x|https://github.com/nagadomi/nunif|waifu2x 图像/视频超分降噪"
   [waifu2x-unlimited]="EntryPoint_waifu2x-unlimited|https://github.com/nagadomi/nunif|waifu2x-unlimited ONNX 本地推理"
   [kokoro-tts]="EntryPoint_Kokoro-TTS|https://github.com/hexgrad/Kokoro-82M|Kokoro TTS 语音合成"
-  [openai-bridge]="EntryPoint_OpenAI-Bridge|https://platform.openai.com/docs/api-reference|OpenAI 兼容 API 桥接（chat/asr/tts/文档）"
+# openai-bridge 不在本映射：非模型适配、纯第一方桥接层，已随主线分发（build.ps1 打包内置）
 )
 
 log() { printf '[sync] %s\n' "$*"; }

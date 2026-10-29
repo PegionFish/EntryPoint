@@ -1,0 +1,96 @@
+# OpenAI 兼容桥接模块清单 —— 按 modules/openai-bridge/CONTRACT.md §1 落盘。
+# 桥接语义（reports/audit/2026-10-25-master-report.md 计划6补充 + T-23 票）：
+# 1. type="python" + backends=["cpu"]：代理本身不做计算，只外连 OpenAI 兼容
+#    API（云端：OpenRouter/SiliconFlow/DeepSeek/Groq…；本地：vLLM/Ollama/LM
+#    Studio…），与 comfyui-bridge 同款桥接模式（MODULE_SPEC §10 复制模板）。
+# 2. 无 [[models]] 声明：桥接模块不携带权重文件；模型由上游服务侧管理，
+#    模型名经 params.model 运行时指定（如 deepseek-chat / whisper-1 / tts-1）。
+# 3. 密钥零明文：本清单与模块目录内不存放任何密钥；密钥只经运行时注入
+#    （params.api_key 运行时值 / params.key_env 环境变量名引用 / 环境变量
+#    OPENAI_API_KEY），服务端集中管理属 T-24 [[llm.providers]] profile 职责。
+
+[module]
+id = "openai-bridge"
+name = "OpenAI 兼容桥接"
+version = "0.1.0"
+description = "把 OpenAI 兼容 API（云端/本地 vLLM·Ollama·LM Studio）接入为标准模块：chat 翻译/润色（SRT 入 → SRT 出时间轴原地重组）、transcribe 云端 ASR 兜底、speak 云端 TTS 兜底"
+category = "custom"
+genre = "openai"
+authors = ["EntryPoint Community"]
+license = "MIT"
+tags = ["openai", "bridge", "llm", "chat", "asr", "tts", "subtitle", "srt"]
+
+[runtime]
+type = "python"
+# 无 torch 等原生 wheel 依赖（fastapi/httpx/uvicorn 均纯 Python 生态），
+# 不设上界 —— Python 3.14 可直接运行（本机验证环境）。
+python_version = ">=3.10"
+entrypoint = "adapter.py"
+start_command = "{venv_python} {MODULE_DIR}/{entrypoint}"
+
+[compute]
+backends = ["cpu"]          # 代理本身不做计算
+default_backend = "cpu"
+ram_estimate_mb = 128       # 纯代理进程，内存占用为 httpx/uvicorn 基线估算（T-20 RAM 池口径）
+
+[compute.env]
+cpu = { OPENAI_BASE_URL = "https://api.openai.com/v1" }
+# 注意：此处绝不注入 OPENAI_API_KEY —— 密钥只经运行时 params / 用户环境变量提供。
+
+[interface]
+type = "http"
+health_endpoint = "/health"
+ready_timeout_secs = 15     # 无模型加载，秒级就绪（私网上游不可达经 /health 503 直白暴露）
+
+[[interface.capabilities]]
+name = "chat"
+description = "文本/字幕处理（翻译/润色/脚本）：SRT 输入时逐段变换并按原时间轴重组（时间轴/序号/样式标签保真），普通文本原样透传上游响应"
+input_type = "text"
+output_type = "text"
+
+[interface.capabilities.params]
+# 除 model 外全部可选：default = ""（daemon 口径「无 default 即必填」；
+# 注入值不参与类型/枚举校验，adapter 侧 "" 视为未设走上游默认）
+model         = { type = "string", description = "上游模型名（如 deepseek-chat / gpt-4o-mini）" }
+system_prompt = { type = "string", default = "", description = "任务指令（如“把每行翻译成简体中文”）" }
+context_in    = { type = "string", default = "", description = "可选参考上下文（术语表/VI 规范/前文；context_in 端口的 params 注入形式），注入 system 上下文" }
+temperature   = { type = "float", default = "", min = 0.0, max = 2.0, description = "采样温度（缺省用上游默认）" }
+base_url      = { type = "string", default = "", description = "覆盖 OPENAI_BASE_URL（须含版本段，如 …/v1）" }
+api_key       = { type = "string", default = "", description = "运行时注入密钥（勿落盘；优先用 key_env）" }
+key_env       = { type = "string", default = "", description = "密钥环境变量名引用（key_ref 形态，如 MY_PROVIDER_KEY）" }
+timeout       = { type = "float", default = "", min = 1, description = "上游超时秒数（缺省 120）" }
+output_format = { type = "select", default = "", options = ["json", "txt", "srt"], description = "文件产物模式（json=文本产物；srt/txt=落盘文件）" }
+
+[[interface.capabilities]]
+name = "transcribe"
+description = "云端 ASR 兜底：纯音频走上游 /audio/transcriptions（透传其文本/SRT）；输入为 SRT 时逐段文本变换（修正/翻译）并按原时间轴重组"
+input_type = "audio"
+output_type = "text"
+
+[interface.capabilities.params]
+model           = { type = "string", description = "上游 ASR 模型名（如 whisper-1 / FunAudioLLM/SenseVoiceSmall）" }
+language        = { type = "string", default = "", description = "语言代码（如 zh/en）或 auto" }
+prompt          = { type = "string", default = "", description = "转写提示词（领域词/拼写引导）" }
+response_format = { type = "select", default = "", options = ["json", "verbose_json", "srt", "vtt", "text"], description = "上游响应格式（缺省 json；output_format=srt 时自动切 srt）" }
+base_url        = { type = "string", default = "", description = "覆盖 OPENAI_BASE_URL" }
+api_key         = { type = "string", default = "", description = "运行时注入密钥（勿落盘）" }
+key_env         = { type = "string", default = "", description = "密钥环境变量名引用" }
+timeout         = { type = "float", default = "", min = 1, description = "上游超时秒数（缺省 120）" }
+output_format   = { type = "select", default = "", options = ["json", "txt", "srt", "vtt"], description = "产物格式（srt=字幕文件，走 MODULE_SPEC §5 产物协议）" }
+
+[[interface.capabilities]]
+name = "speak"
+description = "云端 TTS 兜底/对比：文本 → 上游 /audio/speech 音频文件产物"
+input_type = "text"
+output_type = "audio"
+
+[interface.capabilities.params]
+model           = { type = "string", description = "上游 TTS 模型名（如 tts-1 / fish-speech-1.5）" }
+voice           = { type = "string", default = "", description = "音色（如 alloy；缺省 alloy）" }
+response_format = { type = "select", default = "", options = ["mp3", "opus", "aac", "flac", "wav", "pcm"], description = "音频格式（缺省 mp3，决定产物扩展名）" }
+speed           = { type = "float", default = "", min = 0.25, max = 4.0, description = "语速" }
+base_url        = { type = "string", default = "", description = "覆盖 OPENAI_BASE_URL" }
+api_key         = { type = "string", default = "", description = "运行时注入密钥（勿落盘）" }
+key_env         = { type = "string", default = "", description = "密钥环境变量名引用" }
+timeout         = { type = "float", default = "", min = 1, description = "上游超时秒数（缺省 120）" }
+output_format   = { type = "select", default = "", options = ["mp3", "wav", "flac", "aac", "opus"], description = "产物格式（决定 output_path 扩展名，缺省 mp3）" }

@@ -64,3 +64,6 @@ __pycache__/
 # 开发流：改 modules/<id>/ → scripts/sync-model-repos.sh 反向同步出 repo。
 modules/*
 !modules/README.md
+# openai-bridge 例外：非模型适配、纯第一方桥接层（零密钥/零权重/测试离线），
+# 随主线分发并由 build.ps1 打包进发行 modules/；模型适配层仍全部外部导入。
+!modules/openai-bridge/

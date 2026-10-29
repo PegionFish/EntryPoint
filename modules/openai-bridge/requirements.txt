@@ -1,0 +1,15 @@
+# OpenAI 兼容桥接模块依赖 —— 与 comfyui-bridge 同款 4 行基线（桥接模式复制模板，
+# docs/MODULE_SPEC.md §10.5「requirements 仅 adapter 自身所需」）。
+#
+# 选型说明（T-23 交付物 6）：HTTP 客户端选 httpx 而非 openai 官方 SDK，理由：
+#   1) 与 comfyui-bridge 先例一致（桥接模式统一用 httpx 直连 REST）；
+#   2) 本模块需要逐请求控制 base_url / Authorization 头 / multipart 文件上传 /
+#      音频字节流下载（/audio/speech 返回二进制），httpx 原生直给；
+#   3) SRT 就地重组发生在「上游响应之后」，SDK 的消息抽象帮不上忙，反而引入
+#      自带重试/超时策略与依赖重量（openai SDK 及其 httpx 依赖绑定的额外面）。
+# 兼容性核对（2026-10-25，对照 config/constraints.txt）：constraints 仅一条
+# torch==2.11.0 约束，与本文件零交集 —— 无冲突（代理模块不引 torch 全家桶）。
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+python-multipart>=0.0.6
+httpx>=0.27.0
