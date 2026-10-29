@@ -311,7 +311,13 @@ if ($crtDir) {
 # 配置（整目录复制，与 build.sh 的 cp -a config/. 等价——
 # constraints.txt 等后续新增文件自动包含，避免双平台漂移）
 Copy-Item "$ProjectRoot\config\*" "$packageDir\config\" -Recurse -Force
-Write-Ok "config\ 已复制"
+# T-40 首次运行向导：包内不预置 app.toml（「app.toml 存在 = 已初始化」是
+# WebUI 向导的门控判据，GET /api/setup/status）——以 example 模板形态附带，
+# 由 WebUI 向导/设置保存首次写入时物化（与 build.sh 的 mv 语义对齐）
+if (Test-Path "$packageDir\config\app.toml") {
+    Move-Item "$packageDir\config\app.toml" "$packageDir\config\app.toml.example" -Force
+}
+Write-Ok "config\ 已复制（app.toml 以 app.toml.example 模板附带）"
 
 # 模块
 New-Item -ItemType Directory -Force -Path "$packageDir\modules" | Out-Null

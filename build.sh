@@ -353,7 +353,13 @@ ok "ep-pack CLI 已就位: bin/ep-pack"
 
 # 配置
 cp -a "$PROJECT_ROOT/config/." "$RES/config/"
-ok "config/ 已复制"
+# T-40 首次运行向导：包内不预置 app.toml（「app.toml 存在 = 已初始化」是
+# WebUI 向导的门控判据，GET /api/setup/status）——以 example 模板形态附带，
+# 由 WebUI 向导/设置保存或 deploy.sh 首次写入时物化
+if [[ -f "$RES/config/app.toml" ]]; then
+    mv "$RES/config/app.toml" "$RES/config/app.toml.example"
+fi
+ok "config/ 已复制（app.toml 以 app.toml.example 模板附带）"
 
 # 模块（跳过 __pycache__）
 for m in "$PROJECT_ROOT"/modules/*/; do

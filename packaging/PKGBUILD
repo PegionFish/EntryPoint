@@ -49,7 +49,10 @@ package() {
     install -Dm755 target/release/ep-pack "$pkgdir/opt/entrypoint/bin/ep-pack"
 
     # 配置与模块
-    install -Dm644 config/*.toml "$pkgdir/opt/entrypoint/config/" 2>/dev/null || true
+    # T-40 首次运行向导：包内不预置 app.toml（存在 = 已初始化），以 example 模板附带
+    if [[ -f config/app.toml ]]; then
+        install -Dm644 config/app.toml "$pkgdir/opt/entrypoint/config/app.toml.example"
+    fi
     install -Dm644 config/pipelines/*.toml "$pkgdir/opt/entrypoint/config/pipelines/" 2>/dev/null || true
     cp -r modules/* "$pkgdir/opt/entrypoint/modules/" 2>/dev/null || true
     find "$pkgdir/opt/entrypoint/modules" -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true

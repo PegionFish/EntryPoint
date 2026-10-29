@@ -29,7 +29,9 @@ EntryPoint-vX-linux-x86_64-server/
 ├── start-daemon.sh        # 前台调试启动
 ├── entrypoint.service     # systemd unit 参考模板（deploy.sh 会现场渲染，此文件供高级用户手装）
 ├── webui/                 # WebUI 静态资源
-├── config/                # app.toml + 内置管线 + constraints.txt
+├── config/                # app.toml.example 模板 + 内置管线 + constraints.txt
+│                          # （T-40 首次运行向导：包内不预置 app.toml——文件存在
+│                          #   即视为已初始化；由 WebUI 向导 / deploy.sh / 设置保存首次写入）
 ├── modules/               # Python 模块适配器（不含模型权重）
 ├── workspace/             # 运行期工作目录
 ├── VERSION.txt
@@ -53,6 +55,12 @@ cd EntryPoint-vX-linux-x86_64-server
 ```
 
 完成后浏览器访问 `http://127.0.0.1:9800`（端口以配置为准）。
+
+> **首次运行向导（T-40）**：`deploy.sh install` 会在配置向导步骤把包内
+> `config/app.toml.example` 物化为正式 `config/app.toml` 后合并写入，因此
+> Linux 部署**不会**再弹 WebUI 首次运行向导（文件存在 = 已初始化）。
+> 仅在未经 `deploy.sh`（或未放置 `app.toml`）直接启动 daemon 时，WebUI
+> 首访才弹出向导；跳过 = 按缺省值落盘，行为与旧版一致。
 
 install 流程（每步可交互覆盖，`--yes` 取缺省）：
 

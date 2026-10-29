@@ -169,6 +169,18 @@ require_config() {
     [[ -f "$CONFIG_FILE" ]] || die "未找到 $CONFIG_FILE —— 请确认在解压目录根部运行本脚本（自包含部署）"
 }
 
+# T-40 首次运行向导：全新包只带 app.toml.example 模板（「app.toml 存在 =
+# 已初始化」是 WebUI 向导 GET /api/setup/status 的门控判据）。部署脚本写入
+# 配置前先物化正式文件——deploy.sh 本身就是 Linux 侧的配置向导，物化后
+# WebUI 探测为已初始化，不会再弹向导（零重复打扰）。
+ensure_config_materialized() {
+    if [[ ! -f "$CONFIG_FILE" && -f "${CONFIG_FILE}.example" ]]; then
+        cp "${CONFIG_FILE}.example" "$CONFIG_FILE"
+        ok "已从 app.toml.example 生成 config/app.toml"
+    fi
+    require_config
+}
+
 config_port() {
     local p
     p="$(get_toml_key server port)"
@@ -311,7 +323,7 @@ generate_token() {
 
 run_config_wizard() {
     step "配置向导（合并式写入 $CONFIG_FILE）"
-    require_config
+    ensure_config_materialized
     local cur_host cur_port cur_public cur_http cur_https
     cur_host="$(config_host)"
     cur_port="$(config_port)"
@@ -759,7 +771,7 @@ print_summary() {
 # ── 13. 子命令: install ───────────────────────────────────────────────────────
 cmd_install() {
     step "EntryPoint 安装（自包含目录: ${EP_ROOT}）"
-    require_config
+    ensure_config_materialized
     [[ -x "${EP_ROOT}/bin/ep-daemon" ]] || die "未找到可执行的 ${EP_ROOT}/bin/ep-daemon —— 请在完整解压目录内运行"
 
     # 1) 发行版族探测
