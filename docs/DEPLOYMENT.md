@@ -350,7 +350,8 @@ cargo build -p ep-tray --release   # 与 ep-daemon.exe 放同一目录后双击�
 （含水位线与产物登记表）、Webhook 触发器、存储池逻辑名与模块注册状态，
 一条命令导出为**单个 JSON 迁移包**，在新机一条命令导入。模型权重与模块
 venv 不入包（体积大且 venv 依赖新机 arch 重解析；模块经模块页重新导入，
-requirements 按新机架构自动安装）。
+requirements 按新机后端重装；架构差异（x64↔arm64）当前需人工核对——arch 轴见
+[MODULE_WHEEL_MATRIX.md](MODULE_WHEEL_MATRIX.md) §1「wheel 平台供给」列与 §1.3）。
 
 ### 16.1 导出（旧机）
 
