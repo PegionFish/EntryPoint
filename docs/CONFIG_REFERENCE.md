@@ -77,6 +77,26 @@ cuda_libs_dir = "runtime/cuda-libs"
 # single_device = "cuda:0"    # strategy = "single" 时指定
 ```
 
+**`cuda_libs_dir` 目录应放内容（按平台）**：daemon 只做搜索路径前置注入，不校验目录内容、
+不区分架构——放什么由部署者负责，且**库的架构必须与加载它的模块进程一致**。
+
+| 平台 | 应放内容 | 来源 |
+|---|---|---|
+| Linux | cuBLAS 12 / cuDNN 9 共享库（`libcublas.so.12`、`libcublasLt.so.12`、`libcudnn*.so.9` 等） | CUDA Toolkit / cuDNN 安装目录，或 pip `nvidia-*-cu12` 包内 `lib/` |
+| Windows ARM64（WoA，如 RTX Spark / GB10） | **ARM64 原生 DLL**（PE Machine = `0xAA64`）。T-66 从 CUDA Toolkit 13.4.2 WoA 安装器本机解包得到 8 个（约 835MB）：`cudart64_13.dll`、`cublas64_13.dll`、`cublasLt64_13.dll`、`nvblas64_13.dll`、`cufft64_12.dll`、`curand64_10.dll`、`cusolver64_12.dll`、`cusparse64_12.dll`；cuDNN / NCCL 不在 Toolkit 安装器内（独立分发） | ① CUDA Toolkit 13.4 WoA（2026-09，首个支持 WoA 的版本）安装后的 `bin\`，或用 7-Zip 直接解包安装器；② 随 torch CUDA wheel 自带的 `torch\lib\*.dll`——torch CUDA wheel 当前无 win_arm64 供给（见 [MODULE_WHEEL_MATRIX.md](MODULE_WHEEL_MATRIX.md) §1），该来源要等供给出现后才可用 |
+| Windows x64 | 同类库的 x64 版（PE Machine = `0x8664`），主版本按模块所需 CUDA 版本取（如 CUDA 12 的 `cublas64_12.dll` / `cublasLt64_12.dll`、cuDNN 9 的 `cudnn*64_9.dll`） | CUDA Toolkit / cuDNN（x64） |
+
+- **当前状态**：开发机仓内的 `runtime/cuda-libs` 原先是 13 个 0 字节的 Linux `.so` 占位
+  （`libcublas.so.12` / `libcublasLt.so.12` / `libnvblas.so.12` + `libcudnn*.so.9` ×10，
+  不是真实库，Windows 无法加载），已挪为 `runtime/cuda-libs.broken-linux-symlinks`；
+  `build.ps1` 对 `runtime\cuda-libs` 按存在性随包拷贝，挪走后打包即跳过该目录。
+  上表 ARM64 清单目前只是安装器解包得到的候选物料；**Windows 实际所需清单（哪些模块进程
+  加载哪些 DLL）待 T-66 真机实测后回填本节**。
+- **架构一致**：ARM64 原生进程不能加载 x64 DLL；x64 模拟进程拿不到 GPU（SysWOW64 下无
+  `nvcuda.dll`）——WoA 上走 CUDA 只能是「ARM64 原生模块进程 + ARM64 DLL」。
+- **torch 系模块不依赖 cuda-libs**：torch CUDA wheel 自带所需 CUDA 库（Windows 在
+  `torch\lib\`）；ncnn-vulkan 路线走 Vulkan，同样不需要 cuda-libs。
+
 ### 1.3 `[ports]` — 端口管理
 
 | 字段 | 类型 | 默认值 | 说明 |
@@ -800,7 +820,7 @@ EntryPoint/                        ← 应用根目录
 │   │       ├── ep.lock
 │   │       └── ... (venv 内容)
 │   ├── .uv-cache/                 ← uv 缓存（[python].uv_cache_dir，硬链接去重源）
-│   ├── cuda-libs/                 ← 共享 CUDA 库（[compute].cuda_libs_dir）
+│   ├── cuda-libs/                 ← 共享 CUDA 库（[compute].cuda_libs_dir；按平台应放内容见 §1.2）
 │   ├── packs/                     ← 已装整合包注册表（<pack-id>.json）
 │   ├── tasks/                     ← 任务注册表（原子落盘；重启后非终态任务改判 failed）
 │   ├── watchers.json              ← 触发器规则注册表（原子落盘；WebUI 触发器页 CRUD）
