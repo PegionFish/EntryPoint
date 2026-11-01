@@ -72,8 +72,10 @@ pub fn api_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // 触发规则（PLAN_TRIGGER_UNIFIED_LOG §5.3；巡检循环由 main.rs 驱动）
         .merge(watchers::router())
         // T-13：内置 ffmpeg 模板目录（前端侧栏 / 节点参数表单 / DAG 端口同源）
+        // 路径不含 `/api` 前缀（main.rs nest("/api") 统一挂载；此前误写完整前缀
+        // 致实际落在 /api/api/builtins、前端恒 404——2026-11-01 修复）
         .merge(Router::new().route(
-            "/api/builtins",
+            "/builtins",
             axum::routing::get(builtin_templates),
         ))
         // T-11：存储水位（仪表盘存储卡片 + 下载前空间预检的可观测面）
@@ -419,11 +421,12 @@ async fn builtin_templates() -> Json<Value> {
     }
 
     // T-13：GET /api/builtins 下发内置模板目录（侧栏/参数表单/端口校验同源）
+    // 注：测试直接调 api_router（不含 main.rs 的 nest("/api") 前缀），故 uri 无前缀
     #[tokio::test]
     async fn builtins_route_returns_nine_templates_with_categories() {
         let state = test_state("zh-CN");
         let req = Request::builder()
-            .uri("/api/builtins")
+            .uri("/builtins")
             .body(Body::empty())
             .unwrap();
         let app = api_router(state.clone()).with_state(state.clone());

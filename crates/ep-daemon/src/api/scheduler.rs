@@ -22,12 +22,13 @@ use serde_json::{json, Value};
 use crate::api::execute::execution::{self, QueueStatus};
 use crate::state::AppState;
 
-/// `/api/queue/*` 路由树
+/// `/api/queue/*` 路由树（路径不含 `/api` 前缀：由 main.rs `nest("/api")` 统一挂载；
+/// 此前误写完整前缀导致实际落在 `/api/api/queue`，前端恒 404——2026-11-01 修复）
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/queue", get(queue_status))
-        .route("/api/queue/pause", post(pause_queue))
-        .route("/api/queue/resume", post(resume_queue))
+        .route("/queue", get(queue_status))
+        .route("/queue/pause", post(pause_queue))
+        .route("/queue/resume", post(resume_queue))
 }
 
 /// 统一响应体：`{paused, running, queued}`

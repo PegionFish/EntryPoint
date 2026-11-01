@@ -39,9 +39,10 @@ use serde_json::{Map, Value, json};
 
 use crate::state::AppState;
 
-/// 路由：`GET /api/openapi.json`（挂 `/api` 前缀下，见 api/mod.rs）。
+/// 路由：`GET /api/openapi.json`（路径不含 `/api` 前缀：由 main.rs `nest("/api")`
+/// 统一挂载；此前误写完整前缀导致实际落在 `/api/api/openapi.json`——2026-11-01 修复）。
 pub fn router() -> Router<Arc<AppState>> {
-    Router::new().route("/api/openapi.json", axum::routing::get(openapi_json))
+    Router::new().route("/openapi.json", axum::routing::get(openapi_json))
 }
 
 /// GET /api/openapi.json — 机读规范（每次请求现场组装；文档为纯静态数据，
@@ -794,7 +795,7 @@ mod tests {
         let resp = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/openapi.json")
+                    .uri("/openapi.json")
                     .body(Body::empty())
                     .unwrap(),
             )
