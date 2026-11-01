@@ -293,6 +293,18 @@ Windows 侧用 `build.ps1`（需 PowerShell，Rust 1.97+、Node.js 20+、uv 前�
   Redist 时跳过——目标机需自装 Microsoft Visual C++ Redistributable (ARM64)；
 - clippy/测试仍在主机架构运行（只对产出二进制的 build 步骤做交叉）。
 
+**arm64 包的 ffmpeg（WoA 运行时依赖）**：
+
+- 现状：仓内 `runtime\bin\ffmpeg.exe` / `ffprobe.exe` 是 **x64 PE**（Machine = `0x8664`）；
+  WoA 可经系统 x64 模拟层运行，功能可用但慢（模拟开销）；
+- arm64 原生 ffmpeg 需自备，如 BtbN FFmpeg-Builds 的 `winarm64` 构建产物（例：
+  `ffmpeg-master-latest-winarm64-gpl.zip`；选非 `-shared` 的静态构建，单 exe 自包含）。
+  把包内 `bin\ffmpeg.exe` 与 `bin\ffprobe.exe` 放入（替换）`<EP_ROOT>\runtime\bin\` 即可：
+  daemon 依赖探测（`ep-core` `deps.rs`：`runtime\bin` → PATH → 常见安装路径）与管线节点
+  都优先命中 `runtime\bin`；ffprobe 取与 ffmpeg 同目录的那一份，两者需一并替换；
+- `runtime\bin` **不随包**：`build.ps1` 只对 `runtime\cuda-libs` 做存在性拷贝，ffmpeg 由
+  部署者在目标机自行放置；也可装入 PATH，但 `runtime\bin` 下存在 ffmpeg.exe 时优先于 PATH。
+
 ---
 
 ## 15. ep-tray 托盘管理器（Windows）
