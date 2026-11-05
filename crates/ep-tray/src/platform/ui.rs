@@ -20,7 +20,10 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use crate::autostart;
 use crate::icons;
 use crate::platform::daemon::{DaemonCommand, StateUpdate};
-use crate::platform::probe_ext::{DeviceSnapshot, HealthSnapshot, ProbeSlot, QueueSnapshot};
+use crate::platform::probe_ext::{
+    DeviceSnapshot, HealthSnapshot, ProbeSlot, QueueSnapshot, DEVICES_INTERVAL, HEALTH_INTERVAL,
+    QUEUE_INTERVAL, REQUEST_TIMEOUT, STALE_AFTER,
+};
 use crate::platform::registry::HkuRunKey;
 use crate::supervisor::TrayColor;
 
@@ -45,6 +48,9 @@ pub(crate) struct UiShared {
     pub queue: ProbeSlot<QueueSnapshot>,
     /// /api/devices 快照槽（10s 档，条目 = 物理归并后的设备）
     pub devices: ProbeSlot<Vec<DeviceSnapshot>>,
+    /// CJK 字体加载结果：Some = 已加载的字体文件名；None = 全部候选失败，
+    /// 降级 egui 默认字体（GT-1 的 eprintln 提升为设置页可见状态）
+    pub cjk_font: Option<String>,
 }
 
 /// 主窗口导航页（GT-1 仅骨架，内容归 GT-2/3/5/6）
@@ -101,7 +107,15 @@ impl TrayApp {
         handles: TrayMenuHandles,
         pending_open: bool,
     ) -> Self {
-        load_cjk_fonts(&cc.egui_ctx);
+        let cjk_font_loaded = load_cjk_fonts(&cc.egui_ctx);
+        // 字体加载结果入共享面：GT-2 设置页展示加载状态（失败降级可见化）
+        if let Ok(mut s) = shared.lock() {
+            s.cjk_font = cjk_font_loaded.map(str::to_owned);
+        }
+        // 字体加载结果入共享面：GT-2 设置页展示加载状态（失败降级可见化）
+        if let Ok(mut s) = shared.lock() {
+            s.cjk_font = cjk_font_loaded.map(str::to_owned);
+        }
         Self {
             port,
             cmd_tx,
@@ -283,10 +297,7 @@ impl eframe::App for TrayApp {
                 ui.heading("日志");
                 ui.label("实时日志（/ws/logs + daemon.log + events）与导出：GT-5/GT-6 落地");
             }
-            Page::Settings => {
-                ui.heading("设置");
-                ui.label("root 覆盖 / 轮询间隔 / 缓冲上限：GT-2+ 落地；配置编辑深链 WebUI");
-            }
+            Page::Settings => self.ui_settings(ui),
         });
     }
 }
@@ -306,6 +317,75 @@ impl TrayApp {
 
 /// 探询无数据/失联时的统一占位文案（不显示空白）。
 const PROBE_PLACEHOLDER: &str = "—（探询失联/未就绪）";
+
+/// 设置页最小版（GT-2）：探询节奏只读展示 / 打开 WebUI / 托盘与版本 /
+/// CJK 字体加载状态。root 覆盖、轮询可调、缓冲上限留给后续票。
+impl TrayApp {
+    fn ui_settings(&self, ui: &mut egui::Ui) {
+        ui.heading("设置");
+        let Ok(s) = self.shared.lock() else {
+            ui.label("共享状态不可用（锁中毒）");
+            return;
+        };
+
+        // ── 探询节奏（只读；可调版后续票接线——pub const 已备好接电线）──
+        ui.group(|ui| {
+            ui.strong("探询节奏（当前只读，可调版由后续票接线）");
+            ui.label(format!(
+                "健康 {} 秒 / 队列 {} 秒 / 设备 {} 秒",
+                HEALTH_INTERVAL.as_secs(),
+                QUEUE_INTERVAL.as_secs(),
+                DEVICES_INTERVAL.as_secs()
+            ));
+            ui.label(format!(
+                "单次请求超时 {:.1} 秒 · 失联判定阈值 {} 秒",
+                REQUEST_TIMEOUT.as_secs_f32(),
+                STALE_AFTER.as_secs()
+            ));
+        });
+
+        // ── WebUI（GUI 不承载业务：配置编辑/业务操作深链浏览器）──
+        ui.group(|ui| {
+            ui.strong("WebUI");
+            ui.horizontal(|ui| {
+                if ui.button("打开 WebUI").clicked() {
+                    open_webui(self.port);
+                }
+                ui.weak(format!("http://127.0.0.1:{}", self.port));
+            });
+            ui.weak("业务操作面（模块/任务/配置编辑）：浏览器打开；GUI = 本机运维面");
+        });
+
+        // ── 托盘与版本 ──
+        ui.group(|ui| {
+            ui.strong("托盘与版本");
+            ui.label(format!(
+                "ep-tray v{}（管理台本体）",
+                env!("CARGO_PKG_VERSION")
+            ));
+            match s.health.data.as_ref().filter(|_| s.health.is_fresh()) {
+                Some(h) => {
+                    ui.label(format!("daemon v{}（/api/health 实时）", h.version));
+                }
+                None => {
+                    ui.label(format!("daemon 版本：{PROBE_PLACEHOLDER}"));
+                }
+            }
+            match &s.cjk_font {
+                Some(name) => {
+                    ui.label(format!("中文字体：已加载 {name}"));
+                }
+                None => {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "中文字体：未加载（msyh/simsun 均未找到），中文可能显示为方块",
+                    );
+                }
+            }
+            ui.weak("托盘图标三色随 daemon 状态联动（绿=运行 / 黄=过渡 / 红=故障）");
+        });
+    }
+}
 
 /// 状态页（GT-2）：daemon 卡 / 设备卡 / 队列卡。
 ///
@@ -532,7 +612,8 @@ pub(crate) fn open_webui(port: u16) {
 
 /// CJK 字体运行时加载：微软雅黑（系统必有）→ 失败降级 egui 默认字体。
 /// 不内嵌字体文件（避免 +10MB 产物体积）；全部失败只 eprintln，不阻断启动。
-fn load_cjk_fonts(ctx: &egui::Context) {
+/// 返回值 = 实际加载的字体文件名（None = 全部候选失败，供设置页展示）。
+fn load_cjk_fonts(ctx: &egui::Context) -> Option<&'static str> {
     const CANDIDATES: &[&str] = &[
         r"C:\Windows\Fonts\msyh.ttc",
         r"C:\Windows\Fonts\msyh.ttf",
@@ -550,8 +631,14 @@ fn load_cjk_fonts(ctx: &egui::Context) {
                 }
             }
             ctx.set_fonts(fonts);
-            return;
+            return Some(file_name(path));
         }
     }
     eprintln!("ep-tray: 未找到系统中文字体（msyh/simsun），中文可能显示为方块");
+    None
+}
+
+/// 取路径末段文件名（字体候选路径均为 `\` 分隔的常量，无需 PathBuf）。
+fn file_name(path: &str) -> &str {
+    path.rsplit(['\\', '/']).next().unwrap_or(path)
 }
