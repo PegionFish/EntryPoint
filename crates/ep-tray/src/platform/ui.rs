@@ -399,6 +399,8 @@ impl TrayApp {
             ui.label("共享状态不可用（锁中毒）");
             return;
         };
+        // 设备表格宽于最小窗宽（720px），窄窗下允许双向滚动不裁列
+        egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
 
         // ── daemon 卡：三色圆点 + 状态文字 + 版本 + 端口 + 数据新鲜度 ──
         ui.group(|ui| {
@@ -545,6 +547,7 @@ impl TrayApp {
                     ui.label(PROBE_PLACEHOLDER);
                 }
             }
+        });
         });
     }
 }
