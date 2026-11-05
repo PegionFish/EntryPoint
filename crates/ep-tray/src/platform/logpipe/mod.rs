@@ -24,7 +24,159 @@ pub mod events_jsonl;
 pub mod file_tail;
 pub mod ws_source;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
+
+// ─── 集成：LogPipe::spawn（三源三线程汇入同一 ring） ───────────────────────
+
+/// LogPipe 启动配置。`root` = daemon 根（`runtime/logs` 所在）；daemon 端口
+/// 只喂 WsSource；`ring_cap` = 环形缓冲容量（设置页可调 1000–50000 的接线口，
+/// GT-5 接 UiShared 时换成共享配置即可）；`tail_start` = daemon.log 起始策略
+/// （默认 End 只跟新增，Beginning 供导出/冒烟）。
+#[derive(Debug, Clone)]
+pub struct LogPipeConfig {
+    pub root: std::path::PathBuf,
+    pub daemon_port: u16,
+    pub ring_cap: usize,
+    pub tail_start: file_tail::TailStart,
+}
+
+impl Default for LogPipeConfig {
+    fn default() -> Self {
+        Self {
+            root: std::path::PathBuf::from("."),
+            daemon_port: 9800,
+            ring_cap: LOG_RING_CAP,
+            tail_start: file_tail::TailStart::End,
+        }
+    }
+}
+
+/// 日志引擎命名空间（三源三线程汇流）。线程模式选型：**每源一线程**（而非
+/// 单线程 select）——三源节奏各异（tail 300ms / events 500ms / WS 阻塞读），
+/// 分线程互不拖累且各自单测已覆盖，汇流点只有一个 `Arc<Mutex<LogRing>>`，
+/// 简单可靠；与 GT-1/2 的后台线程先例同模式（IO 全在后台线程，绝不阻塞 UI）。
+pub struct LogPipe;
+
+impl LogPipe {
+    /// 启动日志引擎：起三个后台线程（tail / events / ws），返回句柄供
+    /// UI 侧 drain。与 `UiShared` 解耦（GT-5 日志页自行接线：后台引擎 →
+    /// `drain_new()` → UiShared/直接入 UI 缓存）。
+    ///
+    /// 线程 spawn 失败（极罕见）→ 对应源静默缺席，不影响其余源与句柄。
+    pub fn spawn(cfg: LogPipeConfig) -> LogPipeHandle {
+        let ring = Arc::new(Mutex::new(LogRing::new(cfg.ring_cap)));
+        let ws_status = Arc::new(Mutex::new(ws_source::WsStatus::default()));
+        let jsonl_bad = Arc::new(AtomicU64::new(0));
+
+        // 线程 1：daemon.log tail（300ms 轮）
+        {
+            let path = file_tail::daemon_log_path(&cfg.root);
+            let ring = ring.clone();
+            let start = cfg.tail_start;
+            let _ = std::thread::Builder::new()
+                .name("logpipe-tail".into())
+                .spawn(move || {
+                    let mut tail = file_tail::FileTailSource::new(path, start);
+                    loop {
+                        tail.poll(&mut |line| {
+                            let level = LogRecord::level_from_daemon_line(&line);
+                            if let Ok(mut r) = ring.lock() {
+                                r.push(SystemTime::now(), LogSource::Daemon, level, line);
+                            }
+                        });
+                        std::thread::sleep(file_tail::TAIL_INTERVAL);
+                    }
+                });
+        }
+
+        // 线程 2：events-*.jsonl（500ms 轮；坏行计数定期同步到共享原子量）
+        {
+            let dir = events_jsonl::events_dir(&cfg.root);
+            let ring = ring.clone();
+            let jsonl_bad = jsonl_bad.clone();
+            let _ = std::thread::Builder::new()
+                .name("logpipe-events".into())
+                .spawn(move || {
+                    let mut src = events_jsonl::EventsJsonlSource::new(dir);
+                    loop {
+                        src.poll(&mut |ts, line| {
+                            if let Ok(mut r) = ring.lock() {
+                                r.push(ts, LogSource::Event, None, line);
+                            }
+                        });
+                        jsonl_bad.store(src.bad_lines(), Ordering::Relaxed);
+                        std::thread::sleep(events_jsonl::EVENTS_INTERVAL);
+                    }
+                });
+        }
+
+        // 线程 3：/ws/logs（阻塞读 + 断线指数退避，见 ws_source.rs）
+        {
+            let url = ws_source::ws_logs_url(cfg.daemon_port);
+            let connector = Box::new(ws_source::TungsteniteConnector::new(url));
+            let src = ws_source::WsSource::new(connector, ring.clone(), ws_status.clone());
+            let _ = std::thread::Builder::new()
+                .name("logpipe-ws".into())
+                .spawn(move || src.run());
+        }
+
+        LogPipeHandle {
+            ring,
+            ws_status,
+            jsonl_bad,
+            cursor: 0,
+        }
+    }
+}
+
+/// UI 侧句柄（GT-5 日志页接线面）。每消费者一份（游标独立）；本引擎按
+/// 单 UI 消费者设计，多句柄并存时各游标互不干扰（drain 语义见下）。
+pub struct LogPipeHandle {
+    ring: Arc<Mutex<LogRing>>,
+    ws_status: Arc<Mutex<ws_source::WsStatus>>,
+    jsonl_bad: Arc<AtomicU64>,
+    cursor: u64,
+}
+
+impl LogPipeHandle {
+    /// 取自上次调用以来的新行（游标式增量；本句柄独占游标，需 `&mut self`）。
+    /// 早期行被 ring 挤出时不补历史（缺口经 seq 可检测），由
+    /// [`LogPipeHandle::drop_count`] 提示「已丢弃早期 N 行」。
+    pub fn drain_new(&mut self) -> Vec<LogRecord> {
+        let mut ring = match self.ring.lock() {
+            Ok(r) => r,
+            Err(_) => return Vec::new(), // 锁中毒：静默空（红线：绝不 panic）
+        };
+        let (records, cursor) = ring.drain_since(self.cursor);
+        self.cursor = cursor;
+        records
+    }
+
+    /// 累计丢弃行数（ring 超限挤出的最旧行；GT-5 可提示）
+    pub fn drop_count(&self) -> u64 {
+        self.ring.lock().map(|r| r.dropped()).unwrap_or(0)
+    }
+
+    /// 当前 ring 内行数
+    pub fn ring_len(&self) -> usize {
+        self.ring.lock().map(|r| r.len()).unwrap_or(0)
+    }
+
+    /// WsSource 连接状态快照（「已连接/重连中」徽标）
+    pub fn ws_status(&self) -> ws_source::WsStatus {
+        self.ws_status
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default()
+    }
+
+    /// events jsonl 坏行累计（解析失败被跳过的行数）
+    pub fn jsonl_bad_lines(&self) -> u64 {
+        self.jsonl_bad.load(Ordering::Relaxed)
+    }
+}
 
 // ─── ANSI 剥离（纯函数；daemon.log 为 tracing ANSI 彩色输出） ───────────────
 
@@ -397,4 +549,108 @@ mod tests {
         assert_eq!(records[0].seq, 4);
         assert!(records[0].seq > 0, "缺口：现存首条 seq 大于消费游标");
     }
+
+    // ── 集成：LogPipe::spawn 三源汇流（临时 root；WS 指向必然拒绝的端口，
+    //    后台退避重试不干扰断言）──
+
+    #[test]
+    fn spawn_collects_tail_and_events_into_ring() {
+        let dir = temp_root("spawn");
+        let logs = dir.join("runtime").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        // daemon.log：真实 tracing ANSI 形状
+        std::fs::write(
+            logs.join("daemon.log"),
+            "\x1b[2m2026-08-23T16:56:15.366898Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[2mep_daemon\x1b[0m\x1b[2m:\x1b[0m first line\nsecond plain line\n",
+        )
+        .unwrap();
+        std::fs::write(
+            logs.join("events-2026-08.jsonl"),
+            "{\"ts\":1788057268,\"type\":\"task_terminal\"}\n{\"ts\":1788057269}\n",
+        )
+        .unwrap();
+
+        let cfg = LogPipeConfig {
+            root: dir,
+            daemon_port: 1, // 必然拒绝：WS 线程后台退避，不参与断言
+            ring_cap: LOG_RING_CAP,
+            tail_start: file_tail::TailStart::Beginning,
+        };
+        let mut handle = LogPipe::spawn(cfg);
+        // 300ms tail 轮 + 500ms events 轮 + 余量
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+
+        let records = handle.drain_new();
+        let daemon_lines: Vec<&str> = records
+            .iter()
+            .filter(|r| r.source == LogSource::Daemon)
+            .map(|r| r.line.as_str())
+            .collect();
+        assert_eq!(
+            daemon_lines,
+            vec![
+                "2026-08-23T16:56:15.366898Z  INFO ep_daemon: first line",
+                "second plain line",
+            ],
+            "tail 经 ANSI 剥离入环"
+        );
+        assert_eq!(
+            daemon_lines
+                .iter()
+                .filter_map(|l| LogRecord::level_from_daemon_line(l))
+                .next(),
+            Some(LogLevel::Info)
+        );
+        let event_count = records
+            .iter()
+            .filter(|r| r.source == LogSource::Event)
+            .count();
+        assert_eq!(event_count, 2, "events 启动载入 2 行");
+        assert_eq!(handle.jsonl_bad_lines(), 0);
+        assert_eq!(handle.drop_count(), 0);
+        // 游标增量：立刻再 drain → 空
+        assert!(handle.drain_new().is_empty(), "drain 游标语义");
+    }
+
+    #[test]
+    fn spawn_ring_cap_enforced_with_drop_count() {
+        let dir = temp_root("spawn-cap");
+        let logs = dir.join("runtime").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let mut content = String::new();
+        for i in 0..10 {
+            content.push_str(&format!("line-{i}\n"));
+        }
+        std::fs::write(logs.join("daemon.log"), content).unwrap();
+
+        let cfg = LogPipeConfig {
+            root: dir,
+            daemon_port: 1,
+            ring_cap: 4,
+            tail_start: file_tail::TailStart::Beginning,
+        };
+        let mut handle = LogPipe::spawn(cfg);
+        std::thread::sleep(std::time::Duration::from_millis(900));
+
+        assert_eq!(handle.ring_len(), 4, "容量铁律：缓冲有界");
+        assert_eq!(handle.drop_count(), 6, "10 行入 4 容量环 → 丢 6 条最旧");
+        let records = handle.drain_new();
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0].line, "line-6", "最旧 6 条已挤出");
+        assert_eq!(records[3].line, "line-9");
+    }
+
+    /// 临时 root（runtime/logs 由测试自建）
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "ep-tray-gt4-pipe-{tag}-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    static TMP_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 }
