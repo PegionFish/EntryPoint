@@ -274,12 +274,7 @@ impl eframe::App for TrayApp {
         });
 
         egui::CentralPanel::default().show(ui, |ui| match self.selected {
-            Page::Status => {
-                ui.heading("状态");
-                ui.label(self.last_label.clone().unwrap_or_else(|| "初始化…".into()));
-                ui.separator();
-                ui.label("设备 / 池 / 队列面板：GT-2 落地（消费 /api/devices、/api/queue）");
-            }
+            Page::Status => self.ui_status(ui),
             Page::Control => {
                 ui.heading("管控");
                 ui.label("daemon 启停/重启、自启与模式配置：GT-3 落地（双模式 sidecar ∥ Windows Service）");
@@ -306,6 +301,195 @@ impl TrayApp {
             ),
             None => (TrayColor::Yellow, "启动中…".into()),
         }
+    }
+}
+
+/// 探询无数据/失联时的统一占位文案（不显示空白）。
+const PROBE_PLACEHOLDER: &str = "—（探询失联/未就绪）";
+
+/// 状态页（GT-2）：daemon 卡 / 设备卡 / 队列卡。
+///
+/// 数据全部来自 probe_ext 线程写入 [`UiShared`] 的探询快照；槽位 None 或
+/// 超 [`STALE_AFTER`](probe_ext::STALE_AFTER) 新鲜度 → 统一占位文案。
+/// 守护宕机判定沿 supervisor（顶栏三色圆点，`status_view` 复用）。
+impl TrayApp {
+    fn ui_status(&self, ui: &mut egui::Ui) {
+        ui.heading("状态");
+        let Ok(s) = self.shared.lock() else {
+            ui.label("共享状态不可用（锁中毒）");
+            return;
+        };
+
+        // ── daemon 卡：三色圆点 + 状态文字 + 版本 + 端口 + 数据新鲜度 ──
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                let (color, label) = self.status_view();
+                let (r, g, b) = icons::status_rgb(color);
+                ui.label(
+                    egui::RichText::new("●")
+                        .color(egui::Color32::from_rgb(r, g, b))
+                        .size(16.0),
+                );
+                ui.strong(label);
+                ui.separator();
+                match s.health.data.as_ref().filter(|_| s.health.is_fresh()) {
+                    Some(h) => {
+                        ui.label(format!("daemon v{}", h.version));
+                        ui.weak(format!("健康: {}", h.status));
+                    }
+                    None => {
+                        ui.weak(format!("daemon 版本：{PROBE_PLACEHOLDER}"));
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.weak(format!("端口 {}", self.port));
+                });
+            });
+            // 数据新鲜度行：最后成功轮询时刻；超 10s 标灰提示「探询失联」
+            match (s.health.at, s.health.is_fresh()) {
+                (Some(at), true) => {
+                    ui.weak(format!(
+                        "探询正常（2s 档）· 最后成功 {} 秒前",
+                        at.elapsed().as_secs()
+                    ));
+                }
+                (Some(_), false) => {
+                    ui.colored_label(
+                        egui::Color32::GRAY,
+                        "探询失联：超过 10s 无成功响应（daemon 宕机或拒绝连接）",
+                    );
+                }
+                (None, _) => {
+                    ui.weak("探询未就绪：尚未收到任何成功响应");
+                }
+            }
+        });
+
+        // ── 设备卡：/api/devices 表格（一条 = 物理归并后的设备）──
+        ui.group(|ui| {
+            ui.strong("设备（10s 档）");
+            let devs = s.devices.data.as_ref().filter(|_| s.devices.is_fresh());
+            match devs {
+                Some(devs) if devs.is_empty() => {
+                    ui.weak("（daemon 未报告任何计算设备）");
+                }
+                Some(devs) => {
+                    egui::Grid::new("devices_grid")
+                        .striped(true)
+                        .num_columns(7)
+                        .spacing([16.0, 4.0])
+                        .show(ui, |ui| {
+                            for head in ["名称", "后端", "计算栈", "显存", "已用", "利用率", "温度"]
+                            {
+                                ui.strong(head);
+                            }
+                            ui.end_row();
+                            for d in devs {
+                                ui.label(&d.name);
+                                ui.label(&d.backend);
+                                ui.label(d.stacks.join("/"));
+                                ui.label(mb_to_gb(d.total_memory_mb));
+                                ui.label(mb_to_gb(d.used_memory_mb));
+                                ui.label(metric(d.utilization, "%"));
+                                ui.label(metric(d.temperature, "°C"));
+                                ui.end_row();
+                            }
+                        });
+                }
+                None => {
+                    ui.label(PROBE_PLACEHOLDER);
+                }
+            }
+        });
+
+        // ── 队列卡：paused/running/queued 三个大数字 + 暂停状态徽标 ──
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.strong("队列（5s 档）");
+                let paused_badged = s
+                    .queue
+                    .data
+                    .as_ref()
+                    .filter(|_| s.queue.is_fresh())
+                    .map(|q| q.paused);
+                if let Some(paused) = paused_badged {
+                    if paused {
+                        ui.label(
+                            egui::RichText::new("已暂停派发")
+                                .color(egui::Color32::YELLOW)
+                                .background_color(egui::Color32::from_rgb(70, 60, 20)),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new("派发中")
+                                .color(egui::Color32::from_rgb(80, 200, 120))
+                                .background_color(egui::Color32::from_rgb(20, 60, 40)),
+                        );
+                    }
+                }
+            });
+            match s.queue.data.as_ref().filter(|_| s.queue.is_fresh()) {
+                Some(q) => {
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        big_stat(
+                            ui,
+                            "派发暂停",
+                            if q.paused { "是" } else { "否" },
+                            if q.paused {
+                                egui::Color32::YELLOW
+                            } else {
+                                egui::Color32::from_rgb(80, 200, 120)
+                            },
+                        );
+                        ui.separator();
+                        big_stat(
+                            ui,
+                            "运行中",
+                            &q.running.to_string(),
+                            ui.style().visuals.strong_text_color(),
+                        );
+                        ui.separator();
+                        big_stat(
+                            ui,
+                            "排队中",
+                            &q.queued.to_string(),
+                            ui.style().visuals.strong_text_color(),
+                        );
+                    });
+                    if q.paused {
+                        ui.weak("派发已暂停：排队任务保留，运行中任务照常完成");
+                    }
+                }
+                None => {
+                    ui.label(PROBE_PLACEHOLDER);
+                }
+            }
+        });
+    }
+}
+
+/// 队列卡大数字块（说明行 + 放大数值）。
+fn big_stat(ui: &mut egui::Ui, caption: &str, value: &str, color: egui::Color32) {
+    ui.vertical(|ui| {
+        ui.weak(caption);
+        ui.label(egui::RichText::new(value).size(26.0).color(color).strong());
+    });
+}
+
+/// 显存 MB → GB 显示（None → 占位破折号）。
+fn mb_to_gb(mb: Option<u32>) -> String {
+    match mb {
+        Some(mb) => format!("{:.1} GB", f64::from(mb) / 1024.0),
+        None => "—".into(),
+    }
+}
+
+/// 利用率/温度等小指标显示（None → 占位破折号）。
+fn metric(v: Option<u8>, unit: &str) -> String {
+    match v {
+        Some(v) => format!("{v}{unit}"),
+        None => "—".into(),
     }
 }
 
