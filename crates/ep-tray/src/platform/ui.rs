@@ -20,6 +20,9 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use crate::autostart;
 use crate::icons;
 use crate::platform::daemon::{DaemonCommand, StateUpdate};
+use crate::platform::logpipe::ws_source::WsConnState;
+use crate::platform::logpipe::LogPipeHandle;
+use crate::platform::logs::LogPage;
 use crate::platform::probe_ext::{
     DeviceSnapshot, HealthSnapshot, ProbeSlot, QueueSnapshot, DEVICES_INTERVAL, HEALTH_INTERVAL,
     QUEUE_INTERVAL, REQUEST_TIMEOUT, STALE_AFTER,
@@ -69,6 +72,12 @@ pub(crate) struct TrayApp {
     cmd_tx: Sender<DaemonCommand>,
     shared: Arc<Mutex<UiShared>>,
 
+    // ── GT-5：日志引擎句柄（app.rs creator 里 LogPipe::spawn 的产物；主线程
+    //    独占——logic 帧 drain_new 需 &mut，ws_status/drop_count 为 &self 只读）──
+    log_handle: LogPipeHandle,
+    /// 日志页状态（显示缓冲 + 过滤视图；logic 进数据，ui 渲染）
+    logs: LogPage,
+
     // ── 托盘（TrayIcon 实体在首个 update 帧创建；tray-icon#90 要求事件循环已运行）──
     menu: Menu,
     status_item: MenuItem,
@@ -103,6 +112,7 @@ impl TrayApp {
         port: u16,
         cmd_tx: Sender<DaemonCommand>,
         shared: Arc<Mutex<UiShared>>,
+        log_handle: LogPipeHandle,
         menu: Menu,
         handles: TrayMenuHandles,
         pending_open: bool,
@@ -112,14 +122,12 @@ impl TrayApp {
         if let Ok(mut s) = shared.lock() {
             s.cjk_font = cjk_font_loaded.map(str::to_owned);
         }
-        // 字体加载结果入共享面：GT-2 设置页展示加载状态（失败降级可见化）
-        if let Ok(mut s) = shared.lock() {
-            s.cjk_font = cjk_font_loaded.map(str::to_owned);
-        }
         Self {
             port,
             cmd_tx,
             shared,
+            log_handle,
+            logs: LogPage::new(),
             menu,
             status_item: handles.status_item,
             open_item: handles.open_item,
@@ -232,6 +240,13 @@ impl eframe::App for TrayApp {
 
         self.pump_shared(ctx);
 
+        // GT-5：日志引擎 → 显示缓冲（logic 帧增量 drain；UI 线程零 IO——
+        // IO 全在 logpipe 三线程，本处只搬内存）
+        let new_rows = self.log_handle.drain_new();
+        if !new_rows.is_empty() {
+            self.logs.ingest(new_rows);
+        }
+
         // 关窗拦截：非退出路径 → CancelClose + 缩托盘（eframe 0.37 契约：
         // 取消关闭 = 响应 close_requested 后发 CancelClose）
         if ctx.input(|i| i.viewport().close_requested()) && !self.really_quit {
@@ -293,10 +308,7 @@ impl eframe::App for TrayApp {
                 ui.heading("管控");
                 ui.label("daemon 启停/重启、自启与模式配置：GT-3 落地（双模式 sidecar ∥ Windows Service）");
             }
-            Page::Logs => {
-                ui.heading("日志");
-                ui.label("实时日志（/ws/logs + daemon.log + events）与导出：GT-5/GT-6 落地");
-            }
+            Page::Logs => self.ui_logs(ui),
             Page::Settings => self.ui_settings(ui),
         });
     }
@@ -384,6 +396,81 @@ impl TrayApp {
             }
             ui.weak("托盘图标三色随 daemon 状态联动（绿=运行 / 黄=过渡 / 红=故障）");
         });
+    }
+}
+
+/// 日志页（GT-5）：工具条（WS 连接徽标 + 引擎/缓冲计数）+ 虚拟滚动表格
+/// （表格与过滤渲染由本票后续 commit 接入；工具条数据全部来自 LogPipeHandle
+/// 只读面——logic 帧已 drain，这里不触碰锁）。
+impl TrayApp {
+    fn ui_logs(&mut self, ui: &mut egui::Ui) {
+        ui.heading("日志");
+        let ws = self.log_handle.ws_status();
+        let ring_len = self.log_handle.ring_len();
+        let ring_dropped = self.log_handle.drop_count();
+        let jsonl_bad = self.log_handle.jsonl_bad_lines();
+        let buffer_len = self.logs.buffer.len();
+        let buffer_dropped = self.logs.buffer.dropped();
+
+        ui.horizontal(|ui| {
+            // WS 连接徽标（GT-4 WsStatus）：绿=已连接 / 黄=重连中(第 N 次) /
+            // 灰=未连接。引擎恒启用（三源三线程 spawn 时全起）——GT-4 状态机
+            // 无「未启用」态，断线/未连上统一显示未连接，last_error 挂 tooltip。
+            let (color, text) = match ws.state {
+                WsConnState::Connected => (egui::Color32::from_rgb(80, 200, 120), "WS 已连接".to_owned()),
+                WsConnState::Connecting => (
+                    egui::Color32::YELLOW,
+                    format!("WS 重连中（第 {} 次）", ws.attempts),
+                ),
+                WsConnState::Disconnected => (egui::Color32::GRAY, "WS 未连接".to_owned()),
+            };
+            ui.label(egui::RichText::new("●").color(color).size(14.0));
+            let resp = ui.strong(&text);
+            if let Some(err) = &ws.last_error {
+                resp.on_hover_text(format!("最近错误: {err}"));
+            }
+            ui.separator();
+            ui.weak(format!("引擎 {ring_len} 行"));
+            if ring_dropped > 0 {
+                let resp = ui.colored_label(
+                    egui::Color32::YELLOW,
+                    format!("已丢弃早期 {ring_dropped} 行"),
+                );
+                resp.on_hover_text("引擎环形缓冲（5000 行）超限丢最旧的累计数");
+            }
+            if jsonl_bad > 0 {
+                let resp = ui.colored_label(
+                    egui::Color32::YELLOW,
+                    format!("events 坏行 {jsonl_bad}"),
+                );
+                resp.on_hover_text("events-*.jsonl 解析失败被跳过的行数");
+            }
+            ui.separator();
+            ui.weak(format!("缓冲 {buffer_len} 行"));
+            if buffer_dropped > 0 {
+                let resp = ui.colored_label(
+                    egui::Color32::from_rgb(255, 170, 90),
+                    format!("缓冲淘汰 {buffer_dropped} 行"),
+                );
+                resp.on_hover_text(format!(
+                    "显示缓冲（{LIMIT} 行）超限丢最旧的累计数——回看上限，不影响导出",
+                    LIMIT = crate::platform::logs::DISPLAY_BUFFER_CAP
+                ));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("复制页面摘要").clicked() {
+                    let summary = format!(
+                        "WS={ws_text:?} 引擎={ring_len}行 丢弃={ring_dropped} 缓冲={buffer_len}行",
+                        ws_text = text
+                    );
+                    ui.ctx().copy_text(summary);
+                }
+            });
+        });
+        ui.separator();
+
+        // 过滤器 + 虚拟滚动表格：本票后续 commit 接入（过滤引擎纯逻辑先行）
+        ui.label("（过滤器与虚拟表格由本票后续 commit 接入）");
     }
 }
 

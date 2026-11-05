@@ -19,6 +19,8 @@ use tray_icon::TrayIconEvent;
 
 use crate::autostart;
 use crate::platform::daemon::{run_supervisor_thread, DaemonCommand, DaemonSidecar, StateUpdate};
+use crate::platform::logpipe::{file_tail::TailStart, LogPipe, LogPipeConfig, LOG_RING_CAP};
+use crate::platform::logs::resolve_log_root;
 use crate::platform::mutex::{NamedMutex, TRAY_MUTEX_NAME};
 use crate::platform::registry::HkuRunKey;
 use crate::platform::ui::{TrayApp, TrayMenuHandles, UiShared};
@@ -114,6 +116,14 @@ pub fn run() -> Result<(), String> {
     // 手动启动（无 --minimized）：daemon 首次就绪后自动打开 WebUI 一次
     let pending_open = !minimized;
 
+    // ── GT-5 LogPipe root 解析（daemon 三级口径：EP_ROOT > 标记目录 > cwd；
+    //    启动期一次性解析，无每帧 IO）──
+    let log_root = resolve_log_root(
+        &exe_dir,
+        std::env::var_os("EP_ROOT").map(PathBuf::from),
+        std::env::current_dir().ok(),
+    );
+
     let run_result = eframe::run_native(
         "EntryPoint 管理台",
         native_options,
@@ -172,11 +182,22 @@ pub fn run() -> Result<(), String> {
                         ctx.request_repaint();
                     }));
                 }
+                // ── GT-5：日志引擎（三源三线程，IO 全后台；Handle 交 TrayApp，
+                //    logic 帧 drain——「后台线程写共享 + logic drain」沿 probe_ext 先例）──
+                // tail_start=Beginning：日志页打开即回看 daemon.log 历史
+                // （GT-4 冒烟同语义；超大历史文件由 ring 背压丢最旧兜底，dropped 计数可见）
+                let log_handle = LogPipe::spawn(LogPipeConfig {
+                    root: log_root,
+                    daemon_port: port,
+                    ring_cap: LOG_RING_CAP,
+                    tail_start: TailStart::Beginning,
+                });
                 Ok(Box::new(TrayApp::new(
                     cc,
                     port,
                     cmd_tx,
                     shared,
+                    log_handle,
                     menu,
                     TrayMenuHandles {
                         status_item,
