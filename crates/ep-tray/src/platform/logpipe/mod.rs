@@ -20,6 +20,7 @@
 
 // 子模块接线（逐 commit 加入）：file_tail / events_jsonl / ws_source
 // 各自实现 + 单测独立落地，本文件在集成 commit 提供 LogPipe::spawn 汇流。
+pub mod file_tail;
 
 use std::time::SystemTime;
 
