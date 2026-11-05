@@ -23,6 +23,64 @@
 
 use std::time::SystemTime;
 
+// ─── ANSI 剥离（纯函数；daemon.log 为 tracing ANSI 彩色输出） ───────────────
+
+/// 剥离 ANSI 转义序列，返回纯文本行。
+///
+/// daemon.log 是 tracing 的 ANSI 彩色输出（dim 时间戳/绿色 INFO/斜体字段名），
+/// UI 展示前必须剥离。字节级扫描安全：UTF-8 多字节序列的续字节 ≥ 0x80，
+/// 不可能与 ASCII `ESC`(0x1b) 混淆，非转义字节原样透传（含 CJK）。
+///
+/// 覆盖的序列族：
+/// - **CSI** `ESC [ <params> <final>`（final ∈ 0x40–0x7E）：`ESC[0m` 重置、
+///   `ESC[32m` 前景、`ESC[3m` 斜体、光标移动 `ESC[2J`/`ESC[1;2H` 等；
+/// - **OSC** `ESC ] <payload> BEL` 或 `ESC ] <payload> ESC \`（标题等）；
+/// - **DCS/APC/PM/SOS**（`ESC P/X/^/_` ... `ESC \`）：同 OSC 终止规则；
+/// - 两字节转义（`ESC` + 单字符）与行尾孤 `ESC`：剥弃。
+pub fn strip_ansi(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != 0x1b {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        // bytes[i] == ESC；判断序列族并整体吞掉
+        let next = bytes.get(i + 1).copied();
+        match next {
+            // CSI：吞到 final byte（0x40..=0x7E）
+            Some(b'[') => {
+                i += 2;
+                while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                    i += 1;
+                }
+                i = (i + 1).min(bytes.len()); // 跳过 final byte
+            }
+            // OSC / DCS / SOS / PM / APC：吞到 BEL 或 ST(ESC \)
+            Some(b']' | b'P' | b'X' | b'^' | b'_') => {
+                i += 2;
+                while i < bytes.len() {
+                    if bytes[i] == 0x07 {
+                        i += 1;
+                        break;
+                    }
+                    if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            // 两字节转义（ESC + 单字符，如 ESC M）或行尾孤 ESC
+            Some(_) => i += 2,
+            None => i += 1,
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 // ─── 核心类型 ───────────────────────────────────────────────────────────────
 
 /// ring 容量起步值（契约：默认 5000 行；设置页可调 1000–50000 属 GT-5 接线面，
@@ -177,6 +235,70 @@ mod tests {
     fn ts(secs: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(secs)
     }
+
+    // ── ANSI 剥离：样张 = runtime/logs/daemon.log 真实 tracing 输出（2026-08-23）──
+    //
+    // fixture 常量逐字节取自真文件（ESC = \x1b）：
+    //   \x1b[2m  = dim      \x1b[0m = reset
+    //   \x1b[32m = 绿前景   \x1b[3m = italic（字段名）
+    const FIXTURE_DAEMON_START: &str = concat!(
+        "\x1b[2m2026-08-23T16:56:15.366898Z\x1b[0m ",
+        "\x1b[32m INFO\x1b[0m ",
+        "\x1b[2mep_daemon\x1b[0m\x1b[2m:\x1b[0m EntryPoint Daemon starting...",
+    );
+    const FIXTURE_DAEMON_ROOT: &str = concat!(
+        "\x1b[2m2026-08-23T16:56:15.366920Z\x1b[0m ",
+        "\x1b[32m INFO\x1b[0m ",
+        "\x1b[2mep_daemon\x1b[0m\x1b[2m:\x1b[0m project root resolved ",
+        "\x1b[3mroot\x1b[0m\x1b[2m=\x1b[0m/home/bob/EntryPoint",
+    );
+
+    #[test]
+    fn strip_ansi_real_tracing_line_with_timestamp_and_level() {
+        assert_eq!(
+            strip_ansi(FIXTURE_DAEMON_START),
+            "2026-08-23T16:56:15.366898Z  INFO ep_daemon: EntryPoint Daemon starting..."
+        );
+    }
+
+    #[test]
+    fn strip_ansi_real_tracing_line_with_fields() {
+        assert_eq!(
+            strip_ansi(FIXTURE_DAEMON_ROOT),
+            "2026-08-23T16:56:15.366920Z  INFO ep_daemon: project root resolved root=/home/bob/EntryPoint"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_strips_stripped_line_level_parses() {
+        // 剥离产物与 level_from_daemon_line 串联（真管线形状）
+        let plain = strip_ansi(FIXTURE_DAEMON_START);
+        assert_eq!(
+            LogRecord::level_from_daemon_line(&plain),
+            Some(LogLevel::Info)
+        );
+    }
+
+    #[test]
+    fn strip_ansi_handles_non_color_csi_and_osc() {
+        // 非 m 终符的 CSI（光标/清屏）与 OSC 标题
+        assert_eq!(strip_ansi("\x1b[2J\x1b[1;2Hreset"), "reset", "CSI 吞到字母终符");
+        assert_eq!(strip_ansi("\x1b[38;5;196mred"), "red", "扩展色 SGR");
+        assert_eq!(strip_ansi("\x1b]0;title\x07body"), "body", "OSC+BEL");
+        assert_eq!(strip_ansi("\x1b]8;;http://x\x1b\\link\x1b]8;;\x1b\\"), "link", "OSC+ST");
+        assert_eq!(strip_ansi("\x1bP+q544e\x1b\\after"), "after", "DCS+ST");
+        assert_eq!(strip_ansi("a\x1bMb"), "ab", "两字节转义 ESC M");
+        assert_eq!(strip_ansi("end\x1b"), "end", "行尾孤 ESC 不吞正文");
+    }
+
+    #[test]
+    fn strip_ansi_plain_text_and_cjk_passthrough() {
+        assert_eq!(strip_ansi("plain 123"), "plain 123");
+        assert_eq!(strip_ansi("staging 初始化 budget_mb=7967"), "staging 初始化 budget_mb=7967");
+        // ESC 看似在 CJK 中间也不破坏多字节序列
+        assert_eq!(strip_ansi("中文\x1b[31m红字"), "中文红字");
+    }
+
 
     fn rec(ring: &mut LogRing, i: usize) -> LogRecord {
         let (records, _) = ring.drain_since(0);
