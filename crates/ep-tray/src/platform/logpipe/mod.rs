@@ -22,6 +22,7 @@
 // 各自实现 + 单测独立落地，本文件在集成 commit 提供 LogPipe::spawn 汇流。
 pub mod events_jsonl;
 pub mod file_tail;
+pub mod ws_source;
 
 use std::time::SystemTime;
 
