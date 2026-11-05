@@ -1341,6 +1341,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tray-icon",
+ "tungstenite",
  "ureq",
  "windows-sys 0.61.2",
  "winreg",
