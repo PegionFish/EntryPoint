@@ -16,6 +16,14 @@ tray-icon = "0.26"
 # GUI 事件循环（winit 底座）：主窗口 + 托盘事件轮询宿主。
 # 精确 pin：eframe/egui 版本面变动大，锁死 0.37.0 便于 GT-2~4 接线
 eframe = "=0.37.0"
+# GT-2 状态页轮询（PR 报备新增依赖）：blocking HTTP 客户端，只访问
+# 127.0.0.1:<port>/api/* 明文回环——default-features=false 关掉 TLS/gzip，
+# 产物面最小；请求超时见 platform/probe_ext.rs（红线：绝不阻塞超 3s）
+ureq = { version = "2", default-features = false }
+# 轮询快照反序列化（serde derive）：daemon 响应反序列化成自有快照 struct，
+# 不透传 raw serde_json::Value（UiShared 扩展面类型化）
+serde = { workspace = true }
+serde_json = { workspace = true }
 # HKCU\Software\Microsoft\Windows\CurrentVersion\Run 读写（开机自启开关）
 winreg = "0.56"
 # 命名互斥体（单实例锁；仅 Win32_Foundation + Win32_System_Threading 两个特性面）
