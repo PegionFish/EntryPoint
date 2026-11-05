@@ -20,6 +20,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use crate::autostart;
 use crate::icons;
 use crate::platform::daemon::{DaemonCommand, StateUpdate};
+use crate::platform::probe_ext::{DeviceSnapshot, HealthSnapshot, ProbeSlot, QueueSnapshot};
 use crate::platform::registry::HkuRunKey;
 use crate::supervisor::TrayColor;
 
@@ -35,6 +36,15 @@ pub(crate) struct UiShared {
     pub menu_events: Vec<MenuEvent>,
     /// 托盘图标点击事件
     pub tray_events: Vec<TrayIconEvent>,
+
+    // ── GT-2：daemon HTTP API 探询快照（probe_ext 线程写入；logic/渲染只读；
+    //    GT-4 日志接收口照此模式加字段）──
+    /// /api/health 快照槽（2s 档）
+    pub health: ProbeSlot<HealthSnapshot>,
+    /// /api/queue 快照槽（5s 档）
+    pub queue: ProbeSlot<QueueSnapshot>,
+    /// /api/devices 快照槽（10s 档，条目 = 物理归并后的设备）
+    pub devices: ProbeSlot<Vec<DeviceSnapshot>>,
 }
 
 /// 主窗口导航页（GT-1 仅骨架，内容归 GT-2/3/5/6）

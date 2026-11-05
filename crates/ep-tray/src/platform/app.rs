@@ -138,6 +138,19 @@ pub fn run() -> Result<(), String> {
                         })
                         .map_err(|e| format!("状态转发线程启动失败: {e}"))?;
                 }
+                // GT-2 状态页探询线程：health/queue/devices 三档轮询写 UiShared
+                // （单线程 tick 循环；节奏/超时见 probe_ext.rs pub const；
+                //   生命周期 = 进程生命周期，eframe 退出即随进程终止）
+                {
+                    let shared = Arc::clone(&shared);
+                    let ctx = ctx.clone();
+                    std::thread::Builder::new()
+                        .name("ep-tray-probe".into())
+                        .spawn(move || {
+                            crate::platform::probe_ext::run_probe_thread(port, shared, ctx);
+                        })
+                        .map_err(|e| format!("探询线程启动失败: {e}"))?;
+                }
                 // 托盘菜单事件 → 共享队列 + 即时唤醒（回调在主线程消息泵上）
                 {
                     let shared = Arc::clone(&shared);
