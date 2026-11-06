@@ -103,13 +103,15 @@ impl<T> Default for ProbeSlot<T> {
 }
 
 impl<T> ProbeSlot<T> {
-    fn record_ok(&mut self, data: T) {
+    /// 成功记录（GT-3 scm_watch 复用本槽写服务快照）
+    pub(crate) fn record_ok(&mut self, data: T) {
         self.data = Some(data);
         self.at = Some(Instant::now());
         self.failures = 0;
     }
 
-    fn record_fail(&mut self) {
+    /// 失败记录（data 置 None + 计数）
+    pub(crate) fn record_fail(&mut self) {
         self.data = None;
         self.failures += 1;
     }

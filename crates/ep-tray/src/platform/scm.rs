@@ -19,9 +19,13 @@
 //! 改名必须两处同步（本仓服务端安装脚本与 GUI 管控的唯一约定锚点）。
 
 use std::fmt;
+use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use eframe::egui;
+
+use crate::platform::ui::UiShared;
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_SERVICE_ALREADY_RUNNING,
     ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_NOT_ACTIVE, ERROR_SERVICE_REQUEST_TIMEOUT,
@@ -517,14 +521,49 @@ fn map_last_error(code: u32) -> ScmError {
     }
 }
 
-/// UTF-16 NUL 结尾（Win32 宽字符串入参）。
-fn wide(s: &str) -> Vec<u16> {
+/// UTF-16 NUL 结尾（Win32 宽字符串入参；elevate.rs 复用）。
+pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// 便捷自由函数（模式检测/提权执行器用真实实现直调）。
 pub fn query_service(name: &str) -> Result<ServiceSnap, ScmError> {
     WindowsScm.query(name)
+}
+
+// ─── 模式检测线程（后台线程写共享 + request_repaint，沿 probe_ext 先例） ────
+
+/// 模式复检节奏（派发单口径 30s；启动即先查一轮，UI 无空窗）
+pub const SCM_RECHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// 模式检测线程主循环（app.rs creator 闭包内 spawn）。
+///
+/// 每轮：`query(SERVICE_NAME)`（读路径，标准用户可用，无 UAC）→ 写
+/// [`UiShared::mode`] 徽章 + [`UiShared::service`] 快照槽 → 唤醒 egui。
+/// 线程生命周期 = 进程生命周期（与 probe_ext 同款，无退出通道）。
+pub(crate) fn run_scm_watch(shared: Arc<Mutex<UiShared>>, ctx: egui::Context) {
+    let scm = WindowsScm;
+    loop {
+        let query = scm.query(SERVICE_NAME);
+        if let Ok(mut s) = shared.lock() {
+            s.mode = RunMode::detect(&query);
+            match query {
+                Ok(snap) => s.service.record_ok(snap),
+                // 未安装 = sidecar 常态：只记数不刷日志
+                Err(ScmError::NotFound) => s.service.record_fail(),
+                Err(e) => {
+                    // SCM 异常失败：节流日志（首次 + 每 30 次≈每 15 分钟一条）
+                    let n = s.service.failures;
+                    s.service.record_fail();
+                    if n == 0 || (n + 1).is_multiple_of(30) {
+                        eprintln!("ep-tray: SCM 查询连续失败 {} 次: {e}", n + 1);
+                    }
+                }
+            }
+            ctx.request_repaint();
+        }
+        std::thread::sleep(SCM_RECHECK_INTERVAL);
+    }
 }
 
 // ─── 单测（读路径真跑：标准用户 SC_MANAGER_CONNECT 可用；写路径不在此测，

@@ -28,6 +28,7 @@ use crate::platform::probe_ext::{
     QUEUE_INTERVAL, REQUEST_TIMEOUT, STALE_AFTER,
 };
 use crate::platform::registry::HkuRunKey;
+use crate::platform::scm::{RunMode, ServiceSnap, SERVICE_NAME};
 use crate::supervisor::TrayColor;
 
 /// CREATE_NO_WINDOW：隐藏 cmd 子进程的控制台窗口（开浏览器用）
@@ -54,6 +55,13 @@ pub(crate) struct UiShared {
     /// CJK 字体加载结果：Some = 已加载的字体文件名；None = 全部候选失败，
     /// 降级 egui 默认字体（GT-1 的 eprintln 提升为设置页可见状态）
     pub cjk_font: Option<String>,
+
+    // ── GT-3：运行模式 + SCM 服务快照（scm_watch 线程启动即查 + 30s 复检；
+    //    管控页提权动作完成后由动作线程即时复检刷新）──
+    /// 运行模式徽章（Service=EntryPoint 服务已安装 / Sidecar=未安装）
+    pub mode: RunMode,
+    /// EntryPoint 服务快照槽（Service 模式管控页/状态页显示；sidecar 时常为空）
+    pub service: ProbeSlot<ServiceSnap>,
 }
 
 /// 主窗口导航页（GT-1 仅骨架，内容归 GT-2/3/5/6）
@@ -308,6 +316,20 @@ impl eframe::App for TrayApp {
                     if ui.button("打开 WebUI").clicked() {
                         open_webui(self.port);
                     }
+                    ui.separator();
+                    // GT-3 模式徽章（全局）：sidecar ∥ Windows Service
+                    let mode = self
+                        .shared
+                        .lock()
+                        .map(|s| s.mode)
+                        .unwrap_or(RunMode::Sidecar);
+                    let (text, fg, tip) = mode_badge_view(mode);
+                    let badge = ui.label(
+                        egui::RichText::new(text)
+                            .color(fg)
+                            .background_color(egui::Color32::from_rgb(40, 44, 52)),
+                    );
+                    badge.on_hover_text(tip);
                 });
             });
         });
@@ -379,6 +401,26 @@ impl TrayApp {
 
 /// 探询无数据/失联时的统一占位文案（不显示空白）。
 const PROBE_PLACEHOLDER: &str = "—（探询失联/未就绪）";
+
+/// 模式徽章视图（纯函数）：返回 (文字, 前景色, tooltip)——顶部全局徽章与
+/// 管控页共用。颜色语义与 daemon 状态三色正交（青=Service / 灰=sidecar）。
+pub(crate) fn mode_badge_view(mode: RunMode) -> (&'static str, egui::Color32, &'static str) {
+    match mode {
+        RunMode::Service => (
+            "服务模式",
+            egui::Color32::from_rgb(110, 195, 205),
+            concat!(
+                "Windows 服务（EntryPoint）已安装：daemon 由 SCM 托管；",
+                "启停/重启/自启写操作经 UAC 提权一次性子进程执行"
+            ),
+        ),
+        RunMode::Sidecar => (
+            "sidecar 模式",
+            egui::Color32::GRAY,
+            "Windows 服务未安装：daemon 由 ep-tray 以子进程（sidecar）托管；可在管控页查看服务安装指引",
+        ),
+    }
+}
 
 /// 设置页最小版（GT-2）：探询节奏只读展示 / 打开 WebUI / 托盘与版本 /
 /// CJK 字体加载状态。root 覆盖、轮询可调、缓冲上限留给后续票。
@@ -582,6 +624,32 @@ impl TrayApp {
                     ui.weak("探询未就绪：尚未收到任何成功响应");
                 }
             }
+            // ── 运行模式行（GT-3 徽章，scm_watch 30s 复检）──
+            let mode_line = {
+                let mode = s.mode;
+                match s.service.data.as_ref() {
+                    Some(snap) if mode == RunMode::Service => {
+                        let state = snap
+                            .status
+                            .map(|st| st.label())
+                            .unwrap_or("状态未知");
+                        let recheck = s
+                            .service
+                            .at
+                            .map(|at| format!("，{} 秒前复检", at.elapsed().as_secs()))
+                            .unwrap_or_default();
+                        format!(
+                            "运行模式：Windows 服务（{SERVICE_NAME}）· {state} · 启动类型 {}{recheck}",
+                            snap.start.label()
+                        )
+                    }
+                    Some(_) | None if mode == RunMode::Service => {
+                        "运行模式：Windows 服务（服务快照待复检）".to_owned()
+                    }
+                    _ => "运行模式：sidecar（ep-tray 托管；Windows 服务未安装）".to_owned(),
+                }
+            };
+            ui.weak(mode_line);
         });
 
         // ── 设备卡：/api/devices 表格（一条 = 物理归并后的设备）──
@@ -781,4 +849,37 @@ fn load_cjk_fonts(ctx: &egui::Context) -> Option<&'static str> {
 /// 取路径末段文件名（字体候选路径均为 `\` 分隔的常量，无需 PathBuf）。
 fn file_name(path: &str) -> &str {
     path.rsplit(['\\', '/']).next().unwrap_or(path)
+}
+
+// ─── 单测（纯函数：模式徽章视图；页面渲染走实跑截图留证，见 GT-3 报告） ────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::scm::SCM_RECHECK_INTERVAL;
+
+    #[test]
+    fn mode_badge_covers_both_modes() {
+        let (text, fg, tip) = mode_badge_view(RunMode::Service);
+        assert_eq!(text, "服务模式");
+        assert_ne!(fg, egui::Color32::GRAY, "Service 徽章应与 sidecar 灰色区分");
+        assert!(tip.contains("UAC"), "Service tooltip 应说明提权语义");
+
+        let (text, fg, tip) = mode_badge_view(RunMode::Sidecar);
+        assert_eq!(text, "sidecar 模式");
+        assert_eq!(fg, egui::Color32::GRAY);
+        assert!(tip.contains("sidecar"));
+    }
+
+    #[test]
+    fn uishared_defaults_to_sidecar_mode() {
+        let s = UiShared::default();
+        assert_eq!(s.mode, RunMode::Sidecar, "缺省 sidecar（服务未检测时不误标）");
+        assert!(s.service.data.is_none(), "快照槽初始为空");
+    }
+
+    #[test]
+    fn scm_recheck_interval_is_30s() {
+        assert_eq!(SCM_RECHECK_INTERVAL.as_secs(), 30, "派发单口径：30s 复检");
+    }
 }

@@ -161,6 +161,19 @@ pub fn run() -> Result<(), String> {
                         })
                         .map_err(|e| format!("探询线程启动失败: {e}"))?;
                 }
+                // GT-3 模式检测线程：SCM query(EntryPoint) 启动即查 + 30s 复检
+                // （读路径标准用户可用无 UAC；写 UiShared.mode/service——
+                //   顶部/状态页模式徽章与管控页的数据源）
+                {
+                    let shared = Arc::clone(&shared);
+                    let ctx = ctx.clone();
+                    std::thread::Builder::new()
+                        .name("ep-tray-scm-watch".into())
+                        .spawn(move || {
+                            crate::platform::scm::run_scm_watch(shared, ctx);
+                        })
+                        .map_err(|e| format!("模式检测线程启动失败: {e}"))?;
+                }
                 // 托盘菜单事件 → 共享队列 + 即时唤醒（回调在主线程消息泵上）
                 {
                     let shared = Arc::clone(&shared);
