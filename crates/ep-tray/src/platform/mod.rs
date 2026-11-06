@@ -6,6 +6,7 @@
 //! - [`daemon`]：ep-daemon sidecar 托管线程（spawn/探活/重启接线）
 //! - [`probe_ext`]：daemon HTTP API 轮询线程（GT-2 状态页快照源）
 //! - [`logpipe`]：日志引擎（GT-4，三源汇流 + 环形缓冲；GT-5 日志页接线）
+//! - [`scm`]：Windows 服务控制管理器封装（GT-3：模式检测 + 双模式管控读/写面）
 //! - [`mutex`]：单实例锁的真实实现（命名互斥体）
 //! - [`registry`]：开机自启的真实实现（HKCU Run 键）
 
@@ -16,4 +17,5 @@ pub mod logs;
 pub mod mutex;
 pub mod probe_ext;
 pub mod registry;
+pub mod scm;
 pub mod ui;
