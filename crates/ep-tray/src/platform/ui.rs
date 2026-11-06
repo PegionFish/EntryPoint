@@ -11,7 +11,7 @@
 use std::os::windows::process::CommandExt as _; // creation_flags（open_webui）
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem};
@@ -101,6 +101,16 @@ pub(crate) struct TrayApp {
     really_quit: bool,
     /// Shutdown 命令只发一次
     shutdown_sent: bool,
+    /// 帧率实测（EP_TRAY_FRAME_DEBUG=1 时每 60 帧打印平均耗时；GT-5 留证用）
+    frame_dbg: FrameDebug,
+}
+
+/// 帧耗时累计（`frame_debug_enabled` 门控，生产零输出）
+#[derive(Default)]
+struct FrameDebug {
+    frames: u64,
+    logic: Duration,
+    ui: Duration,
 }
 
 impl TrayApp {
@@ -122,7 +132,18 @@ impl TrayApp {
         if let Ok(mut s) = shared.lock() {
             s.cjk_font = cjk_font_loaded.map(str::to_owned);
         }
+        // 联调钩子：EP_TRAY_PAGE=logs|control|settings 覆盖起始页（截图留证用）
+        let selected = std::env::var("EP_TRAY_PAGE")
+            .ok()
+            .and_then(|p| match p.as_str() {
+                "control" => Some(Page::Control),
+                "logs" => Some(Page::Logs),
+                "settings" => Some(Page::Settings),
+                _ => None,
+            })
+            .unwrap_or(Page::Status);
         Self {
+            selected,
             port,
             cmd_tx,
             shared,
@@ -138,12 +159,12 @@ impl TrayApp {
             quit_item: handles.quit_item,
             tray: None,
             current_color: None,
-            selected: Page::Status,
             last_label: None,
             pending_open,
             pending_show: false,
             really_quit: false,
             shutdown_sent: false,
+            frame_dbg: FrameDebug::default(),
         }
     }
 
@@ -227,6 +248,7 @@ impl eframe::App for TrayApp {
     /// 帧逻辑（含窗口隐藏时——supervisor 状态/托盘事件靠 forwarder 的
     /// request_repaint 唤醒本方法继续驱动托盘图标与命令）。
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let t0 = Instant::now();
         // 首次：创建托盘实体（tray-icon#90：须在事件循环运行后创建）
         if self.tray.is_none() {
             match build_tray(&self.menu) {
@@ -246,6 +268,8 @@ impl eframe::App for TrayApp {
         if !new_rows.is_empty() {
             self.logs.ingest(new_rows);
         }
+        // 帧率实测钩子（EP_TRAY_LOG_BENCH=<n>；缓冲为空时首帧注入一次）
+        crate::platform::logs::maybe_bench_inject(&mut self.logs);
 
         // 关窗拦截：非退出路径 → CancelClose + 缩托盘（eframe 0.37 契约：
         // 取消关闭 = 响应 close_requested 后发 CancelClose）
@@ -263,10 +287,13 @@ impl eframe::App for TrayApp {
 
         // 空闲保活：5fps 轮询兜底（探活节奏 400ms；forwarder 线程另有即时唤醒）
         ctx.request_repaint_after(Duration::from_millis(200));
+
+        self.frame_dbg.logic += t0.elapsed();
     }
 
     /// 主窗口渲染（0.37 新签名：裸 &mut Ui，无 margin——CentralPanel 兜底）。
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let t0 = Instant::now();
         egui::Panel::top("top_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 let (color, label) = self.status_view();
@@ -311,6 +338,29 @@ impl eframe::App for TrayApp {
             Page::Logs => self.ui_logs(ui),
             Page::Settings => self.ui_settings(ui),
         });
+
+        // 帧率实测（EP_TRAY_FRAME_DEBUG=1；GT-5 留证）
+        self.frame_dbg.ui += t0.elapsed();
+        self.frame_debug_tick();
+    }
+}
+
+impl TrayApp {
+    /// 每 60 帧打印一次平均耗时（窗口可见时才计入 ui 值；stderr 输出）
+    fn frame_debug_tick(&mut self) {
+        if !crate::platform::logs::frame_debug_enabled() {
+            return;
+        }
+        self.frame_dbg.frames += 1;
+        if self.frame_dbg.frames.is_multiple_of(60) {
+            eprintln!(
+                "ep-tray: 帧均耗时（最近 60 帧）：logic={:?} ui={:?}",
+                self.frame_dbg.logic / 60,
+                self.frame_dbg.ui / 60
+            );
+            self.frame_dbg.logic = Duration::ZERO;
+            self.frame_dbg.ui = Duration::ZERO;
+        }
     }
 }
 
@@ -469,8 +519,8 @@ impl TrayApp {
         });
         ui.separator();
 
-        // 过滤器 + 虚拟滚动表格：本票后续 commit 接入（过滤引擎纯逻辑先行）
-        ui.label("（过滤器与虚拟表格由本票后续 commit 接入）");
+        // 过滤器 + 跟随/暂停 + 虚拟滚动表格（logs.rs LogPage）
+        self.logs.show(ui);
     }
 }
 

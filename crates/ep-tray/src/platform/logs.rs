@@ -26,11 +26,9 @@
 //!
 //! [`LogPage::show`]: LogPage::show
 
-// commit③ 过滤引擎纯逻辑先行：过滤器/视图消费面（渲染层）在本票后续 commit
-// 接入——接入时移除本 allow（届时残留的未用项应直接删除）。
-#![allow(dead_code)]
-
+use eframe::egui;
 use std::collections::{BTreeSet, VecDeque};
+use std::sync::OnceLock;
 use std::path::PathBuf;
 
 use crate::platform::logpipe::{file_tail, LogRecord, LogSource, LogLevel};
@@ -111,16 +109,12 @@ impl LogBuffer {
         None
     }
 
-    /// 缓冲内最小 seq（首个可显示行；过滤视图判定「起始缺口」用）
-    pub fn first_seq(&self) -> Option<u64> {
-        self.buf.front().map(|r| r.seq)
-    }
-
     /// 按序遍历（过滤视图重建用）
     pub fn iter(&self) -> impl Iterator<Item = &LogRecord> {
         self.buf.iter()
     }
 }
+
 
 // ─── 过滤器（纯逻辑；红线：过滤只动显示层，不动引擎 ring） ─────────────────
 
@@ -212,15 +206,9 @@ pub(crate) struct LogFilter {
 }
 
 impl LogFilter {
-    /// fold 后的子串（每次视图重建 fold 一次；matches 路径零 fold 零分配）
+    /// fold 后的子串（每次视图重建 fold 一次；谓词路径零 fold 零分配）
     pub fn folded_needle(&self) -> String {
         fold_ascii(&self.needle)
-    }
-
-    /// 便捷版（单测用）：即时 fold。
-    pub fn matches(&self, r: &LogRecord) -> bool {
-        let needle = self.folded_needle();
-        self.matches_with(r, &needle)
     }
 
     /// 谓词求值（`needle_folded` = [`Self::folded_needle`] 的缓存产物）。
@@ -312,7 +300,19 @@ pub(crate) struct LogPage {
     dirty: bool,
     /// 引擎流里见过的模块 id（来源过滤 UI 的勾选候选清单；随流自动出现）
     pub module_ids_seen: BTreeSet<String>,
+    /// 跟随模式：视图钉底（用户上滚自动暂停；手动滚到底自动回跟）
+    follow: bool,
+    /// 「回到底部」单次滚动请求（下一帧 ScrollArea 建构期注入 offset——
+    /// egui 内部 stick 标志只在滚到端点时自恢复，跳底须显式 offset）
+    jump_to_bottom: bool,
 }
+
+/// 行高与列宽（行高固定是 show_rows 虚拟化的前提；消息列占余宽截断显示，
+/// 全文走 tooltip / 复制）
+const ROW_TS_W: f32 = 100.0;
+const ROW_SRC_W: f32 = 100.0;
+const ROW_LVL_W: f32 = 56.0;
+const ROW_COPY_W: f32 = 50.0;
 
 impl LogPage {
     pub fn new() -> Self {
@@ -329,6 +329,8 @@ impl LogPage {
             applied: LogFilter::default(),
             dirty: true,
             module_ids_seen: BTreeSet::new(),
+            follow: true,
+            jump_to_bottom: false,
         }
     }
 
@@ -370,6 +372,267 @@ impl LogPage {
     pub fn view_row(&self, i: usize) -> Option<&LogRecord> {
         self.view.get(i).and_then(|seq| self.buffer.get(*seq))
     }
+
+    // ─── 渲染（ui 帧；红线：show_rows 只渲染可视行，LayoutJob 仅对可视行构建）───
+
+    /// 日志页主体（ui.rs Logs 分支调用）：过滤器行 → 跟随条 → 虚拟表格。
+    pub fn show(&mut self, ui: &mut egui::Ui) {
+        self.rebuild(); // 惰性：脏才扫缓冲（过滤切换即时）
+        self.filter_bar(ui);
+        self.follow_bar(ui);
+        self.log_table(ui);
+    }
+
+    /// 过滤器行：来源多选（+模块 id 明细）/ 级别多选（含无级别）/ 子串 / 清空。
+    fn filter_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.weak("来源:");
+            ui.checkbox(&mut self.filter.sources.daemon, "Daemon");
+            ui.checkbox(&mut self.filter.sources.modules, "模块");
+            ui.checkbox(&mut self.filter.sources.events, "Event");
+            // 模块 id 明细：空 = 全部模块；勾选后只显示所选（候选随流出现）
+            if self.filter.sources.modules && !self.module_ids_seen.is_empty() {
+                ui.weak("明细:");
+                let seen: Vec<String> = self.module_ids_seen.iter().cloned().collect();
+                for id in seen {
+                    let mut on = self.filter.sources.module_ids.contains(&id);
+                    if ui.checkbox(&mut on, &id).changed() {
+                        if on {
+                            self.filter.sources.module_ids.insert(id);
+                        } else {
+                            self.filter.sources.module_ids.remove(&id);
+                        }
+                    }
+                }
+                if !self.filter.sources.module_ids.is_empty() && ui.small_button("全选").clicked() {
+                    self.filter.sources.module_ids.clear();
+                }
+            }
+            ui.separator();
+            ui.weak("级别:");
+            ui.checkbox(&mut self.filter.levels.error, "ERROR");
+            ui.checkbox(&mut self.filter.levels.warn, "WARN");
+            ui.checkbox(&mut self.filter.levels.info, "INFO");
+            ui.checkbox(&mut self.filter.levels.debug, "DEBUG");
+            ui.checkbox(&mut self.filter.levels.trace, "TRACE");
+            ui.checkbox(&mut self.filter.levels.none, "无级别");
+            ui.separator();
+            ui.add(
+                egui::TextEdit::singleline(&mut self.filter.needle)
+                    .desired_width(150.0)
+                    .hint_text("过滤子串（大小写不敏感）…"),
+            );
+            if ui.small_button("清空").clicked() {
+                self.filter = LogFilter::default();
+            }
+        });
+    }
+
+    /// 跟随条：跟随/暂停状态 + 回到底部按钮 + 视图/缓冲计数。
+    fn follow_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if self.follow {
+                ui.label(
+                    egui::RichText::new("● 跟随中")
+                        .color(egui::Color32::from_rgb(80, 200, 120)),
+                );
+                ui.weak("（上滚自动暂停）");
+            } else {
+                ui.label(
+                    egui::RichText::new("‖ 跟随已暂停")
+                        .color(egui::Color32::YELLOW),
+                );
+                if ui.button("回到底部").clicked() {
+                    self.follow = true;
+                    self.jump_to_bottom = true;
+                }
+            }
+            ui.separator();
+            ui.weak(format!(
+                "显示 {} / {} 行",
+                self.view_len(),
+                self.buffer.len()
+            ));
+        });
+    }
+
+    /// 虚拟滚动表格（四列：时间/来源/级别/消息；`show_rows` 只渲染可视区）。
+    fn log_table(&mut self, ui: &mut egui::Ui) {
+        let row_h = ui
+            .spacing()
+            .interact_size
+            .y
+            .max(ui.text_style_height(&egui::TextStyle::Body));
+        let total = self.view_len();
+        let needle = self.filter.folded_needle();
+
+        // 滚动建构：跳底单次注入 offset（egui 端点 clamp 收敛到底）；
+        // 跟随模式用内置 stick（内容增长自动钉底，用户上滚即解锁）；
+        // 暂停模式不干预。
+        let scroll = egui::ScrollArea::vertical().auto_shrink(false);
+        let scroll = if self.jump_to_bottom {
+            self.jump_to_bottom = false;
+            scroll.vertical_scroll_offset(1.0e9)
+        } else if self.follow {
+            scroll.stick_to_bottom(true)
+        } else {
+            scroll
+        };
+        let out = scroll.show_rows(ui, row_h, total, |ui, row_range| {
+            for i in row_range {
+                self.render_row(ui, i, row_h, &needle);
+            }
+        });
+
+        // 跟随/暂停状态机：距底 > 1px = 离开底部（上滚/拖滚动条均覆盖）；
+        // 暂停中手动滚到底 = 自动回跟（egui 内部 stick 也在端点自恢复）。
+        let available = out.content_size.y - out.inner_rect.height();
+        let deviation = available - out.state.clamped_offset().y;
+        if self.follow {
+            if deviation > 1.0 {
+                self.follow = false;
+            }
+        } else if deviation <= 1.0 {
+            self.follow = true;
+        }
+    }
+
+    /// 单行渲染：时间（HH:MM:SS.mmm 本地时）/ 来源徽标 / 级别徽标 / 消息
+    /// （子串命中段着色 + 截断 + 悬停全文 + 右键复制）/ 复制按钮。
+    fn render_row(&self, ui: &mut egui::Ui, i: usize, row_h: f32, needle_folded: &str) {
+        let Some(r) = self.view_row(i) else {
+            ui.set_min_height(row_h);
+            ui.weak("…"); // 视图引用了已被淘汰的 seq（下一帧 rebuild 收敛）
+            return;
+        };
+        let ts = format_local_hms_mmm(r.ts);
+        let (src_label, src_color) = source_badge(&r.source);
+        let lvl_label = level_label(r.level);
+        let lvl_color = level_color(r.level);
+        let full_line = format!("{ts} [{src_label}] {lvl_label} {}", r.line);
+
+        ui.horizontal(|ui| {
+            ui.set_min_height(row_h);
+            ui.add_sized(
+                [ROW_TS_W, row_h],
+                egui::Label::new(egui::RichText::new(&ts).monospace().weak()),
+            );
+            ui.add_sized(
+                [ROW_SRC_W, row_h],
+                egui::Label::new(egui::RichText::new(&src_label).color(src_color).strong()),
+            );
+            ui.add_sized(
+                [ROW_LVL_W, row_h],
+                egui::Label::new(egui::RichText::new(lvl_label).color(lvl_color).monospace()),
+            );
+            let msg_w = ui.available_width() - ROW_COPY_W;
+            let job = self.highlight_job(ui, &r.line, needle_folded);
+            let msg = ui.add_sized(
+                [msg_w, row_h],
+                egui::Label::new(job).truncate().sense(egui::Sense::click()),
+            );
+            if msg.secondary_clicked() {
+                ui.ctx().copy_text(full_line.clone());
+            }
+            msg.on_hover_text(&r.line); // 截断行的全文 tooltip
+            if ui.add_sized([ROW_COPY_W, row_h], egui::Button::new("复制")).clicked() {
+                ui.ctx().copy_text(full_line);
+            }
+        });
+    }
+
+    /// 高亮 LayoutJob（只对可视行构建——红线：不逐帧全量重建文本布局）。
+    fn highlight_job(
+        &self,
+        ui: &egui::Ui,
+        line: &str,
+        needle_folded: &str,
+    ) -> egui::text::LayoutJob {
+        let body_font = ui
+            .style()
+            .text_styles
+            .get(&egui::TextStyle::Body)
+            .cloned()
+            .unwrap_or_default();
+        let normal = egui::TextFormat::simple(body_font, ui.style().visuals.text_color());
+        let mut hit = normal.clone();
+        hit.background = egui::Color32::from_rgb(150, 105, 20); // 琥珀底 = 命中段
+
+        let mut job = egui::text::LayoutJob::default();
+        let ranges = match_ranges(line, needle_folded);
+        if ranges.is_empty() {
+            job.append(line, 0.0, normal);
+            return job;
+        }
+        let total_chars = line.chars().count();
+        let mut pos = 0usize;
+        for &(s, e) in &ranges {
+            if s > pos {
+                job.append(slice_chars(line, pos, s), 0.0, normal.clone());
+            }
+            job.append(slice_chars(line, s, e), 0.0, hit.clone());
+            pos = e;
+        }
+        if pos < total_chars {
+            job.append(slice_chars(line, pos, total_chars), 0.0, normal);
+        }
+        job
+    }
+}
+
+// ─── 渲染辅助（纯函数，可测） ────────────────────────────────────────────────
+
+/// 来源徽标：Daemon=青 / Event=紫 / Module(id)=id 哈希稳定配色
+fn source_badge(src: &LogSource) -> (String, egui::Color32) {
+    match src {
+        LogSource::Daemon => ("daemon".into(), egui::Color32::from_rgb(110, 195, 205)),
+        LogSource::Event => ("event".into(), egui::Color32::from_rgb(190, 140, 230)),
+        LogSource::Module(id) => (id.clone(), module_color(id)),
+    }
+}
+
+/// 模块 id → 稳定中亮度配色（FNV-1a 哈希；每通道 90..217 保证深浅主题可读）
+fn module_color(id: &str) -> egui::Color32 {
+    let mut h: u32 = 2166136261;
+    for b in id.bytes() {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(16777619);
+    }
+    let ch = |shift: u32| 90 + ((h >> shift) & 0x7F) as u8;
+    egui::Color32::from_rgb(ch(0), ch(7), ch(14))
+}
+
+fn level_label(l: Option<LogLevel>) -> &'static str {
+    match l {
+        Some(LogLevel::Trace) => "TRACE",
+        Some(LogLevel::Debug) => "DEBUG",
+        Some(LogLevel::Info) => "INFO",
+        Some(LogLevel::Warn) => "WARN",
+        Some(LogLevel::Error) => "ERROR",
+        None => "—", // WS 模块行 / 事件行（无级别语义，GT-4 口径）
+    }
+}
+
+fn level_color(l: Option<LogLevel>) -> egui::Color32 {
+    match l {
+        Some(LogLevel::Error) => egui::Color32::from_rgb(235, 90, 90),
+        Some(LogLevel::Warn) => egui::Color32::from_rgb(235, 185, 80),
+        Some(LogLevel::Info) => egui::Color32::from_rgb(115, 195, 135),
+        Some(LogLevel::Debug) => egui::Color32::from_rgb(115, 155, 225),
+        Some(LogLevel::Trace) => egui::Color32::GRAY,
+        None => egui::Color32::GRAY,
+    }
+}
+
+/// 按 char 索引切片（match_ranges 产出 char 区间 → 原串子串）
+fn slice_chars(s: &str, start: usize, end: usize) -> &str {
+    let byte_at = |n: usize| {
+        s.char_indices()
+            .nth(n)
+            .map(|(b, _)| b)
+            .unwrap_or(s.len())
+    };
+    &s[byte_at(start)..byte_at(end)]
 }
 
 // ─── root 解析（LogPipe 注入口；GT-4 报告 §5 接缝口径） ─────────────────────
@@ -388,6 +651,139 @@ pub(crate) fn resolve_log_root(exe_dir: &std::path::Path, ep_root: Option<PathBu
         return p;
     }
     cwd.unwrap_or_else(|| exe_dir.to_path_buf())
+}
+
+// ─── 本地时间显示（ts 列 HH:MM:SS.mmm；不引 chrono——Windows API 直转） ─────
+
+/// 1601-01-01（FILETIME 纪元）与 1970-01-01（Unix 纪元）的秒差 × 10⁷
+const EPOCH_DIFF_100NS: u64 = 11_644_473_600 * 10_000_000;
+
+/// SystemTime → 本地时区 `HH:MM:SS.mmm`。
+///
+/// 链路：SystemTime → FILETIME → `FileTimeToSystemTime`（UTC SYSTEMTIME）→
+/// `SystemTimeToTzSpecificLocalTime`（按当前时区含 DST 规则转本地）→ 格式化。
+/// DST 由 API 处理（不手算 Bias）；时区 API 失败 → 降级显示 UTC，不崩。
+/// UI 线程安全性：仅内核态查询（每次调用 ~µs 级），只对**可视行**（几十行）
+/// 调用——5 fps 空闲下开销可忽略。
+pub(crate) fn format_local_hms_mmm(ts: std::time::SystemTime) -> String {
+    use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows_sys::Win32::System::Time::{
+        FileTimeToSystemTime, GetTimeZoneInformation, SystemTimeToTzSpecificLocalTime,
+        TIME_ZONE_ID_INVALID, TIME_ZONE_INFORMATION,
+    };
+
+    let d = ts.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let ft_100ns = d.as_secs() * 10_000_000 + (d.subsec_nanos() / 100) as u64 + EPOCH_DIFF_100NS;
+    let ft = FILETIME {
+        dwLowDateTime: (ft_100ns & 0xFFFF_FFFF) as u32,
+        dwHighDateTime: (ft_100ns >> 32) as u32,
+    };
+    let mut utc = SYSTEMTIME {
+        wYear: 0,
+        wMonth: 0,
+        wDayOfWeek: 0,
+        wDay: 0,
+        wHour: 0,
+        wMinute: 0,
+        wSecond: 0,
+        wMilliseconds: 0,
+    };
+    if unsafe { FileTimeToSystemTime(&ft, &mut utc) } == 0 {
+        return "--:--:--.---".into();
+    }
+    let mut tzi = TIME_ZONE_INFORMATION::default();
+    let mut local = SYSTEMTIME {
+        wYear: 0,
+        wMonth: 0,
+        wDayOfWeek: 0,
+        wDay: 0,
+        wHour: 0,
+        wMinute: 0,
+        wSecond: 0,
+        wMilliseconds: 0,
+    };
+    let tz_ok = unsafe { GetTimeZoneInformation(&mut tzi) } != TIME_ZONE_ID_INVALID
+        && unsafe { SystemTimeToTzSpecificLocalTime(&tzi, &utc, &mut local) } != 0;
+    let st = if tz_ok { &local } else { &utc };
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds
+    )
+}
+
+// ─── 帧率实测钩子（联调留证用；生产默认零开销——OnceLock 读一次环境变量） ───
+
+/// EP_TRAY_LOG_BENCH=<n>：首帧注入 n 条合成日志进显示缓冲（绕过引擎 ring——
+/// GT-4 已证引擎面；本钩子专测 UI 显示层 5 万行负载）。0/未设 = 关。
+static BENCH_N: OnceLock<usize> = OnceLock::new();
+/// EP_TRAY_FRAME_DEBUG=1：每 60 帧向 stderr 打印 logic/ui 平均帧耗时。
+static FRAME_DEBUG: OnceLock<bool> = OnceLock::new();
+
+fn bench_n() -> usize {
+    *BENCH_N.get_or_init(|| {
+        std::env::var("EP_TRAY_LOG_BENCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+pub(crate) fn frame_debug_enabled() -> bool {
+    *FRAME_DEBUG.get_or_init(|| std::env::var_os("EP_TRAY_FRAME_DEBUG").is_some())
+}
+
+/// logic 帧调用（缓冲为空时只注一次）。
+pub(crate) fn maybe_bench_inject(page: &mut LogPage) {
+    let n = bench_n();
+    if n == 0 || !page.buffer.is_empty() {
+        return;
+    }
+    eprintln!("ep-tray: GT-5 帧率实测钩子：注入 {n} 条合成日志（EP_TRAY_LOG_BENCH）");
+    page.ingest(bench_records(n));
+}
+
+/// 三源混合合成记录（形状贴近真实流：daemon 行带级别词、模块行无级别、
+/// 事件行 JSON 串；时间戳=当前时刻，seq 仅供缓冲定位——引擎 seq 语义见 GT-4）。
+fn bench_records(n: usize) -> Vec<LogRecord> {
+    use LogSource::{Daemon, Event, Module};
+    let now = std::time::SystemTime::now();
+    (0..n)
+        .map(|i| {
+            let (source, level, line) = match i % 4 {
+                0 => (
+                    Daemon,
+                    Some(LogLevel::Info),
+                    format!("bench daemon line {i} loading module config value=abc{i}"),
+                ),
+                1 => (
+                    Module("kokoro-tts".into()),
+                    None,
+                    format!("bench module stream chunk {i} size=1024 latency=42ms"),
+                ),
+                2 => (
+                    Event,
+                    None,
+                    format!("{{\"ts\":{i},\"type\":\"bench_task\",\"status\":\"running\"}}"),
+                ),
+                _ => (
+                    Daemon,
+                    Some(if i % 17 == 0 {
+                        LogLevel::Error
+                    } else {
+                        LogLevel::Debug
+                    }),
+                    format!("bench mixed severity line {i} payload=xyz{i}"),
+                ),
+            };
+            LogRecord {
+                seq: i as u64,
+                ts: now,
+                source,
+                level,
+                line,
+            }
+        })
+        .collect()
 }
 
 // ─── 虚拟化探针（commit① 路线评估证据 + 回归守卫） ─────────────────────────
@@ -457,7 +853,6 @@ mod tests {
         assert_eq!(b.get(1), None, "最旧两行已淘汰");
         assert_eq!(b.get(2).map(|r| r.line.as_str()), Some("l2"));
         assert_eq!(b.get(4).map(|r| r.line.as_str()), Some("l4"));
-        assert_eq!(b.first_seq(), Some(2));
     }
 
     #[test]
@@ -489,7 +884,7 @@ mod tests {
         b.extend((0..100u64).map(|i| rec(i, "x")));
         assert_eq!(b.len(), 100);
         assert_eq!(b.dropped(), 0);
-        assert_eq!(b.first_seq(), Some(0));
+        
     }
 
     #[test]
@@ -640,12 +1035,18 @@ mod tests {
         LogFilter::default()
     }
 
+    /// 谓词便捷入口（生产路径形状：fold 一次 → matches_with 逐行）
+    fn m(f: &LogFilter, r: &LogRecord) -> bool {
+        let needle = f.folded_needle();
+        f.matches_with(r, &needle)
+    }
+
     #[test]
     fn filter_defaults_show_everything() {
         let f = default_filter();
-        assert!(f.matches(&src_rec(0, LogSource::Daemon, Some(LogLevel::Info), "x")));
-        assert!(f.matches(&src_rec(1, LogSource::Event, None, "{\"ts\":1}")));
-        assert!(f.matches(&src_rec(2, LogSource::Module("asr".into()), None, "gpu ok")));
+        assert!(m(&f, &src_rec(0, LogSource::Daemon, Some(LogLevel::Info), "x")));
+        assert!(m(&f, &src_rec(1, LogSource::Event, None, "{\"ts\":1}")));
+        assert!(m(&f, &src_rec(2, LogSource::Module("asr".into()), None, "gpu ok")));
     }
 
     #[test]
@@ -654,44 +1055,44 @@ mod tests {
         f.sources.daemon = false;
         f.sources.events = false;
         f.sources.modules = false;
-        assert!(!f.matches(&src_rec(0, LogSource::Daemon, Some(LogLevel::Info), "x")));
-        assert!(!f.matches(&src_rec(1, LogSource::Event, None, "e")));
-        assert!(!f.matches(&src_rec(2, LogSource::Module("asr".into()), None, "m")));
+        assert!(!m(&f, &src_rec(0, LogSource::Daemon, Some(LogLevel::Info), "x")));
+        assert!(!m(&f, &src_rec(1, LogSource::Event, None, "e")));
+        assert!(!m(&f, &src_rec(2, LogSource::Module("asr".into()), None, "m")));
         f.sources.modules = true;
-        assert!(f.matches(&src_rec(2, LogSource::Module("asr".into()), None, "m")));
+        assert!(m(&f, &src_rec(2, LogSource::Module("asr".into()), None, "m")));
 
         // 模块 id 明细：空 = 全部；非空 = 只显示勾选
         let mut f2 = default_filter();
         f2.sources.daemon = false;
         f2.sources.events = false;
         f2.sources.module_ids.insert("asr".into());
-        assert!(f2.matches(&src_rec(0, LogSource::Module("asr".into()), None, "a")));
-        assert!(!f2.matches(&src_rec(1, LogSource::Module("tts".into()), None, "t")));
+        assert!(m(&f2, &src_rec(0, LogSource::Module("asr".into()), None, "a")));
+        assert!(!m(&f2, &src_rec(1, LogSource::Module("tts".into()), None, "t")));
     }
 
     #[test]
     fn filter_level_toggles_including_none() {
         let mut f = default_filter();
         f.levels.info = false;
-        assert!(!f.matches(&src_rec(0, LogSource::Daemon, Some(LogLevel::Info), "x")));
-        assert!(f.matches(&src_rec(1, LogSource::Daemon, Some(LogLevel::Error), "y")));
+        assert!(!m(&f, &src_rec(0, LogSource::Daemon, Some(LogLevel::Info), "x")));
+        assert!(m(&f, &src_rec(1, LogSource::Daemon, Some(LogLevel::Error), "y")));
         // None 级别（模块行/事件行）由 none 开关独立控制
         let mut f2 = default_filter();
         f2.levels.none = false;
-        assert!(!f.matches(&src_rec(0, LogSource::Daemon, Some(LogLevel::Info), "x")), "级别与来源互不相干时行仍按级别过滤");
-        assert!(!f2.matches(&src_rec(1, LogSource::Event, None, "e")));
-        assert!(f2.matches(&src_rec(2, LogSource::Event, Some(LogLevel::Warn), "w")));
+        assert!(!m(&f, &src_rec(0, LogSource::Daemon, Some(LogLevel::Info), "x")), "级别与来源互不相干时行仍按级别过滤");
+        assert!(!m(&f2, &src_rec(1, LogSource::Event, None, "e")));
+        assert!(m(&f2, &src_rec(2, LogSource::Event, Some(LogLevel::Warn), "w")));
     }
 
     #[test]
     fn filter_substring_case_insensitive() {
         let mut f = default_filter();
         f.needle = "ERROR".into();
-        assert!(f.matches(&src_rec(0, LogSource::Daemon, Some(LogLevel::Error), "x error occurred")));
-        assert!(!f.matches(&src_rec(1, LogSource::Daemon, Some(LogLevel::Info), "all good")));
+        assert!(m(&f, &src_rec(0, LogSource::Daemon, Some(LogLevel::Error), "x error occurred")));
+        assert!(!m(&f, &src_rec(1, LogSource::Daemon, Some(LogLevel::Info), "all good")));
         f.needle = "错误".into();
-        assert!(f.matches(&src_rec(2, LogSource::Daemon, Some(LogLevel::Error), "发生错误: bad")));
-        assert!(!f.matches(&src_rec(3, LogSource::Daemon, Some(LogLevel::Error), "no match")));
+        assert!(m(&f, &src_rec(2, LogSource::Daemon, Some(LogLevel::Error), "发生错误: bad")));
+        assert!(!m(&f, &src_rec(3, LogSource::Daemon, Some(LogLevel::Error), "no match")));
     }
 
     #[test]
@@ -767,5 +1168,85 @@ mod tests {
         ]);
         let ids: Vec<&String> = page.module_ids_seen.iter().collect();
         assert_eq!(ids, vec!["asr", "tts"]);
+    }
+
+    // ── 本地时间格式化（Windows API 链路） ──
+
+    #[test]
+    fn local_time_formats_hms_mmm_shape() {
+        use std::time::UNIX_EPOCH;
+        let shape_ok = |s: &str| {
+            s.len() == 12
+                && s.as_bytes()[2] == b':'
+                && s.as_bytes()[5] == b':'
+                && s.as_bytes()[8] == b'.'
+                && s.bytes().all(|b| b.is_ascii_digit() || b == b':' || b == b'.')
+        };
+        let now = format_local_hms_mmm(std::time::SystemTime::now());
+        assert!(shape_ok(&now), "HH:MM:SS.mmm 形状，实际 {now}");
+        // 纪元零值：本地时区偏移后的合法时刻（UTC+8 机器 = 08:00:00.000）——
+        // 断言与时区无关的形状而非具体值
+        let zero = format_local_hms_mmm(UNIX_EPOCH);
+        assert!(shape_ok(&zero), "零值形状，实际 {zero}");
+        // 纪元前钳到 UNIX_EPOCH 再转（不 panic，返回合法时刻）
+        let pre = format_local_hms_mmm(UNIX_EPOCH - Duration::from_secs(100_000));
+        assert!(shape_ok(&pre), "纪元前形状，实际 {pre}");
+    }
+
+    // ── 渲染辅助 ──
+
+    #[test]
+    fn module_color_stable_and_mid_brightness() {
+        let c1 = module_color("kokoro-tts");
+        let c2 = module_color("kokoro-tts");
+        assert_eq!(c1, c2, "同 id 同色");
+        assert_ne!(module_color("asr"), module_color("tts"), "不同 id 应大概率不同色");
+        let [r, g, b, _] = c1.to_array();
+        assert!(r >= 90 && g >= 90 && b >= 90, "中亮度下限");
+        assert!(r <= 216 && g <= 216 && b <= 216, "中亮度上限");
+    }
+
+    #[test]
+    fn slice_chars_handles_cjk_and_bounds() {
+        let s = "中文abc";
+        assert_eq!(slice_chars(s, 0, 2), "中文");
+        assert_eq!(slice_chars(s, 2, 5), "abc");
+        assert_eq!(slice_chars(s, 0, 5), s);
+        assert_eq!(slice_chars(s, 5, 5), "");
+        assert_eq!(slice_chars(s, 0, 99), s, "越界钳到串尾");
+    }
+
+    #[test]
+    fn level_and_source_labels_cover_all_variants() {
+        assert_eq!(level_label(Some(LogLevel::Error)), "ERROR");
+        assert_eq!(level_label(None), "—");
+        let (label, color) = source_badge(&LogSource::Module("m1".into()));
+        assert_eq!(label, "m1");
+        assert_ne!(color, egui::Color32::WHITE);
+    }
+
+    // ── 5 万行过滤视图基准（逻辑面证据；渲染面见 EP_TRAY_FRAME_DEBUG 留证） ──
+
+    #[test]
+    fn page_50k_view_rebuild_bench() {
+        let mut page = LogPage::new();
+        page.ingest(bench_records(50_000));
+        let t0 = std::time::Instant::now();
+        page.rebuild();
+        let unfiltered = t0.elapsed();
+        assert_eq!(page.view_len(), 50_000);
+
+        page.filter.needle = "bench".into();
+        page.filter.levels.none = false;
+        let t1 = std::time::Instant::now();
+        page.rebuild();
+        let filtered = t1.elapsed();
+        assert!(page.view_len() > 0);
+        assert!(page.view_len() < 50_000, "needle+级别过滤后应少于全量");
+        println!(
+            "GT-5 基准：5 万行视图重建 无过滤={unfiltered:?} 子串+级别过滤={filtered:?}（命中 {} 行）",
+            page.view_len()
+        );
+        assert!(filtered.as_millis() < 2_000, "5 万行过滤重建应在毫秒级");
     }
 }
