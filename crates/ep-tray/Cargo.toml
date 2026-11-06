@@ -41,9 +41,12 @@ winreg = "0.56"
 # GT-3 报备：+Win32_System_Services（SCM 管控面——OpenSCManager/OpenService/
 # QueryServiceStatusEx/QueryServiceConfig(2)/ControlService/StartService，
 # platform/scm.rs 双模式管控与模式检测；只读 query 标准用户可用）
+# GT-3 报备：+Win32_UI_Shell（elevate.rs 自提权——ShellExecuteExW runas verb
+# + SEE_MASK_NOCLOSEPROCESS 等待一次性动作进程退出码）
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
     "Win32_System_Time",
     "Win32_System_Services",
+    "Win32_UI_Shell",
 ] }

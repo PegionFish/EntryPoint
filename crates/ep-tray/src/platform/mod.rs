@@ -7,11 +7,14 @@
 //! - [`probe_ext`]：daemon HTTP API 轮询线程（GT-2 状态页快照源）
 //! - [`logpipe`]：日志引擎（GT-4，三源汇流 + 环形缓冲；GT-5 日志页接线）
 //! - [`scm`]：Windows 服务控制管理器封装（GT-3：模式检测 + 双模式管控读/写面）
+//! - [`elevate`]：SCM 写操作自提权面（GT-3：ShellExecuteExW runas + --sc-action
+//!   一次性动作进程；主进程绝不提权）
 //! - [`mutex`]：单实例锁的真实实现（命名互斥体）
 //! - [`registry`]：开机自启的真实实现（HKCU Run 键）
 
 pub mod app;
 pub mod daemon;
+pub mod elevate;
 pub mod logpipe;
 pub mod logs;
 pub mod mutex;
