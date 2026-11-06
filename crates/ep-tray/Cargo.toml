@@ -38,8 +38,12 @@ winreg = "0.56"
 # GT-5 报备：+Win32_System_Time（日志页 ts 本地时区显示——FileTimeToSystemTime
 # /SystemTimeToTzSpecificLocalTime，不引 chrono；FILETIME/SYSTEMTIME 在既有
 # Win32_Foundation 面内）
+# GT-3 报备：+Win32_System_Services（SCM 管控面——OpenSCManager/OpenService/
+# QueryServiceStatusEx/QueryServiceConfig(2)/ControlService/StartService，
+# platform/scm.rs 双模式管控与模式检测；只读 query 标准用户可用）
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
     "Win32_System_Time",
+    "Win32_System_Services",
 ] }
