@@ -525,7 +525,7 @@ impl LogPage {
                 [ROW_LVL_W, row_h],
                 egui::Label::new(egui::RichText::new(lvl_label).color(lvl_color).monospace()),
             );
-            let msg_w = ui.available_width() - ROW_COPY_W;
+            let msg_w = ui.available_width() - ROW_COPY_W - ui.spacing().item_spacing.x;
             let job = self.highlight_job(ui, &r.line, needle_folded);
             let msg = ui.add_sized(
                 [msg_w, row_h],
@@ -715,7 +715,10 @@ pub(crate) fn format_local_hms_mmm(ts: std::time::SystemTime) -> String {
 
 /// EP_TRAY_LOG_BENCH=<n>：首帧注入 n 条合成日志进显示缓冲（绕过引擎 ring——
 /// GT-4 已证引擎面；本钩子专测 UI 显示层 5 万行负载）。0/未设 = 关。
+/// 注入一次即熔断（daemon.log tail 可能在首帧前已灌入历史行，不能以
+/// 「缓冲为空」为触发条件）。
 static BENCH_N: OnceLock<usize> = OnceLock::new();
+static BENCH_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// EP_TRAY_FRAME_DEBUG=1：每 60 帧向 stderr 打印 logic/ui 平均帧耗时。
 static FRAME_DEBUG: OnceLock<bool> = OnceLock::new();
 
@@ -732,10 +735,13 @@ pub(crate) fn frame_debug_enabled() -> bool {
     *FRAME_DEBUG.get_or_init(|| std::env::var_os("EP_TRAY_FRAME_DEBUG").is_some())
 }
 
-/// logic 帧调用（缓冲为空时只注一次）。
+/// logic 帧调用（只注一次）。
 pub(crate) fn maybe_bench_inject(page: &mut LogPage) {
     let n = bench_n();
-    if n == 0 || !page.buffer.is_empty() {
+    if n == 0 {
+        return;
+    }
+    if BENCH_DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
     }
     eprintln!("ep-tray: GT-5 帧率实测钩子：注入 {n} 条合成日志（EP_TRAY_LOG_BENCH）");
@@ -1249,4 +1255,94 @@ mod tests {
         );
         assert!(filtered.as_millis() < 2_000, "5 万行过滤重建应在毫秒级");
     }
+
+    // ── 跟随/暂停状态机（egui 测试上下文注入滚轮事件，走真实 show() 路径；
+    //    真机合成滚轮注入到不了 winit——见报告「联调记录」） ──
+
+    /// 测试 UI 宿主：**跨帧共享同一 Context**。egui 的滚轮平滑（WheelState）、
+    /// 指针位置历史、ScrollArea 持久状态都挂在 Context——每帧新建 Context
+    /// 会丢这些状态，滚轮事件将不被 ScrollArea 消费。
+    struct TestUi {
+        ctx: egui::Context,
+        t: f64,
+    }
+
+    impl TestUi {
+        fn new() -> Self {
+            let ctx = egui::Context::default();
+            ctx.set_fonts(egui::FontDefinitions::empty());
+            Self { ctx, t: 0.0 }
+        }
+
+        /// 跑一帧 show()（900x400 视口；可带注入事件）
+        fn frame(&mut self, page: &mut LogPage, events: Vec<egui::Event>) {
+            self.t += 0.05;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 400.0),
+                )),
+                time: Some(self.t),
+                events,
+                ..Default::default()
+            };
+            let out = self.ctx.run_ui(input, |ui| page.show(ui));
+            out.drop_without_applying_deltas();
+        }
+
+        /// 滚轮帧（指针悬停表格区内——egui 0.37 rect_contains_pointer 门控）
+        fn wheel(&mut self, page: &mut LogPage, dy: f32) {
+            let events = vec![
+                egui::Event::PointerMoved(egui::Pos2::new(450.0, 380.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, dy),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Wheel,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ];
+            self.frame(page, events);
+        }
+    }
+
+    #[test]
+    fn follow_pause_state_machine_via_events() {
+        let mut ui_host = TestUi::new();
+        let mut page = LogPage::new_with_cap(300);
+        page.ingest(bench_records(300));
+        assert!(page.follow, "初始为跟随");
+
+        // 若干空帧：跟随模式钉底（stick_to_bottom），follow 保持
+        for _ in 0..5 {
+            ui_host.frame(&mut page, vec![]);
+        }
+        assert!(page.follow, "跟随模式连续帧保持");
+
+        // 上滚（内容下移 = delta 正值；多帧注入覆盖平滑消耗）：自动暂停
+        for _ in 0..4 {
+            ui_host.wheel(&mut page, 3.0);
+        }
+        assert!(!page.follow, "上滚自动暂停跟随");
+
+        // 暂停中持续帧 + 新行入缓冲：不回跟、不拽底（内容增长不拽动视图）
+        page.ingest(bench_records(10));
+        for _ in 0..3 {
+            ui_host.frame(&mut page, vec![]);
+        }
+        assert!(!page.follow, "暂停中新行不触发回跟");
+
+        // 滚到底（内容上移 = delta 负值）：自动回跟
+        for _ in 0..8 {
+            ui_host.wheel(&mut page, -8.0);
+        }
+        assert!(page.follow, "手动滚到底自动回跟");
+
+        // 「回到底部」路径：暂停 → jump 请求一帧 → 到底恢复跟随
+        page.follow = false;
+        page.jump_to_bottom = true;
+        ui_host.frame(&mut page, vec![]);
+        assert!(page.follow, "回到底部后恢复跟随（jump 落底由该断言间接证明）");
+    }
 }
+
