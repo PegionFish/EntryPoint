@@ -9,6 +9,7 @@
 //! 图标换色、标志位）都收敛在主线程，无锁。
 
 use std::os::windows::process::CommandExt as _; // creation_flags（open_webui）
+use std::path::Path;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -20,6 +21,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use crate::autostart;
 use crate::icons;
 use crate::platform::daemon::{DaemonCommand, StateUpdate};
+use crate::platform::elevate::{self, ElevateError, ScAction, EXIT_DENIED, EXIT_OK};
 use crate::platform::logpipe::ws_source::WsConnState;
 use crate::platform::logpipe::LogPipeHandle;
 use crate::platform::logs::LogPage;
@@ -28,7 +30,10 @@ use crate::platform::probe_ext::{
     QUEUE_INTERVAL, REQUEST_TIMEOUT, STALE_AFTER,
 };
 use crate::platform::registry::HkuRunKey;
-use crate::platform::scm::{RunMode, ServiceSnap, SERVICE_NAME};
+use crate::platform::scm::{
+    query_service, RunMode, ScmError, ServiceSnap, ServiceState, StartKind, StartType,
+    SERVICE_NAME,
+};
 use crate::supervisor::TrayColor;
 
 /// CREATE_NO_WINDOW：隐藏 cmd 子进程的控制台窗口（开浏览器用）
@@ -62,6 +67,29 @@ pub(crate) struct UiShared {
     pub mode: RunMode,
     /// EntryPoint 服务快照槽（Service 模式管控页/状态页显示；sidecar 时常为空）
     pub service: ProbeSlot<ServiceSnap>,
+    /// 管控页提权动作反馈（动作线程写：Pending → 终态；UI 渲染只读）
+    pub control_op: Option<ControlOp>,
+}
+
+/// 管控页提权动作反馈（一次 UAC 动作一条；动作完成时动作线程顺带即时复检
+/// SCM 快照，30s 复检线程到来前界面先到位）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ControlOp {
+    /// 动作名（ScAction::label，如「启动服务」）
+    pub label: String,
+    /// 当前状态
+    pub state: ControlOpState,
+    /// 状态写入时刻（UI 显示进行时长用）
+    pub at: Instant,
+}
+
+/// 提权动作状态（Pending=等待 UAC/执行中；终态 Ok/Denied/Failed）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ControlOpState {
+    Pending,
+    Ok,
+    Denied,
+    Failed(String),
 }
 
 /// 主窗口导航页（GT-1 仅骨架，内容归 GT-2/3/5/6）
@@ -353,10 +381,7 @@ impl eframe::App for TrayApp {
 
         egui::CentralPanel::default().show(ui, |ui| match self.selected {
             Page::Status => self.ui_status(ui),
-            Page::Control => {
-                ui.heading("管控");
-                ui.label("daemon 启停/重启、自启与模式配置：GT-3 落地（双模式 sidecar ∥ Windows Service）");
-            }
+            Page::Control => self.ui_control(ui),
             Page::Logs => self.ui_logs(ui),
             Page::Settings => self.ui_settings(ui),
         });
@@ -757,6 +782,345 @@ impl TrayApp {
     }
 }
 
+/// 管控页（GT-3）：双模式分流——Service 模式走 SCM 提权动作，sidecar 模式
+/// 沿用 supervisor 命令（cmd_tx）与 HKCU Run 自启；服务未安装时给安装指引
+/// 文字（**不自动装/卸——红线**）。写操作反馈经 [`UiShared::control_op`]。
+impl TrayApp {
+    fn ui_control(&self, ui: &mut egui::Ui) {
+        ui.heading("管控");
+        let Ok(s) = self.shared.lock() else {
+            ui.label("共享状态不可用（锁中毒）");
+            return;
+        };
+        let mode = s.mode;
+        let snap = s.service.data.clone();
+        let control_op = s.control_op.clone();
+        drop(s); // 释放共享锁再进子视图（子视图 launch_service_op 会重新加锁）
+
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            // 当前模式行
+            let (badge_text, fg, tip) = mode_badge_view(mode);
+            ui.horizontal(|ui| {
+                ui.strong("当前模式：");
+                let badge = ui.label(
+                    egui::RichText::new(badge_text)
+                        .color(fg)
+                        .background_color(egui::Color32::from_rgb(40, 44, 52)),
+                );
+                badge.on_hover_text(tip);
+                if let Some(snap) = &snap {
+                    if mode == RunMode::Service {
+                        ui.weak(format!(
+                            "服务 {} · PID {}",
+                            snap.status.map(|st| st.label()).unwrap_or("状态未知"),
+                            snap.pid.map(|p| p.to_string()).unwrap_or_else(|| "—".into())
+                        ));
+                    }
+                }
+            });
+
+            // 提权操作反馈行（两模式共用：sidecar 的安装指引复制无 UAC，
+            // 但 StartType/Recovery/启停都走这里）
+            if let Some(op) = &control_op {
+                let (text, color) = op_feedback_view(op);
+                ui.label(egui::RichText::new(text).color(color));
+            }
+            ui.separator();
+
+            match mode {
+                RunMode::Service => self.ui_control_service(ui, snap.as_ref()),
+                RunMode::Sidecar => self.ui_control_sidecar(ui, snap.as_ref()),
+            }
+        });
+    }
+
+    /// Service 模式：启动/停止/重启（提权）+ 启动类型单选 + 崩溃自动重启开关。
+    fn ui_control_service(&self, ui: &mut egui::Ui, snap: Option<&ServiceSnap>) {
+        let pending = self.op_pending();
+
+        // ── 服务操作 ──
+        ui.group(|ui| {
+            ui.strong("服务操作（EntryPoint，写操作经 UAC 提权一次性子进程执行）");
+            let (can_start, can_stop, can_restart) =
+                service_control_model(pending, snap.and_then(|x| x.status));
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(can_start, egui::Button::new("启动"))
+                    .clicked()
+                {
+                    self.launch_service_op(ScAction::Start);
+                }
+                if ui
+                    .add_enabled(can_stop, egui::Button::new("停止"))
+                    .clicked()
+                {
+                    self.launch_service_op(ScAction::Stop);
+                }
+                if ui
+                    .add_enabled(can_restart, egui::Button::new("重启"))
+                    .clicked()
+                {
+                    self.launch_service_op(ScAction::Restart);
+                }
+            });
+            ui.weak("每次操作由 UAC 现场批准；主进程绝不持有管理员权限");
+            let snap_fresh = self
+                .shared
+                .lock()
+                .ok()
+                .and_then(|s| s.service.at)
+                .map(|at| format!("（{} 秒前复检）", at.elapsed().as_secs()))
+                .unwrap_or_default();
+            ui.weak(format!(
+                "服务状态每 {} 秒自动复检{snap_fresh}",
+                crate::platform::scm::SCM_RECHECK_INTERVAL.as_secs()
+            ));
+        });
+
+        // ── 自启方式（启动类型）──
+        ui.group(|ui| {
+            ui.strong("自启方式（服务启动类型，等价 systemctl enable/disable）");
+            let current = snap.map(|x| x.start).unwrap_or(StartKind::Other);
+            let snapshot_sel = current.radio_index();
+            let mut sel = snapshot_sel;
+            ui.add_enabled_ui(!pending, |ui| {
+                ui.radio_value(&mut sel, Some(0usize), "自动");
+                ui.radio_value(&mut sel, Some(1usize), "自动（延迟启动）");
+                ui.radio_value(&mut sel, Some(2usize), "手动");
+            });
+            if current == StartKind::Disabled || current == StartKind::Other {
+                ui.weak(format!(
+                    "当前启动类型为「{}」，不可经本页修改；选择任一档位后应用即可覆盖",
+                    current.label()
+                ));
+            }
+            let may_apply = !pending && sel.is_some() && sel != snapshot_sel;
+            if ui
+                .add_enabled(may_apply, egui::Button::new("应用启动类型"))
+                .clicked()
+            {
+                let st = match sel {
+                    Some(1) => StartType::DelayedAuto,
+                    Some(2) => StartType::Manual,
+                    _ => StartType::Auto,
+                };
+                self.launch_service_op(ScAction::SetStartType(st));
+            }
+            ui.weak("改动经 UAC 提权写入 SCM，生效后可用 sc qc EntryPoint 核对");
+        });
+
+        // ── 崩溃自动重启（SCM Recovery）──
+        ui.group(|ui| {
+            ui.strong("崩溃自动重启（等价 systemd Restart=on-failure）");
+            let recovery = snap.and_then(|x| x.recovery_restart);
+            let mut on = recovery.unwrap_or(false);
+            let resp = ui.add_enabled(
+                !pending && recovery.is_some(),
+                egui::Checkbox::new(
+                    &mut on,
+                    "服务进程崩溃时由 SCM 自动拉起（10s/30s/60s 三次，24h 计数窗）",
+                ),
+            );
+            if resp.changed() {
+                self.launch_service_op(ScAction::SetRecovery(on));
+            }
+            if recovery.is_none() {
+                ui.weak("恢复动作状态未知（SCM 读取失败），开关暂不可用——等下一轮复检");
+            }
+            ui.weak("改动经 UAC 提权写入 SCM，生效后可用 sc qfailure EntryPoint 核对");
+        });
+    }
+
+    /// sidecar 模式：supervisor 命令照旧 + HKCU Run 自启 + 服务安装指引。
+    fn ui_control_sidecar(&self, ui: &mut egui::Ui, _snap: Option<&ServiceSnap>) {
+        // ── daemon 进程（sidecar 托管，supervisor 状态机照旧——回归红线）──
+        ui.group(|ui| {
+            ui.strong("daemon 进程（sidecar：ep-tray 以子进程方式托管）");
+            ui.weak("崩溃自动重启一次，再失败托盘红标（supervisor 状态机）");
+            ui.horizontal(|ui| {
+                if ui.button("重启 daemon").clicked() {
+                    let _ = self.cmd_tx.send(DaemonCommand::Restart);
+                }
+                if ui.button("停止 daemon").clicked() {
+                    let _ = self.cmd_tx.send(DaemonCommand::Stop);
+                }
+            });
+        });
+
+        // ── 自启（HKCU Run，与托盘菜单「开机自启」同一事实源）──
+        ui.group(|ui| {
+            ui.strong("开机自启（当前用户登录时）");
+            let mut on = self.autostart_item.is_checked();
+            if ui
+                .checkbox(&mut on, "登录时静默启动托盘（HKCU Run，不开窗）")
+                .changed()
+            {
+                let result = std::env::current_exe()
+                    .map_err(|e| format!("定位 exe: {e}"))
+                    .and_then(|exe| autostart::set_autostart(&HkuRunKey, &exe, on));
+                match result {
+                    Ok(()) => self.autostart_item.set_checked(on),
+                    Err(e) => {
+                        eprintln!("ep-tray: 自启开关写入失败: {e}");
+                        self.autostart_item.set_checked(!on); // 回滚 UI
+                    }
+                }
+            }
+            ui.weak("与托盘菜单「开机自启」为同一注册表项");
+        });
+
+        // ── Windows 服务安装指引（不自动装/卸——红线）──
+        ui.group(|ui| {
+            ui.strong("Windows 服务（可选，未安装）");
+            ui.weak("如需系统级服务（登录前自启、独立于登录会话、SCM 崩溃恢复）：");
+            let cmd = install_command(
+                std::env::current_exe().ok().as_deref().and_then(Path::parent),
+            );
+            ui.monospace(&cmd);
+            ui.horizontal(|ui| {
+                if ui.button("复制安装命令").clicked() {
+                    ui.ctx().copy_text(cmd.clone());
+                }
+                ui.weak("以管理员 PowerShell 运行");
+            });
+            ui.weak("本 GUI 不自动安装/卸载服务；安装后重启 ep-tray 即识别为服务模式");
+        });
+    }
+
+    /// 是否有提权动作进行中（Pending 期间所有提权入口禁用——防双击双进程）。
+    fn op_pending(&self) -> bool {
+        self.shared
+            .lock()
+            .ok()
+            .and_then(|s| s.control_op.clone())
+            .is_some_and(|op| op.state == ControlOpState::Pending)
+    }
+
+    /// 发起提权动作：原子置 Pending（同一主线程内检查+置位，无竞态）→
+    /// 后台线程 ShellExecuteExW(runas) 拉起自身 --sc-action → 退出码映射
+    /// 终态 → 即时复检 SCM 快照。主进程侧零提权（红线）。
+    fn launch_service_op(&self, op: ScAction) {
+        {
+            let mut s = match self.shared.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            if matches!(&s.control_op, Some(c) if c.state == ControlOpState::Pending) {
+                return; // 已有动作进行中（等待 UAC/执行），忽略重复触发
+            }
+            s.control_op = Some(ControlOp {
+                label: op.label().to_owned(),
+                state: ControlOpState::Pending,
+                at: Instant::now(),
+            });
+        }
+        let shared = Arc::clone(&self.shared);
+        let spawned = std::thread::Builder::new()
+            .name("ep-tray-sc-action".into())
+            .spawn(move || {
+                let args = elevate::sc_action_args(op);
+                let state = match elevate::run_elevated_self(&args) {
+                    Ok(code) if code == EXIT_OK => ControlOpState::Ok,
+                    Ok(code) if code == EXIT_DENIED => ControlOpState::Denied,
+                    Ok(code) => ControlOpState::Failed(format!("退出码 {code}")),
+                    Err(ElevateError::Cancelled) => ControlOpState::Denied,
+                    Err(ElevateError::Os(code)) => {
+                        ControlOpState::Failed(format!("提权启动失败（Windows 错误 {code}）"))
+                    }
+                };
+                if let Ok(mut s) = shared.lock() {
+                    s.control_op = Some(ControlOp {
+                        label: op.label().to_owned(),
+                        state,
+                        at: Instant::now(),
+                    });
+                    // 即时复检（读路径无 UAC）：不等 30s 复检线程，界面先到位；
+                    // 服务消失（被卸载）时模式同步回落 sidecar
+                    match query_service(SERVICE_NAME) {
+                        Ok(snap) => {
+                            s.service.record_ok(snap);
+                            s.mode = RunMode::Service;
+                        }
+                        Err(ScmError::NotFound) => {
+                            s.service.record_fail();
+                            s.mode = RunMode::Sidecar;
+                        }
+                        Err(_) => s.service.record_fail(),
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            // 线程起不来（极罕见）：撤销 Pending，否则全部按钮永久禁用
+            if let Ok(mut s) = self.shared.lock() {
+                s.control_op = Some(ControlOp {
+                    label: op.label().to_owned(),
+                    state: ControlOpState::Failed(format!("动作线程启动失败: {e}")),
+                    at: Instant::now(),
+                });
+            }
+        }
+    }
+}
+
+/// Service 模式按钮可用性模型（纯函数，可单测）：
+/// Pending（UAC 等待/执行中）全部禁用；按当前状态给 启动/停止/重启。
+pub(crate) fn service_control_model(
+    pending: bool,
+    status: Option<ServiceState>,
+) -> (bool, bool, bool) {
+    if pending {
+        return (false, false, false);
+    }
+    match status {
+        Some(ServiceState::Running) => (false, true, true),
+        Some(ServiceState::StartPending) => (false, true, false),
+        Some(ServiceState::StopPending) | Some(ServiceState::Paused) | None => (false, false, false),
+        Some(ServiceState::Stopped) => (true, false, false),
+    }
+}
+
+/// 提权操作反馈行（纯函数）：返回 (文案, 颜色)。
+pub(crate) fn op_feedback_view(op: &ControlOp) -> (String, egui::Color32) {
+    match &op.state {
+        ControlOpState::Pending => (
+            format!("{}：执行中…（等待 UAC 授权，请在弹窗中批准或取消）", op.label),
+            egui::Color32::YELLOW,
+        ),
+        ControlOpState::Ok => (
+            format!("上次操作成功：{}", op.label),
+            egui::Color32::from_rgb(80, 200, 120),
+        ),
+        ControlOpState::Denied => (
+            format!(
+                "上次操作未获授权：{}（UAC 被拒绝）——该操作需要管理员权限，可重试",
+                op.label
+            ),
+            egui::Color32::YELLOW,
+        ),
+        ControlOpState::Failed(e) => (
+            format!("上次操作失败：{}（{e}）", op.label),
+            egui::Color32::from_rgb(235, 90, 90),
+        ),
+    }
+}
+
+/// 服务安装指引命令（纯函数）：BinDir = ep-tray.exe 所在目录
+///（与 ep-daemon.exe 同目录的 sidecar 约定 = install-service.ps1 的 -BinDir）。
+pub(crate) fn install_command(exe_dir: Option<&Path>) -> String {
+    const BASE: &str = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\install-service.ps1 -BinDir";
+    match exe_dir {
+        Some(dir) => {
+            let d = dir.display().to_string();
+            if d.contains(' ') {
+                format!("{BASE} \"{d}\"")
+            } else {
+                format!("{BASE} {d}")
+            }
+        }
+        None => format!("{BASE} <部署目录\\bin>"),
+    }
+}
+
 /// 队列卡大数字块（说明行 + 放大数值）。
 fn big_stat(ui: &mut egui::Ui, caption: &str, value: &str, color: egui::Color32) {
     ui.vertical(|ui| {
@@ -881,5 +1245,63 @@ mod tests {
     #[test]
     fn scm_recheck_interval_is_30s() {
         assert_eq!(SCM_RECHECK_INTERVAL.as_secs(), 30, "派发单口径：30s 复检");
+    }
+
+    // ── 管控页纯逻辑 ──
+
+    #[test]
+    fn service_buttons_follow_state() {
+        use crate::platform::scm::ServiceState as St;
+        // 运行中：可停可重启，不可再启动
+        assert_eq!(service_control_model(false, Some(St::Running)), (false, true, true));
+        // 已停止：只可启动
+        assert_eq!(service_control_model(false, Some(St::Stopped)), (true, false, false));
+        // 启动中：可停（SCM 允许打断启动），不可重启
+        assert_eq!(service_control_model(false, Some(St::StartPending)), (false, true, false));
+        // 停止中/暂停/状态未知：全禁用（保守）
+        assert_eq!(service_control_model(false, Some(St::StopPending)), (false, false, false));
+        assert_eq!(service_control_model(false, Some(St::Paused)), (false, false, false));
+        assert_eq!(service_control_model(false, None), (false, false, false));
+    }
+
+    #[test]
+    fn pending_gates_all_service_buttons() {
+        use crate::platform::scm::ServiceState as St;
+        assert_eq!(service_control_model(true, Some(St::Running)), (false, false, false));
+        assert_eq!(service_control_model(true, Some(St::Stopped)), (false, false, false));
+    }
+
+    #[test]
+    fn op_feedback_covers_all_states() {
+        let op = |state| ControlOp {
+            label: "启动服务".into(),
+            state,
+            at: Instant::now(),
+        };
+        let (t, c) = op_feedback_view(&op(ControlOpState::Pending));
+        assert!(t.contains("执行中") && t.contains("UAC"), "{t}");
+        assert_eq!(c, egui::Color32::YELLOW);
+        let (t, _) = op_feedback_view(&op(ControlOpState::Ok));
+        assert!(t.contains("成功"), "{t}");
+        let (t, _) = op_feedback_view(&op(ControlOpState::Denied));
+        assert!(t.contains("未获授权"), "{t}");
+        let (t, c) = op_feedback_view(&op(ControlOpState::Failed("Windows 错误 1053".into())));
+        assert!(t.contains("1053"), "{t}");
+        assert_eq!(c, egui::Color32::from_rgb(235, 90, 90));
+    }
+
+    #[test]
+    fn install_command_uses_sidecar_dir_and_quotes_spaces() {
+        // exe_dir 可得 → 作为 -BinDir（sidecar 约定：与 ep-daemon.exe 同目录）
+        let cmd = install_command(Some(Path::new(r"D:\ep\bin")));
+        assert!(cmd.contains("install-service.ps1"));
+        assert!(cmd.contains(r"-BinDir D:\ep\bin"), "{cmd}");
+        assert!(cmd.contains("-ExecutionPolicy Bypass"), "{cmd}");
+        // 含空格路径必须加引号
+        let cmd = install_command(Some(Path::new(r"D:\Program Files\ep\bin")));
+        assert!(cmd.contains(r#""D:\Program Files\ep\bin""#), "{cmd}");
+        // exe 不可得 → 占位提示（不臆造路径）
+        let cmd = install_command(None);
+        assert!(cmd.contains("<部署目录"), "{cmd}");
     }
 }
