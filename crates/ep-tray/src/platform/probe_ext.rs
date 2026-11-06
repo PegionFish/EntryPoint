@@ -17,6 +17,7 @@
 //!
 //! 轮询节奏为 `pub const`（设置页可调版后续票接线时改读共享配置即可）。
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -127,7 +128,17 @@ impl<T> ProbeSlot<T> {
 // ─── 轮询线程 ───────────────────────────────────────────────────────────────
 
 /// 轮询线程主循环（app.rs creator 闭包内 spawn；cc.egui_ctx 可用）。
-pub(crate) fn run_probe_thread(port: u16, shared: Arc<Mutex<UiShared>>, ctx: egui::Context) {
+///
+/// `token`：GT-3 探询鉴权修复（GT-2 遗留）——resolved root 下
+/// `config/app.toml` 的共享令牌（见 [`read_probe_token`]），非空时所有
+/// /api 请求带 `Authorization: Bearer <token>`。启动时读一次（与 log_root
+/// 同款一次性解析；daemon 配置无热更新，令牌轮换需重启托盘）。
+pub(crate) fn run_probe_thread(
+    port: u16,
+    shared: Arc<Mutex<UiShared>>,
+    ctx: egui::Context,
+    token: Option<String>,
+) {
     let agent = ureq::AgentBuilder::new()
         .timeout(REQUEST_TIMEOUT)
         .timeout_connect(CONNECT_TIMEOUT)
@@ -135,6 +146,9 @@ pub(crate) fn run_probe_thread(port: u16, shared: Arc<Mutex<UiShared>>, ctx: egu
     let health_url = format!("http://127.0.0.1:{port}/api/health");
     let queue_url = format!("http://127.0.0.1:{port}/api/queue");
     let devices_url = format!("http://127.0.0.1:{port}/api/devices");
+    if token.is_some() {
+        eprintln!("ep-tray: 探询已启用 Bearer 鉴权（config/app.toml 共享令牌）");
+    }
 
     // 三个「下次到期时刻」初始为 now：线程起步即各抓一轮，UI 无空窗
     let mut next_health = Instant::now();
@@ -146,7 +160,7 @@ pub(crate) fn run_probe_thread(port: u16, shared: Arc<Mutex<UiShared>>, ctx: egu
 
         if now >= next_health {
             next_health = now + HEALTH_INTERVAL;
-            let result = get_json::<HealthSnapshot>(&agent, &health_url);
+            let result = get_json::<HealthSnapshot>(&agent, &health_url, token.as_deref());
             if let Ok(mut s) = shared.lock() {
                 match result {
                     Ok(snap) => s.health.record_ok(snap),
@@ -158,7 +172,7 @@ pub(crate) fn run_probe_thread(port: u16, shared: Arc<Mutex<UiShared>>, ctx: egu
 
         if now >= next_queue {
             next_queue = now + QUEUE_INTERVAL;
-            let result = get_json::<QueueSnapshot>(&agent, &queue_url);
+            let result = get_json::<QueueSnapshot>(&agent, &queue_url, token.as_deref());
             if let Ok(mut s) = shared.lock() {
                 match result {
                     Ok(snap) => s.queue.record_ok(snap),
@@ -170,7 +184,7 @@ pub(crate) fn run_probe_thread(port: u16, shared: Arc<Mutex<UiShared>>, ctx: egu
 
         if now >= next_devices {
             next_devices = now + DEVICES_INTERVAL;
-            let result = get_json::<Vec<DeviceSnapshot>>(&agent, &devices_url);
+            let result = get_json::<Vec<DeviceSnapshot>>(&agent, &devices_url, token.as_deref());
             if let Ok(mut s) = shared.lock() {
                 match result {
                     Ok(snap) => s.devices.record_ok(snap),
@@ -187,10 +201,114 @@ pub(crate) fn run_probe_thread(port: u16, shared: Arc<Mutex<UiShared>>, ctx: egu
 }
 
 /// 单次 GET + JSON 反序列化。任何一步失败都归一为 String 错误（失败日志节流用）。
-fn get_json<T: for<'de> Deserialize<'de>>(agent: &ureq::Agent, url: &str) -> Result<T, String> {
-    let resp = agent.get(url).call().map_err(|e| e.to_string())?;
+/// `token` 非空 → `Authorization: Bearer` 头（daemon auth.rs：Bearer/X-API-Key/
+/// GET ?token= 均可，探询用标准 Bearer）。
+fn get_json<T: for<'de> Deserialize<'de>>(
+    agent: &ureq::Agent,
+    url: &str,
+    token: Option<&str>,
+) -> Result<T, String> {
+    let mut req = agent.get(url);
+    if let Some(t) = token {
+        req = req.set("Authorization", &format!("Bearer {t}"));
+    }
+    let resp = req.call().map_err(|e| e.to_string())?;
     let body = resp.into_string().map_err(|e| e.to_string())?;
     serde_json::from_str(&body).map_err(|e| e.to_string())
+}
+
+// ─── 探询鉴权令牌读取（GT-3，GT-2 遗留 401 修复） ──────────────────────────
+
+/// 从 resolved root 读 `config/app.toml` 的共享令牌（纯文件读 + 行扫描）。
+/// 读取/解析失败一律 None（等价「无令牌」，探询退回匿名——access_protection
+/// =none 的默认部署不受影响）。
+pub(crate) fn read_probe_token(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(root.join("config").join("app.toml")).ok()?;
+    scan_api_token(&text)
+}
+
+/// app.toml 行扫描取鉴权令牌（**不引 toml crate** 的 naive 实现）。
+///
+/// 段感知：跟踪 `[section]` 行，只认 `[server]` 与 `[api]` 段内的
+/// `token = "..."` 键；**优先 `[server].token`，兜底 `[api].token**。
+///
+/// **与票面口径的偏差说明**：派发单写「读 [api].token」，但 daemon 真实校验
+/// 面（crates/ep-daemon/src/api/auth.rs:108-119）是 `/api/*` 全局访问保护
+/// 校验 **`[server].token`**（`[api].token` 只管 `/api/v1/*` 推理面；全局
+/// token 模式下 v1 回退 server token）——只扫 [api] 会拿错令牌、401 修不掉，
+/// 故按真实鉴权面优先 [server]，兜底 [api] 兼容票面字面（多发一个头无副作用）。
+///
+/// 局限（注释留档）：不做完整 TOML 解析——不支持多行字符串/转义/内联表；
+/// 每段取第一个合法 token（重复键不覆盖）；键名精确匹配 `token`（不含
+/// `xxx_token`）；值支持双引号/单引号/裸值（剥行内 `#` 注释）。daemon 侧
+/// 以 serde toml 为准，本扫描目标仅是「常见配置形状下取到正确 Bearer 头」。
+pub(crate) fn scan_api_token(text: &str) -> Option<String> {
+    let mut section: Option<String> = None;
+    let mut server_token: Option<String> = None;
+    let mut api_token: Option<String> = None;
+
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            // 段头：取 [ 与 ] 之间
+            if let Some(end) = line.find(']') {
+                let name = line[1..end].trim();
+                section = Some(name.to_owned());
+            }
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "token" {
+            continue;
+        }
+        let Some(sec) = section.as_deref() else {
+            continue; // 段外 token 不认（防御：非本约定面）
+        };
+        let value = strip_toml_value(value);
+        if value.is_empty() {
+            continue;
+        }
+        // 每段首个合法值生效（不覆盖）
+        match sec {
+            "server" if server_token.is_none() => server_token = Some(value),
+            "api" if api_token.is_none() => api_token = Some(value),
+            _ => {}
+        }
+    }
+    server_token.or(api_token)
+}
+
+/// 取键值文本：双引号/单引号取引号内子串；裸值剥行内 `#` 注释后 trim；
+/// 非法 header 字符（非可见 ASCII）整体拒绝（ureq 头值仅接受可见 ASCII，
+/// 防御性处理——常规令牌皆为 ASCII）。
+fn strip_toml_value(value: &str) -> String {
+    let v = value.trim();
+    let extracted = if let Some(rest) = v.strip_prefix('"') {
+        match rest.find('"') {
+            Some(end) => &rest[..end],
+            None => return String::new(), // 引号不闭合 → 视为无效
+        }
+    } else if let Some(rest) = v.strip_prefix('\'') {
+        match rest.find('\'') {
+            Some(end) => &rest[..end],
+            None => return String::new(),
+        }
+    } else {
+        // 裸值（TOML 合法形态仅限部分类型；防御性接受并剥注释）
+        v.split('#').next().unwrap_or("").trim()
+    };
+    let s = extracted.trim().to_owned();
+    // 可见 ASCII 才可作 HTTP 头值（空格允许；控制字符拒绝）
+    if s.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+        s
+    } else {
+        String::new()
+    }
 }
 
 /// 失败日志节流：进入失败（首次）与之后每 30 次失败打一条（2s 档 ≈ 每分钟
@@ -310,5 +428,86 @@ mod tests {
         // 手工把成功时刻拨回 STALE_AFTER 之前（模拟 daemon 停止响应后超时）
         slot.at = Some(Instant::now() - STALE_AFTER - Duration::from_millis(1));
         assert!(!slot.is_fresh(), "超 STALE_AFTER → 失联判定");
+    }
+
+    // ── 探询鉴权令牌扫描（GT-3，GT-2 遗留 401 修复）──
+
+    #[test]
+    fn scan_prefers_server_token() {
+        let text = "[server]\naccess_protection = \"token\"\ntoken = \"srv-secret\"\n\n[api]\ntoken = \"api-secret\"\n";
+        assert_eq!(scan_api_token(text).as_deref(), Some("srv-secret"),
+            "/api/* 全局门校验 [server].token（auth.rs 实面），优先级高于 [api]");
+    }
+
+    #[test]
+    fn scan_falls_back_to_api_token() {
+        let text = "[server]\naccess_protection = \"token\"\n\n[api]\ntoken = \"api-secret\"\n";
+        assert_eq!(scan_api_token(text).as_deref(), Some("api-secret"),
+            "票面字面兜底：[api].token 在 [server] 缺失时生效");
+    }
+
+    #[test]
+    fn scan_ignores_other_sections_and_bare_keys() {
+        let text = "[llm]\ntoken = \"should-not-match\"\n\n[server]\napi_key = \"x\"\ntokens = \"y\"\n";
+        assert_eq!(scan_api_token(text), None, "键名精确 token、段限 server/api");
+    }
+
+    #[test]
+    fn scan_handles_quotes_comments_and_bare_values() {
+        // 行内注释（引号内 # 不截断）
+        assert_eq!(
+            scan_api_token("[server]\ntoken = \"a#b\" # comment\n").as_deref(),
+            Some("a#b")
+        );
+        // 单引号字面串
+        assert_eq!(scan_api_token("[server]\ntoken = 'lit-tok'\n").as_deref(), Some("lit-tok"));
+        // 裸值剥注释
+        assert_eq!(scan_api_token("[server]\ntoken = bare-tok # note\n").as_deref(), Some("bare-tok"));
+        // 空串 → None（fail-closed 场景本就 401，不发无效头）
+        assert_eq!(scan_api_token("[server]\ntoken = \"\"\n"), None);
+        // 注释与空行跳过；段外键不认
+        assert_eq!(scan_api_token("# c\n\n[server]\n# token = commented\n").as_deref(), None);
+    }
+
+    #[test]
+    fn scan_rejects_non_ascii_header_value() {
+        // 非 ASCII（HTTP 头值非法）→ 拒绝，不发无效头
+        assert_eq!(scan_api_token("[server]\ntoken = \"令牌-中文\"\n"), None);
+    }
+
+    #[test]
+    fn scan_first_token_per_section_wins() {
+        let text = "[server]\ntoken = \"first\"\ntoken = \"second\"\n";
+        assert_eq!(scan_api_token(text).as_deref(), Some("first"));
+    }
+
+    /// 文件级：临时 root/config/app.toml fixture → read_probe_token。
+    #[test]
+    fn read_probe_token_reads_fixture_file() {
+        static TMP_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ep-tray-gt3-token-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        let cfg = dir.join("config").join("app.toml");
+        std::fs::write(
+            &cfg,
+            "[server]\nhost = \"127.0.0.1\"\nport = 9800\naccess_protection = \"token\"\ntoken = \"file-fixture-token\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_probe_token(&dir).as_deref(),
+            Some("file-fixture-token")
+        );
+        // 无 config/app.toml → None（探询退回匿名）
+        let empty = std::env::temp_dir().join(format!("ep-tray-gt3-token-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&empty);
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(read_probe_token(&empty), None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty);
     }
 }

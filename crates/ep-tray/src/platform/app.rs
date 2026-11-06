@@ -123,6 +123,10 @@ pub fn run() -> Result<(), String> {
         std::env::var_os("EP_ROOT").map(PathBuf::from),
         std::env::current_dir().ok(),
     );
+    // ── GT-3 探询鉴权令牌（GT-2 遗留 401 修复）：同一 root 下 config/app.toml
+    //    共享令牌，启动时读一次（daemon 配置无热更新；见 probe_ext
+    //    read_probe_token 的段感知扫描与票面口径偏差注释）──
+    let probe_token = crate::platform::probe_ext::read_probe_token(&log_root);
 
     let run_result = eframe::run_native(
         "EntryPoint 管理台",
@@ -157,7 +161,7 @@ pub fn run() -> Result<(), String> {
                     std::thread::Builder::new()
                         .name("ep-tray-probe".into())
                         .spawn(move || {
-                            crate::platform::probe_ext::run_probe_thread(port, shared, ctx);
+                            crate::platform::probe_ext::run_probe_thread(port, shared, ctx, probe_token);
                         })
                         .map_err(|e| format!("探询线程启动失败: {e}"))?;
                 }
