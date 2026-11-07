@@ -9,12 +9,14 @@
 //! - [`scm`]：Windows 服务控制管理器封装（GT-3：模式检测 + 双模式管控读/写面）
 //! - [`elevate`]：SCM 写操作自提权面（GT-3：ShellExecuteExW runas + --sc-action
 //!   一次性动作进程；主进程绝不提权）
+//! - [`export`]：日志导出（GT-6：白名单收集 + 密钥掩码 + zip 打包）
 //! - [`mutex`]：单实例锁的真实实现（命名互斥体）
 //! - [`registry`]：开机自启的真实实现（HKCU Run 键）
 
 pub mod app;
 pub mod daemon;
 pub mod elevate;
+pub mod export;
 pub mod logpipe;
 pub mod logs;
 pub mod mutex;

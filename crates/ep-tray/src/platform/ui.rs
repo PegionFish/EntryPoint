@@ -10,6 +10,7 @@
 
 use std::os::windows::process::CommandExt as _; // creation_flags（open_webui）
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -22,6 +23,9 @@ use crate::autostart;
 use crate::icons;
 use crate::platform::daemon::{DaemonCommand, StateUpdate};
 use crate::platform::elevate::{self, ElevateError, ScAction, EXIT_DENIED, EXIT_OK};
+use crate::platform::export::{
+    build_zip, collect_export_set, current_month_local, ExportOptions, ExportOutcome,
+};
 use crate::platform::logpipe::ws_source::WsConnState;
 use crate::platform::logpipe::LogPipeHandle;
 use crate::platform::logs::LogPage;
@@ -114,6 +118,15 @@ pub(crate) struct TrayApp {
     /// 日志页状态（显示缓冲 + 过滤视图；logic 进数据，ui 渲染）
     logs: LogPage,
 
+    // ── GT-6：导出状态（跨线程面 = export_shared；选项/弹窗为主线程态）──
+    /// EP root（与 LogPipeConfig.root 同源——app.rs 一次 resolve 两处消费）
+    root: PathBuf,
+    /// egui 上下文（rfd 异步回调线程写结果后 request_repaint 用）
+    ctx: egui::Context,
+    export_shared: Arc<Mutex<ExportUi>>,
+    export_popup: bool,
+    export_opts: ExportOptions,
+
     // ── 托盘（TrayIcon 实体在首个 update 帧创建；tray-icon#90 要求事件循环已运行）──
     menu: Menu,
     status_item: MenuItem,
@@ -149,6 +162,15 @@ struct FrameDebug {
     ui: Duration,
 }
 
+/// 导出流程 UI 态（跨线程：rfd 回调线程 + 打包线程写，logic/ui 读）
+#[derive(Default)]
+pub(crate) struct ExportUi {
+    /// 保存对话框已确认、打包进行中（按钮 Pending 门控）
+    pending: bool,
+    /// 打包完成结果（Some 即展示；下一次导出前清空）
+    outcome: Option<Result<ExportOutcome, String>>,
+}
+
 impl TrayApp {
     /// 构建应用（在 eframe creator 闭包内调用；--minimized 由 ViewportBuilder
     /// 的 with_visible 处理，此处不管）。
@@ -159,6 +181,7 @@ impl TrayApp {
         cmd_tx: Sender<DaemonCommand>,
         shared: Arc<Mutex<UiShared>>,
         log_handle: LogPipeHandle,
+        root: PathBuf,
         menu: Menu,
         handles: TrayMenuHandles,
         pending_open: bool,
@@ -185,6 +208,11 @@ impl TrayApp {
             shared,
             log_handle,
             logs: LogPage::new(),
+            root,
+            ctx: cc.egui_ctx.clone(),
+            export_shared: Arc::new(Mutex::new(ExportUi::default())),
+            export_popup: false,
+            export_opts: ExportOptions::default(),
             menu,
             status_item: handles.status_item,
             open_item: handles.open_item,
@@ -386,10 +414,189 @@ impl eframe::App for TrayApp {
             Page::Settings => self.ui_settings(ui),
         });
 
+        // GT-6 导出弹窗（独立 Window；Pending 期按钮禁用，结果就地展示）
+        self.ui_export_popup(ui.ctx());
+
         // 帧率实测（EP_TRAY_FRAME_DEBUG=1；GT-5 留证）
         self.frame_dbg.ui += t0.elapsed();
         self.frame_debug_tick();
     }
+}
+
+// ── GT-6：日志导出（弹窗 + rfd 异步保存 + 后台打包线程） ─────────────────
+
+/// 导出弹窗（选项 + Pending 门控 + 结果就地展示）。
+impl TrayApp {
+    fn ui_export_popup(&mut self, ctx: &egui::Context) {
+        if !self.export_popup {
+            return;
+        }
+        let mut open = self.export_popup;
+        egui::Window::new("导出日志")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                {
+                    // —— 选项区 ——
+                    ui.horizontal(|ui| {
+                        ui.label("事件日志范围:");
+                        let cur = self.export_opts.events;
+                        for (range, name) in [
+                            (crate::platform::export::EventsRange::All, "全部月份"),
+                            (
+                                crate::platform::export::EventsRange::CurrentMonth,
+                                "仅当前月",
+                            ),
+                        ] {
+                            if ui
+                                .radio(self.export_opts.events == range, name)
+                                .clicked()
+                            {
+                                self.export_opts.events = range;
+                            }
+                            let _ = cur;
+                        }
+                    });
+                    ui.checkbox(&mut self.export_opts.include_tasks, "含任务注册表（task-*.json）");
+                    ui.checkbox(&mut self.export_opts.include_config, "含 config/app.toml（**密钥自动掩码**）");
+
+                    ui.separator();
+                    let (pending, outcome) = {
+                        let st = self
+                            .export_shared
+                            .lock()
+                            .expect("export shared poisoned");
+                        (st.pending, st.outcome.clone())
+                    };
+
+                    if pending {
+                        ui.add(egui::widgets::Spinner::new().size(18.0));
+                        ui.weak("打包中…（保存对话框确认后开始）");
+                    } else {
+                        ui.horizontal(|ui| {
+                            if ui.button("选择保存位置并导出").clicked() {
+                                self.start_export();
+                            }
+                            if ui.button("关闭").clicked() {
+                                self.export_popup = false;
+                            }
+                        });
+                    }
+
+                    // —— 结果区 ——
+                    if let Some(outcome) = &outcome {
+                        ui.separator();
+                        match outcome {
+                            Ok(o) => {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(80, 200, 120),
+                                    format!("✓ 导出完成：{} 个文件", o.files),
+                                );
+                                ui.weak(format!(
+                                    "{}（{} KB）",
+                                    o.out_path.display(),
+                                    o.total_bytes / 1024
+                                ));
+                                if o.masked_lines > 0 {
+                                    ui.weak(format!("已掩码敏感行 {} 行", o.masked_lines));
+                                }
+                                if !o.skipped.is_empty() {
+                                    ui.weak(format!("跳过 {} 项：", o.skipped.len()));
+                                    for s in &o.skipped {
+                                        ui.weak(format!("  · {s}"));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                ui.colored_label(egui::Color32::from_rgb(220, 90, 90), format!("✗ 导出失败: {e}"));
+                            }
+                        }
+                    }
+                }
+            });
+        // X 按钮 / 关闭键 → open=false 回写（闭包内借用 self 不可直接写）
+        self.export_popup = open;
+    }
+
+    /// 发起导出：rfd 同步 FileDialog 放**独立线程**（Windows 支持任意线程打开
+    /// IFileDialog；不阻塞 winit 主循环）→ 用户选路径 → 同线程 collect+build_zip
+    /// → 结果写共享 + request_repaint。
+    fn start_export(&mut self) {
+        {
+            let mut st = self.export_shared.lock().expect("export shared poisoned");
+            if st.pending {
+                return;
+            }
+            st.pending = true;
+            st.outcome = None;
+        }
+        let shared = Arc::clone(&self.export_shared);
+        let ctx = self.ctx.clone();
+        let root = self.root.clone();
+        let opts = self.export_opts;
+        let default_name = {
+            // 本地日期命名（复用 logs.rs 的本地时区换算链，不引 chrono）
+            let ts = std::time::SystemTime::now();
+            let ymd = format!("{}{:02}", current_month_local(), local_day(ts));
+            format!("EntryPoint-logs-{ymd}")
+        };
+        let _ = std::thread::Builder::new()
+            .name("ep-tray-export".into())
+            .spawn(move || {
+                // 对话框本身也在该线程（选型报告：rfd 0.17 Async 回调 API 已移除）
+                let picked = rfd::FileDialog::new()
+                    .set_file_name(&default_name)
+                    .save_file();
+                let outcome = match picked {
+                    None => {
+                        // 用户取消：解除 Pending，不出结果
+                        if let Ok(mut st) = shared.lock() {
+                            st.pending = false;
+                        }
+                        ctx.request_repaint();
+                        return;
+                    }
+                    Some(path) => {
+                        let month = current_month_local();
+                        let items = collect_export_set(&root, &opts, &month);
+                        build_zip(&items, &path).map_err(|e| e.to_string())
+                    }
+                };
+                if let Ok(mut st) = shared.lock() {
+                    st.pending = false;
+                    st.outcome = Some(outcome);
+                }
+                ctx.request_repaint();
+            });
+    }
+}
+
+/// 本地日（导出文件名用）：SystemTime → 本地 SYSTEMTIME 取 wDay。
+fn local_day(ts: std::time::SystemTime) -> u32 {
+    use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows_sys::Win32::System::Time::{
+        FileTimeToSystemTime, GetTimeZoneInformation, SystemTimeToTzSpecificLocalTime,
+        TIME_ZONE_ID_INVALID, TIME_ZONE_INFORMATION,
+    };
+    const EPOCH_DIFF_100NS: u64 = 11_644_473_600 * 10_000_000;
+    let d = ts.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let ft_100ns = d.as_secs() * 10_000_000 + (d.subsec_nanos() / 100) as u64 + EPOCH_DIFF_100NS;
+    let ft = FILETIME {
+        dwLowDateTime: (ft_100ns & 0xFFFF_FFFF) as u32,
+        dwHighDateTime: (ft_100ns >> 32) as u32,
+    };
+    let mut utc = SYSTEMTIME { wYear: 0, wMonth: 0, wDayOfWeek: 0, wDay: 0, wHour: 0, wMinute: 0, wSecond: 0, wMilliseconds: 0 };
+    // 关键：先把 FILETIME 转成 UTC SYSTEMTIME，再送时区转换（空 SYSTEMTIME 会算出垃圾日期）
+    unsafe { FileTimeToSystemTime(&ft, &mut utc) };
+    let mut tzi = TIME_ZONE_INFORMATION::default();
+    let mut local = SYSTEMTIME { wYear: 0, wMonth: 0, wDayOfWeek: 0, wDay: 0, wHour: 0, wMinute: 0, wSecond: 0, wMilliseconds: 0 };
+    let tz_ok = unsafe { GetTimeZoneInformation(&mut tzi) } != TIME_ZONE_ID_INVALID
+        && unsafe { SystemTimeToTzSpecificLocalTime(&tzi, &utc, &mut local) } != 0;
+    if tz_ok {
+        return u32::from(local.wDay);
+    }
+    0
 }
 
 impl TrayApp {
@@ -575,6 +782,9 @@ impl TrayApp {
                 ));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("导出…").clicked() {
+                    self.export_popup = true;
+                }
                 if ui.button("复制页面摘要").clicked() {
                     let summary = format!(
                         "WS={ws_text:?} 引擎={ring_len}行 丢弃={ring_dropped} 缓冲={buffer_len}行",

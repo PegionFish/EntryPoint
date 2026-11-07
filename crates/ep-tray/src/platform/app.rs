@@ -204,7 +204,7 @@ pub fn run() -> Result<(), String> {
                 // tail_start=Beginning：日志页打开即回看 daemon.log 历史
                 // （GT-4 冒烟同语义；超大历史文件由 ring 背压丢最旧兜底，dropped 计数可见）
                 let log_handle = LogPipe::spawn(LogPipeConfig {
-                    root: log_root,
+                    root: log_root.clone(),
                     daemon_port: port,
                     ring_cap: LOG_RING_CAP,
                     tail_start: TailStart::Beginning,
@@ -215,6 +215,8 @@ pub fn run() -> Result<(), String> {
                     cmd_tx,
                     shared,
                     log_handle,
+                    // GT-6 导出与 LogPipe 同源 root（一次 resolve 两处消费）
+                    log_root,
                     menu,
                     TrayMenuHandles {
                         status_item,

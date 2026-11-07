@@ -50,3 +50,5 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Services",
     "Win32_UI_Shell",
 ] }
+zip = { version = "9.4.1", default-features = false, features = ["deflate"] }
+rfd = "0.17.2"
