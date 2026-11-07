@@ -96,16 +96,9 @@ pub(crate) enum ControlOpState {
     Failed(String),
 }
 
-/// 主窗口导航页（GT-1 仅骨架，内容归 GT-2/3/5/6）
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Page {
-    Status,
-    Control,
-    Logs,
-    Settings,
-}
-
-/// eframe 应用本体（全部字段主线程访问；唯一跨线程面是 [`UiShared`]）。
+/// eframe 应用本体/// eframe 应用本体（全部字段主线程访问；唯一跨线程面是 [`UiShared`]）。
+/// GT-7 单页堆叠：顶栏（状态+模式+动作）→ 状态摘要条 → 日志表占满剩余；
+/// 设备详情 / ⚙设置 / 导出 三弹窗，无页面导航。
 pub(crate) struct TrayApp {
     port: u16,
     /// UI → 托管线程命令通道
@@ -140,8 +133,10 @@ pub(crate) struct TrayApp {
     current_color: Option<TrayColor>,
 
     // ── 窗口/状态（主线程标志位）──
-    selected: Page,
     last_label: Option<String>,
+    /// GT-7 单页化：设备详情 / ⚙设置 弹窗开关（导出弹窗见 export_shared 区）
+    devices_popup: bool,
+    gear_popup: bool,
     /// 手动启动（非 --minimized）：daemon 首次就绪后自动打开 WebUI 一次
     pending_open: bool,
     /// 「打开管理台」菜单置位 → logic 内发 Visible(true)
@@ -191,18 +186,8 @@ impl TrayApp {
         if let Ok(mut s) = shared.lock() {
             s.cjk_font = cjk_font_loaded.map(str::to_owned);
         }
-        // 联调钩子：EP_TRAY_PAGE=logs|control|settings 覆盖起始页（截图留证用）
-        let selected = std::env::var("EP_TRAY_PAGE")
-            .ok()
-            .and_then(|p| match p.as_str() {
-                "control" => Some(Page::Control),
-                "logs" => Some(Page::Logs),
-                "settings" => Some(Page::Settings),
-                _ => None,
-            })
-            .unwrap_or(Page::Status);
+        // 联调钩子 EP_TRAY_PAGE 已随 GT-7 单页化移除（起始页概念不存在了）
         Self {
-            selected,
             port,
             cmd_tx,
             shared,
@@ -224,6 +209,8 @@ impl TrayApp {
             tray: None,
             current_color: None,
             last_label: None,
+            devices_popup: false,
+            gear_popup: false,
             pending_open,
             pending_show: false,
             really_quit: false,
@@ -368,54 +355,49 @@ impl eframe::App for TrayApp {
                         .size(16.0),
                 );
                 ui.strong(label);
+                // GT-3 模式徽章（全局）：sidecar ∥ Windows Service
+                let mode = self
+                    .shared
+                    .lock()
+                    .map(|s| s.mode)
+                    .unwrap_or(RunMode::Sidecar);
+                let (text, fg, tip) = mode_badge_view(mode);
+                let badge = ui.label(
+                    egui::RichText::new(text)
+                        .color(fg)
+                        .background_color(egui::Color32::from_rgb(40, 44, 52)),
+                );
+                badge.on_hover_text(tip);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("打开 WebUI").clicked() {
                         open_webui(self.port);
                     }
                     ui.separator();
-                    // GT-3 模式徽章（全局）：sidecar ∥ Windows Service
-                    let mode = self
-                        .shared
-                        .lock()
-                        .map(|s| s.mode)
-                        .unwrap_or(RunMode::Sidecar);
-                    let (text, fg, tip) = mode_badge_view(mode);
-                    let badge = ui.label(
-                        egui::RichText::new(text)
-                            .color(fg)
-                            .background_color(egui::Color32::from_rgb(40, 44, 52)),
-                    );
-                    badge.on_hover_text(tip);
+                    self.ui_action_buttons(ui, mode);
                 });
             });
-        });
 
-        egui::Panel::left("nav").show(ui, |ui| {
-            ui.add_space(8.0);
-            ui.set_min_width(120.0);
-            ui.heading("EntryPoint");
-            ui.separator();
-            for (page, name) in [
-                (Page::Status, "状态"),
-                (Page::Control, "管控"),
-                (Page::Logs, "日志"),
-                (Page::Settings, "设置"),
-            ] {
-                if ui.selectable_label(self.selected == page, name).clicked() {
-                    self.selected = page;
+            // ── 状态摘要条（原状态页 daemon/队列卡收敛为一行；设备全表进弹窗）──
+            self.ui_status_strip(ui);
+
+            // 提权操作反馈行（GT-3：UAC 结果/失败原因，出现即显示）
+            if let Ok(s) = self.shared.lock() {
+                if let Some(op) = &s.control_op {
+                    let (text, color) = op_feedback_view(op);
+                    ui.label(egui::RichText::new(text).color(color).small());
                 }
             }
         });
 
-        egui::CentralPanel::default().show(ui, |ui| match self.selected {
-            Page::Status => self.ui_status(ui),
-            Page::Control => self.ui_control(ui),
-            Page::Logs => self.ui_logs(ui),
-            Page::Settings => self.ui_settings(ui),
+        // ── 主体：日志页占满剩余全部高度（⚙设置 / 设备 / 导出 都在工具条）──
+        egui::CentralPanel::default().show(ui, |ui| {
+            self.ui_logs(ui);
         });
 
-        // GT-6 导出弹窗（独立 Window；Pending 期按钮禁用，结果就地展示）
+        // 弹窗层（GT-7 单页化：设备详情 / ⚙设置 / 导出）
         self.ui_export_popup(ui.ctx());
+        self.ui_devices_popup(ui.ctx());
+        self.ui_gear_popup(ui.ctx());
 
         // 帧率实测（EP_TRAY_FRAME_DEBUG=1；GT-5 留证）
         self.frame_dbg.ui += t0.elapsed();
@@ -654,81 +636,11 @@ pub(crate) fn mode_badge_view(mode: RunMode) -> (&'static str, egui::Color32, &'
     }
 }
 
-/// 设置页最小版（GT-2）：探询节奏只读展示 / 打开 WebUI / 托盘与版本 /
-/// CJK 字体加载状态。root 覆盖、轮询可调、缓冲上限留给后续票。
-impl TrayApp {
-    fn ui_settings(&self, ui: &mut egui::Ui) {
-        ui.heading("设置");
-        let Ok(s) = self.shared.lock() else {
-            ui.label("共享状态不可用（锁中毒）");
-            return;
-        };
-
-        // ── 探询节奏（只读；可调版后续票接线——pub const 已备好接电线）──
-        ui.group(|ui| {
-            ui.strong("探询节奏（当前只读，可调版由后续票接线）");
-            ui.label(format!(
-                "健康 {} 秒 / 队列 {} 秒 / 设备 {} 秒",
-                HEALTH_INTERVAL.as_secs(),
-                QUEUE_INTERVAL.as_secs(),
-                DEVICES_INTERVAL.as_secs()
-            ));
-            ui.label(format!(
-                "单次请求超时 {:.1} 秒 · 失联判定阈值 {} 秒",
-                REQUEST_TIMEOUT.as_secs_f32(),
-                STALE_AFTER.as_secs()
-            ));
-        });
-
-        // ── WebUI（GUI 不承载业务：配置编辑/业务操作深链浏览器）──
-        ui.group(|ui| {
-            ui.strong("WebUI");
-            ui.horizontal(|ui| {
-                if ui.button("打开 WebUI").clicked() {
-                    open_webui(self.port);
-                }
-                ui.weak(format!("http://127.0.0.1:{}", self.port));
-            });
-            ui.weak("业务操作面（模块/任务/配置编辑）：浏览器打开；GUI = 本机运维面");
-        });
-
-        // ── 托盘与版本 ──
-        ui.group(|ui| {
-            ui.strong("托盘与版本");
-            ui.label(format!(
-                "ep-tray v{}（管理台本体）",
-                env!("CARGO_PKG_VERSION")
-            ));
-            match s.health.data.as_ref().filter(|_| s.health.is_fresh()) {
-                Some(h) => {
-                    ui.label(format!("daemon v{}（/api/health 实时）", h.version));
-                }
-                None => {
-                    ui.label(format!("daemon 版本：{PROBE_PLACEHOLDER}"));
-                }
-            }
-            match &s.cjk_font {
-                Some(name) => {
-                    ui.label(format!("中文字体：已加载 {name}"));
-                }
-                None => {
-                    ui.colored_label(
-                        egui::Color32::YELLOW,
-                        "中文字体：未加载（msyh/simsun 均未找到），中文可能显示为方块",
-                    );
-                }
-            }
-            ui.weak("托盘图标三色随 daemon 状态联动（绿=运行 / 黄=过渡 / 红=故障）");
-        });
-    }
-}
-
 /// 日志页（GT-5）：工具条（WS 连接徽标 + 引擎/缓冲计数）+ 虚拟滚动表格
 /// （表格与过滤渲染由本票后续 commit 接入；工具条数据全部来自 LogPipeHandle
 /// 只读面——logic 帧已 drain，这里不触碰锁）。
 impl TrayApp {
     fn ui_logs(&mut self, ui: &mut egui::Ui) {
-        ui.heading("日志");
         let ws = self.log_handle.ws_status();
         let ring_len = self.log_handle.ring_len();
         let ring_dropped = self.log_handle.drop_count();
@@ -782,6 +694,9 @@ impl TrayApp {
                 ));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("⚙ 设置").clicked() {
+                    self.gear_popup = !self.gear_popup;
+                }
                 if ui.button("导出…").clicked() {
                     self.export_popup = true;
                 }
@@ -801,194 +716,92 @@ impl TrayApp {
     }
 }
 
-/// 状态页（GT-2）：daemon 卡 / 设备卡 / 队列卡。
-///
-/// 数据全部来自 probe_ext 线程写入 [`UiShared`] 的探询快照；槽位 None 或
-/// 超 [`STALE_AFTER`](probe_ext::STALE_AFTER) 新鲜度 → 统一占位文案。
-/// 守护宕机判定沿 supervisor（顶栏三色圆点，`status_view` 复用）。
+/// 状态摘要条（GT-7 单页化：原状态页 daemon/队列卡收敛为一行；设备全表
+/// 进弹窗）。数据全部来自 probe_ext 探询快照（GT-2），槽位 None 或超新鲜度
+/// → 统一占位文案。
 impl TrayApp {
-    fn ui_status(&self, ui: &mut egui::Ui) {
-        ui.heading("状态");
-        let Ok(s) = self.shared.lock() else {
-            ui.label("共享状态不可用（锁中毒）");
-            return;
+    fn ui_status_strip(&mut self, ui: &mut egui::Ui) {
+        let Ok(s) = self.shared.lock() else { return; };
+        let version = s.health.data.as_ref().filter(|_| s.health.is_fresh())
+            .map(|h| format!("daemon v{}", h.version))
+            .unwrap_or_else(|| format!("daemon 版本：{PROBE_PLACEHOLDER}"));
+        let probe = match (s.health.at, s.health.is_fresh()) {
+            (Some(at), true) => format!("探询正常（{} 秒前）", at.elapsed().as_secs()),
+            (Some(_), false) => "探询失联（>10s）".to_owned(),
+            (None, _) => "探询未就绪".to_owned(),
         };
-        // 设备表格宽于最小窗宽（720px），窄窗下允许双向滚动不裁列
-        egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+        let queue = s.queue.data.as_ref().filter(|_| s.queue.is_fresh())
+            .map(|q| format!("队列 {}/{}", q.running, q.queued))
+            .unwrap_or_else(|| "队列 —".to_owned());
+        let gpu = s.devices.data.as_ref().filter(|_| s.devices.is_fresh())
+            .and_then(|ds| ds.iter().find(|d| d.backend == "cuda").or_else(|| ds.first()))
+            .map(|d| format!(
+                "{} 已用 {}",
+                mb_to_gb(d.total_memory_mb),
+                mb_to_gb(d.used_memory_mb)
+            ))
+            .unwrap_or_else(|| "GPU —".to_owned());
+        ui.horizontal(|ui| {
+            ui.weak(format!("{version} · 端口 {} · {probe} · {queue}", self.port));
+            ui.separator();
+            ui.weak(gpu);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("设备…").clicked() {
+                    self.devices_popup = !self.devices_popup;
+                }
+            });
+        });
+    }
+}
 
-        // ── daemon 卡：三色圆点 + 状态文字 + 版本 + 端口 + 数据新鲜度 ──
-        ui.group(|ui| {
-            ui.horizontal(|ui| {
-                let (color, label) = self.status_view();
-                let (r, g, b) = icons::status_rgb(color);
-                ui.label(
-                    egui::RichText::new("●")
-                        .color(egui::Color32::from_rgb(r, g, b))
-                        .size(16.0),
-                );
-                ui.strong(label);
-                ui.separator();
-                match s.health.data.as_ref().filter(|_| s.health.is_fresh()) {
-                    Some(h) => {
-                        ui.label(format!("daemon v{}", h.version));
-                        ui.weak(format!("健康: {}", h.status));
+/// 设备详情弹窗（原状态页设备卡全表：一条 = 物理归并后的设备）。
+impl TrayApp {
+    fn ui_devices_popup(&mut self, ctx: &egui::Context) {
+        if !self.devices_popup {
+            return;
+        }
+        let mut open = self.devices_popup;
+        egui::Window::new("计算设备")
+            .open(&mut open)
+            .resizable(true)
+            .show(ctx, |ui| {
+                let Ok(s) = self.shared.lock() else {
+                    ui.label("共享状态不可用（锁中毒）");
+                    return;
+                };
+                let devs = s.devices.data.as_ref().filter(|_| s.devices.is_fresh());
+                match devs {
+                    Some(devs) if devs.is_empty() => {
+                        ui.weak("（daemon 未报告任何计算设备）");
+                    }
+                    Some(devs) => {
+                        egui::Grid::new("devices_grid")
+                            .striped(true)
+                            .num_columns(7)
+                            .spacing([16.0, 4.0])
+                            .show(ui, |ui| {
+                                for head in ["名称", "后端", "计算栈", "显存", "已用", "利用率", "温度"] {
+                                    ui.strong(head);
+                                }
+                                ui.end_row();
+                                for d in devs {
+                                    ui.label(&d.name);
+                                    ui.label(&d.backend);
+                                    ui.label(d.stacks.join("/"));
+                                    ui.label(mb_to_gb(d.total_memory_mb));
+                                    ui.label(mb_to_gb(d.used_memory_mb));
+                                    ui.label(metric(d.utilization, "%"));
+                                    ui.label(metric(d.temperature, "°C"));
+                                    ui.end_row();
+                                }
+                            });
                     }
                     None => {
-                        ui.weak(format!("daemon 版本：{PROBE_PLACEHOLDER}"));
-                    }
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak(format!("端口 {}", self.port));
-                });
-            });
-            // 数据新鲜度行：最后成功轮询时刻；超 10s 标灰提示「探询失联」
-            match (s.health.at, s.health.is_fresh()) {
-                (Some(at), true) => {
-                    ui.weak(format!(
-                        "探询正常（2s 档）· 最后成功 {} 秒前",
-                        at.elapsed().as_secs()
-                    ));
-                }
-                (Some(_), false) => {
-                    ui.colored_label(
-                        egui::Color32::GRAY,
-                        "探询失联：超过 10s 无成功响应（daemon 宕机或拒绝连接）",
-                    );
-                }
-                (None, _) => {
-                    ui.weak("探询未就绪：尚未收到任何成功响应");
-                }
-            }
-            // ── 运行模式行（GT-3 徽章，scm_watch 30s 复检）──
-            let mode_line = {
-                let mode = s.mode;
-                match s.service.data.as_ref() {
-                    Some(snap) if mode == RunMode::Service => {
-                        let state = snap
-                            .status
-                            .map(|st| st.label())
-                            .unwrap_or("状态未知");
-                        let recheck = s
-                            .service
-                            .at
-                            .map(|at| format!("，{} 秒前复检", at.elapsed().as_secs()))
-                            .unwrap_or_default();
-                        format!(
-                            "运行模式：Windows 服务（{SERVICE_NAME}）· {state} · 启动类型 {}{recheck}",
-                            snap.start.label()
-                        )
-                    }
-                    Some(_) | None if mode == RunMode::Service => {
-                        "运行模式：Windows 服务（服务快照待复检）".to_owned()
-                    }
-                    _ => "运行模式：sidecar（ep-tray 托管；Windows 服务未安装）".to_owned(),
-                }
-            };
-            ui.weak(mode_line);
-        });
-
-        // ── 设备卡：/api/devices 表格（一条 = 物理归并后的设备）──
-        ui.group(|ui| {
-            ui.strong("设备（10s 档）");
-            let devs = s.devices.data.as_ref().filter(|_| s.devices.is_fresh());
-            match devs {
-                Some(devs) if devs.is_empty() => {
-                    ui.weak("（daemon 未报告任何计算设备）");
-                }
-                Some(devs) => {
-                    egui::Grid::new("devices_grid")
-                        .striped(true)
-                        .num_columns(7)
-                        .spacing([16.0, 4.0])
-                        .show(ui, |ui| {
-                            for head in ["名称", "后端", "计算栈", "显存", "已用", "利用率", "温度"]
-                            {
-                                ui.strong(head);
-                            }
-                            ui.end_row();
-                            for d in devs {
-                                ui.label(&d.name);
-                                ui.label(&d.backend);
-                                ui.label(d.stacks.join("/"));
-                                ui.label(mb_to_gb(d.total_memory_mb));
-                                ui.label(mb_to_gb(d.used_memory_mb));
-                                ui.label(metric(d.utilization, "%"));
-                                ui.label(metric(d.temperature, "°C"));
-                                ui.end_row();
-                            }
-                        });
-                }
-                None => {
-                    ui.label(PROBE_PLACEHOLDER);
-                }
-            }
-        });
-
-        // ── 队列卡：paused/running/queued 三个大数字 + 暂停状态徽标 ──
-        ui.group(|ui| {
-            ui.horizontal(|ui| {
-                ui.strong("队列（5s 档）");
-                let paused_badged = s
-                    .queue
-                    .data
-                    .as_ref()
-                    .filter(|_| s.queue.is_fresh())
-                    .map(|q| q.paused);
-                if let Some(paused) = paused_badged {
-                    if paused {
-                        ui.label(
-                            egui::RichText::new("已暂停派发")
-                                .color(egui::Color32::YELLOW)
-                                .background_color(egui::Color32::from_rgb(70, 60, 20)),
-                        );
-                    } else {
-                        ui.label(
-                            egui::RichText::new("派发中")
-                                .color(egui::Color32::from_rgb(80, 200, 120))
-                                .background_color(egui::Color32::from_rgb(20, 60, 40)),
-                        );
+                        ui.label(PROBE_PLACEHOLDER);
                     }
                 }
             });
-            match s.queue.data.as_ref().filter(|_| s.queue.is_fresh()) {
-                Some(q) => {
-                    ui.add_space(2.0);
-                    ui.horizontal(|ui| {
-                        big_stat(
-                            ui,
-                            "派发暂停",
-                            if q.paused { "是" } else { "否" },
-                            if q.paused {
-                                egui::Color32::YELLOW
-                            } else {
-                                egui::Color32::from_rgb(80, 200, 120)
-                            },
-                        );
-                        ui.separator();
-                        big_stat(
-                            ui,
-                            "运行中",
-                            &q.running.to_string(),
-                            ui.style().visuals.strong_text_color(),
-                        );
-                        ui.separator();
-                        big_stat(
-                            ui,
-                            "排队中",
-                            &q.queued.to_string(),
-                            ui.style().visuals.strong_text_color(),
-                        );
-                    });
-                    if q.paused {
-                        ui.weak("派发已暂停：排队任务保留，运行中任务照常完成");
-                    }
-                }
-                None => {
-                    ui.label(PROBE_PLACEHOLDER);
-                }
-            }
-        });
-        });
+        self.devices_popup = open;
     }
 }
 
@@ -996,101 +809,110 @@ impl TrayApp {
 /// 沿用 supervisor 命令（cmd_tx）与 HKCU Run 自启；服务未安装时给安装指引
 /// 文字（**不自动装/卸——红线**）。写操作反馈经 [`UiShared::control_op`]。
 impl TrayApp {
-    fn ui_control(&self, ui: &mut egui::Ui) {
-        ui.heading("管控");
-        let Ok(s) = self.shared.lock() else {
-            ui.label("共享状态不可用（锁中毒）");
-            return;
-        };
-        let mode = s.mode;
-        let snap = s.service.data.clone();
-        let control_op = s.control_op.clone();
-        drop(s); // 释放共享锁再进子视图（子视图 launch_service_op 会重新加锁）
-
-        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            // 当前模式行
-            let (badge_text, fg, tip) = mode_badge_view(mode);
-            ui.horizontal(|ui| {
-                ui.strong("当前模式：");
-                let badge = ui.label(
-                    egui::RichText::new(badge_text)
-                        .color(fg)
-                        .background_color(egui::Color32::from_rgb(40, 44, 52)),
-                );
-                badge.on_hover_text(tip);
-                if let Some(snap) = &snap {
-                    if mode == RunMode::Service {
-                        ui.weak(format!(
-                            "服务 {} · PID {}",
-                            snap.status.map(|st| st.label()).unwrap_or("状态未知"),
-                            snap.pid.map(|p| p.to_string()).unwrap_or_else(|| "—".into())
-                        ));
-                    }
-                }
-            });
-
-            // 提权操作反馈行（两模式共用：sidecar 的安装指引复制无 UAC，
-            // 但 StartType/Recovery/启停都走这里）
-            if let Some(op) = &control_op {
-                let (text, color) = op_feedback_view(op);
-                ui.label(egui::RichText::new(text).color(color));
-            }
-            ui.separator();
-
-            match mode {
-                RunMode::Service => self.ui_control_service(ui, snap.as_ref()),
-                RunMode::Sidecar => self.ui_control_sidecar(ui, snap.as_ref()),
-            }
-        });
-    }
-
-    /// Service 模式：启动/停止/重启（提权）+ 启动类型单选 + 崩溃自动重启开关。
-    fn ui_control_service(&self, ui: &mut egui::Ui, snap: Option<&ServiceSnap>) {
-        let pending = self.op_pending();
-
-        // ── 服务操作 ──
-        ui.group(|ui| {
-            ui.strong("服务操作（EntryPoint，写操作经 UAC 提权一次性子进程执行）");
-            let (can_start, can_stop, can_restart) =
-                service_control_model(pending, snap.and_then(|x| x.status));
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(can_start, egui::Button::new("启动"))
-                    .clicked()
-                {
+    /// 模式感知的启停/重启按钮（顶栏内联；GT-7 单页化——原管控页动作区）：
+    /// sidecar=supervisor 命令（cmd_tx）；service=SCM 提权一次性动作（UAC 现场批）。
+    fn ui_action_buttons(&self, ui: &mut egui::Ui, mode: RunMode) {
+        match mode {
+            RunMode::Service => {
+                let pending = self.op_pending();
+                let snap = self.shared.lock().ok().and_then(|s| s.service.data.clone());
+                let (can_start, can_stop, can_restart) =
+                    service_control_model(pending, snap.as_ref().and_then(|x| x.status));
+                if ui.add_enabled(can_start, egui::Button::new("启动")).clicked() {
                     self.launch_service_op(ScAction::Start);
                 }
-                if ui
-                    .add_enabled(can_stop, egui::Button::new("停止"))
-                    .clicked()
-                {
+                if ui.add_enabled(can_stop, egui::Button::new("停止")).clicked() {
                     self.launch_service_op(ScAction::Stop);
                 }
-                if ui
-                    .add_enabled(can_restart, egui::Button::new("重启"))
-                    .clicked()
-                {
+                if ui.add_enabled(can_restart, egui::Button::new("重启")).clicked() {
                     self.launch_service_op(ScAction::Restart);
                 }
-            });
-            ui.weak("每次操作由 UAC 现场批准；主进程绝不持有管理员权限");
-            let snap_fresh = self
-                .shared
-                .lock()
-                .ok()
-                .and_then(|s| s.service.at)
-                .map(|at| format!("（{} 秒前复检）", at.elapsed().as_secs()))
-                .unwrap_or_default();
-            ui.weak(format!(
-                "服务状态每 {} 秒自动复检{snap_fresh}",
-                crate::platform::scm::SCM_RECHECK_INTERVAL.as_secs()
-            ));
-        });
+            }
+            RunMode::Sidecar => {
+                if ui.button("重启 daemon").clicked() {
+                    let _ = self.cmd_tx.send(DaemonCommand::Restart);
+                }
+                if ui.button("停止 daemon").clicked() {
+                    let _ = self.cmd_tx.send(DaemonCommand::Stop);
+                }
+            }
+        }
+    }
 
-        // ── 自启方式（启动类型）──
+    /// ⚙ 设置弹窗（GT-7 单页化：原设置页 + 管控页配置区收敛）——自启方式、
+    /// 服务安装指引（sidecar）、启动类型/崩溃恢复（Service）、探询节奏、
+    /// 版本与字体状态。写操作经 UAC（service）；主进程绝不提权。
+    fn ui_gear_popup(&mut self, ctx: &egui::Context) {
+        if !self.gear_popup {
+            return;
+        }
+        let mut open = self.gear_popup;
+        egui::Window::new("设置")
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                let mode = self
+                    .shared
+                    .lock()
+                    .map(|s| s.mode)
+                    .unwrap_or(RunMode::Sidecar);
+                match mode {
+                    RunMode::Service => self.ui_gear_service(ui),
+                    RunMode::Sidecar => self.ui_gear_sidecar(ui),
+                }
+                ui.separator();
+
+                // ── 探询节奏（只读；可调版后续票接线）──
+                ui.group(|ui| {
+                    ui.strong("探询节奏（当前只读，可调版由后续票接线）");
+                    ui.label(format!(
+                        "健康 {} 秒 / 队列 {} 秒 / 设备 {} 秒",
+                        HEALTH_INTERVAL.as_secs(),
+                        QUEUE_INTERVAL.as_secs(),
+                        DEVICES_INTERVAL.as_secs()
+                    ));
+                    ui.label(format!(
+                        "单次请求超时 {:.1} 秒 · 失联判定阈值 {} 秒",
+                        REQUEST_TIMEOUT.as_secs_f32(),
+                        STALE_AFTER.as_secs()
+                    ));
+                });
+
+                // ── 托盘与版本 ──
+                ui.group(|ui| {
+                    ui.label(format!("ep-tray v{}（管理台本体）", env!("CARGO_PKG_VERSION")));
+                    let health_version = self.shared.lock().ok().and_then(|s| {
+                        s.health
+                            .data
+                            .as_ref()
+                            .filter(|_| s.health.is_fresh())
+                            .map(|h| h.version.clone())
+                    });
+                    match health_version {
+                        Some(v) => ui.label(format!("daemon v{}（/api/health 实时）", v)),
+                        None => ui.label(format!("daemon 版本：{PROBE_PLACEHOLDER}")),
+                    };
+                    match self.shared.lock().ok().and_then(|s| s.cjk_font.clone()) {
+                        Some(name) => ui.label(format!("中文字体：已加载 {name}")),
+                        None => ui.colored_label(
+                            egui::Color32::YELLOW,
+                            "中文字体：未加载（msyh/simsun 均未找到），中文可能显示为方块",
+                        ),
+                    };
+                });
+            });
+        self.gear_popup = open;
+    }
+
+    /// Service 模式 ⚙：启动类型（systemctl enable 等价）+ 崩溃自动重启
+    /// （Restart=on-failure 等价）。写操作经 UAC 提权一次性子进程。
+    fn ui_gear_service(&mut self, ui: &mut egui::Ui) {
+        let pending = self.op_pending();
+        let snap = self.shared.lock().ok().and_then(|s| s.service.data.clone());
+
         ui.group(|ui| {
             ui.strong("自启方式（服务启动类型，等价 systemctl enable/disable）");
-            let current = snap.map(|x| x.start).unwrap_or(StartKind::Other);
+            let current = snap.as_ref().map(|x| x.start).unwrap_or(StartKind::Other);
             let snapshot_sel = current.radio_index();
             let mut sel = snapshot_sel;
             ui.add_enabled_ui(!pending, |ui| {
@@ -1119,10 +941,9 @@ impl TrayApp {
             ui.weak("改动经 UAC 提权写入 SCM，生效后可用 sc qc EntryPoint 核对");
         });
 
-        // ── 崩溃自动重启（SCM Recovery）──
         ui.group(|ui| {
             ui.strong("崩溃自动重启（等价 systemd Restart=on-failure）");
-            let recovery = snap.and_then(|x| x.recovery_restart);
+            let recovery = snap.as_ref().and_then(|x| x.recovery_restart);
             let mut on = recovery.unwrap_or(false);
             let resp = ui.add_enabled(
                 !pending && recovery.is_some(),
@@ -1141,23 +962,9 @@ impl TrayApp {
         });
     }
 
-    /// sidecar 模式：supervisor 命令照旧 + HKCU Run 自启 + 服务安装指引。
-    fn ui_control_sidecar(&self, ui: &mut egui::Ui, _snap: Option<&ServiceSnap>) {
-        // ── daemon 进程（sidecar 托管，supervisor 状态机照旧——回归红线）──
-        ui.group(|ui| {
-            ui.strong("daemon 进程（sidecar：ep-tray 以子进程方式托管）");
-            ui.weak("崩溃自动重启一次，再失败托盘红标（supervisor 状态机）");
-            ui.horizontal(|ui| {
-                if ui.button("重启 daemon").clicked() {
-                    let _ = self.cmd_tx.send(DaemonCommand::Restart);
-                }
-                if ui.button("停止 daemon").clicked() {
-                    let _ = self.cmd_tx.send(DaemonCommand::Stop);
-                }
-            });
-        });
-
-        // ── 自启（HKCU Run，与托盘菜单「开机自启」同一事实源）──
+    /// sidecar 模式 ⚙：HKCU Run 自启（与托盘菜单同一事实源）+ 服务安装指引
+    /// （不自动装/卸——红线）。
+    fn ui_gear_sidecar(&mut self, ui: &mut egui::Ui) {
         ui.group(|ui| {
             ui.strong("开机自启（当前用户登录时）");
             let mut on = self.autostart_item.is_checked();
@@ -1179,7 +986,6 @@ impl TrayApp {
             ui.weak("与托盘菜单「开机自启」为同一注册表项");
         });
 
-        // ── Windows 服务安装指引（不自动装/卸——红线）──
         ui.group(|ui| {
             ui.strong("Windows 服务（可选，未安装）");
             ui.weak("如需系统级服务（登录前自启、独立于登录会话、SCM 崩溃恢复）：");
@@ -1332,14 +1138,6 @@ pub(crate) fn install_command(exe_dir: Option<&Path>) -> String {
 }
 
 /// 队列卡大数字块（说明行 + 放大数值）。
-fn big_stat(ui: &mut egui::Ui, caption: &str, value: &str, color: egui::Color32) {
-    ui.vertical(|ui| {
-        ui.weak(caption);
-        ui.label(egui::RichText::new(value).size(26.0).color(color).strong());
-    });
-}
-
-/// 显存 MB → GB 显示（None → 占位破折号）。
 fn mb_to_gb(mb: Option<u32>) -> String {
     match mb {
         Some(mb) => format!("{:.1} GB", f64::from(mb) / 1024.0),
